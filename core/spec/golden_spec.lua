@@ -1,0 +1,138 @@
+-- Replays core/golden/*.json against the Lua core. This is the consumer side
+-- of the parity contract: any implementation of core must pass the same
+-- files the same way. core/golden/README.md documents the input semantics
+-- this spec implements (how to build ctx from `input`).
+local H = require "core.spec.helper"
+local core      = require "jev.core"
+local normalize = require "jev.core.normalize"
+local rules_mod = require "jev.core.rules"
+local policy    = require "jev.core.policy"
+local verdict   = require "jev.core.verdict"
+local defaults  = require "jev.core.defaults"
+local breaker_m = require "jev.core.breaker"
+local json = require "dkjson"
+
+local function load(name)
+  local f = assert(io.open("core/golden/" .. name .. ".json", "rb"), "missing golden file " .. name)
+  local doc = assert(json.decode(f:read("*a")))
+  f:close()
+  assert.equals(1, doc.format_version, "unknown golden format version")
+  return doc
+end
+
+-- dkjson turns [] and {} both into empty tables; compare structurally.
+local function same(exp, got, path)
+  path = path or "expect"
+  if type(exp) == "table" then
+    assert.equals("table", type(got), path)
+    for k, v in pairs(exp) do same(v, got[k], path .. "." .. tostring(k)) end
+    for k in pairs(got) do
+      assert.not_nil(exp[k], path .. "." .. tostring(k) .. " is extra")
+    end
+  else
+    assert.same(exp, got, path)
+  end
+end
+
+local function store_from(map)
+  local s = H.store()
+  for k, v in pairs(map or {}) do s:set(k, v) end
+  return s
+end
+
+describe("golden: normalize", function()
+  for _, c in ipairs(load("normalize").cases) do
+    it(c.name, function()
+      same(c.expect.normalized, normalize.normalize(c.input.text, c.input.opts))
+      same(c.expect.fingerprint, normalize.fingerprint(c.input.text, c.input.opts, normalize.djb2))
+    end)
+  end
+end)
+
+describe("golden: extract", function()
+  for _, c in ipairs(load("extract").cases) do
+    it(c.name, function()
+      local text, kind = normalize.extract(c.input.body, c.input.content_type, c.input.fields, H.json.decode)
+      same(c.expect, { text = text, kind = kind })
+    end)
+  end
+end)
+
+describe("golden: rules", function()
+  for _, c in ipairs(load("rules").cases) do
+    it(c.name, function()
+      local rule = require("jev.rules." .. c.input.rule)
+      local ctx = {
+        cache = store_from(c.input.cache), clock = function() return c.input.clock end,
+        json_decode = H.json.decode, re_find = H.re_find,
+      }
+      local r, text, reason = rules_mod.evaluate(c.input.req, rule, ctx)
+      same(c.expect, { result = r, text = text, reason = reason })
+    end)
+  end
+end)
+
+describe("golden: policy", function()
+  for _, c in ipairs(load("policy").cases) do
+    it(c.name, function()
+      local action, label, async
+      if c.input.event == "error" then action, label, async = policy.on_error()
+      elseif c.input.event == "skipped" then action, label, async = policy.on_skipped()
+      else action, label, async = policy.decide(c.input.score, c.input.policy) end
+      same(c.expect, { action = action, label = label, async = async })
+    end)
+  end
+end)
+
+describe("golden: verdict", function()
+  for _, c in ipairs(load("verdict").cases) do
+    it(c.name, function()
+      local v = verdict.new(c.input)
+      same(c.expect, { verdict = v, headers = verdict.headers(v) })
+    end)
+  end
+end)
+
+describe("golden: evaluate", function()
+  for _, c in ipairs(load("evaluate").cases) do
+    it(c.name, function()
+      local inp = c.input
+      local cache = store_from(inp.cache)
+      local writes, calls, seen = {}, 0, nil
+      local rules = {}
+      for _, id in ipairs(inp.rules) do rules[#rules + 1] = require("jev.rules." .. id) end
+      local breaker
+      if inp.breaker then
+        local bstore = H.store()
+        local st = inp.breaker == "open" and breaker_m.OPEN or breaker_m.CLOSED
+        bstore:set("brk:state", { state = st, until_ts = inp.clock + 30 })
+        breaker = breaker_m.new(bstore, function() return inp.clock end, {})
+      end
+      local ctx = {
+        config = defaults.merge(defaults.config, inp.config), rules = rules, breaker = breaker,
+        cache = {
+          get = function(_, k) return cache:get(k) end,
+          set = function(_, k, v, ttl) writes[k] = { value = v, ttl = ttl }; cache:set(k, v, ttl) end,
+        },
+        clock = function() return inp.clock end,
+        hash = normalize.djb2, json_decode = H.json.decode, re_find = H.re_find,
+        judge = { call = function(prompt)
+          calls = calls + 1; seen = prompt
+          if inp.judge.error then return nil, inp.judge.error end
+          return inp.judge.answers
+        end },
+        log = function() end,
+      }
+      local v = core.evaluate(inp.req, ctx)
+      local prompt
+      if seen then
+        local names = {}
+        for n in pairs(seen.questions) do names[#names + 1] = n end
+        table.sort(names)
+        prompt = { text = seen.text, context = seen.context, questions = names }
+      end
+      same(c.expect, { verdict = v, headers = verdict.headers(v), judge_calls = calls,
+        prompt = prompt, cache_writes = writes })
+    end)
+  end
+end)

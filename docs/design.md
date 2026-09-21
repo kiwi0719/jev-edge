@@ -20,7 +20,7 @@ The design behind [jev-edge](../README.md): scope, architecture, each layer, deg
 - Replace a traditional WAF. SQLi, path traversal and scanners belong to CRS / ModSecurity, which are faster and better at it.
 - Filter responses.
 - Train or host a model. Judgment comes entirely from the provider.
-- Ship the Cloudflare adapter (0.3.0). Envoy is supported since 0.2.0.
+- Run an L3 side-path on Cloudflare yet; the Worker sets `verdict.async` and nothing consumes it. Envoy is supported since 0.2.0, Cloudflare since 0.3.0.
 
 ## Architecture
 
@@ -30,7 +30,7 @@ flowchart LR
     subgraph edge [nginx / OpenResty · access_by_lua]
         direction LR
         L1[L1 rules] -->|suspicious| cache[(cache)]
-        cache -->|miss| L2[L2 judge · ≤ 300 ms]
+        cache -->|miss| L2[L2 judge · adaptive timeout]
         cache -->|hit| policy
         L2 -->|verdict| policy[policy · headers]
         L2 -->|ambiguous / timeout| L3[L3 async]
@@ -52,6 +52,8 @@ flowchart LR
 ```
 
 **Decision principle:** each layer can only make a request *more* suspicious or pass it. Any layer that errors degrades to pass and records `X-Jev-Verdict: error`.
+
+**One contract for every implementation.** The behaviour of `core/` is pinned by the golden vectors in [core/golden/](../core/golden/README.md): hand-authored inputs, expectations produced by the Lua core, replayed by `core/spec/golden_spec.lua` and checked for drift by `make golden-check` in CI. The TypeScript port in `adapters/cloudflare` passes the same files under vitest; that is the definition of it being a port. The vectors cover normalisation, extraction, L1, policy, verdict headers and the pipeline order; they deliberately leave cache TTL precision, cross-worker breaker statistics and the adaptive timeout's value to each platform.
 
 **Core / adapter boundary.** `core/` never requires `ngx`. All IO (cache, HTTP, clock, hashing, JSON, regex, logging) is injected through a `ctx` table. This is what makes the Envoy and Cloudflare adapters possible and what lets core run under busted with no OpenResty.
 
@@ -89,7 +91,7 @@ Evaluation is ordered by cost and short-circuits:
 2. **Reputation** (shared dict, one lookup): IP blocked within `block_ttl` → `block`; IP trusted after N consecutive safe verdicts → `pass`. This runs before anything that needs a body so headers-only forward-auth requests can still be rejected.
 3. **Method / Content-Type** not `POST|PUT|PATCH` or not json / form / text → `pass`.
 4. **Body size**: no body → `pass` ("no body"); under `min_body_bytes` (8) → `pass`; over `max_body_bytes` (64 KB) → `pass` with a log line. Large bodies are never read.
-5. **Regex prefilter**: any `always_suspect` pattern hits → `suspect`. Patterns are **PCRE**, matched case-insensitively through `ctx.re_find`. OpenResty injects `ngx.re.find` with `"ijo"`, specs inject lrexlib-pcre2, the Cloudflare adapter will inject JS RegExp. One rule file serves every adapter. If no matcher is injected, this step is skipped with a single warning and the length check alone decides (fail-open).
+5. **Regex prefilter**: any `always_suspect` pattern hits → `suspect`. Patterns are **PCRE**, matched case-insensitively through `ctx.re_find`. OpenResty injects `ngx.re.find` with `"ijo"`, specs inject lrexlib-pcre2, the Cloudflare adapter injects JS RegExp with the `i` flag. Patterns therefore stay in the PCRE / JavaScript intersection (no lookbehind, no possessive quantifiers, no inline flags), and `core/golden/rules.json` carries one positive per pattern so a divergence fails a named case. One rule file serves every adapter. If no matcher is injected, this step is skipped with a single warning and the length check alone decides (fail-open).
 6. **Natural-language check**: extracted text at least `min_text_chars` (20) → `suspect`, else `pass`.
 
 Text is extracted from JSON bodies by configurable paths (`messages[*].content`, `prompt`, `input`, `query`, `text`); form and text bodies are taken whole. Extraction failure → `pass`.
@@ -247,6 +249,20 @@ Envoy uses the OpenResty adapter as its `ext_authz` service; there is no second 
 
 Traefik ForwardAuth, Caddy `forward_auth` and nginx `auth_request` all get one endpoint, `/_jev/forward-auth`. Only Traefik (≥ 3.3, `forwardBody: true`) sends the body, so only Traefik gets L2 verdicts; Caddy and nginx get path, method and IP-reputation checks, and `skipped` otherwise. Configs and a Docker Compose e2e against all three are in [adapters/forward-auth](../adapters/forward-auth/README.md).
 
+## Cloudflare adapter
+
+The one adapter that does not run the Lua core. `adapters/cloudflare` is a TypeScript port of `core/` (about the same size) held to the golden vectors, plus three presets around one `handle()`:
+
+| preset | where judgment happens | cache | breaker + adaptive |
+|---|---|---|---|
+| `thinWorker` | your existing jev-edge, via `/_jev/authz` (the Envoy contract) | KV or per-isolate memory | at the origin |
+| `fullWorker` | the Worker, `jev` / `openai-compat` provider | KV | Durable Object `JevState` |
+| `pagesMiddleware` | same as `fullWorker` | KV | Durable Object |
+
+The thin preset exists because the most common Cloudflare deployment already has a gateway behind it, and two sets of thresholds is the failure mode to avoid: it runs L1 and the cache at the edge and leaves the score, the deployment context and the key at the origin. The `backend` provider translates the origin's `X-Jev-*` answer back into an answer map, so the Worker's own policy still applies (`enforce` at the edge blocks on the origin's score).
+
+What differs from nginx by platform, not by design: KV's 60 s minimum TTL and eventual consistency, the Durable Object hop for breaker state, `djb2` instead of `crc32_long` for fingerprints (caches are never shared between the two, so it does not matter), no `/_jev/config` hot reload (config is code), no L3 yet. The adapter README keeps the full list.
+
 ## Observability
 
 `log_by_lua` writes one JSON object into `$jev_log`. Log it with `log_format jev escape=none '$jev_log';` so it stays valid JSON (`escape=json` would double-escape it):
@@ -258,7 +274,7 @@ Traefik ForwardAuth, Caddy `forward_auth` and nginx `auth_request` all get one e
 `/_jev/metrics` (127.0.0.1) serves Prometheus text:
 
 ```
-jev_requests_total{stage,result}
+jev_requests_total{source,verdict}
 jev_cache_hits_total{kind}
 jev_l2_latency_ms_bucket{le}
 jev_breaker_state
@@ -302,10 +318,12 @@ One dataset, 662 samples, one deployment, mostly German and English. Treat these
 
 Settled unless a PR argues otherwise with bench data.
 
+0. **The golden vectors are the definition of core.** A behaviour change is a change to `core/golden/*.json` reviewed in the same PR; an implementation that does not pass them is not a jev-edge core, whatever language it is written in.
+
 1. **Judgment backend is pluggable** via the provider interface; `jev`, `openai-compat` and `mock` ship in tree.
 2. **Templates are copied into core**, not pulled in as a submodule. Core has zero external dependencies.
 3. **Names:** repository `jev-edge`, OpenResty package `lua-resty-jev-edge`, Lua module prefix `resty.jev`.
-4. **Envoy is supported both ways with the same code.** Verdicts are flat (strings, numbers, booleans; no nesting, no nil holes) so they map losslessly to JSON and protobuf. 0.2.0 added a `/_jev/authz` location so the OpenResty adapter doubles as an Envoy **HTTP ext_authz** service at no extra logic, and a thin Go shim that forwards to that location provides **gRPC ext_authz**. Cloudflare Workers cannot run Lua and are the one adapter that reimplements core in JS, which is why core stays small.
+4. **Envoy is supported both ways with the same code.** Verdicts are flat (strings, numbers, booleans; no nesting, no nil holes) so they map losslessly to JSON and protobuf. 0.2.0 added a `/_jev/authz` location so the OpenResty adapter doubles as an Envoy **HTTP ext_authz** service at no extra logic, and a thin Go shim that forwards to that location provides **gRPC ext_authz**. Cloudflare Workers cannot run Lua and are the one adapter that reimplements core, in TypeScript, which is why core stays small and why the golden vectors exist.
 5. **L1 patterns are PCRE**, matched through injected `ctx.re_find`. Lua patterns lack alternation and do not port to the other adapters.
 6. **Reputation blocking is opt-in** (`async.rep_block_after = 0` by default). One carrier or office NAT address can hide thousands of users; L3 still records reputation and alerts, it just does not block until you turn it on.
 7. **Deployment context is the calibration lever, not the threshold.** Measured: AUC 0.983 → 0.996 on the same texts and model.

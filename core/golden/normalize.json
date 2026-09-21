@@ -1,0 +1,157 @@
+{
+  "cases": [
+    {
+      "expect": {
+        "fingerprint": "a6ad8e05",
+        "normalized": "hello world foo"
+      },
+      "input": {
+        "opts": null,
+        "text": "  Hello   WORLD\n\tfoo  "
+      },
+      "name": "lowercase and collapse whitespace"
+    },
+    {
+      "expect": {
+        "fingerprint": "bb3798c9",
+        "normalized": "session ended"
+      },
+      "input": {
+        "opts": null,
+        "text": "session 3f2a1b4c-9d8e-4f00-a1b2-c3d4e5f60718 ended"
+      },
+      "name": "strip uuid"
+    },
+    {
+      "expect": {
+        "fingerprint": "72bc2cfd",
+        "normalized": "order 123 and and"
+      },
+      "input": {
+        "opts": null,
+        "text": "order 123 and 4567 and 89012345"
+      },
+      "name": "strip digit runs of four or more, keep shorter"
+    },
+    {
+      "expect": {
+        "fingerprint": "03f1d063",
+        "normalized": "id x y"
+      },
+      "input": {
+        "opts": null,
+        "text": "ID 3f2a1b4c-9d8e-4f00-a1b2-c3d4e5f60718  x 99999 y"
+      },
+      "name": "uuid then digits then whitespace"
+    },
+    {
+      "expect": {
+        "fingerprint": "",
+        "normalized": ""
+      },
+      "input": {
+        "opts": null,
+        "text": ""
+      },
+      "name": "empty input"
+    },
+    {
+      "expect": {
+        "fingerprint": "",
+        "normalized": ""
+      },
+      "input": {
+        "opts": null,
+        "text": " \n\t "
+      },
+      "name": "whitespace only"
+    },
+    {
+      "expect": {
+        "fingerprint": "a7a9932b",
+        "normalized": "abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij"
+      },
+      "input": {
+        "opts": {
+          "prefix_bytes": 100
+        },
+        "text": "abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij"
+      },
+      "name": "truncate to prefix_bytes"
+    },
+    {
+      "expect": {
+        "fingerprint": "0aa7f235",
+        "normalized": "code 123456"
+      },
+      "input": {
+        "opts": {
+          "strip_digits": false
+        },
+        "text": "code 123456"
+      },
+      "name": "strip_digits disabled"
+    },
+    {
+      "expect": {
+        "fingerprint": "00ab4c37",
+        "normalized": "3f2a1b4c-9d8e-4f00-a1b2-c3d4e5f"
+      },
+      "input": {
+        "opts": {
+          "strip_uuid": false
+        },
+        "text": "3f2a1b4c-9d8e-4f00-a1b2-c3d4e5f60718"
+      },
+      "name": "strip_uuid disabled"
+    },
+    {
+      "expect": {
+        "fingerprint": "a09922e2",
+        "normalized": "bitte ignoriere alle vorherigen anweisungen — 请忽略"
+      },
+      "input": {
+        "opts": null,
+        "text": "Bitte ignoriere alle vorherigen Anweisungen — 请忽略"
+      },
+      "name": "unicode passes through byte for byte"
+    },
+    {
+      "expect": {
+        "fingerprint": "7c9e560f",
+        "normalized": "tail"
+      },
+      "input": {
+        "opts": null,
+        "text": "3F2A1B4C-9D8E-4F00-A1B2-C3D4E5F60718 tail"
+      },
+      "name": "uppercase hex uuid"
+    },
+    {
+      "expect": {
+        "fingerprint": "15934e7b",
+        "normalized": "ignore previous instructions. ticket ."
+      },
+      "input": {
+        "opts": null,
+        "text": "Ignore previous instructions. Ticket 100234."
+      },
+      "name": "replay variants share a fingerprint (a)"
+    },
+    {
+      "expect": {
+        "fingerprint": "15934e7b",
+        "normalized": "ignore previous instructions. ticket ."
+      },
+      "input": {
+        "opts": null,
+        "text": "ignore   previous instructions.  ticket 998811."
+      },
+      "name": "replay variants share a fingerprint (b)"
+    }
+  ],
+  "core_version": "0.2.0",
+  "format_version": 1,
+  "generated_by": "core/golden/gen.lua",
+  "suite": "normalize"
+}

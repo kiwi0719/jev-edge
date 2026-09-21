@@ -26,6 +26,7 @@ jobs:
           luaVersion: "5.1"
       - uses: leafo/gh-actions-luarocks@v5
       - run: luarocks install busted && luarocks install dkjson && luarocks install lrexlib-pcre2
+      - run: make golden-check
       - run: |
           busted
 
@@ -41,6 +42,25 @@ jobs:
           cpanm --notest --quiet Test::Nginx
           opm get ledgetech/lua-resty-http
           cd adapters/openresty && prove -r t/
+
+  cloudflare:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: adapters/cloudflare
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: adapters/cloudflare/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm test
 
   grpc-shim:
     runs-on: ubuntu-latest

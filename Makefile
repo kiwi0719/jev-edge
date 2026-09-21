@@ -1,4 +1,4 @@
-.PHONY: test lint check luajit-check test-openresty bench bench-offline bench-chart dist opm-build install live-check live-full live-openai soak shim e2e-envoy e2e-forward-auth
+.PHONY: test lint check luajit-check golden golden-check calibrate context-lint test-cloudflare test-openresty bench bench-offline bench-chart dist opm-build install live-check live-full live-openai soak shim e2e-envoy e2e-forward-auth
 
 test:
 	busted
@@ -11,7 +11,34 @@ luajit-check:
 	@for f in $$(find core rules -name '*.lua' -not -path '*/spec/*'); do \
 	  luajit -bl $$f >/dev/null || exit 1; done; echo "luajit ok"
 
-check: lint luajit-check test
+check: lint luajit-check golden-check test
+
+# Golden vectors: the cross-implementation contract for core (core/golden/README.md).
+# `golden` regenerates them from the Lua core after a deliberate behaviour change;
+# `golden-check` fails when the committed files no longer match what core produces.
+golden:
+	lua core/golden/gen.lua
+
+golden-check:
+	@tmp=$$(mktemp -d) && lua core/golden/gen.lua $$tmp 2>/dev/null && \
+	  if diff -ru core/golden $$tmp --exclude=gen.lua --exclude=README.md >/dev/null; then \
+	    echo "golden ok"; rm -rf $$tmp; \
+	  else diff -ru core/golden $$tmp --exclude=gen.lua --exclude=README.md | head -40; \
+	    echo "golden vectors are stale: run 'make golden' and commit core/golden/*.json"; rm -rf $$tmp; exit 1; fi
+
+# Cloudflare adapter: the TypeScript core replays the same golden vectors (needs pnpm).
+test-cloudflare:
+	cd adapters/cloudflare && pnpm install --frozen-lockfile --silent && pnpm typecheck && pnpm test
+
+# Deployment-context lint: make context-lint CONF=/etc/nginx/jev-edge.conf.lua
+# or make context-lint TEXT="A support assistant ..."
+context-lint:
+	lua bench/context_lint.lua $${CONF:-} $${TEXT:+--text "$$TEXT"}
+
+# Threshold calibration from monitor-mode logs plus labels:
+#   make calibrate LOG=/var/log/nginx/jev.log LABELS=labels.csv [MAX_FP=0.001]
+calibrate:
+	lua bench/calibrate.lua $${LOG:?set LOG=<jev access log>} $${LABELS:-} $${MAX_FP:+--max-fp $$MAX_FP}
 
 # Integration tests run in the official OpenResty image (needs Docker).
 # --init matters: without a reaper Test::Nginx waits on zombie masters.

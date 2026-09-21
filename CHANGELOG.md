@@ -6,6 +6,42 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+- Golden vectors in `core/golden/`: 116 cases across six suites (normalize,
+  extract, rules, policy, verdict, evaluate) generated from the Lua core by
+  `core/golden/gen.lua`, replayed by `core/spec/golden_spec.lua`, and checked
+  for drift by `make golden-check` in CI (`make check` includes it). They are
+  the cross-implementation contract the Cloudflare TypeScript core will be
+  held to; `core/golden/README.md` states what parity covers and what is left
+  to each platform.
+- `make calibrate LOG=<jev log> LABELS=<labels> [MAX_FP=]`
+  (`bench/calibrate.lua`): score distribution, would-have-blocked table, AUC,
+  false-positive and miss rates per threshold, and a recommended
+  `block_threshold` / `suspect_threshold` under a false-positive budget, from a
+  monitor-mode `$jev_log` file plus labels keyed by request id or fingerprint.
+  `--json` for scripts. Install step 7 and a "Choosing thresholds" README
+  section point to it.
+
+- Cloudflare adapter (`adapters/cloudflare`, npm package `@jev-edge/cloudflare`):
+  a TypeScript port of core that replays the same golden vectors under vitest
+  (116/116), plus `thinWorker` (L1 and cache at the edge, judgment by an
+  existing jev-edge via `/_jev/authz`), `fullWorker` (KV cache, Durable Object
+  `JevState` for breaker and adaptive timeout, `jev` / `openai-compat` /
+  `mock` providers) and `pagesMiddleware`. `handle()` and `evaluate()` for
+  other frameworks. Wrangler examples, README with the parity boundary, CI job.
+- `make context-lint CONF=<conf.lua> | TEXT=<context>` (`bench/context_lint.lua`):
+  checks a deployment context for length, generic phrasing, a refusal list, an
+  audience, "be safe" instructions and proper nouns; FAIL on missing or
+  generic, WARN otherwise, `--json` for scripts.
+- `make test-cloudflare`.
+
+### Changed
+- README (en, zh-CN) restructured for first-time readers: Status table,
+  "Try it in 30 seconds" on `demo/`, latency figures quoted with their
+  measurement conditions, Contributing spells out the test and bench
+  commands. Design moved to `docs/design.md`, the cost table to
+  `docs/cost.md`. Architecture diagram no longer claims a fixed 300 ms cut.
+
 ## [0.2.0] - 2026-09-22
 
 ### Added

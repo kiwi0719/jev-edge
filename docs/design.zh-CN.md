@@ -20,7 +20,7 @@
 - 替代传统 WAF。SQLi、路径穿越、扫描器交给 CRS / ModSecurity，它们更快也更擅长。
 - 响应侧过滤。
 - 训练或托管模型。判定完全来自 provider。
-- Cloudflare adapter（0.3.0）。Envoy 自 0.2.0 起支持。
+- 在 Cloudflare 上跑 L3 旁路；Worker 会设置 `verdict.async`，但目前没有消费者。Envoy 自 0.2.0 起支持，Cloudflare 自 0.3.0 起。
 
 ## 架构
 
@@ -52,6 +52,8 @@ flowchart LR
 ```
 
 **决策原则：** 每一层只能让请求*更*可疑，或者放行。任何一层出错都退化为放行，并记录 `X-Jev-Verdict: error`。
+
+**所有实现共用一份契约。** `core/` 的行为由 [core/golden/](../core/golden/README.md) 里的 golden vectors 钉死：输入手写，期望由 Lua core 产出，`core/spec/golden_spec.lua` 回放，CI 里 `make golden-check` 检查漂移。`adapters/cloudflare` 里的 TypeScript 移植在 vitest 下通过同一批文件；这就是"移植"的定义。向量覆盖归一化、提取、L1、策略、判定头和流水线顺序；缓存 TTL 精度、跨 worker 的熔断统计和自适应超时的具体值有意留给各平台。
 
 **core / adapter 边界。** `core/` 从不 require `ngx`。所有 IO（缓存、HTTP、时钟、哈希、JSON、正则、日志）都通过一个 `ctx` table 注入。这是 Envoy 和 Cloudflare adapter 能存在的前提，也是 core 能在 busted 里不依赖 OpenResty 跑单测的原因。
 
@@ -89,7 +91,7 @@ local verdict = edge.evaluate(req, {
 2. **信誉**（shared dict，一次查找）：IP 在 `block_ttl` 内被封 → `block`；IP 连续 N 次判定 safe 后被信任 → `pass`。它排在所有需要 body 的步骤之前，只转发头的 forward-auth 请求也能被拒绝。
 3. **方法 / Content-Type** 不是 `POST|PUT|PATCH`，或不是 json / form / text → `pass`。
 4. **body 大小**：没有 body → `pass`（"no body"）；低于 `min_body_bytes`（8）→ `pass`；高于 `max_body_bytes`（64 KB）→ `pass` 并打一条日志。大 body 永远不会被读取。
-5. **正则预筛**：命中任何 `always_suspect` 模式 → `suspect`。模式是 **PCRE**，通过 `ctx.re_find` 大小写不敏感地匹配。OpenResty 注入带 `"ijo"` 的 `ngx.re.find`，spec 注入 lrexlib-pcre2，Cloudflare adapter 将注入 JS RegExp。一份规则文件三个 adapter 共用。没有注入匹配器时跳过本步并告警一次，只靠长度判断（fail-open）。
+5. **正则预筛**：命中任何 `always_suspect` 模式 → `suspect`。模式是 **PCRE**，通过 `ctx.re_find` 大小写不敏感地匹配。OpenResty 注入带 `"ijo"` 的 `ngx.re.find`，spec 注入 lrexlib-pcre2，Cloudflare adapter 注入带 `i` 标志的 JS RegExp。因此模式只用 PCRE 和 JavaScript 的交集（不用 lookbehind、占有量词、内联标志），`core/golden/rules.json` 给每条模式一个命中样本，引擎差异会让一个具名用例失败。一份规则文件三个 adapter 共用。没有注入匹配器时跳过本步并告警一次，只靠长度判断（fail-open）。
 6. **自然语言检查**：抽取的文本长度达到 `min_text_chars`（20）→ `suspect`，否则 `pass`。
 
 JSON body 按可配置的路径抽取文本（`messages[*].content`、`prompt`、`input`、`query`、`text`）；form 和 text body 整体取用。抽取失败 → `pass`。
@@ -247,6 +249,20 @@ Envoy 把 OpenResty adapter 当作它的 `ext_authz` 服务；没有第二套引
 
 Traefik ForwardAuth、Caddy `forward_auth` 和 nginx `auth_request` 共用一个端点 `/_jev/forward-auth`。只有 Traefik（≥ 3.3，`forwardBody: true`）会转发 body，所以只有 Traefik 能拿到 L2 判定；Caddy 和 nginx 只能做路径、方法和 IP 信誉检查，其余情况返回 `skipped`。三种网关的配置和对真实网关的 Docker Compose 端到端测试在 [adapters/forward-auth](../adapters/forward-auth/README.md)。
 
+## Cloudflare adapter
+
+唯一不跑 Lua core 的 adapter。`adapters/cloudflare` 是 `core/` 的 TypeScript 移植（体量相当），受 golden vectors 约束，外加围绕一个 `handle()` 的三种预设：
+
+| 预设 | 判定在哪里 | 缓存 | 熔断 + 自适应 |
+|---|---|---|---|
+| `thinWorker` | 你已有的 jev-edge，走 `/_jev/authz`（Envoy 的契约） | KV 或 isolate 内存 | 在源站 |
+| `fullWorker` | Worker 自己，`jev` / `openai-compat` provider | KV | Durable Object `JevState` |
+| `pagesMiddleware` | 同 `fullWorker` | KV | Durable Object |
+
+薄预设的存在是因为最常见的 Cloudflare 部署后面本来就有网关，而两套阈值正是要避免的故障模式：它在边缘跑 L1 和缓存，把分数、部署上下文和 key 留在源站。`backend` provider 把源站的 `X-Jev-*` 答案翻译回答案表，所以 Worker 自己的 policy 仍然生效（边缘的 `enforce` 会按源站的分数拦截）。
+
+与 nginx 的差异来自平台而不是设计：KV 最小 60 秒 TTL 和最终一致性、熔断状态多一跳 Durable Object、指纹用 `djb2` 而不是 `crc32_long`（两边永远不共享缓存，所以无所谓）、没有 `/_jev/config` 热更新（配置即代码）、暂无 L3。完整清单在 adapter 的 README 里。
+
 ## 可观测性
 
 `log_by_lua` 往 `$jev_log` 写一个 JSON 对象。用 `log_format jev escape=none '$jev_log';` 记录它才是合法 JSON（`escape=json` 会二次转义）：
@@ -258,7 +274,7 @@ Traefik ForwardAuth、Caddy `forward_auth` 和 nginx `auth_request` 共用一个
 `/_jev/metrics`（仅 127.0.0.1）输出 Prometheus 文本：
 
 ```
-jev_requests_total{stage,result}
+jev_requests_total{source,verdict}
 jev_cache_hits_total{kind}
 jev_l2_latency_ms_bucket{le}
 jev_breaker_state
@@ -302,10 +318,12 @@ jev_async_dropped_total
 
 除非有 PR 带着 bench 数据来反驳，否则不再讨论。
 
+0. **golden vectors 就是 core 的定义。** 行为变更就是对 `core/golden/*.json` 的变更，在同一个 PR 里评审；通不过它们的实现就不是 jev-edge 的 core，无论用什么语言写。
+
 1. **判定后端可插拔**，通过 provider 接口；`jev`、`openai-compat`、`mock` 随仓库提供。
 2. **模板复制进 core**，不用 submodule。core 零外部依赖。
 3. **命名：** 仓库 `jev-edge`，OpenResty 包 `lua-resty-jev-edge`，Lua 模块前缀 `resty.jev`。
-4. **Envoy 两种接法共用同一套代码。** verdict 是扁平结构（字符串、数字、布尔；无嵌套、无 nil 洞），能无损映射到 JSON 和 protobuf。0.2.0 加了 `/_jev/authz` location，OpenResty adapter 零新增逻辑就成了 Envoy 的 **HTTP ext_authz** 服务；一个薄 Go 壳转发到这个 location 就提供了 **gRPC ext_authz**。Cloudflare Worker 跑不了 Lua，是唯一要用 JS 重写 core 的 adapter，这也是 core 必须保持小的原因。
+4. **Envoy 两种接法共用同一套代码。** verdict 是扁平结构（字符串、数字、布尔；无嵌套、无 nil 洞），能无损映射到 JSON 和 protobuf。0.2.0 加了 `/_jev/authz` location，OpenResty adapter 零新增逻辑就成了 Envoy 的 **HTTP ext_authz** 服务；一个薄 Go 壳转发到这个 location 就提供了 **gRPC ext_authz**。Cloudflare Worker 跑不了 Lua，是唯一用 TypeScript 重写 core 的 adapter，这既是 core 必须保持小的原因，也是 golden vectors 存在的原因。
 5. **L1 模式是 PCRE**，通过注入的 `ctx.re_find` 匹配。Lua pattern 没有或运算，也没法移植到其他 adapter。
 6. **信誉封禁默认关闭**（`async.rep_block_after = 0`）。一个运营商或办公室的 NAT 地址后面可能有几千个用户；L3 仍然记录信誉并告警，只是在你打开之前不封。
 7. **部署上下文是校准杠杆，阈值不是。** 实测：同样的文本和模型，AUC 0.983 → 0.996。

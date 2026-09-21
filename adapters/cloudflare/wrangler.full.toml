@@ -1,0 +1,17 @@
+name = "jev-edge"
+main = "examples/full.ts"
+compatibility_date = "2025-09-01"
+
+[[kv_namespaces]]
+binding = "JEV_CACHE"
+id = "<kv namespace id>"
+
+[[durable_objects.bindings]]
+name = "JEV_STATE"
+class_name = "JevState"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["JevState"]
+
+# secrets: wrangler secret put TYPESAFE_API_KEY

@@ -1,0 +1,277 @@
+{
+  "cases": [
+    {
+      "expect": {
+        "headers": {
+          "X-Jev-Reason": "",
+          "X-Jev-Score": "0.00",
+          "X-Jev-Source": "l1",
+          "X-Jev-Verdict": "skipped"
+        },
+        "verdict": {
+          "action": "pass",
+          "async": false,
+          "fingerprint": "",
+          "l2_ms": 0,
+          "reason": "",
+          "score": 0,
+          "source": "l1",
+          "verdict": "skipped"
+        }
+      },
+      "input": {},
+      "name": "all defaults"
+    },
+    {
+      "expect": {
+        "headers": {
+          "X-Jev-Reason": "injection+0.91",
+          "X-Jev-Score": "0.91",
+          "X-Jev-Source": "l2",
+          "X-Jev-Verdict": "malicious"
+        },
+        "verdict": {
+          "action": "block",
+          "async": false,
+          "fingerprint": "a1b2c3d4",
+          "l2_ms": 184,
+          "reason": "injection 0.91",
+          "score": 0.91,
+          "source": "l2",
+          "verdict": "malicious"
+        }
+      },
+      "input": {
+        "action": "block",
+        "async": false,
+        "fingerprint": "a1b2c3d4",
+        "l2_ms": 184,
+        "reason": "injection 0.91",
+        "score": 0.91,
+        "source": "l2",
+        "verdict": "malicious"
+      },
+      "name": "full"
+    },
+    {
+      "expect": {
+        "headers": {
+          "X-Jev-Reason": "",
+          "X-Jev-Score": "1.00",
+          "X-Jev-Source": "l1",
+          "X-Jev-Verdict": "skipped"
+        },
+        "verdict": {
+          "action": "pass",
+          "async": false,
+          "fingerprint": "",
+          "l2_ms": 0,
+          "reason": "",
+          "score": 1,
+          "source": "l1",
+          "verdict": "skipped"
+        }
+      },
+      "input": {
+        "score": 1.5
+      },
+      "name": "score clamped high"
+    },
+    {
+      "expect": {
+        "headers": {
+          "X-Jev-Reason": "",
+          "X-Jev-Score": "0.00",
+          "X-Jev-Source": "l1",
+          "X-Jev-Verdict": "skipped"
+        },
+        "verdict": {
+          "action": "pass",
+          "async": false,
+          "fingerprint": "",
+          "l2_ms": 0,
+          "reason": "",
+          "score": 0,
+          "source": "l1",
+          "verdict": "skipped"
+        }
+      },
+      "input": {
+        "score": -0.2
+      },
+      "name": "score clamped low"
+    },
+    {
+      "expect": {
+        "headers": {
+          "X-Jev-Reason": "",
+          "X-Jev-Score": "0.00",
+          "X-Jev-Source": "l1",
+          "X-Jev-Verdict": "skipped"
+        },
+        "verdict": {
+          "action": "pass",
+          "async": false,
+          "fingerprint": "",
+          "l2_ms": 0,
+          "reason": "",
+          "score": 0,
+          "source": "l1",
+          "verdict": "skipped"
+        }
+      },
+      "input": {
+        "async": 1
+      },
+      "name": "async only true when boolean true"
+    },
+    {
+      "expect": {
+        "headers": {
+          "X-Jev-Reason": "pattern%3A+%5Cbyou+are+now%5Cb+%26+more%2Fless%3F",
+          "X-Jev-Score": "0.00",
+          "X-Jev-Source": "l1",
+          "X-Jev-Verdict": "skipped"
+        },
+        "verdict": {
+          "action": "pass",
+          "async": false,
+          "fingerprint": "",
+          "l2_ms": 0,
+          "reason": "pattern: \\byou are now\\b & more/less?",
+          "score": 0,
+          "source": "l1",
+          "verdict": "skipped"
+        }
+      },
+      "input": {
+        "reason": "pattern: \\byou are now\\b & more/less?"
+      },
+      "name": "reason url-encoded"
+    },
+    {
+      "expect": {
+        "headers": {
+          "X-Jev-Reason": "ip+reputation",
+          "X-Jev-Score": "0.00",
+          "X-Jev-Source": "l1",
+          "X-Jev-Verdict": "skipped"
+        },
+        "verdict": {
+          "action": "pass",
+          "async": false,
+          "fingerprint": "",
+          "l2_ms": 0,
+          "reason": "ip reputation",
+          "score": 0,
+          "source": "l1",
+          "verdict": "skipped"
+        }
+      },
+      "input": {
+        "reason": "ip reputation"
+      },
+      "name": "reason spaces become plus"
+    },
+    {
+      "expect": {
+        "headers": {
+          "X-Jev-Reason": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "X-Jev-Score": "0.00",
+          "X-Jev-Source": "l1",
+          "X-Jev-Verdict": "skipped"
+        },
+        "verdict": {
+          "action": "pass",
+          "async": false,
+          "fingerprint": "",
+          "l2_ms": 0,
+          "reason": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "score": 0,
+          "source": "l1",
+          "verdict": "skipped"
+        }
+      },
+      "input": {
+        "reason": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      },
+      "name": "reason truncated at 200 bytes"
+    },
+    {
+      "expect": {
+        "headers": {
+          "X-Jev-Reason": "%C3%BCber",
+          "X-Jev-Score": "0.00",
+          "X-Jev-Source": "l1",
+          "X-Jev-Verdict": "skipped"
+        },
+        "verdict": {
+          "action": "pass",
+          "async": false,
+          "fingerprint": "",
+          "l2_ms": 0,
+          "reason": "über",
+          "score": 0,
+          "source": "l1",
+          "verdict": "skipped"
+        }
+      },
+      "input": {
+        "reason": "über"
+      },
+      "name": "reason unicode percent-encoded"
+    },
+    {
+      "expect": {
+        "headers": {
+          "X-Jev-Reason": "",
+          "X-Jev-Score": "0.34",
+          "X-Jev-Source": "l1",
+          "X-Jev-Verdict": "skipped"
+        },
+        "verdict": {
+          "action": "pass",
+          "async": false,
+          "fingerprint": "",
+          "l2_ms": 0,
+          "reason": "",
+          "score": 0.345,
+          "source": "l1",
+          "verdict": "skipped"
+        }
+      },
+      "input": {
+        "score": 0.345
+      },
+      "name": "score header rounds to two decimals"
+    },
+    {
+      "expect": {
+        "headers": {
+          "X-Jev-Reason": "",
+          "X-Jev-Score": "0.12",
+          "X-Jev-Source": "l1",
+          "X-Jev-Verdict": "skipped"
+        },
+        "verdict": {
+          "action": "pass",
+          "async": false,
+          "fingerprint": "",
+          "l2_ms": 0,
+          "reason": "",
+          "score": 0.125,
+          "source": "l1",
+          "verdict": "skipped"
+        }
+      },
+      "input": {
+        "score": 0.125
+      },
+      "name": "score header rounds half"
+    }
+  ],
+  "core_version": "0.2.0",
+  "format_version": 1,
+  "generated_by": "core/golden/gen.lua",
+  "suite": "verdict"
+}

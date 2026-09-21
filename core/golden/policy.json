@@ -1,0 +1,267 @@
+{
+  "cases": [
+    {
+      "expect": {
+        "action": "pass",
+        "async": false,
+        "label": "safe"
+      },
+      "input": {
+        "policy": {
+          "block_threshold": 0.7,
+          "mode": "monitor",
+          "suspect_threshold": 0.5
+        },
+        "score": 0
+      },
+      "name": "monitor: zero"
+    },
+    {
+      "expect": {
+        "action": "pass",
+        "async": false,
+        "label": "safe"
+      },
+      "input": {
+        "policy": {
+          "block_threshold": 0.7,
+          "mode": "monitor",
+          "suspect_threshold": 0.5
+        },
+        "score": 0.49
+      },
+      "name": "monitor: below suspect"
+    },
+    {
+      "expect": {
+        "action": "pass",
+        "async": true,
+        "label": "suspicious"
+      },
+      "input": {
+        "policy": {
+          "block_threshold": 0.7,
+          "mode": "monitor",
+          "suspect_threshold": 0.5
+        },
+        "score": 0.5
+      },
+      "name": "monitor: at suspect"
+    },
+    {
+      "expect": {
+        "action": "pass",
+        "async": true,
+        "label": "suspicious"
+      },
+      "input": {
+        "policy": {
+          "block_threshold": 0.7,
+          "mode": "monitor",
+          "suspect_threshold": 0.5
+        },
+        "score": 0.69
+      },
+      "name": "monitor: between"
+    },
+    {
+      "expect": {
+        "action": "pass",
+        "async": false,
+        "label": "malicious"
+      },
+      "input": {
+        "policy": {
+          "block_threshold": 0.7,
+          "mode": "monitor",
+          "suspect_threshold": 0.5
+        },
+        "score": 0.7
+      },
+      "name": "monitor: at block"
+    },
+    {
+      "expect": {
+        "action": "pass",
+        "async": false,
+        "label": "malicious"
+      },
+      "input": {
+        "policy": {
+          "block_threshold": 0.7,
+          "mode": "monitor",
+          "suspect_threshold": 0.5
+        },
+        "score": 1
+      },
+      "name": "monitor: one"
+    },
+    {
+      "expect": {
+        "action": "pass",
+        "async": false,
+        "label": "safe"
+      },
+      "input": {
+        "policy": {
+          "block_threshold": 0.7,
+          "mode": "enforce",
+          "suspect_threshold": 0.5
+        },
+        "score": 0
+      },
+      "name": "enforce: zero"
+    },
+    {
+      "expect": {
+        "action": "pass",
+        "async": false,
+        "label": "safe"
+      },
+      "input": {
+        "policy": {
+          "block_threshold": 0.7,
+          "mode": "enforce",
+          "suspect_threshold": 0.5
+        },
+        "score": 0.49
+      },
+      "name": "enforce: below suspect"
+    },
+    {
+      "expect": {
+        "action": "pass",
+        "async": true,
+        "label": "suspicious"
+      },
+      "input": {
+        "policy": {
+          "block_threshold": 0.7,
+          "mode": "enforce",
+          "suspect_threshold": 0.5
+        },
+        "score": 0.5
+      },
+      "name": "enforce: at suspect"
+    },
+    {
+      "expect": {
+        "action": "pass",
+        "async": true,
+        "label": "suspicious"
+      },
+      "input": {
+        "policy": {
+          "block_threshold": 0.7,
+          "mode": "enforce",
+          "suspect_threshold": 0.5
+        },
+        "score": 0.69
+      },
+      "name": "enforce: between"
+    },
+    {
+      "expect": {
+        "action": "block",
+        "async": false,
+        "label": "malicious"
+      },
+      "input": {
+        "policy": {
+          "block_threshold": 0.7,
+          "mode": "enforce",
+          "suspect_threshold": 0.5
+        },
+        "score": 0.7
+      },
+      "name": "enforce: at block"
+    },
+    {
+      "expect": {
+        "action": "block",
+        "async": false,
+        "label": "malicious"
+      },
+      "input": {
+        "policy": {
+          "block_threshold": 0.7,
+          "mode": "enforce",
+          "suspect_threshold": 0.5
+        },
+        "score": 1
+      },
+      "name": "enforce: one"
+    },
+    {
+      "expect": {
+        "action": "block",
+        "async": false,
+        "label": "malicious"
+      },
+      "input": {
+        "policy": {
+          "block_threshold": 0.6,
+          "mode": "enforce",
+          "suspect_threshold": 0.2
+        },
+        "score": 0.6
+      },
+      "name": "custom thresholds"
+    },
+    {
+      "expect": {
+        "action": "pass",
+        "async": false,
+        "label": "malicious"
+      },
+      "input": {
+        "policy": {
+          "block_threshold": 0.7,
+          "suspect_threshold": 0.5
+        },
+        "score": 0.9
+      },
+      "name": "missing mode defaults to monitor"
+    },
+    {
+      "expect": {
+        "action": "block",
+        "async": false,
+        "label": "malicious"
+      },
+      "input": {
+        "policy": {
+          "mode": "enforce"
+        },
+        "score": 0.75
+      },
+      "name": "missing thresholds use defaults"
+    },
+    {
+      "expect": {
+        "action": "pass",
+        "async": true,
+        "label": "error"
+      },
+      "input": {
+        "event": "error"
+      },
+      "name": "on_error"
+    },
+    {
+      "expect": {
+        "action": "pass",
+        "async": true,
+        "label": "skipped"
+      },
+      "input": {
+        "event": "skipped"
+      },
+      "name": "on_skipped"
+    }
+  ],
+  "core_version": "0.2.0",
+  "format_version": 1,
+  "generated_by": "core/golden/gen.lua",
+  "suite": "policy"
+}

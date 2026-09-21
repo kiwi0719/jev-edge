@@ -1,0 +1,12 @@
+name = "jev-edge-thin"
+main = "examples/thin.ts"
+compatibility_date = "2025-09-01"
+
+# Optional: fingerprint cache shared across isolates. Without it each isolate
+# keeps its own (per-isolate memory); the origin's cache still applies.
+# [[kv_namespaces]]
+# binding = "JEV_CACHE"
+# id = "<kv namespace id>"
+
+[vars]
+# JEV_ORIGIN = "https://gateway.example.com"   # or `wrangler secret put JEV_ORIGIN`

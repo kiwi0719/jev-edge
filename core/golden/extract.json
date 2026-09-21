@@ -1,0 +1,238 @@
+{
+  "cases": [
+    {
+      "expect": {
+        "kind": "json",
+        "text": "You are helpful.\nHi there"
+      },
+      "input": {
+        "body": "{\"messages\":[{\"role\":\"system\",\"content\":\"You are helpful.\"},{\"role\":\"user\",\"content\":\"Hi there\"}]}",
+        "content_type": "application/json",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "chat messages joined with newline"
+    },
+    {
+      "expect": {
+        "kind": "json",
+        "text": "Summarise this"
+      },
+      "input": {
+        "body": "{\"prompt\":\"Summarise this\",\"max_tokens\":10}",
+        "content_type": "application/json",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "prompt field"
+    },
+    {
+      "expect": {
+        "kind": "json",
+        "text": "first\nsecond\nthird"
+      },
+      "input": {
+        "body": "{\"text\":\"third\",\"prompt\":\"first\",\"query\":\"second\"}",
+        "content_type": "application/json",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "several fields present, in field order"
+    },
+    {
+      "expect": {
+        "kind": "json",
+        "text": "deep"
+      },
+      "input": {
+        "body": "{\"input\":{\"text\":\"deep\"}}",
+        "content_type": "application/json",
+        "fields": [
+          "input.text"
+        ]
+      },
+      "name": "nested path"
+    },
+    {
+      "expect": {
+        "kind": "json",
+        "text": ""
+      },
+      "input": {
+        "body": "{\"prompt\":42,\"messages\":[{\"content\":[\"a\",\"b\"]}]}",
+        "content_type": "application/json",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "non-string leaves are ignored"
+    },
+    {
+      "expect": {
+        "kind": "json",
+        "text": "with charset"
+      },
+      "input": {
+        "body": "{\"prompt\":\"with charset\"}",
+        "content_type": "application/json; charset=utf-8",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "json with charset parameter"
+    },
+    {
+      "expect": {
+        "kind": "json",
+        "text": "vendor"
+      },
+      "input": {
+        "body": "{\"prompt\":\"vendor\"}",
+        "content_type": "application/vnd.acme+json",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "vendor +json suffix"
+    },
+    {
+      "expect": {
+        "kind": "none",
+        "text": ""
+      },
+      "input": {
+        "body": "{\"prompt\":",
+        "content_type": "application/json",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "invalid json"
+    },
+    {
+      "expect": {
+        "kind": "none",
+        "text": ""
+      },
+      "input": {
+        "body": "",
+        "content_type": "application/json",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "empty body"
+    },
+    {
+      "expect": {
+        "kind": "form",
+        "text": "hello world!\n1"
+      },
+      "input": {
+        "body": "prompt=hello+world%21&x=1",
+        "content_type": "application/x-www-form-urlencoded",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "form urlencoded decodes plus and percent"
+    },
+    {
+      "expect": {
+        "kind": "text",
+        "text": "plain text body"
+      },
+      "input": {
+        "body": "plain text body",
+        "content_type": "text/plain",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "text/plain is the body itself"
+    },
+    {
+      "expect": {
+        "kind": "text",
+        "text": "no ct"
+      },
+      "input": {
+        "body": "no ct",
+        "content_type": null,
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "no content type is treated as text"
+    },
+    {
+      "expect": {
+        "kind": "none",
+        "text": ""
+      },
+      "input": {
+        "body": "{\"prompt\":\"x\"}",
+        "content_type": "application/octet-stream",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "unknown content type yields nothing"
+    }
+  ],
+  "core_version": "0.2.0",
+  "format_version": 1,
+  "generated_by": "core/golden/gen.lua",
+  "suite": "extract"
+}

@@ -1,0 +1,25 @@
+# OpenResty / Test::Nginx
+t/servroot/
+*.log
+logs/
+*.pid
+
+# Lua
+luacov.stats.out
+luacov.report.out
+lua_modules/
+.luarocks/
+
+# bench outputs
+bench/out/
+bench/datasets/private/
+
+# secrets
+*.env
+.env*
+
+# editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp

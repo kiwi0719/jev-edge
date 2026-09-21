@@ -1,0 +1,44 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: leafo/gh-actions-lua@v10
+        with:
+          luaVersion: luajit-2.1
+      - uses: leafo/gh-actions-luarocks@v4
+      - run: luarocks install luacheck
+      - run: luacheck . || [ ! -d core ]   # tolerate empty tree until M1 lands
+
+  core-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: leafo/gh-actions-lua@v10
+        with:
+          luaVersion: luajit-2.1
+      - uses: leafo/gh-actions-luarocks@v4
+      - run: luarocks install busted
+      - run: |
+          if [ -d core/spec ]; then busted core/spec; else echo "no core specs yet"; fi
+
+  openresty-tests:
+    runs-on: ubuntu-latest
+    container: openresty/openresty:alpine-fat
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          if [ -d adapters/openresty/t ]; then
+            apk add --no-cache perl perl-dev make gcc musl-dev
+            cpan -T Test::Nginx
+            cd adapters/openresty && prove -r t/
+          else
+            echo "no openresty tests yet"
+          fi

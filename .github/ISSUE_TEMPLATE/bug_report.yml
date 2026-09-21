@@ -1,0 +1,34 @@
+name: Bug report
+description: Something behaves differently from DESIGN.md or the README
+labels: ["bug"]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: jev-edge version / commit
+    validations:
+      required: true
+  - type: dropdown
+    id: adapter
+    attributes:
+      label: Adapter
+      options: [openresty, envoy, cloudflare, core-only]
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: Include the X-Jev-* headers and the `$jev_log` line if you have them. Never paste API keys.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+  - type: checkboxes
+    id: failopen
+    attributes:
+      label: Fail-open
+      options:
+        - label: This bug caused legitimate traffic to be blocked (highest priority)

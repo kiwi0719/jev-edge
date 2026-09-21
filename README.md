@@ -12,7 +12,7 @@
 
 <p align="center"><img src="docs/hero.webp" alt="Request stream passing L1 rules, L2 judgment lens, the edge gateway and the async side-path before reaching the protected backend" width="100%"></p>
 
-jev-edge sits in nginx / OpenResty (Envoy and Cloudflare adapters planned) and asks one question about incoming requests: *what is this request trying to do to my service?* It uses [TypeSafe Jev](https://typesafe.ai/), a System One model that returns probabilities instead of prose, to catch prompt injection and abuse at the entry point of LLM-backed applications, before the request reaches your backend.
+jev-edge sits in nginx / OpenResty, or behind Envoy as an ext_authz service (Cloudflare Worker planned), and asks one question about incoming requests: *what is this request trying to do to my service?* It uses [TypeSafe Jev](https://typesafe.ai/), a System One model that returns probabilities instead of prose, to catch prompt injection and abuse at the entry point of LLM-backed applications, before the request reaches your backend.
 
 It is built for SREs and platform engineers, not agent authors. Existing Jev guards run on the developer's machine and judge what an AI is about to do. jev-edge runs at the gateway and judges what the outside world is about to do.
 
@@ -54,14 +54,14 @@ Three filters, ordered by cost. Most traffic never pays for the expensive one.
 ```
 L1  cheap rules        99% of normal traffic passes here, zero added latency
     ↓ suspicious 1%
-L2  Jev sync judgment  70–500 ms, hard cut at 300 ms, spent only on this slice
+L2  Jev sync judgment  ~270 ms p50 live, adaptive cut 400–1000 ms, spent only on this slice
     ↓ ambiguous
 L3  async side-path    never blocks the response; feeds reputation + alerts
 ```
 
 Guarantees the project is built around:
 
-- **Fail-open.** Jev slow or down → traffic flows, a log line fires. A circuit breaker stops the gateway from waiting 300 ms per request when the API is unhealthy.
+- **Fail-open.** Jev slow or down → traffic flows, a log line fires. A circuit breaker stops the gateway from waiting out the timeout on every request when the API is unhealthy.
 - **Shared-dict cache.** Normalized body fingerprints are reused within a TTL. Scrapers and replay abuse are highly repetitive.
 - **Verdict headers.** `X-Jev-Verdict` and `X-Jev-Score` are passed to the upstream so the application can make its own second decision instead of getting only allow/deny.
 - **Hot-reloadable thresholds.** Flip from `enforce` to `monitor` with one local PUT, no nginx reload.
@@ -507,12 +507,12 @@ Settled unless a PR argues otherwise with bench data.
 ```
 core/            judgment logic, templates, policy, breaker — no ngx.*; busted specs in core/spec
 adapters/
-  openresty/     access_by_lua glue, providers/, shared-dict cache, config API
-    authz/       /_jev/authz location + gateway examples: Envoy ext_authz,
-                 Caddy forward_auth, Traefik ForwardAuth, nginx auth_request  (v0.2.0)
-  cloudflare/    Worker middleware                                             (v0.2.0)
-rules/           L1 rule sets
-bench/           offline accuracy bench, Docker latency bench, report
+  openresty/     access_by_lua glue, /_jev/{authz,config,health,metrics}, providers/,
+                 shared-dict cache, adaptive timeout, L3 timer; Test::Nginx in t/
+  envoy/         envoy-http.yaml, envoy-grpc.yaml, grpc-shim/ (Go), e2e/ (Docker Compose)
+  cloudflare/    Worker middleware                                             (0.3.0)
+rules/           L1 rule sets (PCRE prefilter, watch paths, text fields)
+bench/           offline accuracy bench, Docker latency bench, live checks, soak, report
 ```
 
 Local development needs `luarocks install busted dkjson lrexlib-pcre2 luacheck`, `luajit` on PATH and Docker for the integration suite:
@@ -535,8 +535,11 @@ make test-openresty
 | M4 ✅ | hot reload, `/_jev/config`, `/_jev/metrics`, structured log |
 | M5 ✅ | offline accuracy bench on recorded Jev answers, Docker latency bench, [report](bench/report.md) |
 | M6 ✅ | v0.1.0: `make install`, opm package, install docs |
-| 0.1.1 | live-verified providers, adaptive timeout with ceiling, `/_jev/health`, `deployment_context`, soak + full live bench |
-| v0.2.0 | `/_jev/authz`: one forward-auth endpoint that serves Envoy HTTP ext_authz, Caddy `forward_auth`, Traefik ForwardAuth and nginx `auth_request` (body source abstracted, since only Envoy forwards it); config examples for each; Cloudflare Worker |
+| 0.1.1 ✅ | live-verified providers, adaptive timeout with ceiling, `/_jev/health`, `deployment_context`, soak + full live bench |
+| 0.2.0 ✅ | Envoy: `/_jev/authz` HTTP ext_authz, `grpc-shim` gRPC ext_authz, Docker Compose e2e against real Envoy (release pending) |
+| 0.2.x | Generic forward-auth on the same endpoint for Caddy `forward_auth`, Traefik ForwardAuth and nginx `auth_request`. These forward headers only, never the body, so the body source is abstracted and judgment there is limited to path, headers and reputation unless the gateway can buffer the body. Config examples for each. |
+| 0.3.0 | Cloudflare Worker: core reimplemented in TypeScript against shared golden test vectors exported from the busted suite; cache via Cache API, breaker and adaptive state via KV or a Durable Object |
+| later | Golden vectors published as a versioned file so any adapter can prove parity; `abuse` template gets its own dataset; multi-tenant `deployment_context` per route |
 
 ## Contributing
 

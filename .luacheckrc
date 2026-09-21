@@ -12,6 +12,12 @@ files["adapters/openresty/"] = {
 
 files["bench/"] = {
   globals = { "ngx" },
+  max_line_length = 200,   -- report strings
+}
+
+files["bench/wrk-post.lua"] = {
+  globals = { "wrk", "request", "done" },
+  unused_args = false,
 }
 
 exclude_files = { "t/servroot/", "lua_modules/" }

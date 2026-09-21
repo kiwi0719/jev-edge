@@ -51,7 +51,7 @@ flowchart LR
     style edge fill:transparent,stroke:#8b949e,color:#8b949e
 ```
 
-**决策原则：** 每一层只能让请求*更*可疑，或者放行。任何一层出错都退化为放行，并记录 `X-Jev-Verdict: error`。
+**决策原则：** 每一层只能让请求*更*可疑，或者放行。任何一层出错都退化为放行，并记录 `X-Jev-Verdict: error`。唯一有意的例外是运维信任（见下）：运维标为误报的指纹在 L1.5、判定缓存之前以 `safe` 放行。它是唯一能降低分数的输入，永远会过期，存在的理由是有人看过。
 
 **所有实现共用一份契约。** `core/` 的行为由 [core/golden/](../core/golden/README.md) 里的 golden vectors 钉死：输入手写，期望由 Lua core 产出，`core/spec/golden_spec.lua` 回放，CI 里 `make golden-check` 检查漂移。`adapters/js` 里的 TypeScript 移植在 vitest 下通过同一批文件；这就是"移植"的定义。向量覆盖归一化、提取、L1、策略、判定头和流水线顺序；缓存 TTL 精度、跨 worker 的熔断统计和自适应超时的具体值有意留给各平台。
 
@@ -281,6 +281,14 @@ HAProxy 的 SPOE 把请求连 body 交给 `adapters/haproxy/spoa`，一个调 `/
 
 与 nginx 的差异来自平台而不是设计：KV 最小 60 秒 TTL 和最终一致性、熔断状态多一跳 Durable Object、指纹用 `djb2` 而不是 `crc32_long`（两边永远不共享缓存，所以无所谓）、没有 `/_jev/config` 热更新（配置即代码）、暂无 L3。完整清单在 adapter 的 README 里。
 
+## 主体轨迹
+
+单条请求可以看起来无害，却是一次分六条消息组装的攻击的第六步。要抓住它需要按主体随时间打分。`core/subject.lua`（移植为 `adapters/js/src/core/subject.ts`）是其中不需要流量就能做的那一半：契约。`evaluate` 接受可选的 `ctx.subject = { id, history, record }`；在每个做出判定的出口（缓存命中、熔断跳过、L2、信任、L1 拦截；L1 放行不算，那是热路径）把一条扁平记录（`at, subject, verdict, score, source, reason, fingerprint`）交给 `record` 然后直接返回，不等待。`history` 在请求路径上读取但**本版本忽略**；golden vectors 断言带主体和非空历史的请求和不带的判定逐字段相同。窗口、衰减和阈值一个都没定，因为没有东西可以校准；0.4.0 会基于记录下来的轨迹打分。现在钉死两条约束，让 adapter 和向量只写一次：主体 id 由 adapter 提取（IP、API key、session、用户 id），core 不知道是哪种；写入是 sink，永不等待。
+
+## 误报反馈
+
+带 token（`feedback = { enabled = true, token = ... }`）向 `POST /_jev/feedback` 发 `{ fp, label, by, rid }` 就把一个指纹标为可信；`label = "attack"` 撤销。信任逻辑在 `core/trust.lua`（`adapters/js/src/core/trust.ts`），在 L1.5 检查：L1 之后、判定缓存之前，所以能压过同一段文本的陈旧恶意分数；命中以 `safe` 放行，`X-Jev-Source: trust`。三条性质是设计而不是默认值：信任**会过期**（`trust_ttl`，7 天），流量最多续期 `max_renewals`（4）次，之后误报有意地重新出现，因为指纹来自攻击者可见的文本，永久条目就是没人再看的旁路；信任**只在本网关**（shared dict，通过默认等于 `ctx.cache` 的 `ctx.trust`），不用多跑任何组件，分区也不会让整个集群 fail-open；**标注文件是派生的**，worker 从不写文件：每次反馈是访问日志里一行 `src="feedback"`，`make labels`（`bench/labels-from-log.lua`）把日志变成 `make calibrate` 读的文件。没有 token 端点拒绝一切，因为它写的是旁路。
+
 ## 决策采样
 
 `sampling` 保留一部分判定结果用于回放和标注：`enabled`（默认关）、`rate`、`min_verdict`（默认 `suspicious`，所以正常流量不会被留下）、`max_samples`（缓存 dict 里的环）、`ttl`、`text_bytes`。每条样本是截断到 `text_bytes` 的归一化文本、指纹、分数、判定、动作、来源、理由、路径、客户端 IP 和请求 id。原始 body 永远不存，访问日志也不写；`sampling.log = true` 额外把每条样本以一行 INFO 日志输出给日志采集器。`GET /_jev/samples` 按最新在前返回整个环，`DELETE` 清空。判定逻辑（`core/sampling.lua`，移植为 `adapters/js/src/sampling.ts`）是纯函数；存储由 adapter 负责：OpenResty 和 APISIX 用 shared dict，JavaScript 宿主用 `onSample` 回调。L1 放行的从不采样；L1 信誉拦截的会。
@@ -349,3 +357,5 @@ jev_async_dropped_total
 5. **L1 模式是 PCRE**，通过注入的 `ctx.re_find` 匹配。Lua pattern 没有或运算，也没法移植到其他 adapter。
 6. **信誉封禁默认关闭**（`async.rep_block_after = 0`）。一个运营商或办公室的 NAT 地址后面可能有几千个用户；L3 仍然记录信誉并告警，只是在你打开之前不封。
 7. **部署上下文是校准杠杆，阈值不是。** 实测：同样的文本和模型，AUC 0.983 → 0.996。
+8. **信任会过期，且只在本地。** 运维的误报标注是唯一能降低分数的输入；它活 `trust_ttl`、有续期上限、存在网关自己的 dict 里，并从日志回放进校准，而不是存成文件。以攻击者可见文本为键的永久或全集群白名单是旁路，不是功能。
+9. **主体轨迹先记录，后打分。** 契约（id 由 adapter 给、忽略 history、record 是 sink）先发；窗口和阈值等记录下来的流量和多轮数据集。猜出来的默认值比没有这个功能更糟。

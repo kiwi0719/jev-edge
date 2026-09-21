@@ -6,7 +6,7 @@ jev-edge sits in nginx / OpenResty (Envoy and Cloudflare adapters planned) and a
 
 It is built for SREs and platform engineers, not agent authors. Existing Jev guards run on the developer's machine and judge what an AI is about to do; jev-edge runs at the gateway and judges what the outside world is about to do.
 
-> **Status:** design complete, implementation in progress. See [DESIGN.md](DESIGN.md) (Chinese) for the full plan. Nothing here is production-ready yet.
+> **Status:** M1 done (core logic + unit tests), OpenResty adapter next. See [DESIGN.md](DESIGN.md) (Chinese) for the full plan. Nothing here is production-ready yet.
 
 ## How it works
 
@@ -68,7 +68,7 @@ bench/      false-positive rate, miss rate, P99 under normal / slow-Jev / dead-J
 
 | Milestone | Scope |
 |---|---|
-| M1 | core skeleton: normalize, rules, policy, breaker; busted green |
+| M1 ✅ | core skeleton: normalize, rules, policy, breaker; busted green |
 | M2 | OpenResty access path with mock provider, headers, fail-open |
 | M3 | shared-dict cache, circuit breaker, L3 async timer |
 | M4 | hot reload, config API, Prometheus metrics |

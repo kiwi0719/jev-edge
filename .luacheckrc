@@ -15,3 +15,7 @@ files["bench/"] = {
 }
 
 exclude_files = { "t/servroot/", "lua_modules/" }
+
+files["core/spec/"] = {
+  std = "+busted",
+}

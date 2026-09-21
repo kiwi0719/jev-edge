@@ -1,0 +1,33 @@
+local D = require "jev.core.defaults"
+
+describe("defaults.merge", function()
+  it("deep merges tables and replaces lists", function()
+    local c = D.merge(D.config, { policy = { mode = "enforce" }, rules = { "a", "b" } })
+    assert.equals("enforce", c.policy.mode)
+    assert.equals(0.85, c.policy.block_threshold)
+    assert.same({ "a", "b" }, c.rules)
+    assert.equals("monitor", D.config.policy.mode) -- base untouched
+  end)
+end)
+
+describe("defaults.validate", function()
+  it("accepts defaults", function()
+    assert.is_true((D.validate(D.merge(D.config))))
+  end)
+
+  it("rejects bad mode", function()
+    local ok, err = D.validate(D.merge(D.config, { policy = { mode = "yolo" } }))
+    assert.is_nil(ok)
+    assert.matches("mode", err)
+  end)
+
+  it("rejects inverted thresholds", function()
+    local ok = D.validate(D.merge(D.config, { policy = { suspect_threshold = 0.9 } }))
+    assert.is_nil(ok)
+  end)
+
+  it("rejects zero timeout", function()
+    local ok = D.validate(D.merge(D.config, { jev = { timeout_ms = 0 } }))
+    assert.is_nil(ok)
+  end)
+end)

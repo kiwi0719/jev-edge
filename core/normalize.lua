@@ -11,7 +11,7 @@ local _M = {}
 local function split_path(path)
   local segs = {}
   for seg in path:gmatch("[^%.]+") do
-    local name, star = seg:match("^([^%[]*)%[(%*)%]$")
+    local name = seg:match("^([^%[]*)%[%*%]$")
     if name then
       segs[#segs + 1] = { key = name, each = true }
     else

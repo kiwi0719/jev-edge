@@ -102,7 +102,10 @@ describe("core.evaluate end to end", function()
 
   it("fails open when the rule names unknown templates", function()
     local ctx = H.ctx()
-    ctx.rules = { { id = "x", watch_paths = { "^/v1" }, text_fields = { "messages[*].content" }, templates = { "nope" } } }
+    ctx.rules = { {
+      id = "x", watch_paths = { "^/v1" },
+      text_fields = { "messages[*].content" }, templates = { "nope" },
+    } }
     local v = core.evaluate(H.chat_req(LONG), ctx)
     assert.equals(V.ACTION_PASS, v.action)
     assert.equals(V.ERROR, v.verdict)

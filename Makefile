@@ -4,7 +4,7 @@ test:
 	busted
 
 lint:
-	luacheck core rules adapters bench
+	luacheck core rules $$(ls -d adapters bench 2>/dev/null)
 
 # Every core file must at least compile under LuaJIT (the OpenResty runtime).
 luajit-check:

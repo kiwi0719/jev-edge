@@ -18,7 +18,7 @@ local function searcher(name)
   return loadfile(file), file
 end
 
-local searchers = package.searchers or package.loaders
+local searchers = package.searchers or package.loaders -- luacheck: ignore 143
 table.insert(searchers, 2, searcher)
 
 -- Shared test doubles ---------------------------------------------------------

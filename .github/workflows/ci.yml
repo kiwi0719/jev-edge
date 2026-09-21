@@ -15,7 +15,7 @@ jobs:
           luaVersion: "5.1"
       - uses: leafo/gh-actions-luarocks@v5
       - run: luarocks install luacheck
-      - run: luacheck core rules adapters bench --exclude-files ".luarocks/**"
+      - run: luacheck core rules $(ls -d adapters bench 2>/dev/null)
 
   core-tests:
     runs-on: ubuntu-latest

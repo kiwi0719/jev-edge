@@ -8,6 +8,7 @@ on:
 jobs:
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: leafo/gh-actions-lua@v11
@@ -19,6 +20,7 @@ jobs:
 
   core-tests:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: leafo/gh-actions-lua@v11
@@ -32,6 +34,7 @@ jobs:
 
   openresty-tests:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     container:
       image: openresty/openresty:alpine-fat
       options: --init
@@ -45,6 +48,7 @@ jobs:
 
   js:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: adapters/js
@@ -64,6 +68,7 @@ jobs:
 
   grpc-shim:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -74,6 +79,7 @@ jobs:
 
   litellm:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -84,6 +90,7 @@ jobs:
 
   haproxy-e2e:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - run: docker build -q -t jev-edge-test -f adapters/openresty/Dockerfile.test adapters/openresty
@@ -91,6 +98,7 @@ jobs:
 
   apisix-e2e:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - run: docker build -q -t jev-edge-test -f adapters/openresty/Dockerfile.test adapters/openresty
@@ -98,6 +106,7 @@ jobs:
 
   envoy-e2e:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - run: docker build -q -t jev-edge-test -f adapters/openresty/Dockerfile.test adapters/openresty
@@ -105,6 +114,7 @@ jobs:
 
   forward-auth-e2e:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - run: docker build -q -t jev-edge-test -f adapters/openresty/Dockerfile.test adapters/openresty

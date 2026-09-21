@@ -12,7 +12,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: leafo/gh-actions-lua@v11
         with:
-          luaVersion: "luajit-openresty"
+          luaVersion: "5.1"
       - uses: leafo/gh-actions-luarocks@v5
       - run: luarocks install luacheck
       - run: luacheck . || [ ! -d core ]   # tolerate empty tree until M1 lands
@@ -23,7 +23,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: leafo/gh-actions-lua@v11
         with:
-          luaVersion: "luajit-openresty"
+          luaVersion: "5.1"
       - uses: leafo/gh-actions-luarocks@v5
       - run: luarocks install busted
       - run: |

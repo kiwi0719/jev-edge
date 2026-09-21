@@ -33,7 +33,8 @@ return {
   -- Decision sampling for replay and labelling: a share of suspicious-and-up
   -- decisions with their normalized text (never the raw body), readable at
   -- /_jev/samples. Turn on during the monitor week, feed the labels to `make calibrate`.
-  sampling = { enabled = false, rate = 0.05, min_verdict = "suspicious", max_samples = 1000, ttl = 86400, text_bytes = 512 },
+  sampling = { enabled = false, rate = 0.05, min_verdict = "suspicious",
+               max_samples = 1000, ttl = 86400, text_bytes = 512 },
   -- False-positive loop: an operator POSTs a fingerprint to /_jev/feedback and
   -- every later request with that exact text passes without an L2 call. Trust
   -- always expires (trust_ttl) and traffic may extend it at most max_renewals

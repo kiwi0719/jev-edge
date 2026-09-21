@@ -54,7 +54,6 @@ local samples = data.samples
 local step = math.max(1, math.floor(#samples / N))
 local lats, diffs, errs = {}, {}, 0
 local flips = 0  -- recorded vs live disagree on the 0.5 side
-local tokens = 0
 io.write("== 2. latency over ", N, " samples (sequential, short state)\n")
 for i = 1, #samples, step do
   if #lats + errs >= N then break end

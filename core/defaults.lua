@@ -75,7 +75,8 @@ function _M.validate(c)
   if type(c.jev.timeout_ms) ~= "number" or c.jev.timeout_ms <= 0 then
     return nil, "jev.timeout_ms must be > 0"
   end
-  if c.jev.timeout_max_ms ~= nil and (type(c.jev.timeout_max_ms) ~= "number" or c.jev.timeout_max_ms < c.jev.timeout_ms) then
+  local max_ms = c.jev.timeout_max_ms
+  if max_ms ~= nil and (type(max_ms) ~= "number" or max_ms < c.jev.timeout_ms) then
     return nil, "jev.timeout_max_ms must be >= timeout_ms"
   end
   return true

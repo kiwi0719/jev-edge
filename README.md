@@ -154,19 +154,28 @@ Start in `monitor` mode. Watch the headers and logs for a week. Then set thresho
 ```mermaid
 flowchart LR
     client([client]) --> L1
-    subgraph nginx["nginx / OpenResty · access_by_lua"]
-        L1["L1 rules"] -- suspicious --> cache["cache<br/>(shared dict)"]
-        cache -- miss --> L2["L2 judge<br/>≤ 300 ms"]
-        L2 -- verdict --> policy["policy<br/>+ verdict headers"]
-        cache -- hit --> policy
-        L2 -- ambiguous / timeout --> L3["L3 async<br/>ngx.timer"]
+    subgraph edge [nginx / OpenResty · access_by_lua]
+        direction LR
+        L1[L1 rules] -->|suspicious| cache[(cache)]
+        cache -->|miss| L2[L2 judge · ≤ 300 ms]
+        cache -->|hit| policy
+        L2 -->|verdict| policy[policy · headers]
+        L2 -->|ambiguous / timeout| L3[L3 async]
     end
-    L1 -- pass --> upstream[["proxy_pass upstream"]]
-    policy -- allow --> upstream
-    policy -- block --> deny([403])
-    L2 -. lua-resty-http .-> jev[("Jev API")]
-    L3 -. no deadline .-> jev
-    L3 --> rep["reputation / alerts"]
+    L1 -->|pass| up[[upstream]]
+    policy -->|allow| up
+    policy -->|block| deny([403])
+    L2 -.-> jev[(Jev API)]
+    L3 -.->|no deadline| jev
+    L3 --> rep[reputation / alerts]
+
+    classDef cheap fill:#dbe9fa,stroke:#2a78d6,color:#0d366b
+    classDef judge fill:#fde3d8,stroke:#eb6834,color:#7a2e10
+    classDef ext fill:#eef1f4,stroke:#8b949e,color:#24292f,stroke-dasharray:3 2
+    class L1,cache cheap
+    class L2,L3,policy judge
+    class client,up,deny,jev,rep ext
+    style edge fill:transparent,stroke:#8b949e
 ```
 
 **Decision principle:** each layer can only make a request *more* suspicious or pass it. Any layer that errors degrades to pass and records `X-Jev-Verdict: error`.

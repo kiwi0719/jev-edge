@@ -1,4 +1,4 @@
-.PHONY: test lint check luajit-check test-openresty bench bench-offline dist install live-check
+.PHONY: test lint check luajit-check test-openresty bench bench-offline bench-chart dist install live-check
 
 test:
 	busted
@@ -25,6 +25,10 @@ bench-offline:
 bench:
 	docker build -q -t jev-edge-test -f adapters/openresty/Dockerfile.test adapters/openresty
 	docker run --rm --init -v "$$(PWD)":/work jev-edge-test sh /work/bench/run.sh
+
+# Redraw docs/bench-latency-*.svg from a results.txt (default: the 4-connection run).
+bench-chart:
+	lua bench/chart.lua $${RESULTS:-bench/out-c4/results.txt} docs
 
 # One real round trip + 60-sample latency/agreement check against the provider.
 # Needs TYPESAFE_API_KEY in .env (gitignored). Costs ~40k input tokens.

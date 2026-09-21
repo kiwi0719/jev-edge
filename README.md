@@ -43,7 +43,7 @@ It is built for SREs and platform engineers, not agent authors. Existing Jev gua
 | Gateways, native | OpenResty; Apache APISIX (plugin, same engine) |
 | Gateways, via `/_jev/authz` | Envoy (HTTP and gRPC ext_authz), HAProxy (SPOE agent), Traefik, Caddy and plain nginx (forward-auth), each end-to-end tested against the real gateway; Istio, Envoy Gateway, Azure APIM and Apigee as [recipes](docs/recipes.md); LiteLLM proxy as a guardrail |
 | JavaScript hosts | Cloudflare Workers and Pages, Next.js, Node, Hono, Lambda@Edge, through one TypeScript port of core held to the same golden vectors (on `main`, unreleased) |
-| Test coverage | 78 unit specs, 202 integration assertions, 116 golden vectors replayed by both cores, 30 JS host tests, 8 guardrail tests, five gateway e2e suites, two benches, a soak run |
+| Test coverage | 242 busted specs including the 116 golden vectors, 175 vitest cases replaying the same vectors plus the JS hosts, 233 Test::Nginx assertions, 8 guardrail tests, four gateway e2e suites against real Envoy, Traefik / Caddy / nginx, APISIX and HAProxy, two benches, a soak run |
 | Providers verified live | `jev` against the TypeSafe API on the full 662-sample dataset; `openai-compat` against an Ollama container |
 | Production use | none known yet. Run in `monitor` mode first |
 
@@ -370,8 +370,9 @@ docs/            design.md, cost.md, recipes.md (Istio, Envoy Gateway, APIM, Api
 | M6 ✅ | v0.1.0: `make install`, opm package, install docs |
 | 0.1.1 ✅ | live-verified providers, adaptive timeout with ceiling, `/_jev/health`, `deployment_context`, soak + full live bench |
 | 0.2.0 ✅ | Gateways beyond OpenResty, same engine: Envoy HTTP ext_authz (`/_jev/authz`) and gRPC ext_authz (`grpc-shim`); `/_jev/forward-auth` for Traefik ForwardAuth (body forwarded, full verdicts), Caddy `forward_auth` and nginx `auth_request` (headers only: path, method, reputation). Docker Compose e2e against every real gateway. `demo/`. License moved to Apache 2.0. |
-| 0.3.0 | Golden vectors as the versioned core contract (`core/golden/`, replayed by both cores in CI); `make calibrate`; `make context-lint`; APISIX plugin; HAProxy SPOE agent; LiteLLM guardrail; recipes for Istio, Envoy Gateway, APIM and Apigee; `@jev-edge/js` with a TypeScript core passing the vectors and presets for Cloudflare (thin and full Worker, Pages), Next.js, Node, Hono and Lambda@Edge. In progress on `main`. |
-| later | Subject-level (session / API key) score trajectories as an L3 side-path; `abuse` template gets its own dataset; multi-tenant `deployment_context` per route; decision sampling and a false-positive feedback loop; Fastly Compute and Deno Deploy once the vectors have survived a real core change |
+| 0.3.0 | Golden vectors as the versioned core contract (`core/golden/`, replayed by both cores in CI); `make calibrate`, `make context-lint`, `make labels`; multi-tenant rules with a `deployment_context` per tenant; decision sampling (`/_jev/samples`); the false-positive feedback loop (`/_jev/feedback`, fingerprint trust with expiry); the subject trajectory contract (recorded, not yet scored); APISIX plugin; HAProxy SPOE agent; LiteLLM guardrail; recipes for Istio, Envoy Gateway, APIM and Apigee; `@jev-edge/js` with a TypeScript core passing the vectors and presets for Cloudflare (thin and full Worker, Pages), Next.js, Node, Hono and Lambda@Edge. On `main`, release pending. |
+| 0.4.0 | Scoring on subject trajectories: the window, decay and thresholds chosen from recorded trajectories and a multi-turn dataset (shared with the `abuse` template, which gets its own dataset at the same time); adapters extract `subject_id` from session, API key or user id, not only IP |
+| later | Fastly Compute and Deno Deploy once the vectors have survived a real core change; a Grafana dashboard for the metrics and the feedback log |
 
 ✅ means shipped in a tagged release.
 

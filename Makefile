@@ -41,7 +41,7 @@ dist:
 	cp -R adapters/openresty/lib/resty/jev $(DIST)/lib/resty/
 	cp core/*.lua $(DIST)/lib/jev/core/ && cp -R core/templates $(DIST)/lib/jev/core/
 	cp rules/*.lua $(DIST)/lib/jev/rules/
-	mkdir -p $(DIST)/doc && cp dist.ini LICENSE $(DIST)/ && cp README.md CHANGELOG.md $(DIST)/doc/
+	mkdir -p $(DIST)/doc && cp dist.ini LICENSE README.md $(DIST)/ && cp README.md CHANGELOG.md $(DIST)/doc/
 	cp -R adapters/openresty/conf $(DIST)/conf
 	@echo "assembled $(DIST)"
 

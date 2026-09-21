@@ -171,13 +171,13 @@ flowchart LR
     L3 -.->|no deadline| jev
     L3 --> rep[reputation / alerts]
 
-    classDef cheap fill:#dbe9fa,stroke:#2a78d6,color:#0d366b
-    classDef judge fill:#fde3d8,stroke:#eb6834,color:#7a2e10
-    classDef ext fill:#eef1f4,stroke:#8b949e,color:#24292f,stroke-dasharray:3 2
+    classDef cheap fill:#2a78d6,stroke:#1a5cb0,color:#ffffff
+    classDef judge fill:#e8632c,stroke:#b84a1a,color:#ffffff
+    classDef ext fill:#6e7781,stroke:#57606a,color:#ffffff,stroke-dasharray:3 2
     class L1,cache cheap
     class L2,L3,policy judge
     class client,up,deny,jev,rep ext
-    style edge fill:transparent,stroke:#8b949e
+    style edge fill:transparent,stroke:#8b949e,color:#8b949e
 ```
 
 **Decision principle:** each layer can only make a request *more* suspicious or pass it. Any layer that errors degrades to pass and records `X-Jev-Verdict: error`.

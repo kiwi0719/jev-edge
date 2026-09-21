@@ -31,14 +31,13 @@ jobs:
 
   openresty-tests:
     runs-on: ubuntu-latest
-    container: openresty/openresty:alpine-fat
+    container:
+      image: openresty/openresty:alpine-fat
+      options: --init
     steps:
       - uses: actions/checkout@v4
       - run: |
-          if [ -d adapters/openresty/t ]; then
-            apk add --no-cache perl perl-dev make gcc musl-dev
-            cpan -T Test::Nginx
-            cd adapters/openresty && prove -r t/
-          else
-            echo "no openresty tests yet"
-          fi
+          apk add --no-cache perl perl-app-cpanminus perl-dev make gcc musl-dev
+          cpanm --notest --quiet Test::Nginx
+          opm get ledgetech/lua-resty-http
+          cd adapters/openresty && prove -r t/

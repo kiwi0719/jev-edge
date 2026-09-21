@@ -1,4 +1,4 @@
-.PHONY: test lint check luajit-check
+.PHONY: test lint check luajit-check test-openresty
 
 test:
 	busted
@@ -12,3 +12,9 @@ luajit-check:
 	  luajit -bl $$f >/dev/null || exit 1; done; echo "luajit ok"
 
 check: lint luajit-check test
+
+# Integration tests run in the official OpenResty image (needs Docker).
+# --init matters: without a reaper Test::Nginx waits on zombie masters.
+test-openresty:
+	docker build -q -t jev-edge-test -f adapters/openresty/Dockerfile.test adapters/openresty
+	docker run --rm --init -v "$$(PWD)":/work jev-edge-test

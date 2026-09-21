@@ -12,6 +12,14 @@ All notable changes to this project are recorded here. The format follows
   disables the prefilter with a single warning (fail-open).
 
 ### Added
+- OpenResty adapter (`adapters/openresty`): `resty.jev.edge` with init /
+  init_worker / access / log / config_api / metrics; providers `jev`
+  (TypeSafe System One), `openai-compat` and `mock`; shared-dict cache,
+  breaker wiring, L3 async timer with IP reputation, `/_jev/config`
+  runtime override with validation, `/_jev/metrics` Prometheus text,
+  config-file reload timer. 14 Test::Nginx blocks (61 assertions) run in
+  the official OpenResty image via `make test-openresty`. File-mtime reload
+  is not yet covered by a test.
 - M1 core skeleton: `core/` (normalize, rules, judge, policy, breaker, verdict,
   defaults, init) with 68 busted specs; bundled `injection` and `abuse`
   templates; `rules/llm-endpoints.lua` and `rules/default.lua`.

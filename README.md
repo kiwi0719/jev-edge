@@ -6,7 +6,7 @@ jev-edge sits in nginx / OpenResty (Envoy and Cloudflare adapters planned) and a
 
 It is built for SREs and platform engineers, not agent authors. Existing Jev guards run on the developer's machine and judge what an AI is about to do. jev-edge runs at the gateway and judges what the outside world is about to do.
 
-> **Status:** M1 done (core logic, 68 unit tests). OpenResty adapter is next. Nothing here is production-ready yet.
+> **Status:** core and the OpenResty adapter work end to end (68 unit specs, 61 Test::Nginx assertions). Bench and a first release are next. Not production-tested yet; run in `monitor` mode.
 
 ## Contents
 
@@ -54,7 +54,7 @@ Guarantees the project is built around:
 
 ## Quick look
 
-Target API for the OpenResty adapter (M2):
+Minimal OpenResty setup (see `adapters/openresty/conf/` for a full example):
 
 ```nginx
 lua_shared_dict jev_cache  64m;
@@ -375,10 +375,14 @@ rules/           L1 rule sets
 bench/           datasets, runner, report                                        (M5)
 ```
 
-Local development needs `luarocks install busted dkjson lrexlib-pcre2 luacheck` and `luajit` on PATH:
+Local development needs `luarocks install busted dkjson lrexlib-pcre2 luacheck`, `luajit` on PATH and Docker for the integration suite:
 
 ```bash
 make check
+```
+
+```bash
+make test-openresty
 ```
 
 ## Roadmap
@@ -386,9 +390,9 @@ make check
 | Milestone | Scope |
 |---|---|
 | M1 ✅ | core: normalize, rules, judge, policy, breaker, verdict; 68 specs green |
-| M2 | OpenResty access path, three providers, headers, fail-open; one nginx.conf runs end to end |
-| M3 | shared-dict cache, breaker wiring, L3 timer; Jev outage is invisible to users |
-| M4 | hot reload, `/_jev/config`, `/_jev/metrics`, structured log |
+| M2 ✅ | OpenResty access path, three providers, headers, fail-open; one nginx.conf runs end to end |
+| M3 ✅ | shared-dict cache, breaker wiring, L3 timer; Jev outage is invisible to users |
+| M4 ✅ | hot reload, `/_jev/config`, `/_jev/metrics`, structured log |
 | M5 | bench datasets, three scenarios, report against the targets above |
 | M6 | v0.1.0 on opm as `lua-resty-jev-edge` |
 | v0.2 | `/_jev/authz` for Envoy HTTP ext_authz; Cloudflare Worker |

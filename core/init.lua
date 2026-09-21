@@ -19,7 +19,7 @@ local judge     = require "jev.core.judge"
 local policy    = require "jev.core.policy"
 local verdict   = require "jev.core.verdict"
 
-local _M = { _VERSION = "0.1.0" }
+local _M = { _VERSION = "0.1.1" }
 
 local function log(ctx, level, msg)
   if ctx.log then ctx.log(level, msg) end

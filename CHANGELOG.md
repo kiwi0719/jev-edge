@@ -6,6 +6,8 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-09-22
+
 ### Planned for 0.2.0
 - `/_jev/authz`: a forward-auth endpoint on the OpenResty adapter. Same HTTP
   contract for Envoy HTTP ext_authz, Caddy `forward_auth`, Traefik
@@ -26,6 +28,8 @@ All notable changes to this project are recorded here. The format follows
   workers, censored samples on timeout. `jev_l2_timeout_ms` gauge.
 
 ### Changed
+- Default `policy.block_threshold` 0.85 → 0.70. With a deployment context
+  on deepset/prompt-injections: 0% FP and 13% miss, against 0% / 28% at 0.85.
 - `async.rep_block_after` defaults to 0 (reputation is recorded and alerted,
   never blocked, until enabled). A NAT address can hide thousands of users.
 - `max_inflight` now applies to every provider, mock included.

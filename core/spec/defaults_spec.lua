@@ -4,7 +4,7 @@ describe("defaults.merge", function()
   it("deep merges tables and replaces lists", function()
     local c = D.merge(D.config, { policy = { mode = "enforce" }, rules = { "a", "b" } })
     assert.equals("enforce", c.policy.mode)
-    assert.equals(0.85, c.policy.block_threshold)
+    assert.equals(0.7, c.policy.block_threshold)
     assert.same({ "a", "b" }, c.rules)
     assert.equals("monitor", D.config.policy.mode) -- base untouched
   end)

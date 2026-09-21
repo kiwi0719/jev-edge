@@ -17,7 +17,7 @@ return {
   rules  = { "llm-endpoints" },
   policy = {
     mode = "monitor",                    -- switch to "enforce" after reviewing a week of logs
-    block_threshold   = 0.85,
+    block_threshold   = 0.7,       -- with a deployment_context: 0% FP, 13% miss on deepset; 0.5 = 0.8% FP, 5% miss
     suspect_threshold = 0.5,
   },
   cache   = { fp_ttl = 300, rep_ttl = 600, fp_prefix_bytes = 2048 },

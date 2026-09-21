@@ -7,7 +7,7 @@ local _M = {}
 
 _M.DEFAULTS = {
   mode              = "monitor",  -- "monitor" | "enforce"
-  block_threshold   = 0.85,
+  block_threshold   = 0.7,
   suspect_threshold = 0.5,
   block_status      = 403,
   block_body        = '{"error":"request rejected"}',

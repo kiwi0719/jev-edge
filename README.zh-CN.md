@@ -123,7 +123,7 @@ location /v1/ {
 return {
   jev    = { provider = "jev", model = "jev-latest", timeout_ms = 300 },
   rules  = { "llm-endpoints" },
-  policy = { mode = "monitor", block_threshold = 0.85, suspect_threshold = 0.5 },
+  policy = { mode = "monitor", block_threshold = 0.7, suspect_threshold = 0.5 },
 }
 ```
 
@@ -300,7 +300,7 @@ return {
 
 ```lua
 policy = {
-  block_threshold   = 0.85,   -- ≥ → enforce 模式下 403
+  block_threshold   = 0.7,    -- ≥ → enforce 模式下 403
   suspect_threshold = 0.5,    -- ≥ → 带头部放行,排队进 L3
   mode = "enforce",           -- 或 "monitor":只打头部,从不拦截
   block_status = 403,

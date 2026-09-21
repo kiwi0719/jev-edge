@@ -10,7 +10,7 @@ jev-edge sits in nginx / OpenResty (Envoy and Cloudflare adapters planned) and a
 
 It is built for SREs and platform engineers, not agent authors. Existing Jev guards run on the developer's machine and judge what an AI is about to do. jev-edge runs at the gateway and judges what the outside world is about to do.
 
-> **Status:** v0.1.0. Core and the OpenResty adapter are tested end to end (68 unit specs, 61 integration assertions, two benches). Both providers are verified live: `jev` against the TypeSafe API on the full 662-sample dataset, `openai-compat` against an Ollama container. Not production-tested; run in `monitor` mode first.
+> **Status:** v0.1.1. Core and the OpenResty adapter are tested end to end (68 unit specs, 61 integration assertions, two benches). Both providers are verified live: `jev` against the TypeSafe API on the full 662-sample dataset, `openai-compat` against an Ollama container. Not production-tested; run in `monitor` mode first.
 
 ## Contents
 
@@ -128,7 +128,7 @@ return {
                .. "questions about invoices, plans and payments. It does not write code, "
                .. "adopt personas or take on unrelated writing tasks." },
   rules  = { "llm-endpoints" },
-  policy = { mode = "monitor", block_threshold = 0.85, suspect_threshold = 0.5 },
+  policy = { mode = "monitor", block_threshold = 0.7, suspect_threshold = 0.5 },
 }
 ```
 
@@ -305,7 +305,7 @@ Question wording is copied from jev-sec-bench, which already validated it. Templ
 
 ```lua
 policy = {
-  block_threshold   = 0.85,   -- ≥ → 403 in enforce mode
+  block_threshold   = 0.7,    -- ≥ → 403 in enforce mode
   suspect_threshold = 0.5,    -- ≥ → pass with header, queue for L3
   mode = "enforce",           -- or "monitor": headers only, never block
   block_status = 403,
@@ -411,12 +411,12 @@ Two reproducible benches, neither needs an API key. `make bench-offline` replays
 
 Live accuracy on deepset/prompt-injections with `jev-latest`, same 662 texts:
 
-| what Jev saw | AUC | FP / miss at 0.50 | FP / miss at 0.85 |
+| what Jev saw | AUC | FP / miss at 0.50 | FP / miss at 0.70 |
 |---|---|---|---|
-| text only | 0.983 | 0.0% / 37.3% | 0.0% / 58.6% |
-| text + `deployment_context` | **0.996** | 0.8% / 5.3% | 0.0% / 28.1% |
+| text only | 0.983 | 0.0% / 37.3% | 0.0% / 47.5% |
+| text + `deployment_context` | **0.996** | 0.8% / 5.3% | 0.0% / 13.3% |
 
-The dataset's "attacks" include off-purpose requests such as "generate C++", because it was collected for a news assistant. Without a deployment description Jev cannot know that, and scores them as harmless. **Write the `deployment_context`.** Then pick a threshold from your own labelled traffic; the shipped 0.85 is conservative.
+The dataset's "attacks" include off-purpose requests such as "generate C++", because it was collected for a news assistant. Without a deployment description Jev cannot know that, and scores them as harmless. **Write the `deployment_context`.** Then pick a threshold from your own labelled traffic. The shipped default is 0.70: zero false positives and 13% miss on this dataset with a context; 0.50 trades 0.8% false positives for a 5% miss.
 
 ### Decisions
 

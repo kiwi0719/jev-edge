@@ -53,9 +53,9 @@ flowchart LR
 
 **决策原则：** 每一层只能让请求*更*可疑，或者放行。任何一层出错都退化为放行，并记录 `X-Jev-Verdict: error`。
 
-**所有实现共用一份契约。** `core/` 的行为由 [core/golden/](../core/golden/README.md) 里的 golden vectors 钉死：输入手写，期望由 Lua core 产出，`core/spec/golden_spec.lua` 回放，CI 里 `make golden-check` 检查漂移。`adapters/cloudflare` 里的 TypeScript 移植在 vitest 下通过同一批文件；这就是"移植"的定义。向量覆盖归一化、提取、L1、策略、判定头和流水线顺序；缓存 TTL 精度、跨 worker 的熔断统计和自适应超时的具体值有意留给各平台。
+**所有实现共用一份契约。** `core/` 的行为由 [core/golden/](../core/golden/README.md) 里的 golden vectors 钉死：输入手写，期望由 Lua core 产出，`core/spec/golden_spec.lua` 回放，CI 里 `make golden-check` 检查漂移。`adapters/js` 里的 TypeScript 移植在 vitest 下通过同一批文件；这就是"移植"的定义。向量覆盖归一化、提取、L1、策略、判定头和流水线顺序；缓存 TTL 精度、跨 worker 的熔断统计和自适应超时的具体值有意留给各平台。
 
-**core / adapter 边界。** `core/` 从不 require `ngx`。所有 IO（缓存、HTTP、时钟、哈希、JSON、正则、日志）都通过一个 `ctx` table 注入。这是 Envoy 和 Cloudflare adapter 能存在的前提，也是 core 能在 busted 里不依赖 OpenResty 跑单测的原因。
+**core / adapter 边界。** `core/` 从不 require `ngx`。所有 IO（缓存、HTTP、时钟、哈希、JSON、正则、日志）都通过一个 `ctx` table 注入。这是 Envoy、APISIX、HAProxy 和 JavaScript adapter 能存在的前提，也是 core 能在 busted 里不依赖 OpenResty 跑单测的原因。
 
 ```lua
 local edge = require "jev.core"
@@ -91,7 +91,7 @@ local verdict = edge.evaluate(req, {
 2. **信誉**（shared dict，一次查找）：IP 在 `block_ttl` 内被封 → `block`；IP 连续 N 次判定 safe 后被信任 → `pass`。它排在所有需要 body 的步骤之前，只转发头的 forward-auth 请求也能被拒绝。
 3. **方法 / Content-Type** 不是 `POST|PUT|PATCH`，或不是 json / form / text → `pass`。
 4. **body 大小**：没有 body → `pass`（"no body"）；低于 `min_body_bytes`（8）→ `pass`；高于 `max_body_bytes`（64 KB）→ `pass` 并打一条日志。大 body 永远不会被读取。
-5. **正则预筛**：命中任何 `always_suspect` 模式 → `suspect`。模式是 **PCRE**，通过 `ctx.re_find` 大小写不敏感地匹配。OpenResty 注入带 `"ijo"` 的 `ngx.re.find`，spec 注入 lrexlib-pcre2，Cloudflare adapter 注入带 `i` 标志的 JS RegExp。因此模式只用 PCRE 和 JavaScript 的交集（不用 lookbehind、占有量词、内联标志），`core/golden/rules.json` 给每条模式一个命中样本，引擎差异会让一个具名用例失败。一份规则文件三个 adapter 共用。没有注入匹配器时跳过本步并告警一次，只靠长度判断（fail-open）。
+5. **正则预筛**：命中任何 `always_suspect` 模式 → `suspect`。模式是 **PCRE**，通过 `ctx.re_find` 大小写不敏感地匹配。OpenResty 注入带 `"ijo"` 的 `ngx.re.find`，spec 注入 lrexlib-pcre2，JavaScript adapter 注入带 `i` 标志的 JS RegExp。因此模式只用 PCRE 和 JavaScript 的交集（不用 lookbehind、占有量词、内联标志），`core/golden/rules.json` 给每条模式一个命中样本，引擎差异会让一个具名用例失败。一份规则文件三个 adapter 共用。没有注入匹配器时跳过本步并告警一次，只靠长度判断（fail-open）。
 6. **自然语言检查**：抽取的文本长度达到 `min_text_chars`（20）→ `suspect`，否则 `pass`。
 
 JSON body 按可配置的路径抽取文本（`messages[*].content`、`prompt`、`input`、`query`、`text`）；form 和 text body 整体取用。抽取失败 → `pass`。
@@ -249,19 +249,41 @@ Envoy 把 OpenResty adapter 当作它的 `ext_authz` 服务；没有第二套引
 
 Traefik ForwardAuth、Caddy `forward_auth` 和 nginx `auth_request` 共用一个端点 `/_jev/forward-auth`。只有 Traefik（≥ 3.3，`forwardBody: true`）会转发 body，所以只有 Traefik 能拿到 L2 判定；Caddy 和 nginx 只能做路径、方法和 IP 信誉检查，其余情况返回 `skipped`。三种网关的配置和对真实网关的 Docker Compose 端到端测试在 [adapters/forward-auth](../adapters/forward-auth/README.md)。
 
-## Cloudflare adapter
+## APISIX adapter
 
-唯一不跑 Lua core 的 adapter。`adapters/cloudflare` 是 `core/` 的 TypeScript 移植（体量相当），受 golden vectors 约束，外加围绕一个 `handle()` 的三种预设：
+APISIX 就是 OpenResty，所以 `adapters/apisix` 是在 nginx adapter 同一批模块（缓存、provider 客户端、熔断、L3）之上的一个插件文件。它加的是插件契约（JSON-schema 配置、优先级 2450 的 `access`、按 conf 对象缓存的每路由运行时），并把 `core.request` 映射到 core 的 `req`。`$jev_log` 注册成 APISIX 变量供 logger 插件使用。没有的东西：`/_jev/config`（Admin API 就是热更新）和 `/_jev/*` 端点。
+
+## HAProxy adapter
+
+HAProxy 的 SPOE 把请求连 body 交给 `adapters/haproxy/spoa`，一个调 `/_jev/authz` 并设置 `txn.jev.*` 变量的 Go agent；`haproxy.cfg` 把 `action=block` 变成 403，其余变成 `X-Jev-*` 头。SPOE 帧限制 body 大小（`tune.bufsize`，参考配置 128 KB）；更大的 body 截断到达、截断判定，这是该 adapter 唯一弱于 Envoy ext_authz 的地方。
+
+## 配方：Istio、Envoy Gateway、APIM、Apigee
+
+凡是能把 body 转发给旁路服务并按答复行动的网关，只靠配置就能用 `/_jev/authz` 契约；[recipes.zh-CN.md](recipes.zh-CN.md) 有每家的片段和 fail-open 开关。
+
+## LiteLLM guardrail
+
+`adapters/litellm` 是一个 `CustomGuardrail`，在 `async_pre_call_hook` 里把 messages 发到 `/_jev/authz`，标注 `metadata.jev_verdict`，enforce 模式下抛 403。Python 里不做判定；jev-edge 的阈值和上下文照常生效。
+
+## JavaScript adapter
+
+唯一不跑 Lua core 的 adapter。`adapters/js` 是 `core/` 的 TypeScript 移植（体量相当），受 golden vectors 约束，外加围绕一个 `handle()` 的三种预设：
 
 | 预设 | 判定在哪里 | 缓存 | 熔断 + 自适应 |
 |---|---|---|---|
 | `thinWorker` | 你已有的 jev-edge，走 `/_jev/authz`（Envoy 的契约） | KV 或 isolate 内存 | 在源站 |
 | `fullWorker` | Worker 自己，`jev` / `openai-compat` provider | KV | Durable Object `JevState` |
 | `pagesMiddleware` | 同 `fullWorker` | KV | Durable Object |
+| `nextMiddleware`、`nodeMiddleware`、`honoMiddleware` | 宿主进程 | 内存，或传入的 `Store` | 内存，或传入的 `Store` |
+| `lambdaEdgeHandler` | Lambda@Edge 执行环境 | 内存，或传入的 `Store` | 内存，或传入的 `Store` |
 
 薄预设的存在是因为最常见的 Cloudflare 部署后面本来就有网关，而两套阈值正是要避免的故障模式：它在边缘跑 L1 和缓存，把分数、部署上下文和 key 留在源站。`backend` provider 把源站的 `X-Jev-*` 答案翻译回答案表，所以 Worker 自己的 policy 仍然生效（边缘的 `enforce` 会按源站的分数拦截）。
 
 与 nginx 的差异来自平台而不是设计：KV 最小 60 秒 TTL 和最终一致性、熔断状态多一跳 Durable Object、指纹用 `djb2` 而不是 `crc32_long`（两边永远不共享缓存，所以无所谓）、没有 `/_jev/config` 热更新（配置即代码）、暂无 L3。完整清单在 adapter 的 README 里。
+
+## 决策采样
+
+`sampling` 保留一部分判定结果用于回放和标注：`enabled`（默认关）、`rate`、`min_verdict`（默认 `suspicious`，所以正常流量不会被留下）、`max_samples`（缓存 dict 里的环）、`ttl`、`text_bytes`。每条样本是截断到 `text_bytes` 的归一化文本、指纹、分数、判定、动作、来源、理由、路径、客户端 IP 和请求 id。原始 body 永远不存，访问日志也不写；`sampling.log = true` 额外把每条样本以一行 INFO 日志输出给日志采集器。`GET /_jev/samples` 按最新在前返回整个环，`DELETE` 清空。判定逻辑（`core/sampling.lua`，移植为 `adapters/js/src/sampling.ts`）是纯函数；存储由 adapter 负责：OpenResty 和 APISIX 用 shared dict，JavaScript 宿主用 `onSample` 回调。L1 放行的从不采样；L1 信誉拦截的会。
 
 ## 可观测性
 
@@ -271,7 +293,7 @@ Traefik ForwardAuth、Caddy `forward_auth` 和 nginx `auth_request` 共用一个
 {"rid":"…","path":"/v1/chat","ip":"1.2.3.4","src":"l2","score":0.91,"verdict":"malicious","action":"block","l2_ms":184,"fp":"a1b2c3"}
 ```
 
-`/_jev/metrics`（仅 127.0.0.1）输出 Prometheus 文本：
+`/_jev/samples`（仅 127.0.0.1）输出采样的判定，见上。`/_jev/metrics`（仅 127.0.0.1）输出 Prometheus 文本：
 
 ```
 jev_requests_total{source,verdict}

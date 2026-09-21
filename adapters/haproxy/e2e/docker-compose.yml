@@ -1,0 +1,27 @@
+# HAProxy end-to-end: real HAProxy with the SPOE filter, the jev-spoa agent,
+# one jev-edge (mock provider) and a stub app that echoes X-Jev-* headers.
+#   :8090  HAProxy
+services:
+  jev-edge:
+    image: jev-edge-test
+    volumes:
+      - ../../..:/work:ro
+      - ../../envoy/e2e/nginx.conf:/tmp/nx/conf/nginx.conf:ro
+      - ../../envoy/e2e/jev-edge.conf.lua:/tmp/nx/conf/jev-edge.conf.lua:ro
+    command: ["sh", "-c", "mkdir -p /tmp/nx/logs && openresty -p /tmp/nx -c /tmp/nx/conf/nginx.conf -g 'daemon off;'"]
+  app:
+    image: jev-edge-test
+    volumes:
+      - ../../envoy/e2e/app.conf:/tmp/app/conf/nginx.conf:ro
+    command: ["sh", "-c", "mkdir -p /tmp/app/logs && openresty -p /tmp/app -c /tmp/app/conf/nginx.conf -g 'daemon off;'"]
+  jev-spoa:
+    build: ../spoa
+    command: ["-listen", ":9000", "-upstream", "http://jev-edge:8080/_jev/authz"]
+    depends_on: [jev-edge]
+  haproxy:
+    image: haproxy:3.1-alpine
+    volumes:
+      - ../haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - ../spoe.conf:/usr/local/etc/haproxy/spoe.conf:ro
+    ports: ["8090:8080"]
+    depends_on: [jev-spoa, app]

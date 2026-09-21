@@ -12,7 +12,7 @@
 
 <p align="center"><img src="docs/hero.webp" alt="请求流经 L1 规则、L2 判定透镜、边缘网关和异步旁路，最后到达被保护的后端" width="100%"></p>
 
-jev-edge 跑在 nginx / OpenResty 里，或者站在 Envoy（ext_authz）、Traefik、Caddy 和原生 nginx（forward-auth）后面，或者跑在 Cloudflare Worker 里。它对每个进来的请求只问一个问题：*这个请求想对我的服务做什么？* 它用 [TypeSafe Jev](https://typesafe.ai/)——一个返回概率而不是散文的 System One 模型——在 LLM 应用的入口处拦截 prompt injection 和滥用，在请求到达后端之前。
+jev-edge 跑在 nginx / OpenResty 或 Apache APISIX 里，站在 Envoy、Istio、HAProxy、Traefik、Caddy 和原生 nginx 后面，跑在 Cloudflare Worker、Next.js 或 Node 中间件、Lambda@Edge 里，或者嵌在 LiteLLM proxy 里。它对每个进来的请求只问一个问题：*这个请求想对我的服务做什么？* 它用 [TypeSafe Jev](https://typesafe.ai/)——一个返回概率而不是散文的 System One 模型——在 LLM 应用的入口处拦截 prompt injection 和滥用，在请求到达后端之前。
 
 它是给 SRE 和平台工程师用的，不是给 agent 作者用的。现有的 Jev guard 跑在开发者机器上，判断的是 AI 将要做什么；jev-edge 跑在网关上，判断的是外部世界将要做什么。
 
@@ -26,6 +26,7 @@ jev-edge 跑在 nginx / OpenResty 里，或者站在 Envoy（ext_authz）、Trae
 - [安装](#安装)
 - [写好部署上下文](#写好部署上下文)
 - [选阈值](#选阈值)
+- [误报](#误报)
 - [花多少钱](#花多少钱)
 - [Bench](#bench)
 - [设计](#设计)
@@ -39,8 +40,10 @@ jev-edge 跑在 nginx / OpenResty 里，或者站在 Envoy（ext_authz）、Trae
 | | |
 |---|---|
 | 版本 | `v0.2.0` |
-| 网关 | OpenResty 原生接入；Envoy（HTTP 和 gRPC ext_authz）、Traefik、Caddy 和普通 nginx（forward-auth）共用同一套引擎，各自对真实网关做了端到端测试；Cloudflare Workers 和 Pages 走 core 的 TypeScript 移植版，受同一批 golden vectors 约束（在 `main` 上，未发版） |
-| 测试覆盖 | 78 个单元 spec、202 条集成断言、两个 core 各自回放的 116 个 golden vectors、18 个 Worker 测试、两套 bench、一次 soak |
+| 网关，原生 | OpenResty；Apache APISIX（插件，同一套引擎） |
+| 网关，走 `/_jev/authz` | Envoy（HTTP 和 gRPC ext_authz）、HAProxy（SPOE agent）、Traefik、Caddy 和普通 nginx（forward-auth），各自对真实网关做了端到端测试；Istio、Envoy Gateway、Azure APIM 和 Apigee 以[配方](docs/recipes.zh-CN.md)形式提供；LiteLLM proxy 作为 guardrail |
+| JavaScript 宿主 | Cloudflare Workers 和 Pages、Next.js、Node、Hono、Lambda@Edge，共用一份受同一批 golden vectors 约束的 TypeScript core 移植（在 `main` 上，未发版） |
+| 测试覆盖 | 78 个单元 spec、202 条集成断言、两个 core 各自回放的 116 个 golden vectors、30 个 JS 宿主测试、8 个 guardrail 测试、五套网关端到端、两套 bench、一次 soak |
 | provider 真实联调 | `jev` 对 TypeSafe API 跑完 662 条全量数据集；`openai-compat` 对 Ollama 容器 |
 | 生产使用 | 目前没有已知案例。先用 `monitor` 模式跑 |
 
@@ -188,7 +191,13 @@ curl -X PUT localhost:8080/_jev/config -d '{"policy":{"mode":"enforce"}}'
 
 回滚就是同一个调用带 `"monitor"`，或者 `DELETE /_jev/config` 丢掉所有运行时覆盖。
 
-**其他网关。** Envoy 把同一个 OpenResty 进程当作 ext_authz 服务：[adapters/envoy](adapters/envoy/README.md)。Traefik、Caddy 和原生 nginx `auth_request` 共用一个 forward-auth 端点：[adapters/forward-auth](adapters/forward-auth/README.md)。Cloudflare 是一个 npm 包里的三种预设，[adapters/cloudflare](adapters/cloudflare/README.md)：薄 Worker（判定留在你已有的网关）、完整 Worker（什么都不需要）、Pages 中间件。
+**其他网关和宿主。**
+
+- **Apache APISIX**：同一套引擎做成插件，按路由配置，键和配置文件一样：[adapters/apisix](adapters/apisix/README.md)。
+- **Envoy** 把 OpenResty 进程当作 ext_authz 服务：[adapters/envoy](adapters/envoy/README.md)。**HAProxy** 通过一个小 SPOE agent 做同样的事：[adapters/haproxy](adapters/haproxy/README.md)。**Traefik、Caddy 和 nginx `auth_request`** 共用一个 forward-auth 端点：[adapters/forward-auth](adapters/forward-auth/README.md)。
+- **Istio、Envoy Gateway、Azure API Management、Apigee**：只有配置，走同一个 `/_jev/authz` 契约：[docs/recipes.zh-CN.md](docs/recipes.zh-CN.md)。
+- **LiteLLM proxy**：每次调用前先问 jev-edge 的 guardrail：[adapters/litellm](adapters/litellm/README.md)。
+- **Cloudflare Workers 和 Pages、Next.js、Node、Hono、Lambda@Edge**：一个 npm 包，core 的 TypeScript 移植，[adapters/js](adapters/js/README.md)。薄 Worker 把判定留在你已有的网关，其余在宿主里跑完整 core。
 
 ## 写好部署上下文
 
@@ -226,7 +235,21 @@ deployment_context = "An internal Q&A assistant over Acme's employee handbook, I
   .. "or discuss individual employees' data."
 ```
 
-注意代码助手那个例子：在那里"写代码"是正常的，在另外两个里是异常的。这正是只有你能提供的区分。一个网关前面挂多个助手时，按规则设置（`rule.deployment_context`）。
+注意代码助手那个例子：在那里"写代码"是正常的，在另外两个里是异常的。这正是只有你能提供的区分。
+
+**一个网关，多个助手。** 给每个助手一条自己的规则：内联规则从某个规则集出发（`extends`），覆盖路径和上下文。租户规则放在通用规则前面，因为第一条路径匹配的规则说了算。
+
+```lua
+rules = {
+  { id = "billing", extends = "llm-endpoints", watch_paths = { "^/v1/billing" },
+    deployment_context = "A support assistant for Acme's billing product. ..." },
+  { id = "ide",     extends = "llm-endpoints", watch_paths = { "^/v1/ide" },
+    deployment_context = "A coding assistant inside Acme's IDE plugin. ..." },
+  "llm-endpoints",   -- 其余流量，用 jev.deployment_context
+},
+```
+
+同样的写法适用于 `PUT /_jev/config`（JSON）、APISIX 插件的每路由配置，以及 JavaScript 包的 `rules` 选项。
 
 写完先检查，别等它吃掉准确率。lint 把上面的规则（长度、泛泛措辞、拒绝清单、受众、"要安全"类指令、专有名词）套在配置文件里的每个 context 上，或者套在一段字符串上：
 
@@ -247,8 +270,33 @@ make calibrate LOG=jev.log LABELS=labels.csv MAX_FP=0.001
 - **输入**：`$jev_log` 访问日志（每请求一个 JSON 对象，不含 body）和一个标注文件，每行一条：`<rid 或 fp>,<0|1>`。按指纹标是省事的办法：一行覆盖同一段文本的所有重放。先标分数在 0.4 到 0.8 之间的，阈值在那里才会动。
 - **输出**：分数分布、每个阈值会拦掉多少、AUC、每个阈值的误报率和漏报率，以及推荐的 `block_threshold`（误报预算内漏报最低的点）和 `suspect_threshold`（预算放宽十倍，因为可疑流量只是放行并喂给 L3）。最后给出应用它们的 `PUT /_jev/config` 命令。`--json` 给脚本用。
 - **没有标注**也会打印分布和"会拦掉多少"那张表，足够看出 0.7 是落在空档里还是落在一堆请求中间。
+- **标注从哪来**：运维反馈（见[误报](#误报)）经 `make labels` 来一份；剩下没人抱怨的那些靠采样：monitor 那一周打开决策采样（`sampling = { enabled = true, rate = 0.05 }`），读 `GET /_jev/samples`。每条是一个被采样决策的归一化文本、指纹、分数和判定，最新在前，在内存里保留 `sampling.ttl` 秒；原始 body 永远不存。按指纹从这份列表里标，就是 `make calibrate` 要的文件。
 
 标注少于几百条时，比率只是方向，不是测量；脚本会说明这一点，并告诉你一条标错会让数字动多少。
+
+## 误报
+
+值班的人判定某个被拦的请求是正常流量。这个判断要落到两个地方：网关，立刻生效，让同一段文本不再被拦；标注文件，让下一次校准知道这件事。`POST /_jev/feedback` 一次做完两件事。
+
+```bash
+curl -s localhost:8080/_jev/feedback -H 'X-Jev-Token: '"$JEV_FEEDBACK_TOKEN" \
+     -d '{"fp":"17e77570","label":"benign","by":"alice","rid":"ab12..."}'
+```
+
+`fp` 是日志行或告警里的指纹；`label: "attack"` 是撤销，标错的代价和标对一样低。用 `feedback = { enabled = true, token = ... }` 打开——token 是必须的，这个端点写的是绕过。
+
+三个决定写死在设计里，它们才是重点：
+
+- **信任一定过期。** 被信任的指纹在 L1.5 放行（在判定缓存之前，所以它压得过同一段文本上一条陈旧的 malicious 分数），有效期 `trust_ttl`，默认七天。同一文本的流量会把它往后推，最多 `max_renewals` 次，合计约五周，之后这条误报会故意回来。指纹是从攻击者看得见的文本算出来的，永久条目就是一条再也没人复查的绕过。如果一个模板五周后还在触发判定，那是规则或 `deployment_context` 的问题，告警回来正是目的。
+- **信任只在本网关。** 它和别的状态一样住在同一个 shared dict 里：不用多跑一个组件、不用为它做高可用，也不会因为网络分区让整个集群一起 fail-open。其他网关见到同一段文本时各自收敛。core 里 `ctx.trust` 和 `ctx.cache` 是分开的 store，所以把信任放进 Redis 是适配器的改动，不是 core 的改动——但那不是默认路径，它带来的是一整个分布式状态问题。
+- **标注文件是派生出来的，不是被写进去的。** worker 不往文件里追加：热路径没有写盘、多 worker 没有竞争、容器没了也不会丢东西。每次反馈是 jev 访问日志里的一行（`src="feedback"`，带 `fp`、`label`、`by` 和他看的那条 `rid`）——日志本来就在收集、在轮转，可审计，改主意只要再报一次。`make labels` 把这些行回放成 `make calibrate` 要的文件：
+
+```bash
+make labels LOG=/var/log/nginx/jev.log OUT=bench/datasets/labels.csv
+make calibrate LOG=/var/log/nginx/jev.log LABELS=bench/datasets/labels.csv
+```
+
+所以：shared dict 是热路径上的短期记忆，日志是长期记忆和跨网关的真相。运维看到的一次点击，落地成一条会过期的绕过加一条不会丢的标注。
 
 ## 花多少钱
 
@@ -288,7 +336,7 @@ L1 放行的流量 p99 多花 24 µs。"健康 Jev"那组是一个 100 ms 应答
 
 完整设计在 [docs/design.zh-CN.md](docs/design.zh-CN.md)：范围、架构、三层各自的细节、缓存、策略、判定头、热更新、降级矩阵、三个 adapter、可观测性、验收表和七条已定决策。要改 L1 规则、阈值或 fail-open 行为，先读[已定决策](docs/design.zh-CN.md#已定决策)。
 
-**跨实现一致性。** core 只有一份行为契约，就是 [core/golden/](core/golden/README.md) 里的 golden vectors：116 个用例，覆盖归一化、文本提取、每一种 L1 判定、策略边界、判定头，以及所有 IO 都被脚本化的完整流水线。两个 core 都回放它们，Lua 的在 busted 下，TypeScript 的在 vitest 下，任一漂移 CI 都失败。同一个请求在 nginx 上和在 Worker 上得到的是同一个判定。向量保证什么、把什么留给平台（缓存 TTL 精度、跨 worker 的熔断统计、自适应超时的具体值），那份 README 和 [Cloudflare adapter](adapters/cloudflare/README.md#what-is-the-same-as-nginx-and-what-is-not) 自己的清单里都写清楚了。
+**跨实现一致性。** core 只有一份行为契约，就是 [core/golden/](core/golden/README.md) 里的 golden vectors：116 个用例，覆盖归一化、文本提取、每一种 L1 判定、策略边界、判定头，以及所有 IO 都被脚本化的完整流水线。两个 core 都回放它们，Lua 的在 busted 下，TypeScript 的在 vitest 下，任一漂移 CI 都失败。同一个请求在 nginx 上和在 Worker 上得到的是同一个判定。向量保证什么、把什么留给平台（缓存 TTL 精度、跨 worker 的熔断统计、自适应超时的具体值），那份 README 和 [JavaScript adapter](adapters/js/README.md#what-is-the-same-as-nginx-and-what-is-not) 自己的清单里都写清楚了。
 
 ## 仓库结构
 
@@ -298,13 +346,16 @@ core/            判定逻辑、模板、策略、熔断 — 不碰 ngx.*；bust
 adapters/
   openresty/     access_by_lua 胶水、/_jev/{authz,config,forward-auth,health,metrics}、providers/、
                  shared dict 缓存、自适应超时、L3 定时器；Test::Nginx 在 t/
+  apisix/        APISIX 插件（同一套引擎，按路由配置）、对真实 APISIX 的 e2e/
   envoy/         envoy-http.yaml、envoy-grpc.yaml、grpc-shim/（Go）、e2e/（Docker Compose）
+  haproxy/       SPOE agent（Go）、spoe.conf、haproxy.cfg、对真实 HAProxy 的 e2e/
   forward-auth/  traefik.yml、Caddyfile、nginx-auth-request.conf、e2e/（Docker Compose）
-  cloudflare/    core 的 TypeScript 移植 + thinWorker / fullWorker / pagesMiddleware；vitest 回放 core/golden
+  litellm/       调 /_jev/authz 的 LiteLLM proxy guardrail（Python）
+  js/            core 的 TypeScript 移植；Cloudflare、Next.js、Node、Hono、Lambda@Edge 预设；vitest 回放 core/golden
 rules/           L1 规则集（PCRE 预筛、监控路径、文本字段）
-bench/           离线准确率 bench、Docker 延迟 bench、live 检查、soak、calibrate、context lint、报告
+bench/           离线准确率 bench、Docker 延迟 bench、live 检查、soak、calibrate、labels-from-log、context lint、报告
 demo/            "30 秒试一下"用的 docker compose demo
-docs/            design、cost、bench 图表
+docs/            design、cost、recipes（Istio、Envoy Gateway、APIM、Apigee）、bench 图表
 ```
 
 ## 路线图
@@ -319,8 +370,8 @@ docs/            design、cost、bench 图表
 | M6 ✅ | v0.1.0：`make install`、opm 包、安装文档 |
 | 0.1.1 ✅ | provider 真实联调、带上限的自适应超时、`/_jev/health`、`deployment_context`、soak 和全量 live bench |
 | 0.2.0 ✅ | OpenResty 之外的网关，同一套引擎：Envoy HTTP ext_authz（`/_jev/authz`）和 gRPC ext_authz（`grpc-shim`）；`/_jev/forward-auth` 服务 Traefik ForwardAuth（转发 body，完整判定）、Caddy `forward_auth` 和 nginx `auth_request`（只有头：路径、方法、信誉）。对每个真实网关的 Docker Compose 端到端。`demo/`。许可证改为 Apache 2.0。 |
-| 0.3.0 | golden vectors 作为带版本的 core 契约（`core/golden/`，两个 core 在 CI 里回放）；`make calibrate` 从 monitor 日志定阈值；`make context-lint`；Cloudflare：通过向量的 TypeScript core、`thinWorker`（判定留在你的网关）、`fullWorker`（KV 缓存，Durable Object 熔断和自适应超时）、`pagesMiddleware`。在 `main` 上进行中。 |
-| 之后 | 主体维度（session / API key）的分数轨迹作为 L3 旁路；`abuse` 模板拥有自己的数据集；按路由的多租户 `deployment_context`；决策采样和误报反馈回路 |
+| 0.3.0 | golden vectors 作为带版本的 core 契约（`core/golden/`，两个 core 在 CI 里回放）；`make calibrate`；`make context-lint`；APISIX 插件；HAProxy SPOE agent；LiteLLM guardrail；Istio、Envoy Gateway、APIM、Apigee 配方；`@jev-edge/js`：通过向量的 TypeScript core，以及 Cloudflare（薄 / 完整 Worker、Pages）、Next.js、Node、Hono、Lambda@Edge 预设。在 `main` 上进行中。 |
+| 之后 | 主体维度（session / API key）的分数轨迹作为 L3 旁路；`abuse` 模板拥有自己的数据集；按路由的多租户 `deployment_context`；决策采样和误报反馈回路；等向量经历过一次真实的 core 变更后再做 Fastly Compute 和 Deno Deploy |
 
 ✅ 表示已随某个 tag 发布。
 
@@ -340,7 +391,7 @@ make test-openresty
 
 **重新生成 golden vectors。** 当 core 的改动就是要改变行为时：`make golden`，把 JSON 的 diff 和代码一起提交。没有这一步的漂移会让 `make check` 失败。
 
-**两个 core 都要绿。** core 行为的变更就是向量的变更，`adapters/cloudflare` 里的 TypeScript 移植要在同一个 PR 里跟上（`make test-cloudflare`，需要 pnpm）。
+**两个 core 都要绿。** core 行为的变更就是向量的变更，`adapters/js` 里的 TypeScript 移植要在同一个 PR 里跟上（`make test-js`，需要 pnpm）。网关端到端（`make e2e-envoy e2e-forward-auth e2e-apisix e2e-haproxy`）和 guardrail 测试（`make test-litellm`）覆盖那些通过 HTTP 调引擎的 adapter。
 
 **带 bench 数据来。** 任何改 L1 规则、归一化、阈值或超时的变更都要。[已定决策](docs/design.zh-CN.md#已定决策)除非有 PR 拿数字来反驳否则不再讨论，产出这些数字的命令是：
 

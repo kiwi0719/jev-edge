@@ -43,11 +43,11 @@ jobs:
           opm get ledgetech/lua-resty-http
           cd adapters/openresty && prove -r t/
 
-  cloudflare:
+  js:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: adapters/cloudflare
+        working-directory: adapters/js
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -57,7 +57,7 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
-          cache-dependency-path: adapters/cloudflare/pnpm-lock.yaml
+          cache-dependency-path: adapters/js/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
       - run: pnpm test
@@ -70,6 +70,31 @@ jobs:
         with:
           go-version-file: adapters/envoy/grpc-shim/go.mod
       - run: cd adapters/envoy/grpc-shim && go vet ./... && go build ./...
+      - run: cd adapters/haproxy/spoa && go vet ./... && go build ./...
+
+  litellm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install httpx pytest
+      - run: cd adapters/litellm && python3 -m pytest -q
+
+  haproxy-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -q -t jev-edge-test -f adapters/openresty/Dockerfile.test adapters/openresty
+      - run: sh adapters/haproxy/e2e/run.sh
+
+  apisix-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -q -t jev-edge-test -f adapters/openresty/Dockerfile.test adapters/openresty
+      - run: sh adapters/apisix/e2e/run.sh
 
   envoy-e2e:
     runs-on: ubuntu-latest

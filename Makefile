@@ -1,4 +1,4 @@
-.PHONY: test lint check luajit-check golden golden-check calibrate context-lint test-cloudflare test-openresty bench bench-offline bench-chart dist opm-build install live-check live-full live-openai soak shim e2e-envoy e2e-forward-auth
+.PHONY: test lint check luajit-check golden golden-check calibrate labels context-lint test-js test-openresty bench bench-offline bench-chart dist opm-build install live-check live-full live-openai soak shim e2e-envoy e2e-forward-auth e2e-apisix e2e-haproxy test-litellm
 
 test:
 	busted
@@ -26,9 +26,9 @@ golden-check:
 	  else diff -ru core/golden $$tmp --exclude=gen.lua --exclude=README.md | head -40; \
 	    echo "golden vectors are stale: run 'make golden' and commit core/golden/*.json"; rm -rf $$tmp; exit 1; fi
 
-# Cloudflare adapter: the TypeScript core replays the same golden vectors (needs pnpm).
-test-cloudflare:
-	cd adapters/cloudflare && pnpm install --frozen-lockfile --silent && pnpm typecheck && pnpm test
+# JavaScript adapter: the TypeScript core replays the same golden vectors (needs pnpm).
+test-js:
+	cd adapters/js && pnpm install --frozen-lockfile --silent && pnpm typecheck && pnpm test
 
 # Deployment-context lint: make context-lint CONF=/etc/nginx/jev-edge.conf.lua
 # or make context-lint TEXT="A support assistant ..."
@@ -37,6 +37,12 @@ context-lint:
 
 # Threshold calibration from monitor-mode logs plus labels:
 #   make calibrate LOG=/var/log/nginx/jev.log LABELS=labels.csv [MAX_FP=0.001]
+# Operator feedback (POST /_jev/feedback) is written to the jev access log, not
+# to a file; this derives the labels file calibrate reads from those log lines:
+#   make labels LOG=/var/log/nginx/jev.log OUT=bench/datasets/labels.csv
+labels:
+	lua bench/labels-from-log.lua $${LOG:?set LOG=<jev access log>} $${OUT:+-o $$OUT}
+
 calibrate:
 	lua bench/calibrate.lua $${LOG:?set LOG=<jev access log>} $${LABELS:-} $${MAX_FP:+--max-fp $$MAX_FP}
 
@@ -92,6 +98,18 @@ e2e-envoy:
 	sh adapters/envoy/e2e/run.sh
 
 # Traefik / Caddy / nginx forward-auth end-to-end (Docker Compose).
+e2e-apisix:
+	docker build -q -t jev-edge-test -f adapters/openresty/Dockerfile.test adapters/openresty
+	sh adapters/apisix/e2e/run.sh
+
+e2e-haproxy:
+	docker build -q -t jev-edge-test -f adapters/openresty/Dockerfile.test adapters/openresty
+	sh adapters/haproxy/e2e/run.sh
+
+# LiteLLM guardrail unit tests (needs python3 with httpx and pytest; LiteLLM itself is optional).
+test-litellm:
+	cd adapters/litellm && python3 -m pytest -q
+
 e2e-forward-auth:
 	docker build -q -t jev-edge-test -f adapters/openresty/Dockerfile.test adapters/openresty
 	sh adapters/forward-auth/e2e/run.sh

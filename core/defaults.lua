@@ -34,6 +34,29 @@ _M.config = {
                               -- IP can hide thousands of users.
     rep_block_ttl   = 600,
   },
+  sampling = {
+    enabled     = false,     -- keep a sample of decisions for replay and labelling
+    rate        = 0.05,      -- share of eligible decisions kept
+    min_verdict = "suspicious", -- "safe" | "suspicious" | "malicious": keep this label and above
+    max_samples = 1000,      -- ring size in the cache dict
+    ttl         = 86400,     -- seconds a sample stays readable
+    text_bytes  = 512,       -- normalized text kept per sample (never the raw body)
+    log         = false,     -- also write each sample as one JSON line at INFO
+  },
+  feedback = {
+    -- False-positive loop: an operator marks a request "not an attack" and its
+    -- fingerprint is trusted from then on. Off by default; turning it on means
+    -- accepting that a POST can create a bypass, so /_jev/feedback also needs
+    -- a token (see the adapter config).
+    enabled      = false,
+    trust_ttl    = 604800,   -- 7 days. Trust always expires: a permanent entry
+                             -- is a bypass nobody reviews again.
+    max_renewals = 4,        -- times traffic or a repeat report may extend it
+                             -- (~5 weeks total), then it must expire. A template
+                             -- still firing by then is a rule bug, not a label.
+    token        = nil,      -- shared secret for POST /_jev/feedback; without it
+                             -- the endpoint refuses every request.
+  },
   breaker = {
     window_s    = 60,
     min_samples = 20,
@@ -76,6 +99,24 @@ function _M.validate(c)
   end
   if type(c.jev.timeout_ms) ~= "number" or c.jev.timeout_ms <= 0 then
     return nil, "jev.timeout_ms must be > 0"
+  end
+  local sm = c.sampling or {}
+  if sm.rate ~= nil and (type(sm.rate) ~= "number" or sm.rate < 0 or sm.rate > 1) then
+    return nil, "sampling.rate must be in [0,1]"
+  end
+  local mv = sm.min_verdict
+  if mv ~= nil and mv ~= "safe" and mv ~= "suspicious" and mv ~= "malicious" then
+    return nil, "sampling.min_verdict must be safe|suspicious|malicious"
+  end
+  local fb = c.feedback or {}
+  if fb.trust_ttl ~= nil and (type(fb.trust_ttl) ~= "number" or fb.trust_ttl <= 0) then
+    return nil, "feedback.trust_ttl must be > 0"
+  end
+  if fb.max_renewals ~= nil and (type(fb.max_renewals) ~= "number" or fb.max_renewals < 0) then
+    return nil, "feedback.max_renewals must be >= 0"
+  end
+  if fb.enabled == true and (fb.token == nil or fb.token == "") then
+    return nil, "feedback.enabled needs feedback.token set"
   end
   local max_ms = c.jev.timeout_max_ms
   if max_ms ~= nil and (type(max_ms) ~= "number" or max_ms < c.jev.timeout_ms) then

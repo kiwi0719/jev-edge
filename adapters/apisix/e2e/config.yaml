@@ -1,0 +1,20 @@
+# APISIX standalone (no etcd) with the jev-edge plugin. The repo is mounted at
+# /opt/jev-edge by docker-compose.yml.
+deployment:
+  role: data_plane
+  role_data_plane:
+    config_provider: yaml
+apisix:
+  node_listen: 9080
+  enable_admin: false
+  extra_lua_path: "/opt/jev-edge/adapters/apisix/?.lua;/opt/jev-edge/adapters/openresty/lib/?.lua;/opt/jev-edge/?.lua;/opt/jev-edge/?/init.lua"
+plugins:
+  - jev-edge
+  - proxy-rewrite
+nginx_config:
+  error_log_level: warn
+  envs:
+    - TYPESAFE_API_KEY
+  http:
+    lua_shared_dict:
+      jev_cache: 16m

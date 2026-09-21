@@ -18,14 +18,23 @@ local state = {
   dict_name = "jev_config",
 }
 
-local function load_rules(names)
+local rules_mod = require "jev.core.rules"
+
+-- rules entries are rule set ids or inline tables (with optional `extends`),
+-- see core/rules.lua resolve(). A bad entry is logged and skipped so one
+-- tenant's typo does not take the gateway down.
+local function load_rules(specs)
   local out = {}
-  for _, name in ipairs(names or {}) do
-    local ok, rule = pcall(require, "jev.rules." .. name)
-    if ok and type(rule) == "table" then
+  for i, spec in ipairs(specs or {}) do
+    local rule, err = rules_mod.resolve(spec, function(id)
+      local ok, r = pcall(require, "jev.rules." .. id)
+      if ok then return r end
+      return nil, tostring(r)
+    end)
+    if rule then
       out[#out + 1] = rule
     else
-      ngx.log(ngx.ERR, "jev-edge: rule set ", name, " failed to load: ", tostring(rule))
+      ngx.log(ngx.ERR, "jev-edge: rules[", i, "] failed to load: ", tostring(err))
     end
   end
   return out

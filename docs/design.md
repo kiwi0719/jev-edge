@@ -53,9 +53,9 @@ flowchart LR
 
 **Decision principle:** each layer can only make a request *more* suspicious or pass it. Any layer that errors degrades to pass and records `X-Jev-Verdict: error`.
 
-**One contract for every implementation.** The behaviour of `core/` is pinned by the golden vectors in [core/golden/](../core/golden/README.md): hand-authored inputs, expectations produced by the Lua core, replayed by `core/spec/golden_spec.lua` and checked for drift by `make golden-check` in CI. The TypeScript port in `adapters/cloudflare` passes the same files under vitest; that is the definition of it being a port. The vectors cover normalisation, extraction, L1, policy, verdict headers and the pipeline order; they deliberately leave cache TTL precision, cross-worker breaker statistics and the adaptive timeout's value to each platform.
+**One contract for every implementation.** The behaviour of `core/` is pinned by the golden vectors in [core/golden/](../core/golden/README.md): hand-authored inputs, expectations produced by the Lua core, replayed by `core/spec/golden_spec.lua` and checked for drift by `make golden-check` in CI. The TypeScript port in `adapters/js` passes the same files under vitest; that is the definition of it being a port. The vectors cover normalisation, extraction, L1, policy, verdict headers and the pipeline order; they deliberately leave cache TTL precision, cross-worker breaker statistics and the adaptive timeout's value to each platform.
 
-**Core / adapter boundary.** `core/` never requires `ngx`. All IO (cache, HTTP, clock, hashing, JSON, regex, logging) is injected through a `ctx` table. This is what makes the Envoy and Cloudflare adapters possible and what lets core run under busted with no OpenResty.
+**Core / adapter boundary.** `core/` never requires `ngx`. All IO (cache, HTTP, clock, hashing, JSON, regex, logging) is injected through a `ctx` table. This is what makes the Envoy, APISIX, HAProxy and JavaScript adapters possible and what lets core run under busted with no OpenResty.
 
 ```lua
 local edge = require "jev.core"
@@ -91,7 +91,7 @@ Evaluation is ordered by cost and short-circuits:
 2. **Reputation** (shared dict, one lookup): IP blocked within `block_ttl` → `block`; IP trusted after N consecutive safe verdicts → `pass`. This runs before anything that needs a body so headers-only forward-auth requests can still be rejected.
 3. **Method / Content-Type** not `POST|PUT|PATCH` or not json / form / text → `pass`.
 4. **Body size**: no body → `pass` ("no body"); under `min_body_bytes` (8) → `pass`; over `max_body_bytes` (64 KB) → `pass` with a log line. Large bodies are never read.
-5. **Regex prefilter**: any `always_suspect` pattern hits → `suspect`. Patterns are **PCRE**, matched case-insensitively through `ctx.re_find`. OpenResty injects `ngx.re.find` with `"ijo"`, specs inject lrexlib-pcre2, the Cloudflare adapter injects JS RegExp with the `i` flag. Patterns therefore stay in the PCRE / JavaScript intersection (no lookbehind, no possessive quantifiers, no inline flags), and `core/golden/rules.json` carries one positive per pattern so a divergence fails a named case. One rule file serves every adapter. If no matcher is injected, this step is skipped with a single warning and the length check alone decides (fail-open).
+5. **Regex prefilter**: any `always_suspect` pattern hits → `suspect`. Patterns are **PCRE**, matched case-insensitively through `ctx.re_find`. OpenResty injects `ngx.re.find` with `"ijo"`, specs inject lrexlib-pcre2, the JavaScript adapter injects JS RegExp with the `i` flag. Patterns therefore stay in the PCRE / JavaScript intersection (no lookbehind, no possessive quantifiers, no inline flags), and `core/golden/rules.json` carries one positive per pattern so a divergence fails a named case. One rule file serves every adapter. If no matcher is injected, this step is skipped with a single warning and the length check alone decides (fail-open).
 6. **Natural-language check**: extracted text at least `min_text_chars` (20) → `suspect`, else `pass`.
 
 Text is extracted from JSON bodies by configurable paths (`messages[*].content`, `prompt`, `input`, `query`, `text`); form and text bodies are taken whole. Extraction failure → `pass`.
@@ -249,19 +249,41 @@ Envoy uses the OpenResty adapter as its `ext_authz` service; there is no second 
 
 Traefik ForwardAuth, Caddy `forward_auth` and nginx `auth_request` all get one endpoint, `/_jev/forward-auth`. Only Traefik (≥ 3.3, `forwardBody: true`) sends the body, so only Traefik gets L2 verdicts; Caddy and nginx get path, method and IP-reputation checks, and `skipped` otherwise. Configs and a Docker Compose e2e against all three are in [adapters/forward-auth](../adapters/forward-auth/README.md).
 
-## Cloudflare adapter
+## APISIX adapter
 
-The one adapter that does not run the Lua core. `adapters/cloudflare` is a TypeScript port of `core/` (about the same size) held to the golden vectors, plus three presets around one `handle()`:
+APISIX is OpenResty, so `adapters/apisix` is one plugin file over the same modules the nginx adapter uses: cache, provider client, breaker, L3. It adds the plugin contract (JSON-schema config, `access` at priority 2450, per-route runtimes keyed by the conf object) and maps `core.request` onto core's `req`. `$jev_log` is registered as an APISIX variable for the logger plugins. What it does not have: `/_jev/config` (the Admin API is the hot reload) and the `/_jev/*` endpoints.
+
+## HAProxy adapter
+
+HAProxy's SPOE hands the request, body included, to `adapters/haproxy/spoa`, a Go agent that calls `/_jev/authz` and sets `txn.jev.*` variables; `haproxy.cfg` turns `action=block` into a 403 and the rest into `X-Jev-*` headers. SPOE frames cap the body (`tune.bufsize`, 128 KB in the reference config); a larger body arrives truncated and is judged truncated, the one way this adapter is weaker than Envoy's ext_authz.
+
+## Recipes: Istio, Envoy Gateway, APIM, Apigee
+
+Every gateway that can forward a body to a side service and act on the answer uses the `/_jev/authz` contract with configuration only; [recipes.md](recipes.md) has the snippets and the fail-open switch for each.
+
+## LiteLLM guardrail
+
+`adapters/litellm` is a `CustomGuardrail` that sends the messages to `/_jev/authz` in `async_pre_call_hook`, annotates `metadata.jev_verdict` and raises a 403 in enforce mode. No judgment in Python; jev-edge's thresholds and context apply.
+
+## JavaScript adapter
+
+The one adapter that does not run the Lua core. `adapters/js` is a TypeScript port of `core/` (about the same size) held to the golden vectors, plus three presets around one `handle()`:
 
 | preset | where judgment happens | cache | breaker + adaptive |
 |---|---|---|---|
 | `thinWorker` | your existing jev-edge, via `/_jev/authz` (the Envoy contract) | KV or per-isolate memory | at the origin |
 | `fullWorker` | the Worker, `jev` / `openai-compat` provider | KV | Durable Object `JevState` |
 | `pagesMiddleware` | same as `fullWorker` | KV | Durable Object |
+| `nextMiddleware`, `nodeMiddleware`, `honoMiddleware` | the host process | memory, or a passed `Store` | memory, or a passed `Store` |
+| `lambdaEdgeHandler` | the Lambda@Edge execution environment | memory, or a passed `Store` | memory, or a passed `Store` |
 
 The thin preset exists because the most common Cloudflare deployment already has a gateway behind it, and two sets of thresholds is the failure mode to avoid: it runs L1 and the cache at the edge and leaves the score, the deployment context and the key at the origin. The `backend` provider translates the origin's `X-Jev-*` answer back into an answer map, so the Worker's own policy still applies (`enforce` at the edge blocks on the origin's score).
 
 What differs from nginx by platform, not by design: KV's 60 s minimum TTL and eventual consistency, the Durable Object hop for breaker state, `djb2` instead of `crc32_long` for fingerprints (caches are never shared between the two, so it does not matter), no `/_jev/config` hot reload (config is code), no L3 yet. The adapter README keeps the full list.
+
+## Decision sampling
+
+`sampling` keeps a share of judged decisions for replay and labelling: `enabled` (off by default), `rate`, `min_verdict` (`suspicious` by default, so safe traffic is not kept), `max_samples` (a ring in the cache dict), `ttl`, `text_bytes`. Each sample is the normalized text truncated to `text_bytes`, the fingerprint, score, verdict, action, source, reason, path, client IP and request id. The raw body is never stored, and nothing is written to the access log; `sampling.log = true` additionally emits each sample as one INFO line for log shippers. `GET /_jev/samples` returns the ring newest first, `DELETE` clears it. The decision (`core/sampling.lua`, ported to `adapters/js/src/sampling.ts`) is pure; storage is the adapter's: the shared dict on OpenResty and APISIX, an `onSample` callback on the JavaScript hosts. L1 skips are never sampled; L1 reputation blocks are.
 
 ## Observability
 
@@ -271,7 +293,7 @@ What differs from nginx by platform, not by design: KV's 60 s minimum TTL and ev
 {"rid":"…","path":"/v1/chat","ip":"1.2.3.4","src":"l2","score":0.91,"verdict":"malicious","action":"block","l2_ms":184,"fp":"a1b2c3"}
 ```
 
-`/_jev/metrics` (127.0.0.1) serves Prometheus text:
+`/_jev/samples` (127.0.0.1) serves the sampled decisions, see above. `/_jev/metrics` (127.0.0.1) serves Prometheus text:
 
 ```
 jev_requests_total{source,verdict}

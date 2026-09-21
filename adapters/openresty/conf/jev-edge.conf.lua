@@ -14,6 +14,14 @@ return {
     timeout_adaptive = true,
     max_inflight = 64,
   },
+  -- Rule sets by id, or inline rules for one gateway that fronts several
+  -- assistants. An inline rule starts from `extends` and overrides what it
+  -- names; list tenant rules before the general one (first match wins):
+  --   rules = {
+  --     { id = "billing", extends = "llm-endpoints", watch_paths = { "^/v1/billing" },
+  --       deployment_context = "A support assistant for Acme's billing product. ..." },
+  --     "llm-endpoints",
+  --   },
   rules  = { "llm-endpoints" },
   policy = {
     mode = "monitor",                    -- switch to "enforce" after reviewing a week of logs
@@ -22,5 +30,16 @@ return {
   },
   cache   = { fp_ttl = 300, rep_ttl = 600, fp_prefix_bytes = 2048 },
   async   = { enabled = true, max_async = 32, rep_block_after = 0, rep_block_ttl = 600 },
+  -- Decision sampling for replay and labelling: a share of suspicious-and-up
+  -- decisions with their normalized text (never the raw body), readable at
+  -- /_jev/samples. Turn on during the monitor week, feed the labels to `make calibrate`.
+  sampling = { enabled = false, rate = 0.05, min_verdict = "suspicious", max_samples = 1000, ttl = 86400, text_bytes = 512 },
+  -- False-positive loop: an operator POSTs a fingerprint to /_jev/feedback and
+  -- every later request with that exact text passes without an L2 call. Trust
+  -- always expires (trust_ttl) and traffic may extend it at most max_renewals
+  -- times (~5 weeks), after which the false positive comes back on purpose --
+  -- by then it is a rule or deployment_context bug, not a label. The token is
+  -- required: this endpoint writes bypasses.
+  feedback = { enabled = false, trust_ttl = 604800, max_renewals = 4, token = os.getenv("JEV_FEEDBACK_TOKEN") },
   breaker = { window_s = 60, min_samples = 20, fail_ratio = 0.5, open_s = 30 },
 }

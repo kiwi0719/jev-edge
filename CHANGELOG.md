@@ -7,7 +7,69 @@ All notable changes to this project are recorded here. The format follows
 ## [Unreleased]
 
 ### Added
-- Golden vectors in `core/golden/`: 116 cases across six suites (normalize,
+- False-positive feedback loop (`core/trust.lua`,
+  `adapters/js/src/core/trust.ts`, `POST /_jev/feedback`, `make labels`): an
+  operator marks a blocked request "not an attack" and every later request
+  with that exact text passes at L1.5 — before the verdict cache, so it beats
+  a stale malicious score — without an L2 call. `feedback = { enabled = true,
+  token = ... }` turns it on; the token is required, because the endpoint
+  writes bypasses. `label = "attack"` revokes, so undoing a mislabel costs
+  what making one did.
+
+  Three decisions are part of the design, not configuration defaults to be
+  shrugged at:
+
+  **Trust expires.** `trust_ttl` is seven days, and traffic on the same
+  fingerprint extends it at most `max_renewals` (4) times — about five weeks,
+  after which the false positive deliberately comes back. A fingerprint is
+  derived from attacker-visible text, so a permanent entry would be a standing
+  bypass nobody reviews again; a template still tripping the judge after five
+  weeks is a rule or `deployment_context` bug, and the alert is the point.
+  Renewals are bounded, so a fingerprint costs at most `max_renewals` writes
+  ever, and only past half its life.
+
+  **Trust is local to the gateway.** It lives in the existing shared dict: no
+  new component to run or make highly available, and no partition that fails
+  the loop open across a fleet. Other gateways converge as they see the same
+  text. Core reads and writes it through `ctx.trust`, which defaults to
+  `ctx.cache`, so moving trust to a shared store is an adapter change rather
+  than a core one — deliberately not the default path.
+
+  **The labels file is derived, never written.** The worker appends to no
+  file: no hot-path write, no multi-worker race, nothing lost with the
+  container. Each report is one line in the jev access log (`src="feedback"`,
+  with `fp`, `label`, `by`, `rid`), which is already collected, rotated and
+  auditable, and correctable by reporting again. `make labels LOG=... OUT=...`
+  (`bench/labels-from-log.lua`) replays those lines, last report per
+  fingerprint winning, into the labels file `make calibrate` reads.
+
+  Six golden vectors pin the behaviour across both cores (trusted pass, trust
+  over a cached malicious score, expiry, disabled, renewal, renewal cap);
+  `core/spec/trust_spec.lua` and `adapters/openresty/t/07-feedback.t` cover
+  the module and the endpoint end to end.
+- Subject trajectory contract (`core/subject.lua`, `adapters/js/src/core/subject.ts`):
+  `evaluate` accepts an optional `ctx.subject = { id, history, record }` and
+  hands one flat trajectory entry to `record` on every exit that made a
+  decision (not the L1 pass path). The entry carries the raw score, not only
+  the label, so it can be replayed later as calibration input.
+
+  **This version records; it does not decide.** `history` is accepted and
+  ignored, and both golden vectors and `core/spec/subject_spec.lua` assert
+  that a request with a subject and a non-empty history gets the same verdict,
+  field for field, as one without. Scoring a subject over time needs a window
+  length, a decay factor and a threshold, and there is no traffic yet to
+  calibrate any of them; a guess shipped as a default would be worse than the
+  absent feature. The shape is frozen now so that turning recording into
+  deciding is an implementation change in two files rather than a contract
+  change in every adapter and vector.
+
+  The read/write split is part of the contract: `history` is one store lookup
+  on the request path and may always be absent (cold subject, evicted entry,
+  a store that lost it — never an error), while `record` is a sink the core
+  hands a value to and never waits for. On nginx a shared dict satisfies that
+  as is; on Workers it keeps a Durable Object hop a deployment choice rather
+  than something the request path pays for.
+- Golden vectors in `core/golden/`: 131 cases across six suites (normalize,
   extract, rules, policy, verdict, evaluate) generated from the Lua core by
   `core/golden/gen.lua`, replayed by `core/spec/golden_spec.lua`, and checked
   for drift by `make golden-check` in CI (`make check` includes it). They are
@@ -22,7 +84,7 @@ All notable changes to this project are recorded here. The format follows
   `--json` for scripts. Install step 7 and a "Choosing thresholds" README
   section point to it.
 
-- Cloudflare adapter (`adapters/cloudflare`, npm package `@jev-edge/cloudflare`):
+- JavaScript adapter (`adapters/js`, npm package `@jev-edge/js`, first as Cloudflare only):
   a TypeScript port of core that replays the same golden vectors under vitest
   (116/116), plus `thinWorker` (L1 and cache at the edge, judgment by an
   existing jev-edge via `/_jev/authz`), `fullWorker` (KV cache, Durable Object
@@ -33,7 +95,34 @@ All notable changes to this project are recorded here. The format follows
   checks a deployment context for length, generic phrasing, a refusal list, an
   audience, "be safe" instructions and proper nouns; FAIL on missing or
   generic, WARN otherwise, `--json` for scripts.
-- `make test-cloudflare`.
+- `make test-js`.
+- Apache APISIX plugin (`adapters/apisix`): same engine, per-route config with
+  the config-file keys, `$jev_log` as an APISIX variable; e2e against real
+  APISIX 3.13 (`make e2e-apisix`, CI job).
+- HAProxy SPOE agent (`adapters/haproxy/spoa`, Go) with `spoe.conf` and a
+  reference `haproxy.cfg`; forwards the original headers and body to
+  `/_jev/authz`, sets `txn.jev.*`, fails open; e2e against real HAProxy 3.1
+  (`make e2e-haproxy`, CI job).
+- LiteLLM proxy guardrail (`adapters/litellm/jev_edge_guardrail.py`):
+  `async_pre_call_hook` that asks `/_jev/authz`, annotates
+  `metadata.jev_verdict`, blocks with 403 in enforce mode, fails open;
+  `make test-litellm`, CI job.
+- `docs/recipes.md` (en, zh-CN): the `/_jev/authz` contract and configuration
+  for Istio, Envoy Gateway, Azure API Management and Apigee.
+- `@jev-edge/js` (renamed from `@jev-edge/cloudflare`, directory
+  `adapters/js`): `nextMiddleware`, `nodeMiddleware`, `honoMiddleware` and
+  `lambdaEdgeHandler` on the shared runtime, with tests; Cloudflare presets
+  unchanged under `./cloudflare`.
+
+- Multi-tenant rules: `rules` entries may be inline tables with `extends`
+  (`core/rules.lua` `resolve()`), each with its own `watch_paths` and
+  `deployment_context`; first match wins. Supported in the config file and
+  `PUT /_jev/config`, the APISIX plugin conf, and the JavaScript `rules`
+  option. Test::Nginx `06-samples-tenants.t`.
+- Decision sampling: `sampling` config section (`core/sampling.lua`,
+  `adapters/js/src/sampling.ts`), `GET|DELETE /_jev/samples` on OpenResty,
+  shared-dict ring on APISIX, `onSample` callback on the JavaScript hosts.
+  Normalized text only, off by default.
 
 ### Changed
 - README (en, zh-CN) restructured for first-time readers: Status table,

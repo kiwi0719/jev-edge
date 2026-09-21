@@ -10,6 +10,10 @@ files["adapters/openresty/"] = {
   globals = { "ngx", "ndk" },
 }
 
+files["adapters/apisix/"] = {
+  globals = { "ngx" },
+}
+
 files["bench/"] = {
   globals = { "ngx" },
   max_line_length = 200,   -- report strings

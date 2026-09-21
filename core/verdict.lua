@@ -15,6 +15,7 @@ _M.SKIPPED    = "skipped"
 
 _M.SRC_L1      = "l1"
 _M.SRC_CACHE   = "cache"
+_M.SRC_TRUST   = "trust"
 _M.SRC_L2      = "l2"
 _M.SRC_BREAKER = "breaker"
 

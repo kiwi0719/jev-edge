@@ -12,7 +12,7 @@
 
 <p align="center"><img src="docs/hero.webp" alt="Request stream passing L1 rules, L2 judgment lens, the edge gateway and the async side-path before reaching the protected backend" width="100%"></p>
 
-jev-edge sits in nginx / OpenResty, or behind Envoy (ext_authz), Traefik, Caddy and plain nginx (forward-auth), or in a Cloudflare Worker, and asks one question about incoming requests: *what is this request trying to do to my service?* It uses [TypeSafe Jev](https://typesafe.ai/), a System One model that returns probabilities instead of prose, to catch prompt injection and abuse at the entry point of LLM-backed applications, before the request reaches your backend.
+jev-edge sits in nginx / OpenResty or Apache APISIX, behind Envoy, Istio, HAProxy, Traefik, Caddy and plain nginx, in a Cloudflare Worker, a Next.js or Node middleware or Lambda@Edge, or inside LiteLLM proxy, and asks one question about incoming requests: *what is this request trying to do to my service?* It uses [TypeSafe Jev](https://typesafe.ai/), a System One model that returns probabilities instead of prose, to catch prompt injection and abuse at the entry point of LLM-backed applications, before the request reaches your backend.
 
 It is built for SREs and platform engineers, not agent authors. Existing Jev guards run on the developer's machine and judge what an AI is about to do. jev-edge runs at the gateway and judges what the outside world is about to do.
 
@@ -26,6 +26,7 @@ It is built for SREs and platform engineers, not agent authors. Existing Jev gua
 - [Install](#install)
 - [Writing the deployment context](#writing-the-deployment-context)
 - [Choosing thresholds](#choosing-thresholds)
+- [False positives](#false-positives)
 - [What it costs](#what-it-costs)
 - [Benchmarks](#benchmarks)
 - [Design](#design)
@@ -39,8 +40,10 @@ It is built for SREs and platform engineers, not agent authors. Existing Jev gua
 | | |
 |---|---|
 | Version | `v0.2.0` |
-| Gateways | OpenResty natively; Envoy (HTTP and gRPC ext_authz), Traefik, Caddy and plain nginx (forward-auth) through the same engine, each end-to-end tested against the real gateway; Cloudflare Workers and Pages through a TypeScript port of core held to the same golden vectors (on `main`, unreleased) |
-| Test coverage | 78 unit specs, 202 integration assertions, 116 golden vectors replayed by both cores, 18 Worker tests, two benches, a soak run |
+| Gateways, native | OpenResty; Apache APISIX (plugin, same engine) |
+| Gateways, via `/_jev/authz` | Envoy (HTTP and gRPC ext_authz), HAProxy (SPOE agent), Traefik, Caddy and plain nginx (forward-auth), each end-to-end tested against the real gateway; Istio, Envoy Gateway, Azure APIM and Apigee as [recipes](docs/recipes.md); LiteLLM proxy as a guardrail |
+| JavaScript hosts | Cloudflare Workers and Pages, Next.js, Node, Hono, Lambda@Edge, through one TypeScript port of core held to the same golden vectors (on `main`, unreleased) |
+| Test coverage | 78 unit specs, 202 integration assertions, 116 golden vectors replayed by both cores, 30 JS host tests, 8 guardrail tests, five gateway e2e suites, two benches, a soak run |
 | Providers verified live | `jev` against the TypeSafe API on the full 662-sample dataset; `openai-compat` against an Ollama container |
 | Production use | none known yet. Run in `monitor` mode first |
 
@@ -188,7 +191,13 @@ curl -X PUT localhost:8080/_jev/config -d '{"policy":{"mode":"enforce"}}'
 
 Rollback is the same call with `"monitor"`, or `DELETE /_jev/config` to drop every runtime override.
 
-**Other gateways.** Envoy uses the same OpenResty process as its ext_authz service: [adapters/envoy](adapters/envoy/README.md). Traefik, Caddy and plain nginx `auth_request` use one forward-auth endpoint: [adapters/forward-auth](adapters/forward-auth/README.md). Cloudflare has three presets in one npm package, [adapters/cloudflare](adapters/cloudflare/README.md): a thin Worker that keeps judgment at the gateway you already run, a full Worker that needs nothing else, and a Pages middleware.
+**Other gateways and hosts.**
+
+- **Apache APISIX**: the same engine as a plugin, per-route config with the same keys: [adapters/apisix](adapters/apisix/README.md).
+- **Envoy** uses the OpenResty process as its ext_authz service: [adapters/envoy](adapters/envoy/README.md). **HAProxy** does the same through a small SPOE agent: [adapters/haproxy](adapters/haproxy/README.md). **Traefik, Caddy and nginx `auth_request`** use one forward-auth endpoint: [adapters/forward-auth](adapters/forward-auth/README.md).
+- **Istio, Envoy Gateway, Azure API Management, Apigee**: configuration only, against the same `/_jev/authz` contract: [docs/recipes.md](docs/recipes.md).
+- **LiteLLM proxy**: a guardrail that asks jev-edge before every call: [adapters/litellm](adapters/litellm/README.md).
+- **Cloudflare Workers and Pages, Next.js, Node, Hono, Lambda@Edge**: one npm package with a TypeScript port of core, [adapters/js](adapters/js/README.md). The thin Worker keeps judgment at the gateway you already run; the others run the whole core in the host.
 
 ## Writing the deployment context
 
@@ -226,7 +235,21 @@ deployment_context = "An internal Q&A assistant over Acme's employee handbook, I
   .. "or discuss individual employees' data."
 ```
 
-Note what the code assistant example does: "write code" is normal there and abnormal for the other two. That is exactly the distinction only you can supply. Set it per rule (`rule.deployment_context`) when one gateway fronts several assistants.
+Note what the code assistant example does: "write code" is normal there and abnormal for the other two. That is exactly the distinction only you can supply.
+
+**One gateway, several assistants.** Give each its own rule: an inline rule starts from a rule set (`extends`) and overrides the paths and the context. Tenant rules go before the general one, since the first rule whose path matches decides.
+
+```lua
+rules = {
+  { id = "billing", extends = "llm-endpoints", watch_paths = { "^/v1/billing" },
+    deployment_context = "A support assistant for Acme's billing product. ..." },
+  { id = "ide",     extends = "llm-endpoints", watch_paths = { "^/v1/ide" },
+    deployment_context = "A coding assistant inside Acme's IDE plugin. ..." },
+  "llm-endpoints",   -- everything else, with jev.deployment_context
+},
+```
+
+The same shape works in `PUT /_jev/config` (JSON), in the APISIX plugin conf per route, and in the `rules` option of the JavaScript package.
 
 Check what you wrote before it costs you accuracy. The lint applies the rules above (length, generic phrasing, refusal list, audience, "be safe" instructions, proper nouns) to every context in a config file, or to a string:
 
@@ -247,8 +270,33 @@ make calibrate LOG=jev.log LABELS=labels.csv MAX_FP=0.001
 - **Input**: the `$jev_log` access log (one JSON object per request, no bodies) and a labels file, one line per request: `<rid or fp>,<0|1>`. Labelling by fingerprint is the cheap way: one line covers every replay of the same text. Start with requests scored 0.4 to 0.8, that is where a threshold moves.
 - **Output**: score distribution, what each threshold would have blocked, AUC, false-positive and miss rate per threshold, and a recommended `block_threshold` (lowest miss rate within the false-positive budget) and `suspect_threshold` (a ten times looser budget, since suspicious traffic is passed and only feeds L3). It ends with the `PUT /_jev/config` line that applies them. `--json` gives the same for scripts.
 - **Without labels** it still prints the distribution and the would-have-blocked table, which is enough to see whether 0.7 is in a gap or in the middle of a cluster.
+- **Where the labels come from**: operator feedback (see [False positives](#false-positives)) via `make labels`, and decision sampling for everything nobody complained about: turn on sampling during the monitor week (`sampling = { enabled = true, rate = 0.05 }`) and read `GET /_jev/samples`. Each entry is the normalized text, fingerprint, score and verdict of a sampled decision, newest first, kept in memory for `sampling.ttl` seconds; the raw body is never stored. Label by fingerprint from that list and you have the file `make calibrate` wants.
 
 Under a few hundred labelled requests the rates are a direction, not a measurement; the script says so and tells you how far one mislabel moves them.
+
+## False positives
+
+Someone on call decides a blocked request was legitimate. That decision has to reach two places: the gateway, now, so the same text stops being blocked; and the labels, so the next calibration knows about it. `POST /_jev/feedback` does both.
+
+```bash
+curl -s localhost:8080/_jev/feedback -H 'X-Jev-Token: '"$JEV_FEEDBACK_TOKEN" \
+     -d '{"fp":"17e77570","label":"benign","by":"alice","rid":"ab12..."}'
+```
+
+The `fp` is the fingerprint from the log line or the alert; `label: "attack"` revokes instead, so undoing a mislabel is as cheap as making one. Turn it on with `feedback = { enabled = true, token = ... }` — a token is required, because this endpoint writes bypasses.
+
+Three decisions are baked in, and they are the interesting part:
+
+- **Trust expires.** A trusted fingerprint passes at L1.5 (before the verdict cache, so it beats a stale malicious score) for `trust_ttl`, seven days by default. Traffic on the same text pushes that out, at most `max_renewals` times — about five weeks in total, after which the false positive comes back on purpose. A fingerprint is derived from text an attacker can see; a permanent entry is a standing bypass that nobody ever reviews again. If a template is still tripping the judge after five weeks, that is a rule or a `deployment_context` bug, and the alert is the point.
+- **Trust is local to the gateway.** It lives in the same shared dict as everything else, so nothing new has to be run or made highly available, and a partition cannot fail the loop open across a fleet. Other gateways converge on their own as they see the same text. `ctx.trust` is a separate store from `ctx.cache` in core, so putting trust in Redis is an adapter change, not a core one — but it is not the default path and it brings a whole distributed-state problem with it.
+- **The labels file is derived, never written.** The worker does not append to a file: no hot-path write, no multi-worker race, nothing lost when the container goes. Each report is one line in the jev access log (`src="feedback"`, with `fp`, `label`, `by` and the `rid` they looked at) — already collected, already rotated, auditable, and correctable by simply reporting again. `make labels` replays those lines into the file `make calibrate` reads:
+
+```bash
+make labels LOG=/var/log/nginx/jev.log OUT=bench/datasets/labels.csv
+make calibrate LOG=/var/log/nginx/jev.log LABELS=bench/datasets/labels.csv
+```
+
+So the shared dict is the short-term memory on the hot path, and the log is the long-term memory and the cross-gateway truth. What the operator sees as one click is one bypass that expires and one durable label.
 
 ## What it costs
 
@@ -288,7 +336,7 @@ One dataset, one deployment, mostly German and English. Treat it as evidence tha
 
 The full design lives in [docs/design.md](docs/design.md): scope, architecture, each of the three layers, the cache, policy, verdict headers, hot reload, the degradation matrix, the three adapters, observability, the acceptance table and the seven settled decisions. Read [Decisions](docs/design.md#decisions) before proposing a change to L1 rules, thresholds or fail-open behaviour.
 
-**Parity across implementations.** Core has one behavioural contract, the golden vectors in [core/golden/](core/golden/README.md): 116 cases covering normalisation, extraction, every L1 decision, policy edges, verdict headers and the whole pipeline with scripted IO. Both cores replay them, the Lua one under busted and the TypeScript one under vitest, and CI fails when either drifts. A verdict on nginx and a verdict on a Worker for the same request are the same verdict. What the vectors guarantee and what they leave to each platform (cache TTL precision, breaker statistics across workers, the adaptive timeout's value) is spelled out in that README and in the [Cloudflare adapter's](adapters/cloudflare/README.md#what-is-the-same-as-nginx-and-what-is-not) own list.
+**Parity across implementations.** Core has one behavioural contract, the golden vectors in [core/golden/](core/golden/README.md): 116 cases covering normalisation, extraction, every L1 decision, policy edges, verdict headers and the whole pipeline with scripted IO. Both cores replay them, the Lua one under busted and the TypeScript one under vitest, and CI fails when either drifts. A verdict on nginx and a verdict on a Worker for the same request are the same verdict. What the vectors guarantee and what they leave to each platform (cache TTL precision, breaker statistics across workers, the adaptive timeout's value) is spelled out in that README and in the [JavaScript adapter's](adapters/js/README.md#what-is-the-same-as-nginx-and-what-is-not) own list.
 
 ## Repository layout
 
@@ -298,13 +346,16 @@ core/            judgment logic, templates, policy, breaker — no ngx.*; busted
 adapters/
   openresty/     access_by_lua glue, /_jev/{authz,config,forward-auth,health,metrics}, providers/,
                  shared-dict cache, adaptive timeout, L3 timer; Test::Nginx in t/
+  apisix/        APISIX plugin (same engine, per-route config), e2e/ against real APISIX
   envoy/         envoy-http.yaml, envoy-grpc.yaml, grpc-shim/ (Go), e2e/ (Docker Compose)
+  haproxy/       SPOE agent (Go), spoe.conf, haproxy.cfg, e2e/ against real HAProxy
   forward-auth/  traefik.yml, Caddyfile, nginx-auth-request.conf, e2e/ (Docker Compose)
-  cloudflare/    TypeScript port of core + thinWorker / fullWorker / pagesMiddleware; vitest replays core/golden
+  litellm/       LiteLLM proxy guardrail (Python) that calls /_jev/authz
+  js/            TypeScript port of core; Cloudflare, Next.js, Node, Hono, Lambda@Edge presets; vitest replays core/golden
 rules/           L1 rule sets (PCRE prefilter, watch paths, text fields)
-bench/           offline accuracy bench, Docker latency bench, live checks, soak, calibrate, context lint, report
+bench/           offline accuracy bench, Docker latency bench, live checks, soak, calibrate, labels-from-log, context lint, report
 demo/            docker compose demo from "Try it in 30 seconds"
-docs/            design.md, cost.md, bench charts
+docs/            design.md, cost.md, recipes.md (Istio, Envoy Gateway, APIM, Apigee), bench charts
 ```
 
 ## Roadmap
@@ -319,8 +370,8 @@ docs/            design.md, cost.md, bench charts
 | M6 ✅ | v0.1.0: `make install`, opm package, install docs |
 | 0.1.1 ✅ | live-verified providers, adaptive timeout with ceiling, `/_jev/health`, `deployment_context`, soak + full live bench |
 | 0.2.0 ✅ | Gateways beyond OpenResty, same engine: Envoy HTTP ext_authz (`/_jev/authz`) and gRPC ext_authz (`grpc-shim`); `/_jev/forward-auth` for Traefik ForwardAuth (body forwarded, full verdicts), Caddy `forward_auth` and nginx `auth_request` (headers only: path, method, reputation). Docker Compose e2e against every real gateway. `demo/`. License moved to Apache 2.0. |
-| 0.3.0 | Golden vectors as the versioned core contract (`core/golden/`, replayed by both cores in CI); `make calibrate` for thresholds from monitor-mode logs; `make context-lint`; Cloudflare: TypeScript core passing the vectors, `thinWorker` (judgment stays at your gateway), `fullWorker` (KV cache, Durable Object breaker and adaptive timeout), `pagesMiddleware`. In progress on `main`. |
-| later | Subject-level (session / API key) score trajectories as an L3 side-path; `abuse` template gets its own dataset; multi-tenant `deployment_context` per route; decision sampling and a false-positive feedback loop |
+| 0.3.0 | Golden vectors as the versioned core contract (`core/golden/`, replayed by both cores in CI); `make calibrate`; `make context-lint`; APISIX plugin; HAProxy SPOE agent; LiteLLM guardrail; recipes for Istio, Envoy Gateway, APIM and Apigee; `@jev-edge/js` with a TypeScript core passing the vectors and presets for Cloudflare (thin and full Worker, Pages), Next.js, Node, Hono and Lambda@Edge. In progress on `main`. |
+| later | Subject-level (session / API key) score trajectories as an L3 side-path; `abuse` template gets its own dataset; multi-tenant `deployment_context` per route; decision sampling and a false-positive feedback loop; Fastly Compute and Deno Deploy once the vectors have survived a real core change |
 
 ✅ means shipped in a tagged release.
 
@@ -340,7 +391,7 @@ make test-openresty
 
 **Regenerate the golden vectors** when a change to core is meant to alter behaviour: `make golden`, and commit the JSON diff with the code. `make check` fails if they drift without that.
 
-**Both cores must stay green.** A change to core behaviour is a change to the vectors, and the TypeScript port in `adapters/cloudflare` has to follow in the same PR (`make test-cloudflare`, needs pnpm).
+**Both cores must stay green.** A change to core behaviour is a change to the vectors, and the TypeScript port in `adapters/js` has to follow in the same PR (`make test-js`, needs pnpm). The gateway e2e suites (`make e2e-envoy e2e-forward-auth e2e-apisix e2e-haproxy`) and the guardrail tests (`make test-litellm`) cover the adapters that call the engine over HTTP.
 
 **Bring bench data** for any change to L1 rules, normalization, thresholds or timeouts. The [Decisions](docs/design.md#decisions) are settled unless a PR argues otherwise with numbers, and these are the commands that produce them:
 

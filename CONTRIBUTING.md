@@ -4,7 +4,7 @@
 
 - `core/` never requires `ngx`. All IO goes through the `ctx` table. luacheck enforces an empty globals list there.
 - Any change to L1 rules, normalization, thresholds or timeouts must come with bench numbers (see [Bench data](#bench-data)), or at least a note on why they cannot. The [design decisions](docs/design.md#decisions) are settled unless a PR argues otherwise with those numbers.
-- `core/golden/*.json` is the definition of core behaviour. A change that alters it regenerates the vectors (`make golden`) in the same PR and updates the TypeScript core in `adapters/cloudflare` so `make test-cloudflare` is green too; `make check` fails on drift. See [core/golden/README.md](core/golden/README.md).
+- `core/golden/*.json` is the definition of core behaviour. A change that alters it regenerates the vectors (`make golden`) in the same PR and updates the TypeScript core in `adapters/js` so `make test-js` is green too; `make check` fails on drift. See [core/golden/README.md](core/golden/README.md).
 - Fail-open is not negotiable. A PR that can make legitimate traffic wait on or be blocked by a Jev outage will not be merged.
 - Never log or commit request bodies from real traffic. Bench datasets under `bench/datasets/private/` are gitignored for this reason.
 
@@ -29,7 +29,7 @@
    For a change that touches core, also run the TypeScript side (needs pnpm):
 
    ```bash
-   make test-cloudflare
+   make test-js
    ```
 
 5. Add a line to `CHANGELOG.md` under Unreleased.
@@ -64,7 +64,7 @@ What the numbers mean and where the current ones stand is in [bench/report.md](b
 | `false-positive` | legitimate traffic judged suspicious / blocked |
 | `miss` | attack traffic judged safe |
 | `fail-open` | anything touching outage behaviour; reviewed with extra care |
-| `core` / `adapter:openresty` / `adapter:envoy` / `adapter:cloudflare` | area |
+| `core` / `adapter:openresty` / `adapter:apisix` / `adapter:envoy` / `adapter:haproxy` / `adapter:forward-auth` / `adapter:litellm` / `adapter:js` | area |
 | `bench` | datasets, methodology, numbers |
 | `provider` | judgment backend integrations |
 | `milestone:M1` … `milestone:M6` | roadmap tracking |

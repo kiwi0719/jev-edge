@@ -112,6 +112,50 @@ function _M.evaluate(req, rule, ctx)
   return _M.PASS, "", "text too short"
 end
 
+--- Resolve a rule spec into a rule table.
+-- A spec is a rule set id (string, loaded through `load`), or a table. A
+-- table with `extends = "<id>"` starts from that rule set and overrides the
+-- fields it names (lists are replaced, not merged); a table without
+-- `extends` is a complete rule. This is how one gateway fronts several
+-- assistants: one rule per tenant with its own watch_paths and
+-- deployment_context, listed before the general rule (first match wins).
+-- @param spec string|table
+-- @param load fn(id) -> rule|nil, err
+-- @return rule|nil, err
+function _M.resolve(spec, load)
+  if type(spec) == "string" then
+    local rule, err = load(spec)
+    if type(rule) ~= "table" then return nil, err or ("rule set " .. spec .. " not found") end
+    return rule
+  end
+  if type(spec) ~= "table" then return nil, "rule spec must be a string or a table" end
+  local base = {}
+  if spec.extends then
+    local b, err = load(spec.extends)
+    if type(b) ~= "table" then return nil, err or ("rule set " .. tostring(spec.extends) .. " not found") end
+    base = b
+  end
+  local out = {}
+  for k, v in pairs(base) do out[k] = v end
+  for k, v in pairs(spec) do if k ~= "extends" then out[k] = v end end
+  if not out.id then return nil, "rule needs an id" end
+  if type(out.watch_paths) ~= "table" then return nil, "rule " .. out.id .. " needs watch_paths" end
+  if not out.text_fields then out.text_fields = { "messages[*].content", "prompt", "input", "query", "text" } end
+  if not out.templates then out.templates = { "injection" } end
+  return out
+end
+
+--- Resolve a list of specs; stops at the first error.
+function _M.resolve_all(specs, load)
+  local out = {}
+  for i, spec in ipairs(specs or {}) do
+    local rule, err = _M.resolve(spec, load)
+    if not rule then return nil, "rules[" .. i .. "]: " .. err end
+    out[#out + 1] = rule
+  end
+  return out
+end
+
 --- Evaluate a list of rules; first non-pass result wins.
 function _M.evaluate_all(req, rules, ctx)
   local last_reason = "no rules"

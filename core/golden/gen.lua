@@ -354,8 +354,22 @@ local function eval_case(name, spec)
     breaker = breaker_m.new(bstore, function() return spec.clock or 1000 end, {})
   end
 
+  -- subject: spec.subject is nil (no subject at all), or { id = ..., history = ... }.
+  -- The history is deliberately non-nil in some cases and must change nothing:
+  -- these vectors are what pins "accepted and ignored" across implementations.
+  local recorded
+  local subject_ctx
+  if spec.subject then
+    subject_ctx = {
+      id = spec.subject.id,
+      history = spec.subject.history,
+      record = function(e) recorded = e end,
+    }
+  end
+
   local ctx = {
     config = cfg, rules = rule_list, cache = recording, breaker = breaker,
+    subject = subject_ctx,
     clock = function() return spec.clock or 1000 end,
     hash = normalize.djb2, json_decode = H.json.decode, re_find = H.re_find,
     judge = { call = function(prompt)
@@ -383,10 +397,12 @@ local function eval_case(name, spec)
       req = spec.req, config = spec.config or {}, rules = spec.rules or { "llm-endpoints" },
       cache = spec.cache or {}, clock = spec.clock or 1000,
       judge = spec.judge, breaker = spec.breaker or NULL,
+      subject = spec.subject or NULL,
     },
     expect = {
       verdict = v, headers = verdict.headers(v),
       judge_calls = calls, prompt = prompt_seen or NULL, cache_writes = writes,
+      subject_record = recorded or NULL,
     },
   }
 end
@@ -444,6 +460,60 @@ eval_case("text/plain body", { req = req("", { headers = { ["content-type"] = "t
     body = LONG, body_size = #LONG }), judge = { answers = { injection = 0.1 } } })
 eval_case("default rule set watches nothing", { req = req(ATTACK), rules = { "default" },
   judge = { answers = { injection = 0.9 } } })
+eval_case("trusted fingerprint passes without L2", { req = req(ATTACK),
+  config = { feedback = { enabled = true, token = "t" } },
+  cache = { ["trust:" .. fp_of(ATTACK)] = { trusted_until = 2000, renewals = 0, by = "alice" } },
+  judge = { answers = { injection = 0.95 } } })
+eval_case("trusted fingerprint beats a cached malicious score", { req = req(ATTACK),
+  config = { policy = { mode = "enforce" }, feedback = { enabled = true, token = "t" } },
+  cache = { ["trust:" .. fp_of(ATTACK)] = { trusted_until = 2000, renewals = 0 },
+            ["fp:" .. fp_of(ATTACK)] = { score = 0.95, reason = "injection 0.95" } },
+  judge = { answers = { injection = 0.95 } } })
+eval_case("expired trust is ignored", { req = req(ATTACK),
+  config = { feedback = { enabled = true, token = "t" } },
+  cache = { ["trust:" .. fp_of(ATTACK)] = { trusted_until = 900, renewals = 0 } },
+  judge = { answers = { injection = 0.95 } } })
+eval_case("trust is ignored when feedback is off", { req = req(ATTACK),
+  cache = { ["trust:" .. fp_of(ATTACK)] = { trusted_until = 2000, renewals = 0 } },
+  judge = { answers = { injection = 0.95 } } })
+eval_case("trust past half life is renewed on the way through", { req = req(ATTACK),
+  config = { feedback = { enabled = true, token = "t", trust_ttl = 1000, max_renewals = 4 } },
+  cache = { ["trust:" .. fp_of(ATTACK)] = { trusted_until = 1400, renewals = 1, first_seen = 100 } },
+  judge = { answers = { injection = 0.95 } } })
+eval_case("trust at the renewal cap is not extended", { req = req(ATTACK),
+  config = { feedback = { enabled = true, token = "t", trust_ttl = 1000, max_renewals = 4 } },
+  cache = { ["trust:" .. fp_of(ATTACK)] = { trusted_until = 1400, renewals = 4, first_seen = 100 } },
+  judge = { answers = { injection = 0.95 } } })
+-- subject trajectory -------------------------------------------------------
+-- The contract slot, recorded but not yet decided on. The parity cases below
+-- have a twin above with no `subject`; the verdict and headers must match it
+-- field for field. core/spec/subject_spec.lua asserts that relation directly.
+local SUBJ = { id = "u-1837" }
+local SUBJ_H = { id = "u-1837", history = {
+  entries = { { at = 900, score = 0.4 }, { at = 940, score = 0.45 } }, n = 2,
+} }
+
+eval_case("subject: L2 verdict is recorded", { req = req(LONG), subject = SUBJ,
+  judge = { answers = { injection = 0.1 } } })
+eval_case("subject: history is accepted and ignored", { req = req(LONG), subject = SUBJ_H,
+  judge = { answers = { injection = 0.1 } } })
+eval_case("subject: malicious records the raw score, not just the label",
+  { req = req(ATTACK), config = { policy = { mode = "enforce" } }, subject = SUBJ_H,
+    judge = { answers = { injection = 0.95 } } })
+eval_case("subject: empty id records nothing", { req = req(LONG), subject = { id = "" },
+  judge = { answers = { injection = 0.1 } } })
+eval_case("subject: L1 pass records nothing", { req = req(LONG, { path = "/healthz" }),
+  subject = SUBJ_H, judge = { answers = { injection = 0.9 } } })
+eval_case("subject: L1 block is a step too", { req = req(LONG), subject = SUBJ_H,
+  cache = { ["rep:203.0.113.7"] = { blocked_until = 2000 } }, judge = { answers = { injection = 0.1 } } })
+eval_case("subject: cache hit is a step too", { req = req(LONG), subject = SUBJ_H,
+  cache = { ["fp:" .. fp_of(LONG)] = { score = 0.8, reason = "injection 0.80" } },
+  judge = { answers = { injection = 0.1 } } })
+eval_case("subject: breaker skip is a step too", { req = req(ATTACK), subject = SUBJ_H,
+  breaker = "open", judge = { answers = { injection = 0.9 } } })
+eval_case("subject: L2 error is a step too", { req = req(ATTACK), subject = SUBJ_H,
+  judge = { error = "timeout" } })
+
 eval_case("custom cache ttl and prefix", { req = req(LONG),
   config = { cache = { fp_ttl = 60, fp_prefix_bytes = 16 } }, judge = { answers = { injection = 0.1 } } })
 

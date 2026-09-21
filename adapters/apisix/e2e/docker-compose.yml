@@ -1,0 +1,17 @@
+# APISIX end-to-end: real APISIX (standalone mode) with the jev-edge plugin in
+# front of a stub app that echoes the X-Jev-* headers it received.
+#   :9080  APISIX
+services:
+  apisix:
+    image: apache/apisix:3.13.0-debian
+    volumes:
+      - ../../..:/opt/jev-edge:ro
+      - ./config.yaml:/usr/local/apisix/conf/config.yaml:ro
+      - ./apisix.yaml:/usr/local/apisix/conf/apisix.yaml:ro
+    ports: ["9080:9080"]
+    depends_on: [app]
+  app:
+    image: jev-edge-test
+    volumes:
+      - ../../envoy/e2e/app.conf:/tmp/app/conf/nginx.conf:ro
+    command: ["sh", "-c", "mkdir -p /tmp/app/logs && openresty -p /tmp/app -c /tmp/app/conf/nginx.conf -g 'daemon off;'"]

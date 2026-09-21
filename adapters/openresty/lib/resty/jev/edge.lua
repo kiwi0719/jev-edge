@@ -1,5 +1,5 @@
 -- resty/jev/edge.lua
--- OpenResty glue: init / init_worker / access / log / config_api / metrics.
+-- OpenResty glue: init / init_worker / access / log / config_api / feedback / metrics.
 -- Everything in access() is wrapped in pcall; any failure passes the request.
 
 require("resty.jev.loader")()
@@ -14,6 +14,8 @@ local cache_m   = require "resty.jev.cache"
 local http      = require "resty.jev.http"
 local async     = require "resty.jev.async"
 local metrics   = require "resty.jev.metrics"
+local sampling  = require "jev.core.sampling"
+local trust     = require "jev.core.trust"
 local cjson     = require "cjson.safe"
 
 local _M = { _VERSION = "0.2.0" }
@@ -141,12 +143,34 @@ local function maybe_async(cfg, v, req, rules)
   if not ok and err ~= "disabled" then metrics.incr_async_dropped() end
 end
 
+local function rule_for(req, rules)
+  for _, r in ipairs(rules) do
+    for _, p in ipairs(r.watch_paths or {}) do
+      if (req.path or ""):find(p) then return r end
+    end
+  end
+  return nil
+end
+
+-- Decision sampling: a share of judged requests, normalized text only, kept
+-- in the cache dict ring for /_jev/samples. Off unless sampling.enabled.
+local function maybe_sample(cfg, v, req, rules)
+  if not sampling.should_sample(cfg, v, math.random) then return end
+  local ok, err = pcall(function()
+    local s = sampling.build(cfg, v, req, rule_for(req, rules),
+      { rid = ngx.var.request_id, ts = ngx.now(), json_decode = cjson.decode })
+    sampling.store(cfg, cache, s)
+    if cfg.sampling.log then ngx.log(ngx.INFO, "jev-edge sample: ", cjson.encode(s)) end
+  end)
+  if not ok then ngx.log(ngx.WARN, "jev-edge: sampling failed: ", err) end
+end
+
 local function evaluate_current(cfg, rules, over)
   ensure_runtime(cfg)
   strip_inbound()
   local req = build_req(rules, over)
   local v = core.evaluate(req, {
-    config = cfg, rules = rules, cache = cache, judge = judge, breaker = breaker,
+    config = cfg, rules = rules, cache = cache, trust = cache, judge = judge, breaker = breaker,
     clock = ngx.now, hash = function(s) return string.format("%08x", ngx.crc32_long(s)) end,
     json_decode = cjson.decode, re_find = re_find,
     log = function(level, msg) ngx.log(level == "error" and ngx.ERR or ngx.WARN, msg) end,
@@ -156,6 +180,7 @@ local function evaluate_current(cfg, rules, over)
   if judge and judge.adaptive then metrics.set_l2_timeout(judge.adaptive:current()) end
   ngx.ctx.jev = v
   maybe_async(cfg, v, req, rules)
+  maybe_sample(cfg, v, req, rules)
   return v
 end
 
@@ -183,17 +208,134 @@ function _M.access()
   end
 end
 
+--- One structured line into the jev access log. $jev_log when the variable is
+-- declared (log_format jev escape=none '$jev_log'), the error log at INFO
+-- otherwise. This is the only place decisions and operator feedback are
+-- written down: the labels for calibrate are derived from this log, never
+-- appended to a file by the worker (no hot-path write, no multi-worker race,
+-- nothing to lose when the container goes away).
+local function emit(tbl)
+  local line = cjson.encode(tbl)
+  local ok = pcall(function() ngx.var.jev_log = line end)
+  if not ok then ngx.log(ngx.INFO, "jev-edge: ", line) end
+end
+
 --- log_by_lua: sets $jev_log if the variable is declared.
 function _M.log()
   local v = ngx.ctx.jev
   if not v then return end
-  local line = cjson.encode({
+  emit({
     rid = ngx.var.request_id, path = ngx.var.uri, ip = ngx.var.remote_addr,
     src = v.source, score = v.score, verdict = v.verdict, action = v.action,
     l2_ms = v.l2_ms, fp = v.fingerprint, reason = v.reason,
   })
-  local ok = pcall(function() ngx.var.jev_log = line end)
-  if not ok then ngx.log(ngx.INFO, "jev-edge: ", line) end
+end
+
+-- Constant-time string compare, so a wrong token cannot be found byte by byte.
+local function token_ok(given, want)
+  if type(given) ~= "string" or type(want) ~= "string" then return false end
+  if #given ~= #want then return false end
+  local diff = 0
+  for i = 1, #want do
+    if given:byte(i) ~= want:byte(i) then diff = diff + 1 end
+  end
+  return diff == 0
+end
+
+local BENIGN = { benign = true, ok = true, good = true, ["0"] = true, ["false"] = true,
+                 ["not-an-attack"] = true, fp = true }
+local ATTACK = { attack = true, bad = true, malicious = true, ["1"] = true, ["true"] = true }
+
+--- content_by_lua for /_jev/feedback: the false-positive loop.
+--
+--   POST /_jev/feedback
+--   X-Jev-Token: <feedback.token>
+--   {"fp":"1f3a9c2b","label":"benign","by":"alice","rid":"..."}
+--
+-- benign  -> the fingerprint is trusted for feedback.trust_ttl and every later
+--            request with the same text passes at L1.5 without an L2 call.
+-- attack  -> any trust for it is revoked (undoing a mislabel is as cheap as
+--            making one), and the label is still written to the log.
+--
+-- Nothing is written to disk here: the decision goes into the shared dict and
+-- one line into the jev log. `lua bench/labels-from-log.lua` turns those lines
+-- into the labels file calibrate reads.
+function _M.feedback()
+  ngx.header["Content-Type"] = "application/json"
+  local cfg = config.current()
+  local fcfg = cfg.feedback or {}
+
+  if not trust.enabled(fcfg) then
+    ngx.status = 404
+    ngx.say('{"error":"feedback.enabled is false"}')
+    return
+  end
+  if type(fcfg.token) ~= "string" or fcfg.token == "" then
+    ngx.status = 503
+    ngx.say('{"error":"feedback.token is not configured"}')
+    return
+  end
+  if ngx.req.get_method() ~= "POST" then
+    ngx.status = 405
+    ngx.say('{"error":"method not allowed"}')
+    return
+  end
+
+  local h = ngx.req.get_headers()
+  local given = h["x-jev-token"]
+  if type(given) == "table" then given = given[1] end
+  if not given then
+    local auth = h["authorization"]
+    if type(auth) == "table" then auth = auth[1] end
+    given = auth and auth:match("^[Bb]earer%s+(.+)$")
+  end
+  if not token_ok(given, fcfg.token) then
+    ngx.status = 403
+    ngx.say('{"error":"bad or missing X-Jev-Token"}')
+    return
+  end
+
+  ngx.req.read_body()
+  local body = ngx.req.get_body_data()
+  local tbl = body and cjson.decode(body)
+  if type(tbl) ~= "table" or type(tbl.fp) ~= "string" or tbl.fp == "" then
+    ngx.status = 400
+    ngx.say('{"error":"body must be a JSON object with a non-empty fp"}')
+    return
+  end
+
+  local label = tostring(tbl.label or "benign"):lower()
+  local by  = tbl.by and tostring(tbl.by):sub(1, 64) or nil
+  local rid = tbl.rid and tostring(tbl.rid):sub(1, 64) or nil
+  if not cache then cache = cache_m.new(CACHE_DICT) end
+  local now = ngx.now()
+
+  if ATTACK[label] then
+    trust.revoke(cache, tbl.fp)
+    emit({ ts = now, src = "feedback", fp = tbl.fp, label = "attack", by = by, rid = rid,
+           action = "revoke", reason = "operator label" })
+    ngx.say(cjson.encode({ ok = true, fp = tbl.fp, label = "attack", trusted = false }))
+    return
+  end
+  if not BENIGN[label] then
+    ngx.status = 400
+    ngx.say('{"error":"label must be benign|ok|good|0 or attack|bad|malicious|1"}')
+    return
+  end
+
+  local rec, err = trust.grant(cache, tbl.fp, now, fcfg, { by = by, rid = rid })
+  if not rec then
+    emit({ ts = now, src = "feedback", fp = tbl.fp, label = "benign", by = by, rid = rid,
+           action = "refused", reason = err })
+    ngx.status = 409
+    ngx.say(cjson.encode({ ok = false, fp = tbl.fp, error = err }))
+    return
+  end
+  emit({ ts = now, src = "feedback", fp = tbl.fp, label = "benign", by = by, rid = rid,
+         action = "trust", reason = "operator label", renewals = rec.renewals })
+  ngx.say(cjson.encode({ ok = true, fp = tbl.fp, label = "benign", trusted = true,
+                         trusted_until = rec.trusted_until, renewals = rec.renewals,
+                         max_renewals = fcfg.max_renewals or trust.DEFAULT_RENEWALS }))
 end
 
 --- content_by_lua for /_jev/config (restrict with allow/deny in nginx.conf).
@@ -330,6 +472,28 @@ function _M.health()
   }
   if not answers then ngx.status = 503 end
   ngx.say(cjson.encode(body))
+end
+
+--- content_by_lua for /_jev/samples (restrict with allow/deny): GET returns the
+-- sampled decisions newest first, DELETE clears them. Each entry carries the
+-- normalized text, fingerprint, score and verdict so it can be replayed and
+-- labelled; label lines for `make calibrate` are `<rid or fp>,<0|1>`.
+function _M.samples()
+  local cfg = config.current()
+  ngx.header["Content-Type"] = "application/json"
+  if not cache then cache = cache_m.new(CACHE_DICT) end
+  local method = ngx.req.get_method()
+  if method == "GET" then
+    local list, total = sampling.dump(cfg, cache)
+    ngx.say(cjson.encode({ enabled = cfg.sampling.enabled == true, total = total, samples = list }))
+    return
+  elseif method == "DELETE" then
+    sampling.clear(cfg, cache)
+    ngx.say('{"ok":true}')
+    return
+  end
+  ngx.status = 405
+  ngx.say('{"error":"method not allowed"}')
 end
 
 --- content_by_lua for /_jev/metrics.

@@ -25,7 +25,7 @@ meant to make.
 | `rules.json` | `rules` | every L1 decision of the shipped `llm-endpoints` rule set, including one positive per `always_suspect` pattern |
 | `policy.json` | `policy` | score to action / label / async mapping, threshold edges, error and skipped events |
 | `verdict.json` | `verdict` | verdict defaults, clamping, header rendering, reason encoding |
-| `evaluate.json` | `evaluate` | the whole pipeline with every IO scripted: L1, cache, breaker, L2, policy, cache writes, prompt contents |
+| `evaluate.json` | `evaluate` | the whole pipeline with every IO scripted: L1, cache, breaker, L2, policy, cache writes, prompt contents, subject trajectory |
 
 Each file is `{ format_version, core_version, suite, generated_by, cases: [ { name, input, expect } ] }`.
 `format_version` changes only when the shape of `input` or `expect` changes; `core_version` records which core produced the file and is informational.
@@ -39,6 +39,7 @@ An implementation replays a case by constructing its IO from `input` exactly as 
 - **`rules`**: rule set ids, loaded from `rules/<id>`.
 - **`config`**: deep-merged over `core/defaults.lua`.
 - **`judge`**: `{ answers }` returns that map from the judge call; `{ error }` returns `nil, error`. `expect.judge_calls` counts calls and `expect.prompt` records the prompt the core built: `text`, `context` and the sorted question names.
+- **`subject`**: `null` means no subject context injected at all. Otherwise `{ id, history }` is passed as `ctx.subject` together with a `record` sink that captures the single entry the core hands over; that entry (or `null`) is `expect.subject_record`. **`history` must change nothing**: several cases pass a non-empty one and expect the same verdict as their subject-less twin. This version records trajectories, it does not score on them.
 - **`breaker`**: `null` means no breaker injected. `"open"` is a breaker whose open period has not elapsed at `clock`; `"closed"` is a healthy one.
 - **`hash`** is the reference djb2 (`normalize.djb2`), **`json_decode`** is any RFC 8259 parser, **`re_find`** is a case-insensitive regex search.
 
@@ -51,6 +52,7 @@ An implementation replays a case by constructing its IO from `input` exactly as 
 - policy: thresholds, mode, the async flag, error and skipped events
 - verdict structure, header names and values, reason encoding and truncation
 - the order in which the pipeline consults L1, cache, breaker and L2, and what it writes to the cache
+- the subject trajectory entry: its fields, which exits produce one (every exit that made a decision; not L1 pass), and that a supplied `history` is ignored
 
 **Not covered** (platform semantics; each adapter documents its own):
 

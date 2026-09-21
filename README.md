@@ -12,13 +12,13 @@
 
 <p align="center"><img src="docs/hero.webp" alt="Request stream passing L1 rules, L2 judgment lens, the edge gateway and the async side-path before reaching the protected backend" width="100%"></p>
 
-jev-edge sits in nginx / OpenResty, or behind Envoy as an ext_authz service (Cloudflare Worker planned), and asks one question about incoming requests: *what is this request trying to do to my service?* It uses [TypeSafe Jev](https://typesafe.ai/), a System One model that returns probabilities instead of prose, to catch prompt injection and abuse at the entry point of LLM-backed applications, before the request reaches your backend.
+jev-edge sits in nginx / OpenResty, or behind Envoy (ext_authz), Traefik, Caddy and plain nginx (forward-auth), with a Cloudflare Worker planned, and asks one question about incoming requests: *what is this request trying to do to my service?* It uses [TypeSafe Jev](https://typesafe.ai/), a System One model that returns probabilities instead of prose, to catch prompt injection and abuse at the entry point of LLM-backed applications, before the request reaches your backend.
 
 It is built for SREs and platform engineers, not agent authors. Existing Jev guards run on the developer's machine and judge what an AI is about to do. jev-edge runs at the gateway and judges what the outside world is about to do.
 
 > **Independent project.** jev-edge is not affiliated with or endorsed by TypeSafe AI. It is a client of their API, the way a Prometheus exporter is a client of the thing it scrapes.
 >
-> **Status:** v0.2.0 in progress: Envoy supported through HTTP and gRPC ext_authz, end-to-end tested against real Envoy. Core and the OpenResty adapter are tested end to end (68 unit specs, 61 integration assertions, two benches). Both providers are verified live: `jev` against the TypeSafe API on the full 662-sample dataset, `openai-compat` against an Ollama container. Not production-tested; run in `monitor` mode first.
+> **Status:** 0.2.x in progress: Envoy (HTTP and gRPC ext_authz), Traefik, Caddy and plain nginx (forward-auth) are supported and end-to-end tested against the real gateways. Core and the OpenResty adapter are tested end to end (68 unit specs, 61 integration assertions, two benches). Both providers are verified live: `jev` against the TypeSafe API on the full 662-sample dataset, `openai-compat` against an Ollama container. Not production-tested; run in `monitor` mode first.
 
 ## Contents
 
@@ -39,6 +39,8 @@ It is built for SREs and platform engineers, not agent authors. Existing Jev gua
   - [Configuration and hot reload](#configuration-and-hot-reload)
   - [Degradation matrix](#degradation-matrix)
   - [OpenResty adapter](#openresty-adapter)
+  - [Envoy adapter](#envoy-adapter)
+  - [Forward-auth adapter](#forward-auth-adapter)
   - [Observability](#observability)
   - [Bench and acceptance](#bench-and-acceptance)
   - [Decisions](#decisions)
@@ -443,6 +445,10 @@ Dependencies: OpenResty ≥ 1.21, lua-resty-http ≥ 0.17, bundled lua-cjson.
 
 Envoy uses the OpenResty adapter as its `ext_authz` service; there is no second engine. `location /_jev/authz/` runs the same evaluation as `access()` and answers 200 with `X-Jev-*` headers or 403 with the block body. HTTP ext_authz calls it directly; gRPC ext_authz goes through a ~150-line Go shim that only converts protocol. Complete configs, the shim and a Docker Compose end-to-end against real Envoy are in [adapters/envoy](adapters/envoy/README.md).
 
+### Forward-auth adapter
+
+Traefik ForwardAuth, Caddy `forward_auth` and nginx `auth_request` all get one endpoint, `/_jev/forward-auth`. Only Traefik (≥ 3.3, `forwardBody: true`) sends the body, so only Traefik gets L2 verdicts; Caddy and nginx get path, method and IP-reputation checks, and `skipped` otherwise. Configs and a Docker Compose e2e against all three are in [adapters/forward-auth](adapters/forward-auth/README.md).
+
 ### Observability
 
 `log_by_lua` writes one JSON object into `$jev_log`. Log it with `log_format jev escape=none '$jev_log';` so it stays valid JSON (`escape=json` would double-escape it):
@@ -510,6 +516,7 @@ adapters/
   openresty/     access_by_lua glue, /_jev/{authz,config,health,metrics}, providers/,
                  shared-dict cache, adaptive timeout, L3 timer; Test::Nginx in t/
   envoy/         envoy-http.yaml, envoy-grpc.yaml, grpc-shim/ (Go), e2e/ (Docker Compose)
+  forward-auth/  traefik.yml, Caddyfile, nginx-auth-request.conf, e2e/ (Docker Compose)
   cloudflare/    Worker middleware                                             (0.3.0)
 rules/           L1 rule sets (PCRE prefilter, watch paths, text fields)
 bench/           offline accuracy bench, Docker latency bench, live checks, soak, report
@@ -537,7 +544,7 @@ make test-openresty
 | M6 ✅ | v0.1.0: `make install`, opm package, install docs |
 | 0.1.1 ✅ | live-verified providers, adaptive timeout with ceiling, `/_jev/health`, `deployment_context`, soak + full live bench |
 | 0.2.0 ✅ | Envoy: `/_jev/authz` HTTP ext_authz, `grpc-shim` gRPC ext_authz, Docker Compose e2e against real Envoy (release pending) |
-| 0.2.x | Generic forward-auth on the same endpoint for Caddy `forward_auth`, Traefik ForwardAuth and nginx `auth_request`. These forward headers only, never the body, so the body source is abstracted and judgment there is limited to path, headers and reputation unless the gateway can buffer the body. Config examples for each. |
+| 0.2.1 ✅ | `/_jev/forward-auth` for Traefik ForwardAuth (body forwarded, full verdicts), Caddy `forward_auth` and nginx `auth_request` (headers only: path, method, reputation); e2e against all three (release pending) |
 | 0.3.0 | Cloudflare Worker: core reimplemented in TypeScript against shared golden test vectors exported from the busted suite; cache via Cache API, breaker and adaptive state via KV or a Durable Object |
 | later | Golden vectors published as a versioned file so any adapter can prove parity; `abuse` template gets its own dataset; multi-tenant `deployment_context` per route |
 

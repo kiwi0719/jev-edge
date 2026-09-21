@@ -12,13 +12,13 @@
 
 <p align="center"><img src="docs/hero.webp" alt="请求流依次经过 L1 规则、L2 判定透镜、边缘网关和异步旁路，最后到达被保护的后端" width="100%"></p>
 
-jev-edge 跑在 nginx / OpenResty 里，或者作为 Envoy 的 ext_authz 服务（Cloudflare Worker 在计划中），只问每个进来的请求一个问题：*它想对我的服务做什么？* 它用 [TypeSafe Jev](https://typesafe.ai/)（一个返回概率而不是文字的 System One 模型）在 LLM 应用的入口处拦截提示词注入和滥用，请求还没到后端就已经被判定。
+jev-edge 跑在 nginx / OpenResty 里，或者挂在 Envoy（ext_authz）、Traefik、Caddy 和普通 nginx（forward-auth）后面（Cloudflare Worker 在计划中），只问每个进来的请求一个问题：*它想对我的服务做什么？* 它用 [TypeSafe Jev](https://typesafe.ai/)（一个返回概率而不是文字的 System One 模型）在 LLM 应用的入口处拦截提示词注入和滥用，请求还没到后端就已经被判定。
 
 它面向 SRE 和平台工程师，不面向写 agent 的人。现有的 Jev 防护工具跑在开发者本机，判断"AI 要做什么"；jev-edge 跑在网关，判断"外面的世界要做什么"。
 
 > **独立项目。** jev-edge 与 TypeSafe AI 没有关联，也未获其背书。它只是 TypeSafe API 的一个客户端，就像 Prometheus exporter 是被采集对象的客户端一样。
 >
-> **状态：** v0.2.0 进行中：Envoy 已通过 HTTP 和 gRPC 两种 ext_authz 接入，并对真实 Envoy 做了端到端测试。core 和 OpenResty adapter 有完整测试（76 个单元 spec、187 个集成断言、两套 bench）。两个 provider 都经过真实联调：`jev` 在 662 条样本的完整数据集上打过 TypeSafe API，`openai-compat` 打过 Ollama 容器。尚未经过生产验证，请先用 `monitor` 模式。
+> **状态：** 0.2.x 进行中：Envoy（HTTP 和 gRPC ext_authz）、Traefik、Caddy 和普通 nginx（forward-auth）均已支持，并对真实网关做了端到端测试。core 和 OpenResty adapter 有完整测试（76 个单元 spec、187 个集成断言、两套 bench）。两个 provider 都经过真实联调：`jev` 在 662 条样本的完整数据集上打过 TypeSafe API，`openai-compat` 打过 Ollama 容器。尚未经过生产验证，请先用 `monitor` 模式。
 
 ## 目录
 
@@ -40,6 +40,7 @@ jev-edge 跑在 nginx / OpenResty 里，或者作为 Envoy 的 ext_authz 服务�
   - [降级矩阵](#降级矩阵)
   - [OpenResty adapter](#openresty-adapter)
   - [Envoy adapter](#envoy-adapter)
+  - [Forward-auth adapter](#forward-auth-adapter)
   - [可观测性](#可观测性)
   - [Bench 与验收](#bench-与验收)
   - [已定决策](#已定决策)
@@ -444,6 +445,10 @@ X-Jev-Request-Id: nginx 的 $request_id，用于关联 L3 结果
 
 Envoy 把 OpenResty adapter 当作它的 `ext_authz` 服务；没有第二套引擎。`location /_jev/authz/` 跑和 `access()` 完全相同的评估，回 200 加 `X-Jev-*` 头或 403 加拦截体。HTTP ext_authz 直接调它；gRPC ext_authz 经过一个约 150 行、只做协议转换的 Go 壳。完整配置、壳的源码、以及对真实 Envoy 的 Docker Compose 端到端测试都在 [adapters/envoy](adapters/envoy/README.md)。
 
+### Forward-auth adapter
+
+Traefik ForwardAuth、Caddy `forward_auth` 和 nginx `auth_request` 共用一个端点 `/_jev/forward-auth`。只有 Traefik（≥ 3.3，`forwardBody: true`）会转发 body，所以只有 Traefik 能拿到 L2 判定；Caddy 和 nginx 只能做路径、方法和 IP 信誉检查，其余情况返回 `skipped`。三种网关的配置和对真实网关的 Docker Compose 端到端测试在 [adapters/forward-auth](adapters/forward-auth/README.md)。
+
 ### 可观测性
 
 `log_by_lua` 往 `$jev_log` 写一个 JSON 对象。用 `log_format jev escape=none '$jev_log';` 记录它才是合法 JSON（`escape=json` 会二次转义）：
@@ -511,6 +516,7 @@ adapters/
   openresty/     access_by_lua 胶水、/_jev/{authz,config,health,metrics}、providers/、
                  shared dict 缓存、自适应超时、L3 定时器；Test::Nginx 在 t/
   envoy/         envoy-http.yaml、envoy-grpc.yaml、grpc-shim/（Go）、e2e/（Docker Compose）
+  forward-auth/  traefik.yml、Caddyfile、nginx-auth-request.conf、e2e/（Docker Compose）
   cloudflare/    Worker 中间件                                                  (0.3.0)
 rules/           L1 规则集（PCRE 预筛、监控路径、文本字段）
 bench/           离线准确率 bench、Docker 延迟 bench、live 检查、soak、报告
@@ -538,7 +544,7 @@ make test-openresty
 | M6 ✅ | v0.1.0：`make install`、opm 包、安装文档 |
 | 0.1.1 ✅ | provider 真实联调、带上限的自适应超时、`/_jev/health`、`deployment_context`、soak 和全量 live bench |
 | 0.2.0 ✅ | Envoy：`/_jev/authz` HTTP ext_authz、`grpc-shim` gRPC ext_authz、对真实 Envoy 的 Docker Compose 端到端（待发版） |
-| 0.2.x | 同一端点上的通用 forward-auth，服务 Caddy `forward_auth`、Traefik ForwardAuth 和 nginx `auth_request`。这些只转发头、从不转发 body，所以 body 来源要抽象出来；除非网关能缓冲 body，否则那里的判定只能基于路径、头和信誉。每种各配一份示例。 |
+| 0.2.1 ✅ | `/_jev/forward-auth`：Traefik ForwardAuth（转发 body，完整判定）、Caddy `forward_auth` 和 nginx `auth_request`（只有头：路径、方法、信誉）；对三者的真实端到端（待发版） |
 | 0.3.0 | Cloudflare Worker：用 TypeScript 按 busted 导出的共享 golden 测试向量重写 core；缓存走 Cache API，熔断和自适应状态走 KV 或 Durable Object |
 | 之后 | golden 向量作为带版本的文件发布，任何 adapter 都能证明一致性；`abuse` 模板拥有自己的数据集；按路由的多租户 `deployment_context` |
 

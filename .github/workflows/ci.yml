@@ -10,10 +10,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: leafo/gh-actions-lua@v10
+      - uses: leafo/gh-actions-lua@v11
         with:
-          luaVersion: luajit-2.1
-      - uses: leafo/gh-actions-luarocks@v4
+          luaVersion: "luajit-openresty"
+      - uses: leafo/gh-actions-luarocks@v5
       - run: luarocks install luacheck
       - run: luacheck . || [ ! -d core ]   # tolerate empty tree until M1 lands
 
@@ -21,10 +21,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: leafo/gh-actions-lua@v10
+      - uses: leafo/gh-actions-lua@v11
         with:
-          luaVersion: luajit-2.1
-      - uses: leafo/gh-actions-luarocks@v4
+          luaVersion: "luajit-openresty"
+      - uses: leafo/gh-actions-luarocks@v5
       - run: luarocks install busted
       - run: |
           if [ -d core/spec ]; then busted core/spec; else echo "no core specs yet"; fi

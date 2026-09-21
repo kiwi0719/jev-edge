@@ -7,6 +7,14 @@ All notable changes to this project are recorded here. The format follows
 ## [Unreleased]
 
 ### Added
+- Generic forward-auth endpoint `resty.jev.edge.forward_auth()` for Traefik
+  ForwardAuth, Caddy `forward_auth` and nginx `auth_request`. Original
+  method/URI from `X-Forwarded-*` or `X-Original-*`, client IP from
+  `X-Forwarded-For`; body judged when forwarded (Traefik ≥ 3.3
+  `forwardBody`), otherwise `skipped` with reason `no body`. Reference
+  configs in `adapters/forward-auth/`, Docker Compose e2e against real
+  Traefik, Caddy and nginx (`make e2e-forward-auth`, CI job), Test::Nginx
+  `05-forward-auth.t` including real `auth_request` wiring.
 - Envoy support. `resty.jev.edge.authz()` serves HTTP `ext_authz` at
   `/_jev/authz/`: same evaluation as `access()`, 200 + `X-Jev-*` headers or
   403 + block body, client IP from `x-envoy-external-address` /
@@ -19,17 +27,13 @@ All notable changes to this project are recorded here. The format follows
   (`make e2e-envoy`, also a CI job): 12 checks across both transports.
 - Test::Nginx `04-authz.t`.
 
-## [0.1.1] - 2026-09-22
+### Changed
+- L1 checks IP reputation right after the path match, before method,
+  content-type and body gates, so headers-only forward-auth requests from a
+  blocked IP are denied. A watched request without a body now passes with
+  reason `no body`.
 
-### Planned for 0.2.0
-- `/_jev/authz`: a forward-auth endpoint on the OpenResty adapter. Same HTTP
-  contract for Envoy HTTP ext_authz, Caddy `forward_auth`, Traefik
-  ForwardAuth and nginx `auth_request`: the gateway forwards headers and
-  path, the endpoint answers 2xx (allow) or 4xx (deny) plus `X-Jev-*` headers.
-  Body source is pluggable because only Envoy forwards the request body;
-  the others need the prompt copied into a header. Config examples for all
-  four gateways.
-- Cloudflare Worker adapter (core reimplemented in JS).
+## [0.1.1] - 2026-09-22
 
 ### Added
 - `/_jev/health`: one real provider round trip reporting latency, effective

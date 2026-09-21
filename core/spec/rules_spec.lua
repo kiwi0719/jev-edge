@@ -111,15 +111,21 @@ describe("rules.evaluate", function()
     assert.equals(R.PASS, r)
   end)
 
+  -- forward-auth style request: headers only, no body at all
+  local function headers_only(method)
+    return { method = method, path = "/v1/chat/completions", headers = { ["content-type"] = "application/json" },
+             body = nil, body_size = 0, client_ip = "203.0.113.7" }
+  end
+
   it("checks reputation before method, content-type and body", function()
     ctx.cache:set("rep:203.0.113.7", { blocked_until = ctx.clock() + 100 })
-    local r, _, reason = R.evaluate(H.chat_req("", { method = "GET", body = nil, body_size = 0, headers = {} }), rule, ctx)
+    local r, _, reason = R.evaluate(headers_only("GET"), rule, ctx)
     assert.equals(R.BLOCK, r)
     assert.equals("ip reputation", reason)
   end)
 
   it("reports a missing body distinctly", function()
-    local r, _, reason = R.evaluate(H.chat_req("", { body = nil, body_size = 0 }), rule, ctx)
+    local r, _, reason = R.evaluate(headers_only("POST"), rule, ctx)
     assert.equals(R.PASS, r)
     assert.equals("no body", reason)
   end)

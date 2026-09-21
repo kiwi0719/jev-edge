@@ -1,5 +1,7 @@
 # jev-edge
 
+**English** | [简体中文](README.zh-CN.md)
+
 **Typed-judgment admission control at the traffic edge.**
 
 <p align="center"><img src="docs/hero.webp" alt="Request stream passing L1 rules, L2 judgment lens, the edge gateway and the async side-path before reaching the protected backend" width="100%"></p>

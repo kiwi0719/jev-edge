@@ -55,7 +55,7 @@ function _M.build_request(prompt, cfg)
   }
 end
 
-function _M.parse_response(status, body)
+function _M.parse_response(status, body, cfg)
   if status ~= 200 then
     return nil, "openai-compat http " .. tostring(status)
   end

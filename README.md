@@ -2,11 +2,13 @@
 
 **Typed-judgment admission control at the traffic edge.**
 
+<p align="center"><img src="docs/hero.webp" alt="Request stream passing L1 rules, L2 judgment lens, the edge gateway and the async side-path before reaching the protected backend" width="100%"></p>
+
 jev-edge sits in nginx / OpenResty (Envoy and Cloudflare adapters planned) and asks one question about incoming requests: *what is this request trying to do to my service?* It uses [TypeSafe Jev](https://typesafe.ai/), a System One model that returns probabilities instead of prose, to catch prompt injection and abuse at the entry point of LLM-backed applications, before the request reaches your backend.
 
 It is built for SREs and platform engineers, not agent authors. Existing Jev guards run on the developer's machine and judge what an AI is about to do. jev-edge runs at the gateway and judges what the outside world is about to do.
 
-> **Status:** v0.1.0. Core and the OpenResty adapter are tested end to end (68 unit specs, 61 integration assertions, two benches). The `jev` and `openai-compat` providers are written to the published API contracts but have not yet been exercised against the live services. Not production-tested; run in `monitor` mode first.
+> **Status:** v0.1.0. Core and the OpenResty adapter are tested end to end (68 unit specs, 61 integration assertions, two benches). The `jev` provider is verified against the live TypeSafe API (`make live-check`); `openai-compat` is written to the published contract but not yet exercised live. Not production-tested; run in `monitor` mode first.
 
 ## Contents
 
@@ -72,9 +74,16 @@ git clone https://github.com/kiwi0719/jev-edge && cd jev-edge && sudo make insta
 **Configure**
 
 1. Put your TypeSafe key in the environment nginx starts with and declare it: `env TYPESAFE_API_KEY;` at the top of `nginx.conf`.
-2. Edit `/etc/nginx/jev-edge.conf.lua`. Leave `policy.mode = "monitor"`.
-3. Add the three shared dicts and the `init` / `init_worker` blocks to `http {}`, then `access_by_lua_block` to the locations you want watched. The full example is [adapters/openresty/conf/example.nginx.conf](adapters/openresty/conf/example.nginx.conf).
-4. Reload nginx and send a request:
+2. Point cosockets at a CA bundle, or every call to the provider fails TLS verification: `lua_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;` in `http {}`.
+3. Edit `/etc/nginx/jev-edge.conf.lua`. Leave `policy.mode = "monitor"`.
+4. Add the three shared dicts and the `init` / `init_worker` blocks to `http {}`, then `access_by_lua_block` to the locations you want watched. The full example is [adapters/openresty/conf/example.nginx.conf](adapters/openresty/conf/example.nginx.conf).
+5. Reload nginx and check the provider from the box itself. This makes one real call and reports latency, the effective timeout and the breaker state:
+
+```bash
+curl -s localhost:8080/_jev/health
+```
+
+6. Send a request:
 
 ```bash
 curl -s -X POST localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
@@ -142,31 +151,22 @@ Start in `monitor` mode. Watch the headers and logs for a week. Then set thresho
 
 ### Architecture
 
-```
-                 ┌────────────────────────────────────────────────┐
-  client ──────► │  nginx / OpenResty                              │
-                 │                                                 │
-                 │  access_by_lua*                                 │
-                 │   ┌──────────┐  pass  ┌─────────────────────┐   │
-                 │   │ L1 rules ├───────►│ proxy_pass upstream │   │
-                 │   └────┬─────┘        └──────────▲──────────┘   │
-                 │        │ suspicious               │             │
-                 │   ┌────▼─────┐  cache hit         │             │
-                 │   │  cache   ├──────────┐         │             │
-                 │   └────┬─────┘          │         │             │
-                 │        │ miss           │         │             │
-                 │   ┌────▼─────┐          │    ┌────┴────┐        │
-                 │   │ L2 judge │──────────┴───►│ policy  │ block  │
-                 │   │ (≤300ms) │  verdict       │ + header│──► 403│
-                 │   └────┬─────┘               └─────────┘        │
-                 │        │ ambiguous / timeout                    │
-                 │   ┌────▼─────┐                                  │
-                 │   │ L3 async │── ngx.timer ──► Jev (no deadline) ──► reputation / alerts
-                 │   └──────────┘                                  │
-                 └────────────────────────────────────────────────┘
-                              │ lua-resty-http
-                              ▼
-                          Jev API
+```mermaid
+flowchart LR
+    client([client]) --> L1
+    subgraph nginx["nginx / OpenResty · access_by_lua"]
+        L1["L1 rules"] -- suspicious --> cache["cache<br/>(shared dict)"]
+        cache -- miss --> L2["L2 judge<br/>≤ 300 ms"]
+        L2 -- verdict --> policy["policy<br/>+ verdict headers"]
+        cache -- hit --> policy
+        L2 -- ambiguous / timeout --> L3["L3 async<br/>ngx.timer"]
+    end
+    L1 -- pass --> upstream[["proxy_pass upstream"]]
+    policy -- allow --> upstream
+    policy -- block --> deny([403])
+    L2 -. lua-resty-http .-> jev[("Jev API")]
+    L3 -. no deadline .-> jev
+    L3 --> rep["reputation / alerts"]
 ```
 
 **Decision principle:** each layer can only make a request *more* suspicious or pass it. Any layer that errors degrades to pass and records `X-Jev-Verdict: error`.
@@ -281,7 +281,7 @@ Each template is one TypeSafe **Noul** question (yes/no, returns a 0–1 probabi
 
 `answers.injection.noul` becomes the score; with several templates the maximum wins. `usage.input_tokens` is recorded for cost metrics. Keys are read only from the environment (`TYPESAFE_API_KEY`), never from config files.
 
-**Timeouts and breaker.** Hard cut at `timeout_ms` (300; connect 50 / send 50 / read 200). A sliding-window breaker (60 s window, ≥20 samples, >50% failures → open for 30 s, then one half-open probe) lives in the shared dict so all workers share it. `max_inflight` (64) caps concurrent L2 calls; beyond it L2 is skipped and the request goes to L3.
+**Timeouts and breaker.** The L2 budget is adaptive with an operator ceiling: it starts at `timeout_ms` (400), tracks an exponentially weighted mean and variance of observed L2 latency shared across workers, and uses `timeout_headroom × (mean + 2 sd)` clamped to `[timeout_ms, timeout_max_ms]` (1000). A timeout feeds back a censored sample so the estimate can climb after a latency step; a sustained move above the ceiling is left to the breaker. The budget is split connect 30% / send 10% / read 60%. Measured from a laptop against `jev-latest`: p50 268 ms, p95 314 ms, max 355 ms, so a fixed 300 ms cut would have dropped 15% of calls. `/_jev/health` and the `jev_l2_timeout_ms` gauge show the effective value. A sliding-window breaker (60 s window, ≥20 samples, >50% failures → open for 30 s, then one half-open probe) lives in the shared dict so all workers share it. `max_inflight` (64) caps concurrent L2 calls; beyond it L2 is skipped and the request goes to L3.
 
 Question wording is copied from jev-sec-bench, which already validated it. Templates expose two slots: `text` and `context`.
 
@@ -379,6 +379,11 @@ jev_async_dropped_total
 
 Two reproducible benches, neither needs an API key. `make bench-offline` replays the Jev probabilities that [jev-sec-bench](https://github.com/Gaurav-Gosain/jev-sec-bench) recorded on deepset/prompt-injections (662 samples) through L1 and the policy thresholds. `make bench` drives OpenResty in Docker with the `mock` provider through five scenarios: baseline, unwatched path, healthy / slow / dead Jev. Full numbers and caveats are in [bench/report.md](bench/report.md).
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/bench-latency-dark.svg">
+  <img src="docs/bench-latency-light.svg" alt="Bar chart of p50 and p99 latency for five scenarios on a log scale: baseline 36/47 µs, unwatched 39/71 µs, healthy Jev 102/106 ms, slow Jev 53 µs/288 ms, dead Jev 48/173 µs" width="100%">
+</picture>
+
 | Metric | v0.1 target | Measured |
 |---|---|---|
 | P99 added to L1-passed traffic | ≤ 1 ms | 24 µs |
@@ -434,6 +439,7 @@ make test-openresty
 | M4 ✅ | hot reload, `/_jev/config`, `/_jev/metrics`, structured log |
 | M5 ✅ | offline accuracy bench on recorded Jev answers, Docker latency bench, [report](bench/report.md) |
 | M6 ✅ | v0.1.0: `make install`, opm package, install docs |
+| 0.1.1 | live-verified `jev` provider, adaptive timeout with ceiling, `/_jev/health`, `make live-check` |
 | v0.2 | `/_jev/authz` for Envoy HTTP ext_authz; Cloudflare Worker |
 
 ## Contributing

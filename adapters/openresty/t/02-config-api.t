@@ -80,3 +80,47 @@ Content-Type: application/json
 X-Jev-Mock-Score: 0.2
 --- response_body_like eval
 ["verdict=safe", 'jev_requests_total\{source="l2",verdict="safe"\} 1']
+
+
+
+=== TEST 5: health endpoint reports a live provider round trip
+--- http_config eval: $::HttpConfig
+--- user_files eval: ::conf()
+--- config
+location = /_jev/health { content_by_lua_block { require("resty.jev.edge").health() } }
+--- request
+GET /_jev/health
+--- response_body_like: ^(?=.*"ok":true)(?=.*"provider":"mock")(?=.*"effective_ms":300)
+--- no_error_log
+[error]
+
+
+
+=== TEST 6: health endpoint returns 503 when the provider fails
+--- http_config eval: $::HttpConfig
+--- user_files eval: ::conf('jev = { provider = "mock", mock_fail_ratio = 1, timeout_ms = 300 },')
+--- config
+location = /_jev/health { content_by_lua_block { require("resty.jev.edge").health() } }
+--- request
+GET /_jev/health
+--- error_code: 503
+--- response_body_like: ^(?=.*"ok":false)(?=.*"error":"mock failure")
+
+
+
+=== TEST 7: adaptive timeout climbs above a too-low floor until calls succeed
+--- http_config eval: $::HttpConfig
+--- user_files eval: ::conf('jev = { provider = "mock", mock_header = "x-jev-mock-score", mock_score = 0.2, mock_delay_ms = 60, timeout_ms = 20, timeout_max_ms = 400, timeout_warmup = 2 }, breaker = { min_samples = 1000 },')
+--- config eval
+qq{
+location /v1/chat/completions { $::Access $::Echo }
+location = /_jev/metrics { content_by_lua_block { require("resty.jev.edge").metrics() } }
+}
+--- request eval
+[ (map { "POST /v1/chat/completions\n{\"messages\":[{\"role\":\"user\",\"content\":\"distinct request number $_ long enough to be judged\"}]}" } 1..40),
+  "GET /_jev/metrics" ]
+--- more_headers
+Content-Type: application/json
+--- response_body_like eval
+[ ("verdict=(error|safe)") x 40,
+  '(?s)(?=.*jev_l2_timeout_ms ([6-9]\d|[1-4]\d\d)\b)(?=.*jev_requests_total\{source="l2",verdict="safe"\} [1-9])' ]

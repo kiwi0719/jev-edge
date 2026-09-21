@@ -41,6 +41,11 @@ end
 
 function _M.incr_async_dropped() incr("async_dropped") end
 
+function _M.set_l2_timeout(ms)
+  local d = dict()
+  if d then d:set("l2_timeout_ms", ms) end
+end
+
 function _M.render()
   local d = dict()
   if not d then return "# jev_metrics shared dict not defined\n" end
@@ -53,6 +58,7 @@ function _M.render()
   line("# TYPE jev_tokens_total counter")
   line("# TYPE jev_breaker_state gauge")
   line("# TYPE jev_async_dropped_total counter")
+  line("# TYPE jev_l2_timeout_ms gauge")
   for _, key in ipairs(d:get_keys(0)) do
     local val = d:get(key)
     local src, verdict = key:match("^req:([^:]+):(.+)$")
@@ -74,6 +80,8 @@ function _M.render()
       line("jev_breaker_state " .. val)
     elseif key == "async_dropped" then
       line("jev_async_dropped_total " .. val)
+    elseif key == "l2_timeout_ms" then
+      line("jev_l2_timeout_ms " .. val)
     end
   end
   return table.concat(out, "\n") .. "\n"

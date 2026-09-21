@@ -1,4 +1,4 @@
-.PHONY: test lint check luajit-check test-openresty bench bench-offline dist install
+.PHONY: test lint check luajit-check test-openresty bench bench-offline dist install live-check
 
 test:
 	busted
@@ -25,6 +25,13 @@ bench-offline:
 bench:
 	docker build -q -t jev-edge-test -f adapters/openresty/Dockerfile.test adapters/openresty
 	docker run --rm --init -v "$$(PWD)":/work jev-edge-test sh /work/bench/run.sh
+
+# One real round trip + 60-sample latency/agreement check against the provider.
+# Needs TYPESAFE_API_KEY in .env (gitignored). Costs ~40k input tokens.
+live-check:
+	docker run --rm --env-file .env -v "$$(PWD)":/work jev-edge-test sh -c \
+	  'resty --http-conf "lua_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt; lua_ssl_verify_depth 5;" \
+	   -I /work/adapters/openresty/lib -I /work /work/bench/live.lua $${N:-60}'
 
 # ---------------------------------------------------------------------------
 # Packaging. The opm tarball and `make install` both flatten the tree into a

@@ -7,7 +7,10 @@ _M.config = {
   jev = {
     provider    = "jev",
     model       = "jev-latest",
-    timeout_ms  = 300,
+    timeout_ms       = 400,   -- floor and cold-start value
+    timeout_max_ms   = 1000,  -- ceiling the adaptive estimate may reach
+    timeout_headroom = 1.5,   -- multiplier over observed mean + 2 sd
+    timeout_adaptive = true,
     max_inflight = 64,
   },
   rules  = { "llm-endpoints" },
@@ -71,6 +74,9 @@ function _M.validate(c)
   end
   if type(c.jev.timeout_ms) ~= "number" or c.jev.timeout_ms <= 0 then
     return nil, "jev.timeout_ms must be > 0"
+  end
+  if c.jev.timeout_max_ms ~= nil and (type(c.jev.timeout_max_ms) ~= "number" or c.jev.timeout_max_ms < c.jev.timeout_ms) then
+    return nil, "jev.timeout_max_ms must be >= timeout_ms"
   end
   return true
 end

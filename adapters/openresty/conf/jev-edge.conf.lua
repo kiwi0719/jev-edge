@@ -5,7 +5,13 @@ return {
     endpoint    = "https://api.typesafe.ai/v1/systemone",
     model       = "jev-latest",
     api_key_env = "TYPESAFE_API_KEY",    -- needs `env TYPESAFE_API_KEY;` in nginx.conf
-    timeout_ms  = 300,
+    -- L2 timeout: starts at timeout_ms and adapts to observed latency
+    -- (headroom x (mean + 2 sd)), never below timeout_ms, never above
+    -- timeout_max_ms. Measured from a laptop: jev-latest p50 ~270 ms, p95 ~315 ms.
+    timeout_ms       = 400,
+    timeout_max_ms   = 1000,
+    timeout_headroom = 1.5,
+    timeout_adaptive = true,
     max_inflight = 64,
   },
   rules  = { "llm-endpoints" },

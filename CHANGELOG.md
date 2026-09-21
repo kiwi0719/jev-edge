@@ -6,6 +6,27 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+- `/_jev/health`: one real provider round trip reporting latency, effective
+  timeout, breaker state and mode. `bench/live.lua` + `make live-check` run
+  connectivity, a 60-sample latency distribution and agreement with the
+  recorded jev-sec-bench probabilities.
+- Adaptive L2 timeout (`resty.jev.adaptive`): `timeout_headroom × (mean + 2 sd)`
+  of observed latency clamped to `[timeout_ms, timeout_max_ms]`, shared across
+  workers, censored samples on timeout. `jev_l2_timeout_ms` gauge.
+
+### Changed
+- Default L2 timeout: fixed 300 ms → adaptive 400–1000 ms. Live measurement
+  against `jev-latest` showed p95 314 ms; 300 ms would have dropped 15% of calls.
+- HTTP timeout budget split 30/10/60 (connect/send/read) instead of a fixed
+  50 ms connect, which could not complete a TLS handshake to the API.
+- Example nginx.conf sets `lua_ssl_trusted_certificate`; without it every
+  provider call fails certificate verification.
+
+### Fixed
+- `jev` provider verified against the live TypeSafe API (auth, request shape,
+  response parsing).
+
 ## [0.1.0] - 2026-09-22
 
 First release. OpenResty adapter only.

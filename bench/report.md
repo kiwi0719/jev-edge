@@ -83,3 +83,16 @@ Scenarios: **baseline** = plain `content_by_lua`, jev-edge not loaded. **unwatch
 
 Two targets are not met as written. The replay number is honest about a normalization gap.
 The L2-share target needs a mixed-traffic dataset to be meaningful; the offline bench cannot produce it.
+
+## Part 3: live provider check (`make live-check`, 2026-09-22)
+
+From a laptop on a residential connection, Docker on macOS, `jev-latest`, one Noul question, short state (the dataset text only).
+
+| | |
+|---|---|
+| connectivity | OK; first call 701 ms (cold TLS handshake) |
+| latency, 60 sequential calls | p50 268 ms, p90 304 ms, p95 314 ms, p99 355 ms, min 230 ms, 0 errors |
+| calls over a fixed 300 ms cut | 9 / 60 (15%) |
+| agreement with recorded jev-1.13.0 | median \|Δp\| 0.030, mean 0.157, max 0.880; 10 / 60 flip sides at 0.5 |
+
+Consequences: the default timeout moved from a fixed 300 ms to adaptive `400 … 1000 ms`. The agreement numbers are not a like-for-like model comparison: jev-sec-bench supplied a deployment context as state and its own question wording, this check sends the bare text with jev-edge's `injection` template. The offline accuracy table in Part 1 therefore describes jev-1.13.0 under jev-sec-bench's prompt, not `jev-latest` under jev-edge's.

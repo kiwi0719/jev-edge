@@ -1,6 +1,6 @@
 return {
   default = {
-    ROOT = { "core/spec" },
+    ROOT = { "core/spec", "adapters/openresty/spec" },
     pattern = "_spec",
     helper = "core/spec/helper.lua",
     lpath = "./?.lua;./?/init.lua",

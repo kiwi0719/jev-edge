@@ -6,6 +6,15 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-09-22
+
+First release. OpenResty adapter only.
+
+Known gaps: the `jev` and `openai-compat` providers follow the published API
+contracts but have not been run against the live services; the config-file
+mtime reload has no integration test; the replay-cache bench target (80%)
+is not met (74%) on synthetic variants.
+
 ### Changed
 - `mock` provider emulates the HTTP hard timeout so slow-Jev scenarios trip
   the breaker like the real client would.
@@ -17,6 +26,9 @@ All notable changes to this project are recorded here. The format follows
   disables the prefilter with a single warning (fail-open).
 
 ### Added
+- Packaging: `dist.ini` for opm (`lua-resty-jev-edge`), `make dist`,
+  `make install` (flattens core/ and rules/ under `lib/jev/`).
+- Install section in the README.
 - Bench (`bench/`): offline accuracy evaluation replaying jev-sec-bench's
   recorded Jev probabilities (deepset/prompt-injections) through L1 and the
   policy, replay-cache measurement, core latency microbench; Docker

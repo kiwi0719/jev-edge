@@ -1,4 +1,4 @@
-.PHONY: test lint check luajit-check test-openresty bench bench-offline
+.PHONY: test lint check luajit-check test-openresty bench bench-offline dist install
 
 test:
 	busted
@@ -25,3 +25,33 @@ bench-offline:
 bench:
 	docker build -q -t jev-edge-test -f adapters/openresty/Dockerfile.test adapters/openresty
 	docker run --rm --init -v "$$(PWD)":/work jev-edge-test sh /work/bench/run.sh
+
+# ---------------------------------------------------------------------------
+# Packaging. The opm tarball and `make install` both flatten the tree into a
+# single lib/ so `require "jev.core"` resolves without the loader shim:
+#   lib/resty/jev/*   adapter        lib/jev/core/*  core        lib/jev/rules/*  rules
+# ---------------------------------------------------------------------------
+VERSION   := $(shell sed -n 's/^version = //p' dist.ini)
+DIST      := dist/lua-resty-jev-edge-$(VERSION)
+LUA_LIB_DIR ?= /usr/local/openresty/lualib
+PREFIX_CONF ?= /etc/nginx
+
+dist:
+	rm -rf $(DIST) && mkdir -p $(DIST)/lib/jev/core $(DIST)/lib/jev/rules $(DIST)/lib/resty
+	cp -R adapters/openresty/lib/resty/jev $(DIST)/lib/resty/
+	cp core/*.lua $(DIST)/lib/jev/core/ && cp -R core/templates $(DIST)/lib/jev/core/
+	cp rules/*.lua $(DIST)/lib/jev/rules/
+	mkdir -p $(DIST)/doc && cp dist.ini LICENSE $(DIST)/ && cp README.md CHANGELOG.md $(DIST)/doc/
+	cp -R adapters/openresty/conf $(DIST)/conf
+	@echo "assembled $(DIST)"
+
+# opm build/upload run from the assembled tree (opm needs lib/ next to dist.ini).
+opm-build: dist
+	cd $(DIST) && opm build
+
+install: dist
+	mkdir -p $(LUA_LIB_DIR)/jev $(LUA_LIB_DIR)/resty
+	cp -R $(DIST)/lib/jev $(LUA_LIB_DIR)/
+	cp -R $(DIST)/lib/resty/jev $(LUA_LIB_DIR)/resty/
+	@test -f $(PREFIX_CONF)/jev-edge.conf.lua || cp $(DIST)/conf/jev-edge.conf.lua $(PREFIX_CONF)/jev-edge.conf.lua
+	@echo "installed to $(LUA_LIB_DIR); config at $(PREFIX_CONF)/jev-edge.conf.lua"

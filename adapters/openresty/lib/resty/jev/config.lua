@@ -33,7 +33,7 @@ end
 
 local function read_api_key(cfg)
   local env = cfg.jev and cfg.jev.api_key_env
-  if env and not cfg.jev.api_key then
+  if env and not cfg.jev.api_key and cfg.jev.provider ~= "mock" then
     cfg.jev.api_key = os.getenv(env)
     if not cfg.jev.api_key then
       ngx.log(ngx.WARN, "jev-edge: env ", env, " is empty (did you add `env ", env, ";` to nginx.conf?)")

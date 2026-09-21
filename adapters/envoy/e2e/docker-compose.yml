@@ -1,0 +1,33 @@
+# End-to-end: real Envoy in front of a stub app, with jev-edge as ext_authz.
+# Two Envoy instances share one jev-edge (mock provider):
+#   :10000  HTTP ext_authz  -> jev-edge:8080/_jev/authz
+#   :10001  gRPC ext_authz  -> jev-shim:9001 -> jev-edge:8080/_jev/authz
+services:
+  jev-edge:
+    image: jev-edge-test
+    volumes:
+      - ../../..:/work:ro
+      - ./nginx.conf:/tmp/nx/conf/nginx.conf:ro
+      - ./jev-edge.conf.lua:/tmp/nx/conf/jev-edge.conf.lua:ro
+    command: ["sh", "-c", "mkdir -p /tmp/nx/logs && openresty -p /tmp/nx -c /tmp/nx/conf/nginx.conf -g 'daemon off;'"]
+  app:
+    image: jev-edge-test
+    volumes:
+      - ./app.conf:/tmp/app/conf/nginx.conf:ro
+    command: ["sh", "-c", "mkdir -p /tmp/app/logs && openresty -p /tmp/app -c /tmp/app/conf/nginx.conf -g 'daemon off;'"]
+  jev-shim:
+    build: ../grpc-shim
+    command: ["-listen", ":9001", "-upstream", "http://jev-edge:8080/_jev/authz"]
+    depends_on: [jev-edge]
+  envoy-http:
+    image: envoyproxy/envoy:v1.31-latest
+    volumes:
+      - ../envoy-http.yaml:/etc/envoy/envoy.yaml:ro
+    ports: ["10000:10000"]
+    depends_on: [jev-edge, app]
+  envoy-grpc:
+    image: envoyproxy/envoy:v1.31-latest
+    volumes:
+      - ../envoy-grpc.yaml:/etc/envoy/envoy.yaml:ro
+    ports: ["10001:10000"]
+    depends_on: [jev-shim, app]

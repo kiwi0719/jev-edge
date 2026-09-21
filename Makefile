@@ -56,6 +56,14 @@ live-openai:
 soak:
 	docker run --rm --init -e DUR=$${DUR:-60s} -v "$$(PWD)":/work jev-edge-test sh /work/bench/soak.sh
 
+# Envoy: gRPC shim build and the two-transport end-to-end (Docker Compose).
+shim:
+	cd adapters/envoy/grpc-shim && go vet ./... && go build -o jev-shim .
+
+e2e-envoy:
+	docker build -q -t jev-edge-test -f adapters/openresty/Dockerfile.test adapters/openresty
+	sh adapters/envoy/e2e/run.sh
+
 # ---------------------------------------------------------------------------
 # Packaging. The opm tarball and `make install` both flatten the tree into a
 # single lib/ so `require "jev.core"` resolves without the loader shim:

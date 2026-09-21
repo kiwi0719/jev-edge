@@ -2,6 +2,12 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
+[![CI](https://github.com/kiwi0719/jev-edge/actions/workflows/ci.yml/badge.svg)](https://github.com/kiwi0719/jev-edge/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![opm](https://img.shields.io/badge/opm-lua--resty--jev--edge-orange.svg)](https://opm.openresty.org/package/kiwi0719/lua-resty-jev-edge/)
+[![OpenResty](https://img.shields.io/badge/OpenResty-1.21%2B-brightgreen.svg)](https://openresty.org)
+[![Release](https://img.shields.io/github/v/tag/kiwi0719/jev-edge?label=release)](https://github.com/kiwi0719/jev-edge/tags)
+
 **Typed-judgment admission control at the traffic edge.**
 
 <p align="center"><img src="docs/hero.webp" alt="Request stream passing L1 rules, L2 judgment lens, the edge gateway and the async side-path before reaching the protected backend" width="100%"></p>
@@ -10,7 +16,7 @@ jev-edge sits in nginx / OpenResty (Envoy and Cloudflare adapters planned) and a
 
 It is built for SREs and platform engineers, not agent authors. Existing Jev guards run on the developer's machine and judge what an AI is about to do. jev-edge runs at the gateway and judges what the outside world is about to do.
 
-> **Status:** v0.1.1. Core and the OpenResty adapter are tested end to end (68 unit specs, 61 integration assertions, two benches). Both providers are verified live: `jev` against the TypeSafe API on the full 662-sample dataset, `openai-compat` against an Ollama container. Not production-tested; run in `monitor` mode first.
+> **Status:** v0.2.0 in progress: Envoy supported through HTTP and gRPC ext_authz, end-to-end tested against real Envoy. Core and the OpenResty adapter are tested end to end (68 unit specs, 61 integration assertions, two benches). Both providers are verified live: `jev` against the TypeSafe API on the full 662-sample dataset, `openai-compat` against an Ollama container. Not production-tested; run in `monitor` mode first.
 
 ## Contents
 
@@ -154,7 +160,7 @@ Start in `monitor` mode. Watch the headers and logs for a week. Then set thresho
 - Replace a traditional WAF. SQLi, path traversal and scanners belong to CRS / ModSecurity, which are faster and better at it.
 - Filter responses.
 - Train or host a model. Judgment comes entirely from the provider.
-- Ship Envoy or Cloudflare adapters (v0.2+).
+- Ship the Cloudflare adapter (0.3.0). Envoy is supported since 0.2.0.
 
 ### Architecture
 
@@ -372,6 +378,10 @@ Layers: core defaults < config file < runtime override in the shared dict.
 `access()` is one `pcall` around: read body (only after L1 confirmed path and method), strip inbound headers, `core.evaluate`, set upstream headers, record metrics, `ngx.exit(403)` on block. Any error inside sets `X-Jev-Verdict: error` and returns.
 
 Dependencies: OpenResty ≥ 1.21, lua-resty-http ≥ 0.17, bundled lua-cjson.
+
+### Envoy adapter
+
+Envoy uses the OpenResty adapter as its `ext_authz` service; there is no second engine. `location /_jev/authz/` runs the same evaluation as `access()` and answers 200 with `X-Jev-*` headers or 403 with the block body. HTTP ext_authz calls it directly; gRPC ext_authz goes through a ~150-line Go shim that only converts protocol. Complete configs, the shim and a Docker Compose end-to-end against real Envoy are in [adapters/envoy](adapters/envoy/README.md).
 
 ### Observability
 

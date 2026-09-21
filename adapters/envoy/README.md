@@ -1,0 +1,60 @@
+# jev-edge for Envoy
+
+Envoy talks to jev-edge through `ext_authz`. There is no second judgment engine: the OpenResty adapter exposes its evaluate path as an HTTP authorization service at `/_jev/authz`, and Envoy can call it directly (HTTP) or through a small gRPC shim.
+
+```
+HTTP   Envoy ──ext_authz/HTTP──► OpenResty /_jev/authz ──► verdict headers ──► upstream
+gRPC   Envoy ──ext_authz/gRPC──► grpc-shim ──HTTP──► OpenResty /_jev/authz ──► ...
+```
+
+Both keep every property of the nginx deployment: L1 rules, cache, breaker, adaptive timeout, L3 reputation, `/_jev/config` hot reload, `/_jev/metrics`. Verdict headers reach your upstream through `allowed_upstream_headers`; a block becomes a 403 from Envoy with jev-edge's block body.
+
+## HTTP ext_authz
+
+1. Run OpenResty with jev-edge as usual and add:
+
+   ```nginx
+   location /_jev/authz/ { content_by_lua_block { require("resty.jev.edge").authz() } }
+   ```
+
+   Envoy sends the original method, the original path appended to `path_prefix`, the headers you allow, and the body. jev-edge strips the prefix, takes the client IP from `x-envoy-external-address` / `x-forwarded-for`, runs the same evaluation as `access()`, and answers 200 with `X-Jev-*` headers or 403 with the block body. Adapter errors answer 200 + `X-Jev-Verdict: error`.
+
+2. Configure the filter. [envoy-http.yaml](envoy-http.yaml) is a complete listener; the parts that matter:
+
+   ```yaml
+   with_request_body: { max_request_bytes: 65536, allow_partial_message: true }
+   allowed_headers: { patterns: [ {exact: content-type}, {exact: content-length},
+                                  {exact: x-forwarded-for}, {exact: x-envoy-external-address} ] }
+   http_service:
+     server_uri: { uri: http://jev-edge:8080, cluster: jev-edge, timeout: 2s }
+     path_prefix: /_jev/authz
+     authorization_response:
+       allowed_upstream_headers: { patterns: [ {prefix: x-jev-} ] }
+       allowed_client_headers:   { patterns: [ {exact: content-type} ] }
+   failure_mode_allow: true
+   ```
+
+   `timeout` must exceed `jev.timeout_max_ms` plus network, otherwise Envoy gives up before jev-edge's own fail-open can answer. `failure_mode_allow: true` is the Envoy-level fail-open for when OpenResty itself is unreachable.
+
+## gRPC ext_authz
+
+`grpc-shim/` is a ~150-line Go service implementing `envoy.service.auth.v3.Authorization/Check`. It forwards each check to `/_jev/authz` and maps the answer to `OkHttpResponse` (with the `X-Jev-*` headers to add upstream) or `DeniedHttpResponse` (status and body from jev-edge). If it cannot reach the adapter it returns OK with `X-Jev-Verdict: error`, `X-Jev-Source: shim`.
+
+```bash
+cd adapters/envoy/grpc-shim && go build -o jev-shim . && ./jev-shim -listen :9001 -upstream http://127.0.0.1:8080/_jev/authz
+```
+
+or `docker build -t jev-shim adapters/envoy/grpc-shim`. Envoy side: [envoy-grpc.yaml](envoy-grpc.yaml), with `pack_as_bytes: true` so bodies arrive as `raw_body`.
+
+## End-to-end test
+
+```bash
+make e2e-envoy
+```
+
+Brings up one jev-edge (mock provider), a stub upstream, the shim, and two Envoys (HTTP on :10000, gRPC on :10001) with Docker Compose, then checks on each transport: unwatched path skipped, safe verdict reaches the app, malicious request blocked with jev-edge's body, provider failure fails open, forged inbound `X-Jev-Verdict` ignored. Finally it stops jev-edge and checks that the HTTP path passes via `failure_mode_allow` and the gRPC path passes via the shim's own fail-open.
+
+## Not covered yet
+
+- Bodies larger than `max_request_bytes` arrive truncated with `allow_partial_message`; jev-edge treats the truncated JSON as unparseable and passes at L1. Not asserted by the e2e.
+- Streaming / gRPC upstream traffic through Envoy. jev-edge only judges buffered HTTP bodies.

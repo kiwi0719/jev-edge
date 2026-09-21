@@ -6,6 +6,19 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+- Envoy support. `resty.jev.edge.authz()` serves HTTP `ext_authz` at
+  `/_jev/authz/`: same evaluation as `access()`, 200 + `X-Jev-*` headers or
+  403 + block body, client IP from `x-envoy-external-address` /
+  `x-forwarded-for`, adapter errors answer 200 + `X-Jev-Verdict: error`.
+- `adapters/envoy/grpc-shim`: Go implementation of
+  `envoy.service.auth.v3.Authorization/Check` that forwards to `/_jev/authz`
+  and fails open on adapter errors.
+- `adapters/envoy/envoy-http.yaml`, `envoy-grpc.yaml` reference configs;
+  `adapters/envoy/e2e` Docker Compose end-to-end against real Envoy
+  (`make e2e-envoy`, also a CI job): 12 checks across both transports.
+- Test::Nginx `04-authz.t`.
+
 ## [0.1.1] - 2026-09-22
 
 ### Planned for 0.2.0

@@ -1,0 +1,75 @@
+# Envoy with jev-edge as an HTTP ext_authz service.
+# Envoy -> (ext_authz, HTTP) -> OpenResty /_jev/authz -> verdict -> upstream
+static_resources:
+  listeners:
+    - name: ingress
+      address: { socket_address: { address: 0.0.0.0, port_value: 10000 } }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress
+                use_remote_address: true
+                route_config:
+                  name: local
+                  virtual_hosts:
+                    - name: app
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: app }
+                http_filters:
+                  - name: envoy.filters.http.ext_authz
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz
+                      transport_api_version: V3
+                      # fail-open at the Envoy layer too: an unreachable authz service allows the request
+                      failure_mode_allow: true
+                      failure_mode_allow_header_add: true
+                      # headers forwarded to the authz service (ExtAuthz.allowed_headers; the
+                      # older authorization_request.allowed_headers is deprecated)
+                      allowed_headers:
+                        patterns:
+                          - exact: content-type
+                          - exact: content-length
+                          - exact: x-forwarded-for
+                          - exact: x-envoy-external-address
+                          - exact: x-request-id
+                          - exact: x-jev-mock-score     # e2e only; drop in production
+                      with_request_body:
+                        max_request_bytes: 65536       # matches rules.max_body_bytes
+                        allow_partial_message: true    # larger bodies: jev-edge sees a truncated body and passes it at L1
+                      http_service:
+                        server_uri:
+                          uri: http://jev-edge:8080
+                          cluster: jev-edge
+                          timeout: 2s                  # must exceed jev.timeout_max_ms
+                        path_prefix: /_jev/authz
+                        authorization_response:
+                          allowed_upstream_headers:
+                            patterns:
+                              - prefix: x-jev-
+                          allowed_client_headers:
+                            patterns:
+                              - exact: content-type
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+    - name: jev-edge
+      connect_timeout: 0.25s
+      type: STRICT_DNS
+      load_assignment:
+        cluster_name: jev-edge
+        endpoints:
+          - lb_endpoints:
+              - endpoint: { address: { socket_address: { address: jev-edge, port_value: 8080 } } }
+    - name: app
+      connect_timeout: 0.25s
+      type: STRICT_DNS
+      load_assignment:
+        cluster_name: app
+        endpoints:
+          - lb_endpoints:
+              - endpoint: { address: { socket_address: { address: app, port_value: 8081 } } }

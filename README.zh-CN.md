@@ -2,6 +2,12 @@
 
 [English](README.md) | **简体中文**
 
+[![CI](https://github.com/kiwi0719/jev-edge/actions/workflows/ci.yml/badge.svg)](https://github.com/kiwi0719/jev-edge/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![opm](https://img.shields.io/badge/opm-lua--resty--jev--edge-orange.svg)](https://opm.openresty.org/package/kiwi0719/lua-resty-jev-edge/)
+[![OpenResty](https://img.shields.io/badge/OpenResty-1.21%2B-brightgreen.svg)](https://openresty.org)
+[![Release](https://img.shields.io/github/v/tag/kiwi0719/jev-edge?label=release)](https://github.com/kiwi0719/jev-edge/tags)
+
 **在流量边缘做类型化判定的准入控制。**
 
 <p align="center"><img src="docs/hero.webp" alt="请求流依次经过 L1 规则、L2 判定透镜、边缘网关和异步旁路,最终到达受保护的后端" width="100%"></p>

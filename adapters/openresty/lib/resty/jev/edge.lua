@@ -62,13 +62,14 @@ local function re_find(subject, pattern)
   return from ~= nil
 end
 
-local function build_req(rules)
+local function build_req(rules, over)
+  over = over or {}
   local headers = ngx.req.get_headers()
   local req = {
     method    = ngx.req.get_method(),
-    path      = ngx.var.uri,
+    path      = over.path or ngx.var.uri,
     headers   = headers,
-    client_ip = ngx.var.remote_addr,
+    client_ip = over.client_ip or ngx.var.remote_addr,
     body      = nil,
     body_size = tonumber(headers["content-length"]) or 0,
   }
@@ -140,26 +141,31 @@ local function maybe_async(cfg, v, req, rules)
   if not ok and err ~= "disabled" then metrics.incr_async_dropped() end
 end
 
+local function evaluate_current(cfg, rules, over)
+  ensure_runtime(cfg)
+  strip_inbound()
+  local req = build_req(rules, over)
+  local v = core.evaluate(req, {
+    config = cfg, rules = rules, cache = cache, judge = judge, breaker = breaker,
+    clock = ngx.now, hash = function(s) return string.format("%08x", ngx.crc32_long(s)) end,
+    json_decode = cjson.decode, re_find = re_find,
+    log = function(level, msg) ngx.log(level == "error" and ngx.ERR or ngx.WARN, msg) end,
+  })
+  metrics.record(v)
+  if breaker then metrics.set_breaker_state(breaker:state()) end
+  if judge and judge.adaptive then metrics.set_l2_timeout(judge.adaptive:current()) end
+  ngx.ctx.jev = v
+  maybe_async(cfg, v, req, rules)
+  return v
+end
+
 function _M.access()
   local cfg = config.current()
   local rules = config.rules()
   local v
   local ok, err = pcall(function()
-    ensure_runtime(cfg)
-    strip_inbound()
-    local req = build_req(rules)
-    v = core.evaluate(req, {
-      config = cfg, rules = rules, cache = cache, judge = judge, breaker = breaker,
-      clock = ngx.now, hash = function(s) return string.format("%08x", ngx.crc32_long(s)) end,
-      json_decode = cjson.decode, re_find = re_find,
-      log = function(level, msg) ngx.log(level == "error" and ngx.ERR or ngx.WARN, msg) end,
-    })
-    metrics.record(v)
-    if breaker then metrics.set_breaker_state(breaker:state()) end
-    if judge and judge.adaptive then metrics.set_l2_timeout(judge.adaptive:current()) end
+    v = evaluate_current(cfg, rules)
     set_headers(v)
-    ngx.ctx.jev = v
-    maybe_async(cfg, v, req, rules)
   end)
 
   if not ok then
@@ -221,6 +227,50 @@ function _M.config_api()
   end
   ngx.status = 405
   ngx.say('{"error":"method not allowed"}')
+end
+
+--- content_by_lua for Envoy HTTP ext_authz. Configure Envoy with
+--   path_prefix: "/_jev/authz"   with_request_body: {max_request_bytes: 65536}
+--   allowed_upstream_headers: X-Jev-*
+-- and nginx with `location /_jev/authz/ { content_by_lua_block { ...authz() } }`.
+-- Envoy forwards the original method, path (after the prefix), headers and
+-- body. 200 = allow, verdict headers go upstream; 403 = deny with the block
+-- body. Any adapter error is 200 + X-Jev-Verdict: error (fail-open).
+function _M.authz(prefix)
+  prefix = prefix or "/_jev/authz"
+  local cfg = config.current()
+  local rules = config.rules()
+  local uri = ngx.var.uri or ""
+  local path = uri
+  if uri:sub(1, #prefix) == prefix then path = uri:sub(#prefix + 1) end
+  if path == "" then path = "/" end
+  -- Envoy sets x-envoy-external-address / x-forwarded-for; nginx sees Envoy's IP.
+  local h = ngx.req.get_headers()
+  local xff = h["x-envoy-external-address"] or h["x-forwarded-for"]
+  if type(xff) == "table" then xff = xff[1] end
+  local client_ip = xff and xff:match("^%s*([^,%s]+)") or ngx.var.remote_addr
+
+  local v
+  local ok, err = pcall(function()
+    v = evaluate_current(cfg, rules, { path = path, client_ip = client_ip })
+  end)
+  if not ok then
+    ngx.log(ngx.ERR, "jev-edge: authz error, failing open: ", err)
+    ngx.header["X-Jev-Verdict"] = verdict.ERROR
+    ngx.header["X-Jev-Source"] = "adapter"
+    ngx.status = 200
+    return ngx.exit(200)
+  end
+  for k, val in pairs(verdict.headers(v)) do ngx.header[k] = val end
+  ngx.header["X-Jev-Request-Id"] = ngx.var.request_id or ""
+  if v.action == verdict.ACTION_BLOCK then
+    ngx.status = cfg.policy.block_status or 403
+    ngx.header["Content-Type"] = "application/json"
+    ngx.say(cfg.policy.block_body or '{"error":"request rejected"}')
+    return ngx.exit(ngx.HTTP_OK)
+  end
+  ngx.status = 200
+  return ngx.exit(200)
 end
 
 --- content_by_lua for /_jev/health: one real provider round trip.

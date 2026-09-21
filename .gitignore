@@ -25,3 +25,6 @@ bench/datasets/private/
 *.swp
 bench/out*/
 dist/
+
+# go
+adapters/envoy/grpc-shim/jev-shim

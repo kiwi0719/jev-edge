@@ -41,3 +41,19 @@ jobs:
           cpanm --notest --quiet Test::Nginx
           opm get ledgetech/lua-resty-http
           cd adapters/openresty && prove -r t/
+
+  grpc-shim:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: adapters/envoy/grpc-shim/go.mod
+      - run: cd adapters/envoy/grpc-shim && go vet ./... && go build ./...
+
+  envoy-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -q -t jev-edge-test -f adapters/openresty/Dockerfile.test adapters/openresty
+      - run: sh adapters/envoy/e2e/run.sh

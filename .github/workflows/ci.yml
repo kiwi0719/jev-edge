@@ -25,7 +25,7 @@ jobs:
         with:
           luaVersion: "5.1"
       - uses: leafo/gh-actions-luarocks@v5
-      - run: luarocks install busted
+      - run: luarocks install busted && luarocks install dkjson && luarocks install lrexlib-pcre2
       - run: |
           if [ -d core/spec ]; then busted core/spec; else echo "no core specs yet"; fi
 

@@ -6,6 +6,11 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- L1 `always_suspect` patterns are PCRE, matched through an injected
+  `ctx.re_find`, so one rule file serves every adapter. Missing matcher
+  disables the prefilter with a single warning (fail-open).
+
 ### Added
 - M1 core skeleton: `core/` (normalize, rules, judge, policy, breaker, verdict,
   defaults, init) with 63 busted specs; bundled `injection` and `abuse`

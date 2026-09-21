@@ -11,11 +11,10 @@
 
 1. Open an issue or pick one labelled `good first issue` / `help wanted`.
 2. Branch from `main`. Keep PRs to one milestone item.
-3. Run locally:
+3. Run locally (needs `luarocks install busted dkjson lrexlib-pcre2 luacheck`, plus `luajit` on PATH):
 
    ```bash
-   luacheck .
-   busted core/spec
+   make check
    cd adapters/openresty && prove -r t/
    ```
 

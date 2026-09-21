@@ -44,6 +44,22 @@ end
 
 H.json = require "dkjson"
 
+-- PCRE matcher with the same contract the OpenResty adapter gives core:
+-- re_find(subject, pattern) -> truthy on a case-insensitive match.
+do
+  local rex = require "rex_pcre2"
+  local CASELESS = rex.flags().CASELESS
+  local compiled = {}
+  function H.re_find(subject, pattern)
+    local re = compiled[pattern]
+    if not re then
+      re = rex.new(pattern, CASELESS)
+      compiled[pattern] = re
+    end
+    return re:find(subject) ~= nil
+  end
+end
+
 function H.ctx(over)
   local defaults = require "jev.core.defaults"
   local normalize = require "jev.core.normalize"
@@ -56,6 +72,7 @@ function H.ctx(over)
     _clock = clock,
     hash = normalize.djb2,
     json_decode = function(s) return H.json.decode(s) end,
+    re_find = H.re_find,
     judge = { call = function() return { injection = 0.1 } end },
     logs = {},
   }

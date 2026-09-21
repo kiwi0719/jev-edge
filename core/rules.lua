@@ -10,9 +10,32 @@ _M.PASS    = "pass"
 _M.BLOCK   = "block"
 _M.SUSPECT = "suspect"
 
-local function matches_any(s, patterns)
+-- Path patterns are Lua patterns (cheap, anchored, no alternation needed).
+local function path_matches(s, patterns)
   for _, p in ipairs(patterns or {}) do
     if s:find(p) then return p end
+  end
+  return nil
+end
+
+-- always_suspect patterns are PCRE, matched through ctx.re_find so the same
+-- rule files work under ngx.re (OpenResty), lrexlib (tests) or JS RegExp.
+-- Without an injected matcher the prefilter is skipped (fail-open) and the
+-- length check alone decides.
+local warned = false
+local function text_matches(s, patterns, ctx)
+  if not patterns or #patterns == 0 then return nil end
+  local re_find = ctx and ctx.re_find
+  if not re_find then
+    if not warned and ctx and ctx.log then
+      warned = true
+      ctx.log("warn", "jev-edge: ctx.re_find not provided; always_suspect prefilter disabled")
+    end
+    return nil
+  end
+  for _, p in ipairs(patterns) do
+    local ok, hit = pcall(re_find, s, p)
+    if ok and hit then return p end
   end
   return nil
 end
@@ -29,11 +52,12 @@ end
 --- Evaluate one rule set against a request.
 -- @param req  { method, path, headers, body, body_size, client_ip }
 -- @param rule rule table (see rules/*.lua)
--- @param ctx  { cache = {get=fn}, json_decode = fn, clock = fn }
+-- @param ctx  { cache = {get=fn}, json_decode = fn, clock = fn,
+--               re_find = fn(subject, pcre) -> truthy on match (case-insensitive) }
 -- @return result, text, reason
 function _M.evaluate(req, rule, ctx)
   -- 1. path watch list
-  if not matches_any(req.path or "", rule.watch_paths) then
+  if not path_matches(req.path or "", rule.watch_paths) then
     return _M.PASS, "", "path not watched"
   end
 
@@ -74,8 +98,7 @@ function _M.evaluate(req, rule, ctx)
   if text == "" then
     return _M.PASS, "", "no text"
   end
-  local lowered = text:lower()
-  local hit = matches_any(lowered, rule.always_suspect)
+  local hit = text_matches(text, rule.always_suspect, ctx)
   if hit then
     return _M.SUSPECT, text, "pattern: " .. hit
   end

@@ -137,7 +137,7 @@ local verdict = edge.evaluate(req, {
 2. **方法与 Content-Type**：非 `POST/PUT/PATCH`，或 Content-Type 不是 json / form / text → `pass`。
 3. **body 大小**：`< min_body_bytes`（默认 8）→ `pass`；`> max_body_bytes`（默认 64KB）→ `pass` 并打日志（不读大 body，避免拖慢）。
 4. **reputation 查询**（shared dict）：该 IP 在 `block_ttl` 内被封 → `block`；在 `trust_ttl` 内连续 N 次判定 safe → `pass`。
-5. **正则预筛**（可选，用户配置）：命中 `always_suspect` 模式（如 `ignore previous`、`system prompt`、base64 长串）→ `suspect`。
+5. **正则预筛**（可选，用户配置）：命中 `always_suspect` 模式（如 `ignore previous`、`system prompt`、base64 长串）→ `suspect`。模式统一用 **PCRE** 语法，core 不自带正则实现，通过 `ctx.re_find(subject, pattern)` 注入：OpenResty 给 `ngx.re.find` 加 `"ijo"`，测试给 lrexlib-pcre2，Cloudflare 给 JS RegExp。这样同一份规则文件三个 adapter 共用。未注入时跳过本步并告警一次，仍然 fail-open。`watch_paths` 是锚定前缀，用 Lua pattern 即可。
 6. **自然语言检测**：body 中提取待判定文本（见 4.3），长度 `≥ min_text_chars`（默认 20）→ `suspect`，否则 `pass`。
 
 ### 4.3 文本提取
@@ -159,9 +159,9 @@ return {
   max_body_bytes = 65536,
   text_fields = { "messages[*].content", "prompt", "input" },
   min_text_chars = 20,
-  always_suspect = {
-    [[ignore (all )?(previous|prior|above) instructions]],
-    [[you are now]],
+  always_suspect = {              -- PCRE，大小写不敏感，通过 ctx.re_find 匹配
+    [[\b(ignore|disregard)\b.{0,20}\b(previous|prior|above)\b.{0,20}\binstructions?\b]],
+    [[\byou are now\b]],
     [[<\|?system\|?>]],
   },
   templates = { "injection" },   -- 送 L2 时用哪些问题模板

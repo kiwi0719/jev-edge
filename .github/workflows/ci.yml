@@ -57,3 +57,10 @@ jobs:
       - uses: actions/checkout@v4
       - run: docker build -q -t jev-edge-test -f adapters/openresty/Dockerfile.test adapters/openresty
       - run: sh adapters/envoy/e2e/run.sh
+
+  forward-auth-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -q -t jev-edge-test -f adapters/openresty/Dockerfile.test adapters/openresty
+      - run: sh adapters/forward-auth/e2e/run.sh

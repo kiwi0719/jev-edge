@@ -1,0 +1,12 @@
+# Caddy forward_auth with jev-edge. Caddy never forwards the body, so the
+# verdict is `skipped` unless the client IP has a reputation entry; use this
+# for reputation enforcement on top of another judging path, or move judgment
+# into the OpenResty adapter behind Caddy.
+:80 {
+    forward_auth jev-edge:8080 {
+        uri /_jev/forward-auth
+        copy_headers X-Jev-Verdict X-Jev-Score X-Jev-Source X-Jev-Reason X-Jev-Request-Id
+        # Caddy sets X-Forwarded-Method and X-Forwarded-Uri itself.
+    }
+    reverse_proxy app:8081
+}

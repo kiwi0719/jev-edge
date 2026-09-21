@@ -66,7 +66,7 @@ local function build_req(rules, over)
   over = over or {}
   local headers = ngx.req.get_headers()
   local req = {
-    method    = ngx.req.get_method(),
+    method    = over.method or ngx.req.get_method(),
     path      = over.path or ngx.var.uri,
     headers   = headers,
     client_ip = over.client_ip or ngx.var.remote_addr,
@@ -229,6 +229,30 @@ function _M.config_api()
   ngx.say('{"error":"method not allowed"}')
 end
 
+local function respond_authz(cfg, rules, over, who)
+  local v
+  local ok, err = pcall(function()
+    v = evaluate_current(cfg, rules, over)
+  end)
+  if not ok then
+    ngx.log(ngx.ERR, "jev-edge: ", who, " error, failing open: ", err)
+    ngx.header["X-Jev-Verdict"] = verdict.ERROR
+    ngx.header["X-Jev-Source"] = "adapter"
+    ngx.status = 200
+    return ngx.exit(200)
+  end
+  for k, val in pairs(verdict.headers(v)) do ngx.header[k] = val end
+  ngx.header["X-Jev-Request-Id"] = ngx.var.request_id or ""
+  if v.action == verdict.ACTION_BLOCK then
+    ngx.status = cfg.policy.block_status or 403
+    ngx.header["Content-Type"] = "application/json"
+    ngx.say(cfg.policy.block_body or '{"error":"request rejected"}')
+    return ngx.exit(ngx.HTTP_OK)
+  end
+  ngx.status = 200
+  return ngx.exit(200)
+end
+
 --- content_by_lua for Envoy HTTP ext_authz. Configure Envoy with
 --   path_prefix: "/_jev/authz"   with_request_body: {max_request_bytes: 65536}
 --   allowed_upstream_headers: X-Jev-*
@@ -250,27 +274,30 @@ function _M.authz(prefix)
   if type(xff) == "table" then xff = xff[1] end
   local client_ip = xff and xff:match("^%s*([^,%s]+)") or ngx.var.remote_addr
 
-  local v
-  local ok, err = pcall(function()
-    v = evaluate_current(cfg, rules, { path = path, client_ip = client_ip })
-  end)
-  if not ok then
-    ngx.log(ngx.ERR, "jev-edge: authz error, failing open: ", err)
-    ngx.header["X-Jev-Verdict"] = verdict.ERROR
-    ngx.header["X-Jev-Source"] = "adapter"
-    ngx.status = 200
-    return ngx.exit(200)
-  end
-  for k, val in pairs(verdict.headers(v)) do ngx.header[k] = val end
-  ngx.header["X-Jev-Request-Id"] = ngx.var.request_id or ""
-  if v.action == verdict.ACTION_BLOCK then
-    ngx.status = cfg.policy.block_status or 403
-    ngx.header["Content-Type"] = "application/json"
-    ngx.say(cfg.policy.block_body or '{"error":"request rejected"}')
-    return ngx.exit(ngx.HTTP_OK)
-  end
-  ngx.status = 200
-  return ngx.exit(200)
+  return respond_authz(cfg, rules, { path = path, client_ip = client_ip }, "authz")
+end
+
+--- content_by_lua for generic forward-auth: Traefik ForwardAuth, Caddy
+-- forward_auth, nginx auth_request. The original request is described by
+-- headers (X-Forwarded-Method / X-Forwarded-Uri, or X-Original-Method /
+-- X-Original-URI); the client IP by X-Forwarded-For. Only Traefik with
+-- `forwardBody: true` sends the body; without one L1 can only see path,
+-- method and reputation, and the verdict is `skipped` with reason "no body".
+-- Responses follow the same contract as authz(): 200 + X-Jev-* or 403 + body.
+function _M.forward_auth()
+  local cfg = config.current()
+  local rules = config.rules()
+  local h = ngx.req.get_headers()
+  local function first(v) if type(v) == "table" then return v[1] end return v end
+  local method = first(h["x-forwarded-method"] or h["x-original-method"]) or ngx.req.get_method()
+  -- nginx auth_request subrequests inherit the main request, so $request_uri
+  -- is the original URI even when no X-Original-URI header was set.
+  local uri = first(h["x-forwarded-uri"] or h["x-original-uri"] or h["x-original-url"]) or ngx.var.request_uri or "/"
+  local path = uri:match("^[^?]*") or "/"
+  if path == "" then path = "/" end
+  local xff = first(h["x-forwarded-for"] or h["x-real-ip"])
+  local client_ip = xff and xff:match("^%s*([^,%s]+)") or ngx.var.remote_addr
+  return respond_authz(cfg, rules, { method = method:upper(), path = path, client_ip = client_ip }, "forward_auth")
 end
 
 --- content_by_lua for /_jev/health: one real provider round trip.

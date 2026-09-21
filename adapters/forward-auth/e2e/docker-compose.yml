@@ -1,0 +1,41 @@
+# Forward-auth end-to-end: real Traefik, Caddy and plain nginx in front of a
+# stub app, all using one jev-edge (mock provider) at /_jev/forward-auth.
+#   :10002 Traefik ForwardAuth (forwardBody: true)  -> full L2 verdicts
+#   :10003 Caddy forward_auth  (headers only)         -> skipped / reputation
+#   :10004 nginx auth_request  (headers only)         -> skipped / reputation
+services:
+  jev-edge:
+    image: jev-edge-test
+    volumes:
+      - ../../..:/work:ro
+      - ./jev-nginx.conf:/tmp/nx/conf/nginx.conf:ro
+      - ./jev-edge.conf.lua:/tmp/nx/conf/jev-edge.conf.lua:ro
+    command: ["sh", "-c", "mkdir -p /tmp/nx/logs && openresty -p /tmp/nx -c /tmp/nx/conf/nginx.conf -g 'daemon off;'"]
+  app:
+    image: jev-edge-test
+    volumes:
+      - ../../envoy/e2e/app.conf:/tmp/app/conf/nginx.conf:ro
+    command: ["sh", "-c", "mkdir -p /tmp/app/logs && openresty -p /tmp/app -c /tmp/app/conf/nginx.conf -g 'daemon off;'"]
+  traefik:
+    image: traefik:v3.3
+    command:
+      - --entryPoints.web.address=:80
+      - --providers.file.filename=/etc/traefik/dynamic.yml
+      - --log.level=WARN
+    volumes:
+      - ../traefik.yml:/etc/traefik/dynamic.yml:ro
+    ports: ["10002:80"]
+    depends_on: [jev-edge, app]
+  caddy:
+    image: caddy:2
+    volumes:
+      - ../Caddyfile:/etc/caddy/Caddyfile:ro
+    ports: ["10003:80"]
+    depends_on: [jev-edge, app]
+  nginx:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./plain-nginx.conf:/etc/nginx/nginx.conf:ro
+      - ../nginx-auth-request.conf:/etc/nginx/jev-auth-request.conf:ro
+    ports: ["10004:80"]
+    depends_on: [jev-edge, app]

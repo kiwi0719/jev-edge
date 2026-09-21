@@ -61,25 +61,8 @@ function _M.evaluate(req, rule, ctx)
     return _M.PASS, "", "path not watched"
   end
 
-  -- 2. method + content type
-  if rule.methods and not rule.methods[(req.method or ""):upper()] then
-    return _M.PASS, "", "method not watched"
-  end
-  local ct = req.headers and (req.headers["content-type"] or req.headers["Content-Type"]) or ""
-  if not ct_allowed(ct, rule.content_types) then
-    return _M.PASS, "", "content-type not watched"
-  end
-
-  -- 3. body size
-  local size = tonumber(req.body_size) or (req.body and #req.body) or 0
-  if size < (rule.min_body_bytes or 8) then
-    return _M.PASS, "", "body too small"
-  end
-  if size > (rule.max_body_bytes or 65536) then
-    return _M.PASS, "", "body too large"
-  end
-
-  -- 4. reputation
+  -- 2. reputation: one dict lookup, before anything that needs a body, so a
+  --    headers-only forward-auth request can still be rejected or trusted
   if ctx and ctx.cache and req.client_ip then
     local rep = ctx.cache:get("rep:" .. req.client_ip)
     if type(rep) == "table" then
@@ -91,6 +74,27 @@ function _M.evaluate(req, rule, ctx)
         return _M.PASS, "", "ip trusted"
       end
     end
+  end
+
+  -- 3. method + content type
+  if rule.methods and not rule.methods[(req.method or ""):upper()] then
+    return _M.PASS, "", "method not watched"
+  end
+  local ct = req.headers and (req.headers["content-type"] or req.headers["Content-Type"]) or ""
+  if not ct_allowed(ct, rule.content_types) then
+    return _M.PASS, "", "content-type not watched"
+  end
+
+  -- 4. body size
+  local size = tonumber(req.body_size) or (req.body and #req.body) or 0
+  if size == 0 and req.body == nil then
+    return _M.PASS, "", "no body"
+  end
+  if size < (rule.min_body_bytes or 8) then
+    return _M.PASS, "", "body too small"
+  end
+  if size > (rule.max_body_bytes or 65536) then
+    return _M.PASS, "", "body too large"
   end
 
   -- 5+6. extract text, regex prefilter, natural-language length

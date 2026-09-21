@@ -287,9 +287,9 @@ local verdict = edge.evaluate(req, {
 求值按代价排序，短路：
 
 1. **路径不在监控列表** → `pass`。默认监控列表为空，不显式列出路径 jev-edge 什么都不做。
-2. **方法 / Content-Type** 不是 `POST|PUT|PATCH`，或不是 json / form / text → `pass`。
-3. **body 大小**低于 `min_body_bytes`（8）→ `pass`；高于 `max_body_bytes`（64 KB）→ `pass` 并打一条日志。大 body 永远不会被读取。
-4. **信誉**（shared dict）：IP 在 `block_ttl` 内被封 → `block`；IP 连续 N 次判定 safe 后被信任 → `pass`。
+2. **信誉**（shared dict，一次查找）：IP 在 `block_ttl` 内被封 → `block`；IP 连续 N 次判定 safe 后被信任 → `pass`。它排在所有需要 body 的步骤之前，只转发头的 forward-auth 请求也能被拒绝。
+3. **方法 / Content-Type** 不是 `POST|PUT|PATCH`，或不是 json / form / text → `pass`。
+4. **body 大小**：没有 body → `pass`（"no body"）；低于 `min_body_bytes`（8）→ `pass`；高于 `max_body_bytes`（64 KB）→ `pass` 并打一条日志。大 body 永远不会被读取。
 5. **正则预筛**：命中任何 `always_suspect` 模式 → `suspect`。模式是 **PCRE**，通过 `ctx.re_find` 大小写不敏感地匹配。OpenResty 注入带 `"ijo"` 的 `ngx.re.find`，spec 注入 lrexlib-pcre2，Cloudflare adapter 将注入 JS RegExp。一份规则文件三个 adapter 共用。没有注入匹配器时跳过本步并告警一次，只靠长度判断（fail-open）。
 6. **自然语言检查**：抽取的文本长度达到 `min_text_chars`（20）→ `suspect`，否则 `pass`。
 

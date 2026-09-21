@@ -1,0 +1,35 @@
+# Traefik v3.3+ ForwardAuth with jev-edge. Static config (traefik.yml) must
+# enable the file provider; this is the dynamic part.
+http:
+  middlewares:
+    jev-edge:
+      forwardAuth:
+        address: "http://jev-edge:8080/_jev/forward-auth"
+        # v3.3+: send the request body so jev-edge can judge it. Without this
+        # the verdict is always `skipped` (headers only).
+        forwardBody: true
+        maxBodySize: 65536            # matches rules.max_body_bytes
+        # copy the verdict onto the request that reaches your service
+        authResponseHeaders:
+          - X-Jev-Verdict
+          - X-Jev-Score
+          - X-Jev-Source
+          - X-Jev-Reason
+          - X-Jev-Request-Id
+        # forward only what jev-edge needs
+        authRequestHeaders:
+          - Content-Type
+          - Content-Length
+          - X-Forwarded-For
+          - X-Jev-Mock-Score           # e2e only; drop in production
+  routers:
+    app:
+      rule: "PathPrefix(`/`)"
+      entryPoints: [web]
+      middlewares: [jev-edge]
+      service: app
+  services:
+    app:
+      loadBalancer:
+        servers:
+          - url: "http://app:8081"

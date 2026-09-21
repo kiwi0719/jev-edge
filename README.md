@@ -286,9 +286,9 @@ Input: `req` and the configured rule sets. Output is one of:
 Evaluation is ordered by cost and short-circuits:
 
 1. **Path not watched** → `pass`. The default watch list is empty. jev-edge does nothing until a path is explicitly listed.
-2. **Method / Content-Type** not `POST|PUT|PATCH` or not json / form / text → `pass`.
-3. **Body size** under `min_body_bytes` (8) → `pass`; over `max_body_bytes` (64 KB) → `pass` with a log line. Large bodies are never read.
-4. **Reputation** (shared dict): IP blocked within `block_ttl` → `block`; IP trusted after N consecutive safe verdicts → `pass`.
+2. **Reputation** (shared dict, one lookup): IP blocked within `block_ttl` → `block`; IP trusted after N consecutive safe verdicts → `pass`. This runs before anything that needs a body so headers-only forward-auth requests can still be rejected.
+3. **Method / Content-Type** not `POST|PUT|PATCH` or not json / form / text → `pass`.
+4. **Body size**: no body → `pass` ("no body"); under `min_body_bytes` (8) → `pass`; over `max_body_bytes` (64 KB) → `pass` with a log line. Large bodies are never read.
 5. **Regex prefilter**: any `always_suspect` pattern hits → `suspect`. Patterns are **PCRE**, matched case-insensitively through `ctx.re_find`. OpenResty injects `ngx.re.find` with `"ijo"`, specs inject lrexlib-pcre2, the Cloudflare adapter will inject JS RegExp. One rule file serves every adapter. If no matcher is injected, this step is skipped with a single warning and the length check alone decides (fail-open).
 6. **Natural-language check**: extracted text at least `min_text_chars` (20) → `suspect`, else `pass`.
 

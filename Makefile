@@ -1,4 +1,4 @@
-.PHONY: test lint check luajit-check test-openresty bench bench-offline bench-chart dist install live-check
+.PHONY: test lint check luajit-check test-openresty bench bench-offline bench-chart dist opm-build install live-check live-full live-openai soak shim e2e-envoy e2e-forward-auth
 
 test:
 	busted
@@ -63,6 +63,11 @@ shim:
 e2e-envoy:
 	docker build -q -t jev-edge-test -f adapters/openresty/Dockerfile.test adapters/openresty
 	sh adapters/envoy/e2e/run.sh
+
+# Traefik / Caddy / nginx forward-auth end-to-end (Docker Compose).
+e2e-forward-auth:
+	docker build -q -t jev-edge-test -f adapters/openresty/Dockerfile.test adapters/openresty
+	sh adapters/forward-auth/e2e/run.sh
 
 # ---------------------------------------------------------------------------
 # Packaging. The opm tarball and `make install` both flatten the tree into a

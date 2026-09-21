@@ -1,5 +1,5 @@
 FROM openresty/openresty:alpine-fat
-RUN apk add --no-cache perl perl-app-cpanminus perl-dev make gcc musl-dev \
+RUN apk add --no-cache curl perl perl-app-cpanminus perl-dev make gcc musl-dev \
  && cpanm --notest --quiet Test::Nginx \
  && opm get ledgetech/lua-resty-http
 WORKDIR /work/adapters/openresty

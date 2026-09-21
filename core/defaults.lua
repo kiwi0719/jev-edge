@@ -29,7 +29,9 @@ _M.config = {
   async = {
     enabled         = true,
     max_async       = 32,
-    rep_block_after = 3,
+    rep_block_after = 0,      -- 0 = never block by reputation; N = block an IP after N
+                              -- malicious verdicts. Off by default: one NAT or carrier
+                              -- IP can hide thousands of users.
     rep_block_ttl   = 600,
   },
   breaker = {

@@ -6,6 +6,16 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Planned for 0.2.0
+- `/_jev/authz`: a forward-auth endpoint on the OpenResty adapter. Same HTTP
+  contract for Envoy HTTP ext_authz, Caddy `forward_auth`, Traefik
+  ForwardAuth and nginx `auth_request`: the gateway forwards headers and
+  path, the endpoint answers 2xx (allow) or 4xx (deny) plus `X-Jev-*` headers.
+  Body source is pluggable because only Envoy forwards the request body;
+  the others need the prompt copied into a header. Config examples for all
+  four gateways.
+- Cloudflare Worker adapter (core reimplemented in JS).
+
 ### Added
 - `/_jev/health`: one real provider round trip reporting latency, effective
   timeout, breaker state and mode. `bench/live.lua` + `make live-check` run
@@ -16,6 +26,11 @@ All notable changes to this project are recorded here. The format follows
   workers, censored samples on timeout. `jev_l2_timeout_ms` gauge.
 
 ### Changed
+- `async.rep_block_after` defaults to 0 (reputation is recorded and alerted,
+  never blocked, until enabled). A NAT address can hide thousands of users.
+- `max_inflight` now applies to every provider, mock included.
+- Example `log_format` uses `escape=none`; `escape=json` double-escaped the
+  JSON in `$jev_log`.
 - Default L2 timeout: fixed 300 ms → adaptive 400–1000 ms. Live measurement
   against `jev-latest` showed p95 314 ms; 300 ms would have dropped 15% of calls.
 - HTTP timeout budget split 30/10/60 (connect/send/read) instead of a fixed
@@ -24,6 +39,8 @@ All notable changes to this project are recorded here. The format follows
   provider call fails certificate verification.
 
 ### Fixed
+- Chunked request bodies (no Content-Length) bypassed `max_body_bytes` and
+  were read whole; reads are now bounded to `max_body_bytes + 1`.
 - `jev` provider verified against the live TypeSafe API (auth, request shape,
   response parsing).
 

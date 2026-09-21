@@ -35,7 +35,8 @@ local function handler(premature, job)
       if label == verdict.MALICIOUS then
         rep.malicious = (rep.malicious or 0) + 1
         rep.safe = 0
-        if rep.malicious >= (cfg.async.rep_block_after or 3) then
+        local after = tonumber(cfg.async.rep_block_after) or 0
+        if after > 0 and rep.malicious >= after then
           rep.blocked_until = ngx.now() + (cfg.async.rep_block_ttl or 600)
         end
         if job.on_alert then

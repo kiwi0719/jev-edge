@@ -69,7 +69,10 @@ function _M.evaluate(req, ctx)
   end
 
   -- L2 ------------------------------------------------------------------
-  local prompt, perr = judge.build(rule.templates, text, { path = req.path or "", method = req.method or "" })
+  local prompt, perr = judge.build(rule.templates, text, {
+    path = req.path or "", method = req.method or "",
+    deployment = rule.deployment_context or cfg.jev.deployment_context or "",
+  })
   if not prompt then
     log(ctx, "error", "jev-edge: " .. perr)
     local action, label, async = policy.on_error()

@@ -21,6 +21,6 @@ return {
     suspect_threshold = 0.5,
   },
   cache   = { fp_ttl = 300, rep_ttl = 600, fp_prefix_bytes = 2048 },
-  async   = { enabled = true, max_async = 32, rep_block_after = 3, rep_block_ttl = 600 },
+  async   = { enabled = true, max_async = 32, rep_block_after = 0, rep_block_ttl = 600 },
   breaker = { window_s = 60, min_samples = 20, fail_ratio = 0.5, open_s = 30 },
 }

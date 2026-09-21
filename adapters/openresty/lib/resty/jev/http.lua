@@ -36,18 +36,9 @@ function _M.new(cfg, inflight, metrics)
   -- core passes cfg.jev.timeout_ms; the adaptive estimate overrides it.
   function self.call(prompt, _requested_timeout)
     local timeout_ms = adaptive:current()
-    if provider.local_only then
-      local t0 = now_ms()
-      local answers, err = provider.call(prompt, cfg, timeout_ms)
-      ngx.update_time()
-      if answers then adaptive:success(now_ms() - t0)
-      elseif tostring(err):find("timeout", 1, true) then adaptive:timeout(timeout_ms) end
-      return answers, err
-    end
-    if not http_ok then
-      return nil, "lua-resty-http not installed"
-    end
 
+    -- Concurrency cap applies to every provider, mock included, so the limit
+    -- is exercised by the soak test.
     local key = "inflight:l2"
     local max = tonumber(cfg.max_inflight) or 64
     if inflight then
@@ -56,6 +47,20 @@ function _M.new(cfg, inflight, metrics)
         inflight:incr(key, -1, 0)
         return nil, "max_inflight exceeded"
       end
+    end
+
+    if provider.local_only then
+      local t0 = now_ms()
+      local answers, err = provider.call(prompt, cfg, timeout_ms)
+      if inflight then inflight:incr(key, -1, 0) end
+      ngx.update_time()
+      if answers then adaptive:success(now_ms() - t0)
+      elseif tostring(err):find("timeout", 1, true) then adaptive:timeout(timeout_ms) end
+      return answers, err
+    end
+    if not http_ok then
+      if inflight then inflight:incr(key, -1, 0) end
+      return nil, "lua-resty-http not installed"
     end
 
     local req = provider.build_request(prompt, cfg)

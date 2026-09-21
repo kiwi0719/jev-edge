@@ -7,17 +7,27 @@ local cjson = require "cjson.safe"
 local _M = { name = "jev" }
 
 function _M.build_request(prompt, cfg)
+  local deployment = prompt.context and prompt.context.deployment
+  if deployment == "" then deployment = nil end
   local questions = {}
   for name, t in pairs(prompt.questions) do
-    local q = { type = "noul", instructions = t.instructions }
-    if t.criteria then
-      q.criteria = { ["true"] = t.criteria[true], ["false"] = t.criteria[false] }
+    local instr = (deployment and t.instructions_ctx) or t.instructions
+    local crit  = (deployment and t.criteria_ctx) or t.criteria
+    local q = { type = "noul", instructions = instr }
+    if crit then
+      q.criteria = { ["true"] = crit[true], ["false"] = crit[false] }
     end
     questions[name] = q
   end
+  -- With a deployment context the state is an object, so the question can
+  -- refer to `assistant` and `user_message` by name.
+  local state = prompt.text
+  if deployment then
+    state = { assistant = deployment, user_message = prompt.text }
+  end
   local body = cjson.encode({
     model     = cfg.model or "jev-latest",
-    state     = prompt.text,
+    state     = state,
     questions = questions,
   })
   return {

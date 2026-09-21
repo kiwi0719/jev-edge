@@ -27,6 +27,13 @@ local f = assert(io.open(path, "rb"))
 local data = assert(json.decode(f:read("*a")))
 f:close()
 local samples = data.samples
+-- live-*.json files (bench/live_full.lua) carry `injection`; jev-sec-bench
+-- results carry `probability`. Use whichever is present as the L2 oracle.
+for _, s in ipairs(samples) do
+  if s.probability == nil then s.probability = tonumber(s.injection) or 0 end
+end
+local oracle = data.deployment_context and data.deployment_context ~= "" and "live, with deployment context"
+  or (data.templates and "live, bare text") or "recorded by jev-sec-bench"
 
 local function ctx_for(mode, block_t, suspect_t, lookup)
   local c = H.ctx({ config = { policy = { mode = mode, block_threshold = block_t, suspect_threshold = suspect_t } } })
@@ -49,7 +56,7 @@ local function lookup(text)
   return by_text[text] or 0
 end
 
-local thresholds = { 0.5, 0.7, 0.85, 0.95 }
+local thresholds = { 0.3, 0.5, 0.7, 0.85 }
 local rows = {}
 
 for _, t in ipairs(thresholds) do
@@ -131,19 +138,54 @@ local lat = {
 }
 
 -- ---------------------------------------------------------------------------
+-- 4. L1 prefilter on its own: how many benign texts trip always_suspect, and
+--    worst-case match time per pattern on adversarial input (ReDoS check)
+-- ---------------------------------------------------------------------------
+
+local rule = require "jev.rules.llm-endpoints"
+local pre_hits_benign, pre_hits_attack = 0, 0
+for _, s in ipairs(samples) do
+  local hit = false
+  for _, pat in ipairs(rule.always_suspect) do
+    if H.re_find(s.text, pat) then hit = true break end
+  end
+  if hit then
+    if s.label == 1 then pre_hits_attack = pre_hits_attack + 1 else pre_hits_benign = pre_hits_benign + 1 end
+  end
+end
+
+local adversarial = {
+  ("ignore " ):rep(2000),
+  ("a"):rep(20000),
+  ("ignore all all all all "):rep(500) .. "x",
+  ("QUJD"):rep(5000) .. "!",
+  ("<|"):rep(5000),
+}
+local redos = {}
+for i, pat in ipairs(rule.always_suspect) do
+  local worst = 0
+  for _, sub in ipairs(adversarial) do
+    local t0 = os.clock()
+    H.re_find(sub, pat)
+    worst = math.max(worst, (os.clock() - t0) * 1000)
+  end
+  redos[#redos + 1] = { i = i, ms = worst, pat = pat }
+end
+
+-- ---------------------------------------------------------------------------
 -- Report
 -- ---------------------------------------------------------------------------
 
 local function pct(x) return string.format("%.1f%%", x * 100) end
 
 io.write("# Offline bench report\n\n")
-io.write(string.format("Dataset: `%s` (%d samples, %d attacks, %d benign), recorded model `%s`, run_at %s.\n\n",
-  path, #samples, rows[1].n_pos, rows[1].n_neg, tostring(data.model), tostring(data.run_at)))
+io.write(string.format("Dataset: `%s` (%d samples, %d attacks, %d benign), model `%s`, run_at %s, L2 oracle: %s.\n\n",
+  path, #samples, rows[1].n_pos, rows[1].n_neg, tostring(data.model), tostring(data.run_at), oracle))
 io.write("Rules: `llm-endpoints`; body path `/v1/chat/completions`; mode `enforce`. ")
-io.write("L2 uses the recorded Jev probability for each text instead of a live call.\n\n")
+io.write("L2 replays the stored Jev probability for each text instead of calling the API again.\n\n")
 
 io.write("## Pipeline accuracy vs Jev alone\n\n")
-io.write("| block threshold | benign passed at L1 | benign sent to L2 | attacks passed at L1 (never judged) | FP (pipeline) | miss (pipeline) | FP (Jev alone) | miss (Jev alone) |\n")
+io.write("| block threshold | benign passed at L1 | benign sent to L2 | attacks passed at L1 (never judged) | FP (pipeline) | miss (pipeline) | FP (oracle alone) | miss (oracle alone) |\n")
 io.write("|---|---|---|---|---|---|---|---|\n")
 for _, r in ipairs(rows) do
   io.write(string.format("| %.2f | %s | %s | %s | %s | %s | %s | %s |\n",
@@ -158,6 +200,17 @@ io.write(string.format("%d requests, %d L2 calls. Of the %d repeats, **%s** were
   replay_total, l2_calls, replay_total - rows[1].n_pos, pct(replay_hits / (replay_total - rows[1].n_pos)), pct(replay_l1 / replay_total)))
 io.write("The variant that defeats the cache is the appended reference number: digits are stripped but the surrounding ")
 io.write("`(ref )` text remains, so the fingerprint differs. Case, whitespace and padding variants all hit.\n\n")
+
+io.write("## L1 prefilter alone\n\n")
+io.write(string.format("`always_suspect` hits: %d / %d benign (%s), %d / %d attacks (%s). ",
+  pre_hits_benign, rows[1].n_neg, pct(pre_hits_benign / rows[1].n_neg),
+  pre_hits_attack, rows[1].n_pos, pct(pre_hits_attack / rows[1].n_pos)))
+io.write("A prefilter hit only forces L2; it never blocks by itself, so benign hits cost latency, not availability.\n\n")
+io.write("Worst-case match time per pattern on 5 adversarial inputs (20 KB repeats):\n\n| # | worst ms | pattern |\n|---|---|---|\n")
+for _, r in ipairs(redos) do
+  io.write(string.format("| %d | %.2f | `%s` |\n", r.i, r.ms, (r.pat:gsub("|", "\\|"))))
+end
+io.write("\n")
 
 io.write("## core.evaluate latency (single core, " .. _VERSION .. ", no nginx)\n\n")
 io.write("| path | µs per call |\n|---|---|\n")

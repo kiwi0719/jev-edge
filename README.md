@@ -10,7 +10,7 @@ jev-edge sits in nginx / OpenResty (Envoy and Cloudflare adapters planned) and a
 
 It is built for SREs and platform engineers, not agent authors. Existing Jev guards run on the developer's machine and judge what an AI is about to do. jev-edge runs at the gateway and judges what the outside world is about to do.
 
-> **Status:** v0.1.0. Core and the OpenResty adapter are tested end to end (68 unit specs, 61 integration assertions, two benches). The `jev` provider is verified against the live TypeSafe API (`make live-check`); `openai-compat` is written to the published contract but not yet exercised live. Not production-tested; run in `monitor` mode first.
+> **Status:** v0.1.0. Core and the OpenResty adapter are tested end to end (68 unit specs, 61 integration assertions, two benches). Both providers are verified live: `jev` against the TypeSafe API on the full 662-sample dataset, `openai-compat` against an Ollama container. Not production-tested; run in `monitor` mode first.
 
 ## Contents
 
@@ -77,7 +77,7 @@ git clone https://github.com/kiwi0719/jev-edge && cd jev-edge && sudo make insta
 
 1. Put your TypeSafe key in the environment nginx starts with and declare it: `env TYPESAFE_API_KEY;` at the top of `nginx.conf`.
 2. Point cosockets at a CA bundle, or every call to the provider fails TLS verification: `lua_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;` in `http {}`.
-3. Edit `/etc/nginx/jev-edge.conf.lua`. Leave `policy.mode = "monitor"`.
+3. Edit `/etc/nginx/jev-edge.conf.lua`. Write a `deployment_context` paragraph describing what your assistant does and does not do; without it Jev can only judge "is this an injection", not "is this a misuse of my service". Leave `policy.mode = "monitor"`.
 4. Add the three shared dicts and the `init` / `init_worker` blocks to `http {}`, then `access_by_lua_block` to the locations you want watched. The full example is [adapters/openresty/conf/example.nginx.conf](adapters/openresty/conf/example.nginx.conf).
 5. Reload nginx and check the provider from the box itself. This makes one real call and reports latency, the effective timeout and the breaker state:
 
@@ -121,7 +121,12 @@ location /v1/ {
 ```lua
 -- /etc/nginx/jev-edge.conf.lua
 return {
-  jev    = { provider = "jev", model = "jev-latest", timeout_ms = 300 },
+  jev    = { provider = "jev", model = "jev-latest",
+             -- One paragraph on what your assistant is for. The single most
+             -- important setting: see "Bench and acceptance".
+             deployment_context = "A support assistant for Acme's billing product. It answers "
+               .. "questions about invoices, plans and payments. It does not write code, "
+               .. "adopt personas or take on unrelated writing tasks." },
   rules  = { "llm-endpoints" },
   policy = { mode = "monitor", block_threshold = 0.85, suspect_threshold = 0.5 },
 }
@@ -278,7 +283,7 @@ To plug in your own backend, write those two functions and set `provider = "mine
 | `openai-compat` | `POST {endpoint}/chat/completions`, system = template, user = text, JSON-only output | `Authorization: Bearer` | vLLM, Ollama, any OpenAI-compatible endpoint |
 | `mock` | no network; fixed score, delay, failure rate from config | none | tests and bench |
 
-Each template is one TypeSafe **Noul** question (yes/no, returns a 0–1 probability). Several templates go in one request:
+Each template is one TypeSafe **Noul** question (yes/no, returns a 0–1 probability). Several templates go in one request. When `jev.deployment_context` (or `rule.deployment_context`) is set, the state becomes `{assistant, user_message}` and templates switch to their context form, which asks whether the message subverts *this* assistant rather than whether the text looks like an attack:
 
 ```json
 {
@@ -323,7 +328,7 @@ Triggered by an L2 timeout, a breaker skip, or a score in `[suspect, block)`. Ru
 
 1. Call Jev with a relaxed 5 s timeout.
 2. Write `fp:<hash>` so the next replay hits the cache.
-3. Update `rep:<ip>`; after `rep_block_after` (3) malicious verdicts, mark the IP blocked so L1 rejects it directly.
+3. Update `rep:<ip>`; if `rep_block_after` is set (default 0 = off), mark the IP blocked after that many malicious verdicts so L1 rejects it directly.
 4. On malicious, fire `on_alert` (error log by default, webhook configurable).
 
 A shared-dict counter caps in-flight timers at `max_async` (32). Beyond that, work is dropped and counted, never queued.
@@ -370,7 +375,7 @@ Dependencies: OpenResty ≥ 1.21, lua-resty-http ≥ 0.17, bundled lua-cjson.
 
 ### Observability
 
-`log_by_lua` writes one JSON line into `$jev_log`:
+`log_by_lua` writes one JSON object into `$jev_log`. Log it with `log_format jev escape=none '$jev_log';` so it stays valid JSON (`escape=json` would double-escape it):
 
 ```json
 {"rid":"…","path":"/v1/chat","ip":"1.2.3.4","src":"l2","score":0.91,"verdict":"malicious","action":"block","l2_ms":184,"fp":"a1b2c3"}
@@ -398,13 +403,20 @@ Two reproducible benches, neither needs an API key. `make bench-offline` replays
 | Metric | v0.1 target | Measured |
 |---|---|---|
 | P99 added to L1-passed traffic | ≤ 1 ms | 24 µs |
-| False-positive rate (enforce, block ≥ 0.85) | ≤ 0.1% | 0.0% |
-| Miss rate vs Jev alone | ≤ baseline + 2 pt | +0.8 pt |
+| False-positive rate (enforce) | ≤ 0.1% | 0.0% at block ≥ 0.70 with a deployment context |
+| Miss rate vs Jev alone | ≤ oracle + 2 pt | +1.2 pt |
 | Replay cache hit rate | ≥ 80% | 74% |
 | Pass rate with Jev fully down | 100% | 100% |
-| Normal traffic sent to L2 | ≤ 2% site-wide | not measurable on a chat-only dataset |
+| Soak, 4 workers, 12.3 M requests | no crash, flat memory | 0 crashes, RSS plateau at 48 MB |
 
-Thresholds matter more than anything jev-edge does: at block ≥ 0.85 Jev alone misses 22% of this dataset's attacks with zero false positives; at 0.50 it misses 5% with 2.5% false positives. Pick yours from your own labelled traffic.
+Live accuracy on deepset/prompt-injections with `jev-latest`, same 662 texts:
+
+| what Jev saw | AUC | FP / miss at 0.50 | FP / miss at 0.85 |
+|---|---|---|---|
+| text only | 0.983 | 0.0% / 37.3% | 0.0% / 58.6% |
+| text + `deployment_context` | **0.996** | 0.8% / 5.3% | 0.0% / 28.1% |
+
+The dataset's "attacks" include off-purpose requests such as "generate C++", because it was collected for a news assistant. Without a deployment description Jev cannot know that, and scores them as harmless. **Write the `deployment_context`.** Then pick a threshold from your own labelled traffic; the shipped 0.85 is conservative.
 
 ### Decisions
 
@@ -415,6 +427,8 @@ Settled unless a PR argues otherwise with bench data.
 3. **Names:** repository `jev-edge`, OpenResty package `lua-resty-jev-edge`, Lua module prefix `resty.jev`.
 4. **Envoy is supported both ways with the same code.** Verdicts are flat (strings, numbers, booleans; no nesting, no nil holes) so they map losslessly to JSON and protobuf. v0.2 adds a `/_jev/authz` location so the OpenResty adapter doubles as an Envoy **HTTP ext_authz** service at no extra logic. A thin Go/Rust shim can later expose **gRPC ext_authz** by forwarding to that location. Cloudflare Workers cannot run Lua and are the one adapter that reimplements core in JS, which is why core stays small.
 5. **L1 patterns are PCRE**, matched through injected `ctx.re_find`. Lua patterns lack alternation and do not port to the other adapters.
+6. **Reputation blocking is opt-in** (`async.rep_block_after = 0` by default). One carrier or office NAT address can hide thousands of users; L3 still records reputation and alerts, it just does not block until you turn it on.
+7. **Deployment context is the calibration lever, not the threshold.** Measured: AUC 0.983 → 0.996 on the same texts and model.
 
 ---
 
@@ -423,9 +437,10 @@ Settled unless a PR argues otherwise with bench data.
 ```
 core/            judgment logic, templates, policy, breaker — no ngx.*; busted specs in core/spec
 adapters/
-  openresty/     access_by_lua glue, providers/, shared-dict cache, config API   (M2)
-  cloudflare/    Worker middleware                                               (v0.2+)
-  envoy/         ext_authz                                                       (v0.2+)
+  openresty/     access_by_lua glue, providers/, shared-dict cache, config API
+    authz/       /_jev/authz location + gateway examples: Envoy ext_authz,
+                 Caddy forward_auth, Traefik ForwardAuth, nginx auth_request  (v0.2.0)
+  cloudflare/    Worker middleware                                             (v0.2.0)
 rules/           L1 rule sets
 bench/           offline accuracy bench, Docker latency bench, report
 ```
@@ -450,8 +465,8 @@ make test-openresty
 | M4 ✅ | hot reload, `/_jev/config`, `/_jev/metrics`, structured log |
 | M5 ✅ | offline accuracy bench on recorded Jev answers, Docker latency bench, [report](bench/report.md) |
 | M6 ✅ | v0.1.0: `make install`, opm package, install docs |
-| 0.1.1 | live-verified `jev` provider, adaptive timeout with ceiling, `/_jev/health`, `make live-check` |
-| v0.2 | `/_jev/authz` for Envoy HTTP ext_authz; Cloudflare Worker |
+| 0.1.1 | live-verified providers, adaptive timeout with ceiling, `/_jev/health`, `deployment_context`, soak + full live bench |
+| v0.2.0 | `/_jev/authz`: one forward-auth endpoint that serves Envoy HTTP ext_authz, Caddy `forward_auth`, Traefik ForwardAuth and nginx `auth_request` (body source abstracted, since only Envoy forwards it); config examples for each; Cloudflare Worker |
 
 ## Contributing
 

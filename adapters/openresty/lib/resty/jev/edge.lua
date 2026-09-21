@@ -88,11 +88,22 @@ local function build_req(rules)
       local file = ngx.req.get_body_file()
       if file then
         local f = io.open(file, "rb")
-        if f then body = f:read("*a"); f:close() end
+        if f then
+          -- read at most max+1 bytes: a chunked body has no Content-Length, so
+          -- the size gate above could not see it; do not slurp it whole.
+          body = f:read(max + 1)
+          f:close()
+        end
       end
     end
-    req.body = body
-    if body then req.body_size = #body end
+    if body then
+      req.body_size = #body
+      if #body > max then
+        req.body = nil   -- rules see body_size > max and pass ("body too large")
+      else
+        req.body = body
+      end
+    end
   end
   return req
 end

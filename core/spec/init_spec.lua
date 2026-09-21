@@ -100,6 +100,19 @@ describe("core.evaluate end to end", function()
     assert.is_true(math.abs(v.l2_ms - 200) < 0.001)
   end)
 
+  it("passes the deployment context to the judge", function()
+    local seen
+    local ctx = H.ctx({ config = { jev = { deployment_context = "A news assistant" } },
+      judge = { call = function(p) seen = p.context.deployment; return { injection = 0 } end } })
+    core.evaluate(H.chat_req(LONG), ctx)
+    assert.equals("A news assistant", seen)
+    ctx.rules[1].deployment_context = "Rule-level wins"
+    ctx.cache = H.store()
+    core.evaluate(H.chat_req(LONG), ctx)
+    assert.equals("Rule-level wins", seen)
+    ctx.rules[1].deployment_context = nil
+  end)
+
   it("fails open when the rule names unknown templates", function()
     local ctx = H.ctx()
     ctx.rules = { {

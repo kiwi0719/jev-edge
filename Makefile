@@ -37,6 +37,25 @@ live-check:
 	  'resty --http-conf "lua_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt; lua_ssl_verify_depth 5;" \
 	   -I /work/adapters/openresty/lib -I /work /work/bench/live.lua $${N:-60}'
 
+# Every dataset sample through the live provider with both templates; writes
+# bench/datasets/live-<model>[-ctx].json. ~340k input tokens bare, ~400k with
+# JEV_DEPLOYMENT_CONTEXT set in the environment.
+live-full:
+	docker run --rm --env-file .env -e JEV_DEPLOYMENT_CONTEXT -v "$$(PWD)":/work jev-edge-test sh -c \
+	  'resty --http-conf "lua_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt; lua_ssl_verify_depth 5;" \
+	   -I /work/adapters/openresty/lib -I /work /work/bench/live_full.lua'
+
+# openai-compat provider against an Ollama container on the jev-net network:
+#   docker network create jev-net; docker run -d --rm --name ollama --network jev-net ollama/ollama
+#   docker exec ollama ollama pull qwen2.5:0.5b
+live-openai:
+	docker run --rm --network jev-net -v "$$(PWD)":/work jev-edge-test \
+	  resty -I /work/adapters/openresty/lib -I /work /work/bench/live_openai.lua $${N:-20}
+
+# 4 workers, tiny dicts, low caps, slow flaky mock: limits, drops, memory, crashes.
+soak:
+	docker run --rm --init -e DUR=$${DUR:-60s} -v "$$(PWD)":/work jev-edge-test sh /work/bench/soak.sh
+
 # ---------------------------------------------------------------------------
 # Packaging. The opm tarball and `make install` both flatten the tree into a
 # single lib/ so `require "jev.core"` resolves without the loader shim:

@@ -171,13 +171,13 @@ flowchart LR
     L3 -.->|无截止| jev
     L3 --> rep[信誉 / 告警]
 
-    classDef cheap fill:#dbe9fa,stroke:#2a78d6,color:#0d366b
-    classDef judge fill:#fde3d8,stroke:#eb6834,color:#7a2e10
-    classDef ext fill:#eef1f4,stroke:#8b949e,color:#24292f,stroke-dasharray:3 2
+    classDef cheap fill:#2a78d6,stroke:#1a5cb0,color:#ffffff
+    classDef judge fill:#e8632c,stroke:#b84a1a,color:#ffffff
+    classDef ext fill:#6e7781,stroke:#57606a,color:#ffffff,stroke-dasharray:3 2
     class L1,cache cheap
     class L2,L3,policy judge
     class client,up,deny,jev,rep ext
-    style edge fill:transparent,stroke:#8b949e
+    style edge fill:transparent,stroke:#8b949e,color:#8b949e
 ```
 
 **决策原则:** 每一层只能让请求变得*更*可疑,或者放行。任何一层出错都降级为放行,并记录 `X-Jev-Verdict: error`。
@@ -423,9 +423,10 @@ jev_async_dropped_total
 ```
 core/            判定逻辑、模板、策略、熔断器 — 不含 ngx.*;busted 用例在 core/spec
 adapters/
-  openresty/     access_by_lua 胶水、providers/、共享字典缓存、配置 API   (M2)
-  cloudflare/    Worker 中间件                                             (v0.2+)
-  envoy/         ext_authz                                                 (v0.2+)
+  openresty/     access_by_lua 胶水、providers/、共享字典缓存、配置 API
+    authz/       /_jev/authz location 与各网关示例:Envoy ext_authz、
+                 Caddy forward_auth、Traefik ForwardAuth、nginx auth_request  (v0.2.0)
+  cloudflare/    Worker 中间件                                             (v0.2.0)
 rules/           L1 规则集
 bench/           离线准确率基准、Docker 延迟基准、报告
 ```
@@ -451,7 +452,7 @@ make test-openresty
 | M5 ✅ | 基于记录的 Jev 答案的离线准确率基准、Docker 延迟基准、[报告](bench/report.md) |
 | M6 ✅ | v0.1.0:`make install`、opm 包、安装文档 |
 | 0.1.1 | 在线验证的 `jev` provider、带上限的自适应超时、`/_jev/health`、`make live-check` |
-| v0.2 | 用于 Envoy HTTP ext_authz 的 `/_jev/authz`;Cloudflare Worker |
+| v0.2.0 | `/_jev/authz`:一个 forward-auth 端点同时兼容 Envoy HTTP ext_authz、Caddy `forward_auth`、Traefik ForwardAuth 和 nginx `auth_request`(请求体来源抽象化,因为只有 Envoy 会转发 body);各家配置示例;Cloudflare Worker |
 
 ## 贡献
 

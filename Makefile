@@ -1,4 +1,4 @@
-.PHONY: test lint check luajit-check test-openresty
+.PHONY: test lint check luajit-check test-openresty bench bench-offline
 
 test:
 	busted
@@ -18,3 +18,10 @@ check: lint luajit-check test
 test-openresty:
 	docker build -q -t jev-edge-test -f adapters/openresty/Dockerfile.test adapters/openresty
 	docker run --rm --init -v "$$(PWD)":/work jev-edge-test
+
+bench-offline:
+	lua bench/offline.lua
+
+bench:
+	docker build -q -t jev-edge-test -f adapters/openresty/Dockerfile.test adapters/openresty
+	docker run --rm --init -v "$$(PWD)":/work jev-edge-test sh /work/bench/run.sh

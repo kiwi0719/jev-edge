@@ -9,9 +9,18 @@
 
 local _M = { name = "mock", local_only = true }
 
-function _M.call(prompt, cfg)
+-- Emulates the HTTP client's hard timeout: a delay longer than timeout_ms
+-- sleeps for timeout_ms and then fails, exactly like a read timeout would.
+function _M.call(prompt, cfg, timeout_ms)
   local delay = tonumber(cfg.mock_delay_ms) or 0
-  if delay > 0 then ngx.sleep(delay / 1000) end
+  local limit = tonumber(timeout_ms) or math.huge
+  if delay > 0 then
+    if delay > limit then
+      ngx.sleep(limit / 1000)
+      return nil, "timeout (mock)"
+    end
+    ngx.sleep(delay / 1000)
+  end
 
   local ratio = tonumber(cfg.mock_fail_ratio) or 0
   if ratio > 0 and math.random() < ratio then

@@ -7,11 +7,21 @@ All notable changes to this project are recorded here. The format follows
 ## [Unreleased]
 
 ### Changed
+- `mock` provider emulates the HTTP hard timeout so slow-Jev scenarios trip
+  the breaker like the real client would.
+- `edge.access` no longer JSON-encodes config on every request to detect
+  changes; it compares table identity (p50 on the unwatched path 153 → 111 µs
+  under saturation).
 - L1 `always_suspect` patterns are PCRE, matched through an injected
   `ctx.re_find`, so one rule file serves every adapter. Missing matcher
   disables the prefilter with a single warning (fail-open).
 
 ### Added
+- Bench (`bench/`): offline accuracy evaluation replaying jev-sec-bench's
+  recorded Jev probabilities (deepset/prompt-injections) through L1 and the
+  policy, replay-cache measurement, core latency microbench; Docker
+  end-to-end latency bench with wrk over baseline / unwatched / healthy /
+  slow / dead scenarios. `bench/report.md` holds the numbers.
 - OpenResty adapter (`adapters/openresty`): `resty.jev.edge` with init /
   init_worker / access / log / config_api / metrics; providers `jev`
   (TypeSafe System One), `openai-compat` and `mock`; shared-dict cache,

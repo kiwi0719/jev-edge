@@ -30,7 +30,7 @@ function _M.new(cfg, inflight, metrics)
 
   function self.call(prompt, timeout_ms)
     if provider.local_only then
-      return provider.call(prompt, cfg)
+      return provider.call(prompt, cfg, timeout_ms)
     end
     if not http_ok then
       return nil, "lua-resty-http not installed"

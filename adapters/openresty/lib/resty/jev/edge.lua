@@ -21,7 +21,7 @@ local _M = { _VERSION = core._VERSION }
 local CACHE_DICT = "jev_cache"
 local HEADER_NAMES = { "X-Jev-Verdict", "X-Jev-Score", "X-Jev-Source", "X-Jev-Reason", "X-Jev-Request-Id" }
 
-local cache, breaker, judge, judge_cfg_id
+local cache, breaker, judge, judge_cfg
 
 -- ---------------------------------------------------------------------------
 
@@ -40,11 +40,11 @@ function _M.init_worker()
   if not ok then ngx.log(ngx.ERR, "jev-edge: cannot start reload timer: ", err) end
 end
 
--- Judge and breaker are rebuilt whenever the jev config section changes.
+-- Judge and breaker are rebuilt whenever config is rebuilt (config.current()
+-- returns a fresh table only on reload, so identity is a cheap change check).
 local function ensure_runtime(cfg)
   if not cache then cache = cache_m.new(CACHE_DICT) end
-  local id = cjson.encode(cfg.jev) .. cjson.encode(cfg.breaker)
-  if id ~= judge_cfg_id then
+  if cfg ~= judge_cfg then
     local j, err = http.new(cfg.jev, cache, metrics.usage)
     if not j then
       ngx.log(ngx.ERR, "jev-edge: ", err)
@@ -53,7 +53,7 @@ local function ensure_runtime(cfg)
       judge = j
     end
     breaker = breaker_m.new(cache, ngx.now, cfg.breaker)
-    judge_cfg_id = id
+    judge_cfg = cfg
   end
 end
 

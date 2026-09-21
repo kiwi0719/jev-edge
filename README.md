@@ -340,16 +340,18 @@ jev_async_dropped_total
 
 ### Bench and acceptance
 
-Datasets: `normal` (anonymized real chat traffic plus synthetic), `injection` (from jev-sec-bench), `replay` (five variants per injection sample: digits, whitespace, case). Three scenarios: healthy Jev, slow Jev (500 ms), dead Jev. Driven by wrk against local OpenResty with the `mock` provider.
+Two reproducible benches, neither needs an API key. `make bench-offline` replays the Jev probabilities that [jev-sec-bench](https://github.com/Gaurav-Gosain/jev-sec-bench) recorded on deepset/prompt-injections (662 samples) through L1 and the policy thresholds. `make bench` drives OpenResty in Docker with the `mock` provider through five scenarios: baseline, unwatched path, healthy / slow / dead Jev. Full numbers and caveats are in [bench/report.md](bench/report.md).
 
-| Metric | v0.1 target |
-|---|---|
-| P99 added to L1-passed normal traffic | ≤ 1 ms |
-| Normal traffic sent to L2 | ≤ 2% |
-| False-positive rate (enforce, normal set) | ≤ 0.1% |
-| Miss rate (injection set) | ≤ jev-sec-bench baseline + 2% |
-| Cache hit rate (replay set) | ≥ 80% |
-| Pass rate with Jev fully down | 100% |
+| Metric | v0.1 target | Measured |
+|---|---|---|
+| P99 added to L1-passed traffic | ≤ 1 ms | 24 µs |
+| False-positive rate (enforce, block ≥ 0.85) | ≤ 0.1% | 0.0% |
+| Miss rate vs Jev alone | ≤ baseline + 2 pt | +0.8 pt |
+| Replay cache hit rate | ≥ 80% | 74% |
+| Pass rate with Jev fully down | 100% | 100% |
+| Normal traffic sent to L2 | ≤ 2% site-wide | not measurable on a chat-only dataset |
+
+Thresholds matter more than anything jev-edge does: at block ≥ 0.85 Jev alone misses 22% of this dataset's attacks with zero false positives; at 0.50 it misses 5% with 2.5% false positives. Pick yours from your own labelled traffic.
 
 ### Decisions
 
@@ -372,7 +374,7 @@ adapters/
   cloudflare/    Worker middleware                                               (v0.2+)
   envoy/         ext_authz                                                       (v0.2+)
 rules/           L1 rule sets
-bench/           datasets, runner, report                                        (M5)
+bench/           offline accuracy bench, Docker latency bench, report
 ```
 
 Local development needs `luarocks install busted dkjson lrexlib-pcre2 luacheck`, `luajit` on PATH and Docker for the integration suite:
@@ -393,7 +395,7 @@ make test-openresty
 | M2 ✅ | OpenResty access path, three providers, headers, fail-open; one nginx.conf runs end to end |
 | M3 ✅ | shared-dict cache, breaker wiring, L3 timer; Jev outage is invisible to users |
 | M4 ✅ | hot reload, `/_jev/config`, `/_jev/metrics`, structured log |
-| M5 | bench datasets, three scenarios, report against the targets above |
+| M5 ✅ | offline accuracy bench on recorded Jev answers, Docker latency bench, [report](bench/report.md) |
 | M6 | v0.1.0 on opm as `lua-resty-jev-edge` |
 | v0.2 | `/_jev/authz` for Envoy HTTP ext_authz; Cloudflare Worker |
 

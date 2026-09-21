@@ -16,7 +16,7 @@ local async     = require "resty.jev.async"
 local metrics   = require "resty.jev.metrics"
 local cjson     = require "cjson.safe"
 
-local _M = { _VERSION = "0.1.1" }
+local _M = { _VERSION = "0.2.0" }
 
 local CACHE_DICT = "jev_cache"
 local HEADER_NAMES = { "X-Jev-Verdict", "X-Jev-Score", "X-Jev-Source", "X-Jev-Reason", "X-Jev-Request-Id" }

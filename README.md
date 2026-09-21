@@ -3,7 +3,7 @@
 **English** | [简体中文](README.zh-CN.md)
 
 [![CI](https://github.com/kiwi0719/jev-edge/actions/workflows/ci.yml/badge.svg)](https://github.com/kiwi0719/jev-edge/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![opm](https://img.shields.io/badge/opm-lua--resty--jev--edge-orange.svg)](https://opm.openresty.org/package/kiwi0719/lua-resty-jev-edge/)
 [![OpenResty](https://img.shields.io/badge/OpenResty-1.21%2B-brightgreen.svg)](https://openresty.org)
 [![Release](https://img.shields.io/github/v/tag/kiwi0719/jev-edge?label=release)](https://github.com/kiwi0719/jev-edge/tags)
@@ -18,7 +18,7 @@ It is built for SREs and platform engineers, not agent authors. Existing Jev gua
 
 > **Independent project.** jev-edge is not affiliated with or endorsed by TypeSafe AI. It is a client of their API, the way a Prometheus exporter is a client of the thing it scrapes.
 >
-> **Status:** 0.2.x in progress: Envoy (HTTP and gRPC ext_authz), Traefik, Caddy and plain nginx (forward-auth) are supported and end-to-end tested against the real gateways. Core and the OpenResty adapter are tested end to end (68 unit specs, 61 integration assertions, two benches). Both providers are verified live: `jev` against the TypeSafe API on the full 662-sample dataset, `openai-compat` against an Ollama container. Not production-tested; run in `monitor` mode first.
+> **Status:** v0.2.0. OpenResty natively; Envoy (HTTP and gRPC ext_authz), Traefik, Caddy and plain nginx (forward-auth) through the same engine, each end-to-end tested against the real gateway. 78 unit specs, 202 integration assertions, two benches. Both providers are verified live: `jev` against the TypeSafe API on the full 662-sample dataset, `openai-compat` against an Ollama container. Not production-tested; run in `monitor` mode first.
 
 ## Contents
 
@@ -543,8 +543,7 @@ make test-openresty
 | M5 ✅ | offline accuracy bench on recorded Jev answers, Docker latency bench, [report](bench/report.md) |
 | M6 ✅ | v0.1.0: `make install`, opm package, install docs |
 | 0.1.1 ✅ | live-verified providers, adaptive timeout with ceiling, `/_jev/health`, `deployment_context`, soak + full live bench |
-| 0.2.0 ✅ | Envoy: `/_jev/authz` HTTP ext_authz, `grpc-shim` gRPC ext_authz, Docker Compose e2e against real Envoy (release pending) |
-| 0.2.1 ✅ | `/_jev/forward-auth` for Traefik ForwardAuth (body forwarded, full verdicts), Caddy `forward_auth` and nginx `auth_request` (headers only: path, method, reputation); e2e against all three (release pending) |
+| 0.2.0 ✅ | Gateways beyond OpenResty, same engine: Envoy HTTP ext_authz (`/_jev/authz`) and gRPC ext_authz (`grpc-shim`); `/_jev/forward-auth` for Traefik ForwardAuth (body forwarded, full verdicts), Caddy `forward_auth` and nginx `auth_request` (headers only: path, method, reputation). Docker Compose e2e against every real gateway. License moved to Apache 2.0. |
 | 0.3.0 | Cloudflare Worker: core reimplemented in TypeScript against shared golden test vectors exported from the busted suite; cache via Cache API, breaker and adaptive state via KV or a Durable Object |
 | later | Golden vectors published as a versioned file so any adapter can prove parity; `abuse` template gets its own dataset; multi-tenant `deployment_context` per route |
 
@@ -554,4 +553,4 @@ Issues and PRs are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md). Read the [De
 
 ## License
 
-[MIT](LICENSE). Independent project; see the note at the top.
+[Apache 2.0](LICENSE). Independent project; see the note at the top.

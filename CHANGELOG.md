@@ -6,6 +6,8 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-22
+
 ### Added
 - Generic forward-auth endpoint `resty.jev.edge.forward_auth()` for Traefik
   ForwardAuth, Caddy `forward_auth` and nginx `auth_request`. Original
@@ -28,6 +30,7 @@ All notable changes to this project are recorded here. The format follows
 - Test::Nginx `04-authz.t`.
 
 ### Changed
+- License changed from MIT to Apache 2.0.
 - L1 checks IP reputation right after the path match, before method,
   content-type and body gates, so headers-only forward-auth requests from a
   blocked IP are denied. A watched request without a body now passes with

@@ -3,7 +3,7 @@
 [English](README.md) | **简体中文**
 
 [![CI](https://github.com/kiwi0719/jev-edge/actions/workflows/ci.yml/badge.svg)](https://github.com/kiwi0719/jev-edge/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![opm](https://img.shields.io/badge/opm-lua--resty--jev--edge-orange.svg)](https://opm.openresty.org/package/kiwi0719/lua-resty-jev-edge/)
 [![OpenResty](https://img.shields.io/badge/OpenResty-1.21%2B-brightgreen.svg)](https://openresty.org)
 [![Release](https://img.shields.io/github/v/tag/kiwi0719/jev-edge?label=release)](https://github.com/kiwi0719/jev-edge/tags)
@@ -18,7 +18,7 @@ jev-edge 跑在 nginx / OpenResty 里，或者挂在 Envoy（ext_authz）、Trae
 
 > **独立项目。** jev-edge 与 TypeSafe AI 没有关联，也未获其背书。它只是 TypeSafe API 的一个客户端，就像 Prometheus exporter 是被采集对象的客户端一样。
 >
-> **状态：** 0.2.x 进行中：Envoy（HTTP 和 gRPC ext_authz）、Traefik、Caddy 和普通 nginx（forward-auth）均已支持，并对真实网关做了端到端测试。core 和 OpenResty adapter 有完整测试（76 个单元 spec、187 个集成断言、两套 bench）。两个 provider 都经过真实联调：`jev` 在 662 条样本的完整数据集上打过 TypeSafe API，`openai-compat` 打过 Ollama 容器。尚未经过生产验证，请先用 `monitor` 模式。
+> **状态：** v0.2.0。OpenResty 原生接入；Envoy（HTTP 和 gRPC ext_authz）、Traefik、Caddy 和普通 nginx（forward-auth）共用同一套引擎，各自对真实网关做了端到端测试。78 个单元 spec、202 个集成断言、两套 bench。两个 provider 都经过真实联调：`jev` 在 662 条样本的完整数据集上打过 TypeSafe API，`openai-compat` 打过 Ollama 容器。尚未经过生产验证，请先用 `monitor` 模式。
 
 ## 目录
 
@@ -543,8 +543,7 @@ make test-openresty
 | M5 ✅ | 基于记录的 Jev 答案的离线准确率 bench、Docker 延迟 bench、[报告](bench/report.md) |
 | M6 ✅ | v0.1.0：`make install`、opm 包、安装文档 |
 | 0.1.1 ✅ | provider 真实联调、带上限的自适应超时、`/_jev/health`、`deployment_context`、soak 和全量 live bench |
-| 0.2.0 ✅ | Envoy：`/_jev/authz` HTTP ext_authz、`grpc-shim` gRPC ext_authz、对真实 Envoy 的 Docker Compose 端到端（待发版） |
-| 0.2.1 ✅ | `/_jev/forward-auth`：Traefik ForwardAuth（转发 body，完整判定）、Caddy `forward_auth` 和 nginx `auth_request`（只有头：路径、方法、信誉）；对三者的真实端到端（待发版） |
+| 0.2.0 ✅ | OpenResty 之外的网关，同一套引擎：Envoy HTTP ext_authz（`/_jev/authz`）和 gRPC ext_authz（`grpc-shim`）；`/_jev/forward-auth` 服务 Traefik ForwardAuth（转发 body，完整判定）、Caddy `forward_auth` 和 nginx `auth_request`（只有头：路径、方法、信誉）。对每个真实网关的 Docker Compose 端到端。许可证改为 Apache 2.0。 |
 | 0.3.0 | Cloudflare Worker：用 TypeScript 按 busted 导出的共享 golden 测试向量重写 core；缓存走 Cache API，熔断和自适应状态走 KV 或 Durable Object |
 | 之后 | golden 向量作为带版本的文件发布，任何 adapter 都能证明一致性；`abuse` 模板拥有自己的数据集；按路由的多租户 `deployment_context` |
 
@@ -554,4 +553,4 @@ make test-openresty
 
 ## 许可证
 
-[MIT](LICENSE)。独立项目，见顶部说明。
+[Apache 2.0](LICENSE)。独立项目，见顶部说明。

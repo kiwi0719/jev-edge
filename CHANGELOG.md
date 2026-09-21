@@ -13,8 +13,8 @@ All notable changes to this project are recorded here. The format follows
 
 ### Added
 - M1 core skeleton: `core/` (normalize, rules, judge, policy, breaker, verdict,
-  defaults, init) with 63 busted specs; bundled `injection` and `abuse`
+  defaults, init) with 68 busted specs; bundled `injection` and `abuse`
   templates; `rules/llm-endpoints.lua` and `rules/default.lua`.
-- Design document (`DESIGN.md`) covering the three-layer filter, provider
+- Design section in `README.md` covering the three-layer filter, provider
   abstraction, cache, breaker, header protocol, hot reload and bench plan.
 - Repository scaffolding: license, lint config, changelog.

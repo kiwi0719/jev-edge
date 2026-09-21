@@ -24,7 +24,7 @@
 
 | Label | Meaning |
 |---|---|
-| `bug` | behaviour differs from DESIGN.md |
+| `bug` | behaviour differs from the README design section |
 | `false-positive` | legitimate traffic judged suspicious / blocked |
 | `miss` | attack traffic judged safe |
 | `fail-open` | anything touching outage behaviour; reviewed with extra care |

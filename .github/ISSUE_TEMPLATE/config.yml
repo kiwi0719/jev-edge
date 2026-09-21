@@ -1,5 +1,5 @@
 blank_issues_enabled: true
 contact_links:
   - name: Design discussion
-    url: https://github.com/kiwi0719/jev-edge/blob/main/DESIGN.md
+    url: https://github.com/kiwi0719/jev-edge/blob/main/README.md#design
     about: Read the design doc first; open an issue to challenge a recorded decision with bench data.

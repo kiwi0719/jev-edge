@@ -1,5 +1,5 @@
 name: Bug report
-description: Something behaves differently from DESIGN.md or the README
+description: Something behaves differently from the README design section
 labels: ["bug"]
 body:
   - type: input

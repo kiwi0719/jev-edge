@@ -13,7 +13,8 @@ return {
   text_fields = { "messages[*].content", "prompt", "input", "query", "text" },
   min_text_chars = 20,
   always_suspect = {
-    [[\b(ignore|disregard|forget)\b.{0,20}\b(previous|prior|above|earlier|all)\b.{0,20}\b(instructions?|rules?|prompts?)\b]],
+    [[\b(ignore|disregard|forget)\b.{0,20}\b(previous|prior|above|earlier|all)\b]]
+      .. [[.{0,20}\b(instructions?|rules?|prompts?)\b]],
     [[\byou are now\b]],
     [[\b(system|hidden|secret|initial)\s+prompt\b]],
     [[<\|?(system|im_start)\|?>]],

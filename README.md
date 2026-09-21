@@ -16,12 +16,16 @@ jev-edge sits in nginx / OpenResty (Envoy and Cloudflare adapters planned) and a
 
 It is built for SREs and platform engineers, not agent authors. Existing Jev guards run on the developer's machine and judge what an AI is about to do. jev-edge runs at the gateway and judges what the outside world is about to do.
 
+> **Independent project.** jev-edge is not affiliated with or endorsed by TypeSafe AI. It is a client of their API, the way a Prometheus exporter is a client of the thing it scrapes.
+>
 > **Status:** v0.2.0 in progress: Envoy supported through HTTP and gRPC ext_authz, end-to-end tested against real Envoy. Core and the OpenResty adapter are tested end to end (68 unit specs, 61 integration assertions, two benches). Both providers are verified live: `jev` against the TypeSafe API on the full 662-sample dataset, `openai-compat` against an Ollama container. Not production-tested; run in `monitor` mode first.
 
 ## Contents
 
 - [How it works](#how-it-works)
 - [Install](#install)
+- [Writing the deployment context](#writing-the-deployment-context)
+- [What it costs](#what-it-costs)
 - [Quick look](#quick-look)
 - [Design](#design)
   - [Scope](#scope)
@@ -83,7 +87,7 @@ git clone https://github.com/kiwi0719/jev-edge && cd jev-edge && sudo make insta
 
 1. Put your TypeSafe key in the environment nginx starts with and declare it: `env TYPESAFE_API_KEY;` at the top of `nginx.conf`.
 2. Point cosockets at a CA bundle, or every call to the provider fails TLS verification: `lua_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;` in `http {}`.
-3. Edit `/etc/nginx/jev-edge.conf.lua`. Write a `deployment_context` paragraph describing what your assistant does and does not do; without it Jev can only judge "is this an injection", not "is this a misuse of my service". Leave `policy.mode = "monitor"`.
+3. Edit `/etc/nginx/jev-edge.conf.lua`. Write the `deployment_context`; see [the next section](#writing-the-deployment-context), it is the setting that decides your accuracy. Leave `policy.mode = "monitor"`.
 4. Add the three shared dicts and the `init` / `init_worker` blocks to `http {}`, then `access_by_lua_block` to the locations you want watched. The full example is [adapters/openresty/conf/example.nginx.conf](adapters/openresty/conf/example.nginx.conf).
 5. Reload nginx and check the provider from the box itself. This makes one real call and reports latency, the effective timeout and the breaker state:
 
@@ -105,6 +109,62 @@ curl -X PUT localhost:8080/_jev/config -d '{"policy":{"mode":"enforce"}}'
 ```
 
 Rollback is the same call with `"monitor"`, or `DELETE /_jev/config` to drop every runtime override.
+
+## Writing the deployment context
+
+`jev.deployment_context` is one paragraph that tells Jev what your assistant is *for*. With it, the question Jev answers changes from "does this text look like an attack" to "is this message a misuse of *this* service". On the same 662 texts and the same model that moved AUC from 0.983 to 0.996 and cut the miss rate at threshold 0.5 from 37% to 5%. Nothing else in the config comes close.
+
+It fails when written too generally. "A helpful AI assistant" gives Jev no purpose to defend, so off-purpose requests score as harmless. Write it like a job description with a refusal list:
+
+- **What it does**, concretely: the product, the tasks, the audience.
+- **What it does not do**: the things a hijacked version would be asked for. Personas, unrelated writing, code, other companies' products, anything outside the product.
+- **Who talks to it**: customers, employees, anonymous web users. This sets what counts as normal.
+- Three to six sentences. Specific nouns beat adjectives. Do not write "be safe" or "refuse attacks"; Jev already knows what an attack is, it needs to know what *normal* is.
+
+Three shapes that work:
+
+```lua
+-- Customer support
+deployment_context = "A support assistant on Acme's billing website. It answers customers' "
+  .. "questions about invoices, subscription plans, refunds and payment methods, and "
+  .. "helps them find settings in their account. Users are Acme customers, often "
+  .. "frustrated. It does not write code, adopt personas, discuss other companies' "
+  .. "products, or produce essays, stories or marketing copy on request."
+
+-- Code assistant
+deployment_context = "A coding assistant inside Acme's IDE plugin. It explains, writes, "
+  .. "reviews and refactors code in the user's open project, in any language, and "
+  .. "answers programming questions. Users are software developers. It does not "
+  .. "reveal its own configuration, roleplay, give legal or medical advice, or "
+  .. "generate content unrelated to software."
+
+-- Internal knowledge base
+deployment_context = "An internal Q&A assistant over Acme's employee handbook, IT and HR "
+  .. "policies and engineering runbooks. It answers with citations to those documents. "
+  .. "Users are authenticated Acme employees. It does not answer from outside the "
+  .. "documents, take on other roles, summarise or translate arbitrary pasted text, "
+  .. "or discuss individual employees' data."
+```
+
+Note what the code assistant example does: "write code" is normal there and abnormal for the other two. That is exactly the distinction only you can supply. Set it per rule (`rule.deployment_context`) when one gateway fronts several assistants.
+
+## What it costs
+
+Two numbers decide the bill: how much of your traffic reaches L2, and TypeSafe's input price. L1 passes everything that is not a watched path with a natural-language body, and the fingerprint cache absorbs replays, so on a whole site the L2 share is typically a few percent; on a pure chat endpoint it is most requests.
+
+Measured on the live runs (`make live-full`), one L2 call with the `injection` template is about 610 input tokens with a deployment context (513 without) and 39 output tokens. TypeSafe's published input price on 2026-09-22 was **$42 per billion input tokens**; no output price was listed, and at 39 tokens per call output is negligible at any plausible rate. Verify the current price at [typesafe.ai](https://typesafe.ai/) before you plan.
+
+```
+monthly cost ≈ QPS × L2 share × 2.63M s/month × 610 tokens × $42 / 1e9
+```
+
+| average QPS | 1% reaches L2 | 5% reaches L2 | 100% reaches L2 |
+|---|---|---|---|
+| 10 | $7 / month | $34 / month | $675 / month |
+| 100 | $67 / month | $337 / month | $6,750 / month |
+| 1,000 | $674 / month | $3,370 / month | $67,500 / month |
+
+`jev_tokens_total{direction="input"}` in `/_jev/metrics` gives you the real number after a day in `monitor` mode. Add the `abuse` template and the per-call token count rises slightly; the questions share one request. Longer user messages cost more: the 610 figure is for the deepset dataset's short prompts, and `rules.max_body_bytes` (64 KB) is the upper bound per call.
 
 ## Quick look
 
@@ -426,7 +486,7 @@ Live accuracy on deepset/prompt-injections with `jev-latest`, same 662 texts:
 | text only | 0.983 | 0.0% / 37.3% | 0.0% / 47.5% |
 | text + `deployment_context` | **0.996** | 0.8% / 5.3% | 0.0% / 13.3% |
 
-The dataset's "attacks" include off-purpose requests such as "generate C++", because it was collected for a news assistant. Without a deployment description Jev cannot know that, and scores them as harmless. **Write the `deployment_context`.** Then pick a threshold from your own labelled traffic. The shipped default is 0.70: zero false positives and 13% miss on this dataset with a context; 0.50 trades 0.8% false positives for a 5% miss.
+One dataset, 662 samples, one deployment, mostly German and English. Treat these as evidence that the pipeline preserves Jev's accuracy and that the deployment context matters, not as a rate you will see on your traffic; measure yours in `monitor` mode. The dataset's "attacks" include off-purpose requests such as "generate C++", because it was collected for a news assistant. Without a deployment description Jev cannot know that, and scores them as harmless. **Write the `deployment_context`.** Then pick a threshold from your own labelled traffic. The shipped default is 0.70: zero false positives and 13% miss on this dataset with a context; 0.50 trades 0.8% false positives for a 5% miss.
 
 ### Decisions
 
@@ -484,4 +544,4 @@ Issues and PRs are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md). Read the [De
 
 ## License
 
-[MIT](LICENSE). Not affiliated with or endorsed by TypeSafe AI.
+[MIT](LICENSE). Independent project; see the note at the top.

@@ -8,6 +8,7 @@ our $HttpConfig = qq{
     lua_shared_dict jev_cache   8m;
     lua_shared_dict jev_config  1m;
     lua_shared_dict jev_metrics 1m;
+    lua_shared_dict jev_subject 1m;
 
     init_by_lua_block {
         require("resty.jev.edge").init("$pwd/t/servroot/html/jev-edge.conf.lua")

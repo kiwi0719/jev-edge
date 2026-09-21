@@ -30,6 +30,11 @@ return {
   },
   cache   = { fp_ttl = 300, rep_ttl = 600, fp_prefix_bytes = 2048 },
   async   = { enabled = true, max_async = 32, rep_block_after = 0, rep_block_ttl = 600 },
+  -- Who a trajectory belongs to. Off by default. The raw header or cookie is a
+  -- credential: it is hashed with `salt` before it is stored or logged, so set
+  -- a per-deployment secret. Needs `lua_shared_dict jev_subject` in nginx.conf.
+  -- subject = { enabled = true, from = "header", name = "x-api-key", salt = os.getenv("JEV_SUBJECT_SALT"),
+  --             history_ttl = 3600, max_entries = 20 },
   -- Decision sampling for replay and labelling: a share of suspicious-and-up
   -- decisions with their normalized text (never the raw body), readable at
   -- /_jev/samples. Turn on during the monitor week, feed the labels to `make calibrate`.

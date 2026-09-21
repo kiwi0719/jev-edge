@@ -43,6 +43,23 @@ _M.config = {
     text_bytes  = 512,       -- normalized text kept per sample (never the raw body)
     log         = false,     -- also write each sample as one JSON line at INFO
   },
+  subject = {
+    -- Who is the subject of a trajectory. Off by default; "ip" needs nothing
+    -- else, "header" / "cookie" take `name`. The raw value is a credential
+    -- (API key, session id) and is never stored: adapters hash it with `salt`
+    -- before core, the store, the log or a sample ever see it. `hashed = true`
+    -- says the value already is a hash (a thin Worker forwarding X-Jev-Subject).
+    enabled      = false,
+    from         = "ip",       -- "ip" | "header" | "cookie"
+    name         = nil,        -- header or cookie name for "header" / "cookie"
+    salt         = nil,        -- per-deployment secret mixed into the hash; required unless hashed
+    hashed       = false,
+    history_ttl  = 3600,       -- seconds a subject's trajectory stays readable
+    max_entries  = 20,         -- entries kept per subject; older ones drop
+    -- Trajectories live in their own dict (`jev_subject`), sized by the
+    -- operator: a scraper with a million sessions can fill it, and when it
+    -- does only trajectories are evicted, never verdicts or trust.
+  },
   feedback = {
     -- False-positive loop: an operator marks a request "not an attack" and its
     -- fingerprint is trusted from then on. Off by default; turning it on means
@@ -107,6 +124,24 @@ function _M.validate(c)
   local mv = sm.min_verdict
   if mv ~= nil and mv ~= "safe" and mv ~= "suspicious" and mv ~= "malicious" then
     return nil, "sampling.min_verdict must be safe|suspicious|malicious"
+  end
+  local sj = c.subject or {}
+  if sj.from ~= nil and sj.from ~= "ip" and sj.from ~= "header" and sj.from ~= "cookie" then
+    return nil, "subject.from must be ip|header|cookie"
+  end
+  if sj.enabled == true then
+    if (sj.from == "header" or sj.from == "cookie") and (type(sj.name) ~= "string" or sj.name == "") then
+      return nil, "subject.from = " .. sj.from .. " needs subject.name"
+    end
+    if not sj.hashed and (type(sj.salt) ~= "string" or sj.salt == "") then
+      return nil, "subject.enabled needs subject.salt (or hashed = true)"
+    end
+  end
+  if sj.max_entries ~= nil and (type(sj.max_entries) ~= "number" or sj.max_entries < 1) then
+    return nil, "subject.max_entries must be >= 1"
+  end
+  if sj.history_ttl ~= nil and (type(sj.history_ttl) ~= "number" or sj.history_ttl <= 0) then
+    return nil, "subject.history_ttl must be > 0"
   end
   local fb = c.feedback or {}
   if fb.trust_ttl ~= nil and (type(fb.trust_ttl) ~= "number" or fb.trust_ttl <= 0) then

@@ -19,6 +19,73 @@
 import type { Verdict } from "./verdict";
 
 export const FORMAT = 1;
+export const KEY_PREFIX = "subj:";
+
+export interface SubjectConfig {
+  enabled?: boolean;
+  from?: "ip" | "header" | "cookie";
+  name?: string | null;
+  salt?: string | null;
+  hashed?: boolean;
+  history_ttl?: number;
+  max_entries?: number;
+}
+
+export interface RequestView {
+  ip?: string | null;
+  header?: (name: string) => string | null | undefined;
+  cookie?: (name: string) => string | null | undefined;
+}
+
+/** The raw subject value for this request, or null. Mirrors core/subject.lua extract(). */
+export function extract(scfg: SubjectConfig | undefined, view: RequestView): string | null {
+  if (!scfg?.enabled) return null;
+  const from = scfg.from ?? "ip";
+  let v: string | null | undefined;
+  if (from === "ip") v = view.ip;
+  else if (from === "header") v = view.header?.(scfg.name ?? "");
+  else if (from === "cookie") v = view.cookie?.(scfg.name ?? "");
+  if (typeof v !== "string") return null;
+  v = v.trim();
+  return v === "" ? null : v;
+}
+
+/** `<from>:<hash(salt \0 value)>`; the raw value never leaves this function. `hashed` means the value already is the complete id. */
+export async function hashId(scfg: SubjectConfig, value: string | null, hash: (s: string) => Promise<string> | string): Promise<string | null> {
+  if (value === null || value === undefined) return null;
+  if (scfg.hashed) return value;
+  if (typeof scfg.salt !== "string" || scfg.salt === "") return null;
+  return (scfg.from ?? "ip") + ":" + String(await hash(scfg.salt + "\0" + value));
+}
+
+/** SHA-256 hex over UTF-8 with the Web Crypto API (Workers, Node 18+, browsers). */
+export async function sha256Hex(s: string): Promise<string> {
+  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
+  return Array.from(new Uint8Array(buf), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+export function append(history: unknown, e: Entry, maxEntries = 20): Entry[] {
+  const out = Array.isArray(history) ? [...(history as Entry[])] : [];
+  out.push(e);
+  const max = Math.max(1, Number(maxEntries) || 20);
+  while (out.length > max) out.shift();
+  return out;
+}
+
+export function key(id: string): string {
+  return KEY_PREFIX + id;
+}
+
+/** Cookie header -> one cookie's value, or null. */
+export function cookieValue(header: string | null | undefined, name: string): string | null {
+  if (!header) return null;
+  for (const part of header.split(";")) {
+    const i = part.indexOf("=");
+    if (i < 0) continue;
+    if (part.slice(0, i).trim() === name) return part.slice(i + 1).trim();
+  }
+  return null;
+}
 
 /** One trajectory entry: flat, so it maps 1:1 onto JSON, a log line and a
  *  stored value, and can be replayed later as calibration input. Carries the

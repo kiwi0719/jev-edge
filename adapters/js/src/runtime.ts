@@ -6,6 +6,7 @@
 import * as core from "./core";
 import { resolve as resolveRule, type RuleSpec } from "./rules";
 import { shouldSample, buildSample, type Sample } from "./sampling";
+import * as subjectMod from "./core/subject";
 import { load as loadProvider, type Provider, type ProviderRequestInfo } from "./providers";
 import { kvStore, memoryStore, durableStore, type KVLike, type DOStubLike } from "./cf/stores";
 import { Adaptive } from "./cf/adaptive";
@@ -24,6 +25,8 @@ export interface Options {
   cache?: KVLike | Store;
   /** Durable Object stub (or any Store) for breaker + adaptive timeout. Memory (per isolate) if absent. */
   state?: DOStubLike | Store;
+  /** Store for per-subject trajectories (KV or memory). Memory (per isolate) if absent. Only used with config.subject.enabled. */
+  subjectStore?: KVLike | Store;
   /** Header carrying the client IP (Cloudflare sets cf-connecting-ip). */
   clientIpHeader?: string;
   /** Called once per judged request with the verdict; wire to console.log or an analytics binding. */
@@ -40,6 +43,7 @@ export interface Runtime {
   provider: Provider;
   cache: Store;
   state: Store;
+  subjectStore: Store;
   breaker: core.breaker.Breaker;
   adaptive: Adaptive;
   opts: Options;
@@ -61,9 +65,10 @@ export function createRuntime(opts: Options): Runtime {
   const clock = () => Date.now() / 1000;
   const cache: Store = isKV(opts.cache) ? kvStore(opts.cache) : (opts.cache as Store | undefined) ?? memoryStore(clock);
   const state: Store = isStub(opts.state) ? durableStore(opts.state) : (opts.state as Store | undefined) ?? memoryStore(clock);
+  const subjectStore: Store = isKV(opts.subjectStore) ? kvStore(opts.subjectStore, "jev:") : (opts.subjectStore as Store | undefined) ?? memoryStore(clock);
   const breaker = new core.breaker.Breaker(state, clock, config.breaker);
   const adaptive = new Adaptive(state, config.jev);
-  return { config, rules, provider, cache, state, breaker, adaptive, opts };
+  return { config, rules, provider, cache, state, subjectStore, breaker, adaptive, opts };
 }
 
 const HEADER_NAMES = ["X-Jev-Verdict", "X-Jev-Score", "X-Jev-Source", "X-Jev-Reason", "X-Jev-Request-Id"];
@@ -91,15 +96,43 @@ async function readReq(request: Request, rt: Runtime): Promise<[core.Req, Provid
   return [req, { method: request.method, path: url.pathname, headers: request.headers, body, clientIp }];
 }
 
+/** Subject context for this request, or undefined: hashed id, one history read, a sink that writes without being awaited. */
+async function subjectCtx(rt: Runtime, request: Request, clientIp: string): Promise<subjectMod.SubjectCtx | undefined> {
+  const scfg = rt.config.subject;
+  if (!scfg?.enabled) return undefined;
+  const raw = subjectMod.extract(scfg, {
+    ip: clientIp,
+    header: (n) => request.headers.get(n),
+    cookie: (n) => subjectMod.cookieValue(request.headers.get("cookie"), n),
+  });
+  const id = await subjectMod.hashId(scfg, raw, subjectMod.sha256Hex);
+  if (!id) return undefined;
+  const store = rt.subjectStore;
+  const k = subjectMod.key(id);
+  return {
+    id,
+    history: await store.get(k),
+    record: (e) => {
+      void (async () => {
+        const h = subjectMod.append(await store.get(k), e, scfg.max_entries);
+        await store.set(k, h, scfg.history_ttl ?? 3600);
+      })().catch(() => {});
+    },
+  };
+}
+
 /** Evaluate one request. Returns the verdict and, when it must be returned as-is, a Response. */
 export async function evaluate(request: Request, rt: Runtime): Promise<{ verdict: core.Verdict; response?: Response; requestId: string }> {
   const requestId = request.headers.get("cf-ray") ?? crypto.randomUUID();
   const [req, info] = await readReq(request, rt);
+  const subject = await subjectCtx(rt, request, info.clientIp);
+  if (subject?.id) info.subjectId = subject.id;
   const ctx: core.Ctx = {
     config: rt.config,
     rules: rt.rules,
     cache: rt.cache,
     breaker: rt.breaker,
+    subject,
     clock: () => Date.now() / 1000,
     hash: core.normalize.djb2,
     json_decode: (s) => JSON.parse(s),

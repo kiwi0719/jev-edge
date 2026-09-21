@@ -137,6 +137,8 @@ return handle(request, rt, (req) => fetch(req));
 
 `evaluate(request, rt)` returns the verdict without forwarding. `GET /_jev/health` is served by `handle` unless `health: false`.
 
+**Subjects.** `config.subject = { enabled: true, from: "cookie", name: "sid", salt: env.JEV_SUBJECT_SALT }` gives every request a hashed subject id (SHA-256 over the salt and the value; the raw cookie or header is never stored) and records its trajectory in `subjectStore` (KV or memory), `max_entries` per subject for `history_ttl`. The thin Worker forwards the id as `X-Jev-Subject`; configure the origin with `subject = { enabled = true, from = "header", name = "x-jev-subject", hashed = true }`.
+
 **Tenants and sampling.** `rules` accepts rule set ids, complete `Rule` objects, or `{ id, extends, watch_paths, deployment_context, ... }` inline rules, first match wins, same as the Lua config. `config.sampling` plus an `onSample(sample, request)` option gives you the sampled decisions (normalized text, fingerprint, score, verdict); write them to KV, a log or an analytics binding. There is no `/_jev/samples` endpoint here because storage is yours.
 
 ## What is the same as nginx, and what is not

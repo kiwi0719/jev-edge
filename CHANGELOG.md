@@ -9,6 +9,17 @@ All notable changes to this project are recorded here. The format follows
 ## [0.3.0] - 2026-09-22
 
 ### Added
+- Subject extraction and storage behind the trajectory contract: `subject =
+  { enabled, from = ip|header|cookie, name, salt, hashed, history_ttl,
+  max_entries }` on OpenResty, APISIX and the JavaScript hosts. The raw value
+  is hashed with the per-deployment `salt` (SHA-1 / SHA-256) before storage
+  or logging; the config is rejected without one. Trajectories live in their
+  own bounded store (`lua_shared_dict jev_subject`, `subjectStore`) so a
+  flood of subjects evicts trajectories, never verdicts or trust. The thin
+  Worker forwards its hashed id as `X-Jev-Subject` (`hashed = true` at the
+  origin). `$jev_log` carries `subject`. Test::Nginx `08-subject.t`.
+
+### Added
 - False-positive feedback loop (`core/trust.lua`,
   `adapters/js/src/core/trust.ts`, `POST /_jev/feedback`, `make labels`): an
   operator marks a blocked request "not an attack" and every later request

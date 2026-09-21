@@ -65,6 +65,7 @@ Your upstream receives `X-Jev-Verdict`, `X-Jev-Score`, `X-Jev-Source`, `X-Jev-Re
 | `/_jev/health`, `/_jev/metrics` | not exposed; APISIX's own `prometheus` plugin and the logger carry the verdict fields |
 | L3 side-path, reputation | same modules, same `async` config |
 | inline tenant rules | same: `"rules": [{"id": "billing", "extends": "llm-endpoints", "watch_paths": ["^/v1/billing"], "deployment_context": "..."}, "llm-endpoints"]`; or simply one route per tenant, each with its own `jev.deployment_context` |
+| `subject` | same keys; needs `nginx_config.http.lua_shared_dict.jev_subject` |
 | `/_jev/samples` | `sampling` config is honoured and samples land in `jev_cache`; read them with `sampling.log = true` through a logger plugin, or expose `resty.jev.edge.samples()` from a plain OpenResty location on the same box |
 
 One runtime (provider client, breaker, adaptive timeout) is built per distinct plugin conf and kept until the conf object changes, so routes with different `deployment_context` do not share a breaker but do share the fingerprint cache. Fingerprints include the text only, so a cached verdict for identical text is reused across routes; set `cache.fp_ttl` low on a route where that is wrong.

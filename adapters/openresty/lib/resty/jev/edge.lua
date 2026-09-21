@@ -15,12 +15,15 @@ local http      = require "resty.jev.http"
 local async     = require "resty.jev.async"
 local metrics   = require "resty.jev.metrics"
 local sampling  = require "jev.core.sampling"
+local subject_m = require "jev.core.subject"
 local trust     = require "jev.core.trust"
 local cjson     = require "cjson.safe"
 
 local _M = { _VERSION = "0.3.0" }
 
 local CACHE_DICT = "jev_cache"
+local SUBJECT_DICT = "jev_subject"
+local subject_store
 local HEADER_NAMES = { "X-Jev-Verdict", "X-Jev-Score", "X-Jev-Source", "X-Jev-Reason", "X-Jev-Request-Id" }
 
 local cache, breaker, judge, judge_cfg
@@ -165,12 +168,47 @@ local function maybe_sample(cfg, v, req, rules)
   if not ok then ngx.log(ngx.WARN, "jev-edge: sampling failed: ", err) end
 end
 
+local function sha1_hex(s)
+  return (ngx.sha1_bin(s):gsub(".", function(c) return string.format("%02x", c:byte()) end))
+end
+
+-- Per-subject trajectory: id extracted per cfg.subject, hashed with the salt
+-- before anything stores or logs it; history read once here; the write goes
+-- through a 0-delay timer so the request never waits on it.
+local function subject_ctx(cfg, req)
+  local scfg = cfg.subject
+  if not scfg or not scfg.enabled then return nil end
+  local raw = subject_m.extract(scfg, {
+    ip = req.client_ip,
+    header = function(n) return req.headers[n] end,
+    cookie = function(n) return ngx.var["cookie_" .. tostring(n)] end,
+  })
+  local id = subject_m.hash_id(scfg, raw, sha1_hex)
+  if not id then return nil end
+  subject_store = subject_store or cache_m.new(SUBJECT_DICT)
+  local store = subject_store
+  return {
+    id = id,
+    history = subject_m.load(store, id),
+    record = function(e)
+      local ok, err = ngx.timer.at(0, function(premature)
+        if premature then return end
+        local h = subject_m.append(subject_m.load(store, id), e, scfg.max_entries)
+        subject_m.save(store, id, h, scfg.history_ttl)
+      end)
+      if not ok then ngx.log(ngx.WARN, "jev-edge: subject write skipped: ", err) end
+    end,
+  }
+end
+
 local function evaluate_current(cfg, rules, over)
   ensure_runtime(cfg)
   strip_inbound()
   local req = build_req(rules, over)
+  local subj = subject_ctx(cfg, req)
+  ngx.ctx.jev_subject = subj and subj.id or nil
   local v = core.evaluate(req, {
-    config = cfg, rules = rules, cache = cache, trust = cache, judge = judge, breaker = breaker,
+    config = cfg, rules = rules, cache = cache, trust = cache, judge = judge, breaker = breaker, subject = subj,
     clock = ngx.now, hash = function(s) return string.format("%08x", ngx.crc32_long(s)) end,
     json_decode = cjson.decode, re_find = re_find,
     log = function(level, msg) ngx.log(level == "error" and ngx.ERR or ngx.WARN, msg) end,
@@ -227,7 +265,7 @@ function _M.log()
   emit({
     rid = ngx.var.request_id, path = ngx.var.uri, ip = ngx.var.remote_addr,
     src = v.source, score = v.score, verdict = v.verdict, action = v.action,
-    l2_ms = v.l2_ms, fp = v.fingerprint, reason = v.reason,
+    l2_ms = v.l2_ms, fp = v.fingerprint, reason = v.reason, subject = ngx.ctx.jev_subject,
   })
 end
 

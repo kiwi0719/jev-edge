@@ -208,3 +208,52 @@ describe("rule specs and sampling", () => {
     expect(s.fp).not.toBe("");
   });
 });
+
+describe("subject trajectories", () => {
+  it("hashes the cookie value, keeps a bounded history, forwards X-Jev-Subject in thin mode", async () => {
+    const { createRuntime, evaluate } = await import("../src/runtime");
+    const { memoryStore } = await import("../src/cf/stores");
+    const store = memoryStore();
+    const seen: Record<string, unknown> = {};
+    const wrapped = { get: (k: string) => store.get(k), set: (k: string, v: unknown, ttl: number) => { seen[k] = v; return store.set(k, v, ttl); } };
+    const rt = createRuntime({
+      ...opts(),
+      config: { ...opts().config, subject: { enabled: true, from: "cookie", name: "sid", salt: "pepper", max_entries: 2 } },
+      subjectStore: wrapped,
+    });
+    const req = (body: string, score?: string) => chat(body, { cookie: "sid=secret-session; other=1", ...(score ? { "x-jev-mock-score": score } : {}) });
+    await evaluate(req(BENIGN, "0.3"), rt);
+    await evaluate(req('{"messages":[{"role":"user","content":"Please summarise the attached quarterly report for me."}]}', "0.4"), rt);
+    await evaluate(req(ATTACK, "0.9"), rt);
+    await new Promise((r) => setTimeout(r, 10));
+    const keys = Object.keys(seen);
+    expect(keys).toHaveLength(1);
+    expect(keys[0]).toMatch(/^subj:cookie:[0-9a-f]{64}$/);
+    expect(JSON.stringify(seen)).not.toContain("secret-session");
+    const h = seen[keys[0]] as { score: number }[];
+    expect(h.map((e) => e.score)).toEqual([0.4, 0.9]);
+  });
+
+  it("thin worker forwards the hashed id to the origin", async () => {
+    const { thinWorker } = await import("../src/cloudflare");
+    const { vi } = await import("vitest");
+    let seenSubject = "";
+    vi.stubGlobal("fetch", vi.fn(async (input: string | Request, init?: RequestInit) => {
+      const r = input instanceof Request ? input : new Request(input, init);
+      if (new URL(r.url).pathname.startsWith("/_jev/authz")) {
+        seenSubject = r.headers.get("x-jev-subject") ?? "";
+        return new Response(null, { status: 200, headers: { "X-Jev-Verdict": "safe", "X-Jev-Score": "0.10", "X-Jev-Reason": "injection+0.10" } });
+      }
+      return Response.json({ ok: true });
+    }));
+    const w = thinWorker({ origin: "https://origin.example", config: { subject: { enabled: true, from: "header", name: "x-api-key", salt: "pepper" } } });
+    await w.fetch(chat(BENIGN, { "x-api-key": "k-1" }), {});
+    vi.unstubAllGlobals();
+    expect(seenSubject).toMatch(/^header:[0-9a-f]{64}$/);
+  });
+
+  it("rejects subject.enabled without a salt", async () => {
+    const { createRuntime } = await import("../src/runtime");
+    expect(() => createRuntime({ config: { subject: { enabled: true, from: "ip" } } })).toThrow(/salt/);
+  });
+});

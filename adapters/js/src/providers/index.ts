@@ -21,6 +21,8 @@ export interface ProviderRequestInfo {
   headers: Headers;
   body: string | null;
   clientIp: string;
+  /** Hashed subject id, when config.subject is enabled; the backend provider forwards it as X-Jev-Subject. */
+  subjectId?: string;
 }
 
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
@@ -167,6 +169,7 @@ export const backend: Provider = {
     const path = info?.path ?? prompt.context.path ?? "/";
     const headers: Record<string, string> = { "Content-Type": info?.headers.get("content-type") ?? "application/json" };
     if (info?.clientIp) headers["X-Forwarded-For"] = info.clientIp;
+    if (info?.subjectId) headers["X-Jev-Subject"] = info.subjectId;
     let res: Response;
     try {
       res = await fetchWithTimeout(base + "/_jev/authz" + path, {

@@ -77,4 +77,73 @@ function _M.record(ctx, v)
   return e
 end
 
+-- ---------------------------------------------------------------------------
+-- Extraction, hashing and the bounded history. Pure; adapters supply the
+-- request view, the hash function and the store.
+-- ---------------------------------------------------------------------------
+
+_M.KEY_PREFIX = "subj:"
+
+--- The raw subject value for this request, or nil.
+-- @param scfg cfg.subject
+-- @param view { ip = string|nil, header = fn(name) -> string|nil, cookie = fn(name) -> string|nil }
+function _M.extract(scfg, view)
+  if type(scfg) ~= "table" or not scfg.enabled then return nil end
+  local from = scfg.from or "ip"
+  local v
+  if from == "ip" then
+    v = view.ip
+  elseif from == "header" then
+    v = view.header and view.header(scfg.name)
+  elseif from == "cookie" then
+    v = view.cookie and view.cookie(scfg.name)
+  end
+  if type(v) == "table" then v = v[1] end
+  if type(v) ~= "string" then return nil end
+  v = v:match("^%s*(.-)%s*$")
+  if v == "" then return nil end
+  return v
+end
+
+--- The id core and the store see: `<from>:<hash(salt .. value)>`. The raw
+-- value never leaves this function. With `hashed = true` the value is used as
+-- is: it is the complete id another jev-edge computed (a thin Worker's
+-- X-Jev-Subject), prefix included.
+-- @param hash fn(string) -> string, a one-way function (sha1 / sha256 hex)
+function _M.hash_id(scfg, value, hash)
+  if value == nil then return nil end
+  local from = scfg.from or "ip"
+  if scfg.hashed then return value end
+  if type(scfg.salt) ~= "string" or scfg.salt == "" then return nil end
+  return from .. ":" .. tostring(hash(scfg.salt .. "\0" .. value))
+end
+
+--- Append an entry to a history list, keeping the newest `max_entries`.
+function _M.append(history, e, max_entries)
+  local out = {}
+  if type(history) == "table" then
+    for _, x in ipairs(history) do out[#out + 1] = x end
+  end
+  out[#out + 1] = e
+  local max = tonumber(max_entries) or 20
+  while #out > max do table.remove(out, 1) end
+  return out
+end
+
+function _M.key(id) return _M.KEY_PREFIX .. tostring(id) end
+
+--- Read a subject's history from a store. nil when absent, always valid.
+function _M.load(store, id)
+  if not store or not id then return nil end
+  local h = store:get(_M.key(id))
+  if type(h) ~= "table" then return nil end
+  return h
+end
+
+--- Write a subject's history. Adapters call this from the sink, off the request path.
+function _M.save(store, id, history, ttl)
+  if not store or not id then return false end
+  return store:set(_M.key(id), history, tonumber(ttl) or 3600)
+end
+
 return _M

@@ -283,7 +283,9 @@ HAProxy 的 SPOE 把请求连 body 交给 `adapters/haproxy/spoa`，一个调 `/
 
 ## 主体轨迹
 
-单条请求可以看起来无害，却是一次分六条消息组装的攻击的第六步。要抓住它需要按主体随时间打分。`core/subject.lua`（移植为 `adapters/js/src/core/subject.ts`）是其中不需要流量就能做的那一半：契约。`evaluate` 接受可选的 `ctx.subject = { id, history, record }`；在每个做出判定的出口（缓存命中、熔断跳过、L2、信任、L1 拦截；L1 放行不算，那是热路径）把一条扁平记录（`at, subject, verdict, score, source, reason, fingerprint`）交给 `record` 然后直接返回，不等待。`history` 在请求路径上读取但**本版本忽略**；golden vectors 断言带主体和非空历史的请求和不带的判定逐字段相同。窗口、衰减和阈值一个都没定，因为没有东西可以校准；0.4.0 会基于记录下来的轨迹打分。现在钉死两条约束，让 adapter 和向量只写一次：主体 id 由 adapter 提取（IP、API key、session、用户 id），core 不知道是哪种；写入是 sink，永不等待。
+单条请求可以看起来无害，却是一次分六条消息组装的攻击的第六步。要抓住它需要按主体随时间打分。`core/subject.lua`（移植为 `adapters/js/src/core/subject.ts`）是其中不需要流量就能做的那一半：契约。`evaluate` 接受可选的 `ctx.subject = { id, history, record }`；在每个做出判定的出口（缓存命中、熔断跳过、L2、信任、L1 拦截；L1 放行不算，那是热路径）把一条扁平记录（`at, subject, verdict, score, source, reason, fingerprint`）交给 `record` 然后直接返回，不等待。`history` 在请求路径上读取但**本版本忽略**；golden vectors 断言带主体和非空历史的请求和不带的判定逐字段相同。窗口、衰减和阈值一个都没定，因为没有东西可以校准；0.4.0 会基于记录下来的轨迹打分。现在钉死两条约束，让 adapter 和向量只写一次：主体 id 由 adapter 提取，core 不知道是哪种；写入是 sink，永不等待。
+
+提取和存储随契约一起发布。`subject = { enabled, from = "ip" | "header" | "cookie", name, salt, hashed, history_ttl, max_entries }` 在每个 adapter 上相同。header 或 cookie 的原始值是凭证（API key、session id），**永远不存、不记日志、不采样**：adapter 对 `salt .. value` 做哈希（OpenResty 和 APISIX 用 SHA-1，JavaScript 宿主用 SHA-256），下游只见 `<from>:<hex>`。salt 是每个部署一个的秘密，日志或 dict 泄露不等于凭证泄露；没有 salt 的配置会被拒绝。`hashed = true` 把值当作完整 id 接受，薄 Worker 就是这样通过 `X-Jev-Subject` 把哈希后的 id 交给源站。轨迹放在**自己的 dict** 里（OpenResty 和 APISIX 的 `jev_subject`，JavaScript 宿主的 `subjectStore`），每个主体一个 key，保留最新 `max_entries` 条、`history_ttl` 秒：一个有一百万个 session 的爬虫可以把它填满，填满时被淘汰的只有轨迹，判定缓存和信任不受影响。历史读取是请求路径上的一次查找；写入在零延迟定时器里（JavaScript 宿主上是不等待的 promise）。哈希后的 id 也出现在每行 `$jev_log` 的 `subject` 字段里，0.4.0 就靠它校准。
 
 ## 误报反馈
 
@@ -359,3 +361,4 @@ jev_async_dropped_total
 7. **部署上下文是校准杠杆，阈值不是。** 实测：同样的文本和模型，AUC 0.983 → 0.996。
 8. **信任会过期，且只在本地。** 运维的误报标注是唯一能降低分数的输入；它活 `trust_ttl`、有续期上限、存在网关自己的 dict 里，并从日志回放进校准，而不是存成文件。以攻击者可见文本为键的永久或全集群白名单是旁路，不是功能。
 9. **主体轨迹先记录，后打分。** 契约（id 由 adapter 给、忽略 history、record 是 sink）先发；窗口和阈值等记录下来的流量和多轮数据集。猜出来的默认值比没有这个功能更糟。
+10. **主体 id 用每部署一个的 salt 哈希，轨迹有自己的有界存储。** API key 或 session id 是凭证，永远不会明文进 dict、日志或样本；轨迹存储满了淘汰的是轨迹，不是判定或信任。任何 adapter 都不许存原始主体值，无论能省多少事。

@@ -38,9 +38,11 @@ local http      = require("resty.jev.http")
 local async     = require("resty.jev.async")
 local rules_mod = require("jev.core.rules")
 local sampling  = require("jev.core.sampling")
+local subject_m = require("jev.core.subject")
 local cjson     = require("cjson.safe")
 
 local DICT = "jev_cache"
+local SUBJECT_DICT = "jev_subject"
 local HEADER_NAMES = { "X-Jev-Verdict", "X-Jev-Score", "X-Jev-Source", "X-Jev-Reason", "X-Jev-Request-Id" }
 
 local schema = {
@@ -74,6 +76,18 @@ local schema = {
       } },
       description = "rule set ids under rules/, or inline rules "
         .. "({ id, extends, watch_paths, deployment_context, ... })",
+    },
+    subject = {
+      type = "object",
+      properties = {
+        enabled     = { type = "boolean" },
+        from        = { type = "string", enum = { "ip", "header", "cookie" } },
+        name        = { type = "string" },
+        salt        = { type = "string" },
+        hashed      = { type = "boolean" },
+        history_ttl = { type = "number", minimum = 1 },
+        max_entries = { type = "integer", minimum = 1 },
+      },
     },
     sampling = {
       type = "object",
@@ -149,6 +163,36 @@ end
 
 local runtimes = setmetatable({}, { __mode = "k" })
 local cache
+local subject_store
+
+local function sha1_hex(s)
+  return (ngx.sha1_bin(s):gsub(".", function(c) return string.format("%02x", c:byte()) end))
+end
+
+local function subject_ctx(rt, req, ctx)
+  local scfg = rt.cfg.subject
+  if not scfg or not scfg.enabled then return nil end
+  local raw = subject_m.extract(scfg, {
+    ip = req.client_ip,
+    header = function(n) return req.headers[n] end,
+    cookie = function(n) return ctx.var["cookie_" .. tostring(n)] end,
+  })
+  local id = subject_m.hash_id(scfg, raw, sha1_hex)
+  if not id then return nil end
+  subject_store = subject_store or cache_m.new(SUBJECT_DICT)
+  local store = subject_store
+  return {
+    id = id,
+    history = subject_m.load(store, id),
+    record = function(e)
+      ngx.timer.at(0, function(premature)
+        if premature then return end
+        local h = subject_m.append(subject_m.load(store, id), e, scfg.max_entries)
+        subject_m.save(store, id, h, scfg.history_ttl)
+      end)
+    end,
+  }
+end
 
 local function load_rules(specs)
   local out = {}
@@ -278,8 +322,11 @@ function _M.access(conf, ctx)
   local v
   local ok, err = pcall(function()
     local req = build_req(rt, ctx)
+    local subj = subject_ctx(rt, req, ctx)
+    ctx.jev_subject = subj and subj.id or nil
     v = jev_core.evaluate(req, {
-      config = rt.cfg, rules = rt.rules, cache = cache, judge = rt.judge, breaker = rt.breaker,
+      config = rt.cfg, rules = rt.rules, cache = cache, trust = cache, judge = rt.judge, breaker = rt.breaker,
+      subject = subj,
       clock = ngx.now, hash = function(s) return string.format("%08x", ngx.crc32_long(s)) end,
       json_decode = cjson.decode, re_find = re_find,
       log = function(level, msg) if level == "error" then core.log.error(msg) else core.log.warn(msg) end end,
@@ -316,7 +363,7 @@ function _M.init()
     return cjson.encode({
       rid = ctx.var.request_id, path = ctx.var.uri, ip = ctx.var.remote_addr,
       src = v.source, score = v.score, verdict = v.verdict, action = v.action,
-      l2_ms = v.l2_ms, fp = v.fingerprint, reason = v.reason,
+      l2_ms = v.l2_ms, fp = v.fingerprint, reason = v.reason, subject = ctx.jev_subject,
     })
   end)
 end

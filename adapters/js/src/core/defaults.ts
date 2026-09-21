@@ -25,6 +25,7 @@ export interface Config {
   policy: Policy;
   cache: { fp_ttl: number; rep_ttl: number; fp_prefix_bytes: number };
   async: { enabled: boolean; max_async: number; rep_block_after: number; rep_block_ttl: number };
+  subject: { enabled: boolean; from: "ip" | "header" | "cookie"; name: string | null; salt: string | null; hashed: boolean; history_ttl: number; max_entries: number };
   sampling: { enabled: boolean; rate: number; min_verdict: "safe" | "suspicious" | "malicious"; max_samples: number; ttl: number; text_bytes: number; log: boolean };
   feedback: FeedbackConfig;
   breaker: BreakerConfig;
@@ -50,6 +51,7 @@ export const config: Config = {
   },
   cache: { fp_ttl: 300, rep_ttl: 600, fp_prefix_bytes: 2048 },
   async: { enabled: true, max_async: 32, rep_block_after: 0, rep_block_ttl: 600 },
+  subject: { enabled: false, from: "ip", name: null, salt: null, hashed: false, history_ttl: 3600, max_entries: 20 },
   sampling: { enabled: false, rate: 0.05, min_verdict: "suspicious", max_samples: 1000, ttl: 86400, text_bytes: 512, log: false },
   feedback: { enabled: false, trust_ttl: 604800, max_renewals: 4, token: null },
   breaker: { window_s: 60, min_samples: 20, fail_ratio: 0.5, open_s: 30 },
@@ -82,6 +84,14 @@ export function validate(c: Config): [true, null] | [null, string] {
   if (fb.trust_ttl !== undefined && (typeof fb.trust_ttl !== "number" || fb.trust_ttl <= 0)) return [null, "feedback.trust_ttl must be > 0"];
   if (fb.max_renewals !== undefined && (typeof fb.max_renewals !== "number" || fb.max_renewals < 0)) return [null, "feedback.max_renewals must be >= 0"];
   if (fb.enabled === true && !fb.token) return [null, "feedback.enabled needs feedback.token set"];
+  const sj = c.subject ?? {};
+  if (sj.from !== undefined && !["ip", "header", "cookie"].includes(sj.from)) return [null, "subject.from must be ip|header|cookie"];
+  if (sj.enabled === true) {
+    if ((sj.from === "header" || sj.from === "cookie") && !sj.name) return [null, `subject.from = ${sj.from} needs subject.name`];
+    if (!sj.hashed && !sj.salt) return [null, "subject.enabled needs subject.salt (or hashed = true)"];
+  }
+  if (sj.max_entries !== undefined && (typeof sj.max_entries !== "number" || sj.max_entries < 1)) return [null, "subject.max_entries must be >= 1"];
+  if (sj.history_ttl !== undefined && (typeof sj.history_ttl !== "number" || sj.history_ttl <= 0)) return [null, "subject.history_ttl must be > 0"];
   const sm = c.sampling ?? {};
   if (sm.rate !== undefined && (typeof sm.rate !== "number" || sm.rate < 0 || sm.rate > 1)) return [null, "sampling.rate must be in [0,1]"];
   if (sm.min_verdict !== undefined && !["safe", "suspicious", "malicious"].includes(sm.min_verdict)) return [null, "sampling.min_verdict must be safe|suspicious|malicious"];

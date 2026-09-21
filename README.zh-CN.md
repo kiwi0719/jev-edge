@@ -39,7 +39,7 @@ jev-edge 跑在 nginx / OpenResty 或 Apache APISIX 里，站在 Envoy、Istio�
 
 | | |
 |---|---|
-| 版本 | `v0.2.0` |
+| 版本 | `v0.3.0` |
 | 网关，原生 | OpenResty；Apache APISIX（插件，同一套引擎） |
 | 网关，走 `/_jev/authz` | Envoy（HTTP 和 gRPC ext_authz）、HAProxy（SPOE agent）、Traefik、Caddy 和普通 nginx（forward-auth），各自对真实网关做了端到端测试；Istio、Envoy Gateway、Azure APIM 和 Apigee 以[配方](docs/recipes.zh-CN.md)形式提供；LiteLLM proxy 作为 guardrail |
 | JavaScript 宿主 | Cloudflare Workers 和 Pages、Next.js、Node、Hono、Lambda@Edge，共用一份受同一批 golden vectors 约束的 TypeScript core 移植（在 `main` 上，未发版） |
@@ -370,7 +370,7 @@ docs/            design、cost、recipes（Istio、Envoy Gateway、APIM、Apigee
 | M6 ✅ | v0.1.0：`make install`、opm 包、安装文档 |
 | 0.1.1 ✅ | provider 真实联调、带上限的自适应超时、`/_jev/health`、`deployment_context`、soak 和全量 live bench |
 | 0.2.0 ✅ | OpenResty 之外的网关，同一套引擎：Envoy HTTP ext_authz（`/_jev/authz`）和 gRPC ext_authz（`grpc-shim`）；`/_jev/forward-auth` 服务 Traefik ForwardAuth（转发 body，完整判定）、Caddy `forward_auth` 和 nginx `auth_request`（只有头：路径、方法、信誉）。对每个真实网关的 Docker Compose 端到端。`demo/`。许可证改为 Apache 2.0。 |
-| 0.3.0 | golden vectors 作为带版本的 core 契约（`core/golden/`，两个 core 在 CI 里回放）；`make calibrate`、`make context-lint`、`make labels`；多租户规则，每个租户自己的 `deployment_context`；决策采样（`/_jev/samples`）；误报反馈回路（`/_jev/feedback`，带过期的指纹信任）；主体轨迹契约（只记录，尚不打分）；APISIX 插件；HAProxy SPOE agent；LiteLLM guardrail；Istio、Envoy Gateway、APIM、Apigee 配方；`@jev-edge/js`：通过向量的 TypeScript core，以及 Cloudflare（薄 / 完整 Worker、Pages）、Next.js、Node、Hono、Lambda@Edge 预设。在 `main` 上，待发版。 |
+| 0.3.0 ✅ | golden vectors 作为带版本的 core 契约（`core/golden/`，两个 core 在 CI 里回放）；`make calibrate`、`make context-lint`、`make labels`；多租户规则，每个租户自己的 `deployment_context`；决策采样（`/_jev/samples`）；误报反馈回路（`/_jev/feedback`，带过期的指纹信任）；主体轨迹契约（只记录，尚不打分）；APISIX 插件；HAProxy SPOE agent；LiteLLM guardrail；Istio、Envoy Gateway、APIM、Apigee 配方；`@jev-edge/js`：通过向量的 TypeScript core，以及 Cloudflare（薄 / 完整 Worker、Pages）、Next.js、Node、Hono、Lambda@Edge 预设。 |
 | 0.4.0 | 基于主体轨迹打分：窗口、衰减和阈值从记录下来的轨迹和一个多轮数据集里定（和 `abuse` 模板共用，`abuse` 同时得到自己的数据集）；adapter 从 session、API key 或用户 id 提取 `subject_id`，不只是 IP |
 | 之后 | 等向量经历过一次真实的 core 变更后再做 Fastly Compute 和 Deno Deploy；面向指标和反馈日志的 Grafana dashboard |
 

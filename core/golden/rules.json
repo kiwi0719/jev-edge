@@ -866,7 +866,7 @@
       "name": "ignore without instructions is not a pattern"
     }
   ],
-  "core_version": "0.2.0",
+  "core_version": "0.3.0",
   "format_version": 1,
   "generated_by": "core/golden/gen.lua",
   "suite": "rules"

@@ -12,7 +12,7 @@ import type { Breaker } from "./breaker";
 import type { Req, Rule, CacheLike } from "./rules";
 import type { JsonValue } from "./normalize";
 
-export const VERSION = "0.2.1";
+export const VERSION = "0.3.0";
 
 export interface Judge {
   call(prompt: judge.Prompt, timeoutMs: number): Promise<[judge.Answers, null] | [null, string]> | [judge.Answers, null] | [null, string];

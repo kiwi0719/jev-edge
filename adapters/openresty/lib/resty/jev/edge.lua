@@ -18,7 +18,7 @@ local sampling  = require "jev.core.sampling"
 local trust     = require "jev.core.trust"
 local cjson     = require "cjson.safe"
 
-local _M = { _VERSION = "0.2.0" }
+local _M = { _VERSION = "0.3.0" }
 
 local CACHE_DICT = "jev_cache"
 local HEADER_NAMES = { "X-Jev-Verdict", "X-Jev-Score", "X-Jev-Source", "X-Jev-Reason", "X-Jev-Request-Id" }

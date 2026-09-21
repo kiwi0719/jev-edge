@@ -6,6 +6,8 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-22
+
 ### Added
 - False-positive feedback loop (`core/trust.lua`,
   `adapters/js/src/core/trust.ts`, `POST /_jev/feedback`, `make labels`): an

@@ -13,8 +13,8 @@
 // you pass Store implementations (DynamoDB Global Tables is the usual
 // choice; it costs a round trip per lookup). Read the API key from Secrets
 // Manager at cold start and pass it in `config.jev.api_key`.
-import { createRuntime, evaluate, markTruncated, type Options, type Runtime } from "./runtime";
-import { headers as verdictHeaders, newVerdict, ERROR, SRC_ADAPTER } from "./core/verdict";
+import { createRuntime, evaluate, markTruncated, type Options, type Runtime } from "./runtime.js";
+import { headers as verdictHeaders, newVerdict, ERROR, SRC_ADAPTER } from "./core/verdict.js";
 
 export interface CfHeader { key?: string; value: string }
 export interface CfRequest {

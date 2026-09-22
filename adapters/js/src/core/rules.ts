@@ -1,5 +1,5 @@
 // Port of core/rules.lua: L1, cheap and short-circuiting.
-import { extract, byteLength, head, tail, fieldKeys, scanStrings, window, type JsonValue } from "./normalize";
+import { extract, byteLength, head, tail, fieldKeys, scanStrings, window, type JsonValue } from "./normalize.js";
 
 export type RuleResult = "pass" | "block" | "suspect" | "unjudgeable";
 export const PASS: RuleResult = "pass";

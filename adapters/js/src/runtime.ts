@@ -8,15 +8,15 @@
 // (body read, subject store, judge, onVerdict, block response) passes the
 // request with X-Jev-Verdict: error and X-Jev-Source: adapter, and is logged.
 
-import * as core from "./core";
-import { decodeBody } from "./decode";
-import { resolve as resolveRule, type RuleSpec } from "./rules";
-import { shouldSample, buildSample, type Sample } from "./sampling";
-import * as subjectMod from "./core/subject";
-import { load as loadProvider, type Provider, type ProviderRequestInfo } from "./providers";
-import { kvStore, memoryStore, durableStore, durableBreaker, durableAdaptive, type KVLike, type DOStubLike } from "./cf/stores";
-import { Adaptive, type AdaptiveLike } from "./cf/adaptive";
-import type { Store, BreakerLike } from "./core/breaker";
+import * as core from "./core/index.js";
+import { decodeBody } from "./decode.js";
+import { resolve as resolveRule, type RuleSpec } from "./rules/index.js";
+import { shouldSample, buildSample, type Sample } from "./sampling.js";
+import * as subjectMod from "./core/subject.js";
+import { load as loadProvider, type Provider, type ProviderRequestInfo } from "./providers/index.js";
+import { kvStore, memoryStore, durableStore, durableBreaker, durableAdaptive, type KVLike, type DOStubLike } from "./cf/stores.js";
+import { Adaptive, type AdaptiveLike } from "./cf/adaptive.js";
+import type { Store, BreakerLike } from "./core/breaker.js";
 
 type DeepPartial<T> = { [K in keyof T]?: T[K] extends object ? DeepPartial<T[K]> : T[K] };
 

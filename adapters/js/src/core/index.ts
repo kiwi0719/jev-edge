@@ -1,16 +1,16 @@
 // Port of core/init.lua: evaluate(req, ctx) -> verdict. Async because every
 // Cloudflare store is; the order of operations is the one the golden vectors pin.
-import * as rulesMod from "./rules";
-import * as normalize from "./normalize";
-import * as judge from "./judge";
-import * as policy from "./policy";
-import * as verdict from "./verdict";
-import * as trust from "./trust";
-import * as subject from "./subject";
-import type { Config } from "./defaults";
-import type { BreakerLike } from "./breaker";
-import type { Req, Rule, CacheLike, RulesCtx } from "./rules";
-import type { JsonValue } from "./normalize";
+import * as rulesMod from "./rules.js";
+import * as normalize from "./normalize.js";
+import * as judge from "./judge.js";
+import * as policy from "./policy.js";
+import * as verdict from "./verdict.js";
+import * as trust from "./trust.js";
+import * as subject from "./subject.js";
+import type { Config } from "./defaults.js";
+import type { BreakerLike } from "./breaker.js";
+import type { Req, Rule, CacheLike, RulesCtx } from "./rules.js";
+import type { JsonValue } from "./normalize.js";
 
 export const VERSION = "0.4.0";
 
@@ -189,11 +189,11 @@ export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
 }
 
 export { rulesMod as rules, normalize, judge, policy, verdict, trust, subject };
-export { sha256Hex } from "./sha256";
-export * as defaults from "./defaults";
-export * as breaker from "./breaker";
-export type { Req, Rule, CacheLike } from "./rules";
-export type { Verdict } from "./verdict";
-export type { Config } from "./defaults";
-export type { Prompt, Answers } from "./judge";
-export type { Entry as SubjectEntry, SubjectCtx } from "./subject";
+export { sha256Hex } from "./sha256.js";
+export * as defaults from "./defaults.js";
+export * as breaker from "./breaker.js";
+export type { Req, Rule, CacheLike } from "./rules.js";
+export type { Verdict } from "./verdict.js";
+export type { Config } from "./defaults.js";
+export type { Prompt, Answers } from "./judge.js";
+export type { Entry as SubjectEntry, SubjectCtx } from "./subject.js";

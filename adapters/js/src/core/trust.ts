@@ -3,7 +3,7 @@
 // and every later request with the same text passes without an L2 call.
 // Trust always expires, and traffic may extend it only maxRenewals times:
 // a permanent entry would be a standing bypass keyed on attacker-visible text.
-import type { CacheLike } from "./rules";
+import type { CacheLike } from "./rules.js";
 
 export const PREFIX = "trust:";
 export const DEFAULT_TTL = 7 * 24 * 3600;

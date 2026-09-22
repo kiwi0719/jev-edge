@@ -4,8 +4,8 @@
 //   backend        an existing jev-edge (OpenResty/Envoy) reached at /_jev/authz:
 //                  the "thin Worker" mode, one set of thresholds for edge and origin
 //   mock           fixed score, no network
-import type { Prompt, Answers } from "../core/judge";
-import type { JevConfig } from "../core/defaults";
+import type { Prompt, Answers } from "../core/judge.js";
+import type { JevConfig } from "../core/defaults.js";
 
 export type JudgeResult = [Answers, null] | [null, string];
 

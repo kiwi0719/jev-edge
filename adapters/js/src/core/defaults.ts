@@ -44,6 +44,17 @@ export interface Config {
   sampling: { enabled: boolean; rate: number; min_verdict: "safe" | "suspicious" | "malicious"; max_samples: number; ttl: number; text_bytes: number; log: boolean };
   feedback: FeedbackConfig;
   breaker: BreakerConfig;
+  /** see core/defaults.lua `untrusted`: retrieved content judged on its own, off by default */
+  untrusted: UntrustedConfig;
+}
+
+export interface UntrustedConfig {
+  enabled: boolean;
+  /** OpenAI role "tool"/"function" messages, Anthropic tool_result blocks, Responses function_call_output */
+  tool_results: boolean;
+  /** JSON paths (text_fields syntax) holding retrieved content outside a tool message */
+  fields: string[];
+  templates: string[];
 }
 
 export const config: Config = {
@@ -75,6 +86,7 @@ export const config: Config = {
   sampling: { enabled: false, rate: 0.05, min_verdict: "suspicious", max_samples: 1000, ttl: 86400, text_bytes: 512, log: false },
   feedback: { enabled: false, trust_ttl: 604800, max_renewals: 4, token: null },
   breaker: { window_s: 60, min_samples: 20, fail_ratio: 0.5, open_s: 30 },
+  untrusted: { enabled: false, tool_results: true, fields: [], templates: ["untrusted"] },
 };
 
 type Plain = Record<string, unknown>;
@@ -149,5 +161,35 @@ export function validate(c: Config): [true, null] | [null, string] {
   if (sm.min_verdict !== undefined && !["safe", "suspicious", "malicious"].includes(sm.min_verdict)) return [null, "sampling.min_verdict must be safe|suspicious|malicious"];
   const max = c.jev.timeout_max_ms;
   if (max !== undefined && (typeof max !== "number" || max < c.jev.timeout_ms)) return [null, "jev.timeout_max_ms must be >= timeout_ms"];
+  const [uok, uerr] = validateUntrusted(c.untrusted, "untrusted");
+  if (!uok) return [null, uerr];
+  return [true, null];
+}
+
+/** Port of defaults.untrusted_spec: config.untrusted with the rule's own `untrusted` over it. */
+export function untrustedSpec(cfg: { untrusted?: UntrustedConfig } | undefined, rule?: { untrusted?: Partial<UntrustedConfig> }): UntrustedConfig {
+  const base = cfg?.untrusted ?? config.untrusted;
+  const over = rule?.untrusted;
+  if (!over || typeof over !== "object") return base;
+  return { ...base, ...over };
+}
+
+/** Port of defaults.validate_untrusted: type check for the config section or a rule's override. */
+export function validateUntrusted(u: unknown, where: string): [true, null] | [null, string] {
+  if (u === undefined || u === null) return [true, null];
+  if (typeof u !== "object" || Array.isArray(u)) return [null, `${where} must be a table`];
+  const t = u as Record<string, unknown>;
+  for (const k of ["enabled", "tool_results"]) {
+    if (t[k] !== undefined && typeof t[k] !== "boolean") return [null, `${where}.${k} must be true|false`];
+  }
+  for (const k of ["fields", "templates"]) {
+    const v = t[k];
+    if (v === undefined) continue;
+    if (!Array.isArray(v)) return [null, `${where}.${k} must be a list of strings`];
+    for (let i = 0; i < v.length; i++) {
+      if (typeof v[i] !== "string" || v[i] === "") return [null, `${where}.${k}[${i + 1}] must be a non-empty string`];
+    }
+  }
+  if (Array.isArray(t.templates) && t.templates.length === 0) return [null, `${where}.templates must not be empty`];
   return [true, null];
 }

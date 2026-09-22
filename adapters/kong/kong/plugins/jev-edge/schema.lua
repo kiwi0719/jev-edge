@@ -131,6 +131,17 @@ return {
             { unjudgeable       = { type = "string", one_of = { "pass", "block" } } },
           },
         } },
+        -- retrieved content judged on its own (core/defaults.lua `untrusted`)
+        { untrusted = {
+          type = "record",
+          fields = {
+            { enabled      = { type = "boolean" } },
+            { tool_results = { type = "boolean" } },
+            { fields       = { type = "array", elements = { type = "string", len_min = 1 } } },
+            { templates    = { type = "array", len_min = 1,
+                               elements = { type = "string", one_of = { "untrusted", "injection", "abuse" } } } },
+          },
+        } },
         { cache = {
           type = "record",
           fields = {

@@ -1,5 +1,6 @@
 // Port of core/rules.lua: L1, cheap and short-circuiting.
-import { extract, byteLength, head, tail, fieldKeys, scanStrings, window, chunks as splitChunks, utf8Bytes, type JsonValue } from "./normalize.js";
+import { extract, extractUntrustedValues, byteLength, head, tail, fieldKeys, scanStrings, window, chunks as splitChunks, utf8Bytes, type JsonValue } from "./normalize.js";
+import { untrustedSpec, type UntrustedConfig } from "./defaults.js";
 import { repBlocked, type SubjectCtx, type ReputationConfig } from "./subject.js";
 
 export type RuleResult = "pass" | "block" | "suspect" | "unjudgeable";
@@ -35,7 +36,12 @@ export interface Rule {
   always_suspect?: string[];
   templates: string[];
   deployment_context?: string;
+  /** Overrides config.untrusted for this rule (core/defaults.lua `untrusted`). */
+  untrusted?: Partial<UntrustedConfig>;
 }
+
+/** Retrieved content L1 found for untrusted judging, cut to its own window. `only`: the rest of the text would have passed on its own. */
+export interface UntrustedPart { text: string; windowed: boolean; only?: boolean }
 
 export interface Req {
   method?: string;
@@ -65,7 +71,7 @@ export interface RulesCtx {
   re_find?: (subject: string, pattern: string) => boolean | readonly [number, number] | null;
   log?: (level: string, msg: string) => void;
   subject?: SubjectCtx;
-  config?: { subject?: { reputation?: ReputationConfig } };
+  config?: { subject?: { reputation?: ReputationConfig }; untrusted?: UntrustedConfig };
 }
 
 /**
@@ -295,14 +301,27 @@ export function reFind(subject: string, pattern: string): readonly [number, numb
   return [from, from + byteLength(m[0]) - 1];
 }
 
+// Port of untrusted_part() in core/rules.lua: retrieved content when untrusted
+// judging is on for `rule`, from a body parsed whole, cut to its own window.
+function untrustedPart(decoded: JsonValue | undefined, rule: Rule, ctx: RulesCtx | undefined): UntrustedPart | undefined {
+  const spec = untrustedSpec(ctx?.config, rule);
+  if (!spec.enabled || decoded === undefined || decoded === null || typeof decoded !== "object") return undefined;
+  const values = extractUntrustedValues(decoded, spec);
+  const utext = values.join("\n");
+  if (utext === "") return undefined;
+  const [w, cut] = window(utext, values, rule.max_judge_bytes ?? MAX_JUDGE_BYTES);
+  return { text: w, windowed: cut };
+}
+
 // Port of judged() in core/rules.lua.
 async function judged(
   req: Req, rule: Rule, ctx: RulesCtx | undefined, ct: string, size: number,
-): Promise<{ text: string; unj?: string; hit?: string; windowed?: boolean; chunks?: string[]; capped?: boolean }> {
+): Promise<{ text: string; unj?: string; hit?: string; windowed?: boolean; chunks?: string[]; capped?: boolean; untrusted?: UntrustedPart }> {
   const max = rule.max_body_bytes ?? MAX_BODY_BYTES;
   let values: string[];
   let text: string;
   let partial = false;
+  let untrusted: UntrustedPart | undefined;
   if (size > max) {
     let hd = req.body_head ?? undefined;
     let tl = req.body_tail ?? undefined;
@@ -320,17 +339,19 @@ async function judged(
     partial = true;
   } else {
     let kind: string;
-    [text, kind, values] = extract(req.body, ct, rule.text_fields, ctx?.json_decode);
+    let decoded: JsonValue | undefined;
+    [text, kind, values, decoded] = extract(req.body, ct, rule.text_fields, ctx?.json_decode);
     if (kind === "binary") return { text: "", unj: "unjudgeable: binary body" };
+    untrusted = untrustedPart(decoded, rule, ctx);
   }
-  if (text === "") return { text: "" };
+  if (text === "") return { text: "", untrusted };
   const hit = textMatches(text, rule.always_suspect, ctx);
   const budget = rule.max_judge_bytes ?? MAX_JUDGE_BYTES;
   const maxc = Math.floor(Number(rule.max_judge_chunks ?? 1)) || 1;
   if (maxc > 1 && byteLength(text) > budget) {
     // port of the chunked branch of judged() in core/rules.lua
     const [pieces, starts] = splitChunks(text, budget);
-    if (pieces.length <= maxc) return { text: pieces.join("\n"), hit: hit?.[0], windowed: partial, chunks: pieces, capped: false };
+    if (pieces.length <= maxc) return { text: pieces.join("\n"), hit: hit?.[0], windowed: partial, chunks: pieces, capped: false, untrusted };
     const firstKept = pieces.length - (maxc - 1); // 0-based
     const tb = utf8Bytes(text);
     let older = new TextDecoder().decode(tb.subarray(0, starts[firstKept] - 1));
@@ -339,10 +360,10 @@ async function judged(
     const inside = hit?.[1] !== undefined && hit?.[2] !== undefined && hit[2] <= olderLen;
     const [win] = window(older, [older], budget, inside ? hit![1] : undefined, inside ? hit![2] : undefined);
     const out = [win, ...pieces.slice(firstKept)];
-    return { text: out.join("\n"), hit: hit?.[0], windowed: true, chunks: out, capped: true };
+    return { text: out.join("\n"), hit: hit?.[0], windowed: true, chunks: out, capped: true, untrusted };
   }
   const [w, cut] = window(text, values, budget, hit?.[1], hit?.[2]);
-  return { text: w, hit: hit?.[0], windowed: cut || partial };
+  return { text: w, hit: hit?.[0], windowed: cut || partial, untrusted };
 }
 
 /** Port of rules.judged_text: the text evaluate() judges under `rule` ("" when none). */
@@ -357,7 +378,7 @@ export async function judgedText(req: Req, rule: Rule | undefined, ctx?: RulesCt
 
 export async function evaluate(
   req: Req, rule: Rule, ctx?: RulesCtx,
-): Promise<[RuleResult, string, string, boolean?, string[]?, boolean?]> {
+): Promise<[RuleResult, string, string, boolean?, string[]?, boolean?, UntrustedPart?]> {
   // 1. path watch list
   if (!pathMatches(req.path ?? "", rule.watch_paths)) return [PASS, "", "path not watched"];
 
@@ -395,11 +416,21 @@ export async function evaluate(
   // 6+7. extract, prefilter over all of it, judging window, length
   const j = await judged(req, rule, ctx, ct, size);
   if (j.unj) return [UNJUDGEABLE, "", j.unj];
-  if (j.text === "") return [PASS, "", "no text"];
+  const minChars = rule.min_text_chars ?? 20;
+  // retrieved content is judged on its own when there is enough of it, even
+  // beside a short message or none (an untrusted.fields value outside text_fields)
+  let u = j.untrusted;
+  if (u && byteLength(u.text) < minChars) u = undefined;
+  if (j.text === "" && !u) return [PASS, "", "no text"];
   let tag = j.windowed ? " (window)" : "";
   if (j.chunks && !j.capped) tag = ` (${j.chunks.length} chunks)`;
-  if (j.hit) return [SUSPECT, j.text, "pattern: " + j.hit + tag, j.windowed, j.chunks, j.capped];
-  if (byteLength(j.text) >= (rule.min_text_chars ?? 20)) return [SUSPECT, j.text, "natural language" + tag, j.windowed, j.chunks, j.capped];
+  if (j.hit) return [SUSPECT, j.text, "pattern: " + j.hit + tag, j.windowed, j.chunks, j.capped, u];
+  if (byteLength(j.text) >= minChars) return [SUSPECT, j.text, "natural language" + tag, j.windowed, j.chunks, j.capped, u];
+  if (u) {
+    // the text alone would have passed: only the retrieved content is judged
+    u.only = true;
+    return [SUSPECT, j.text, "retrieved content" + (u.windowed ? " (window)" : ""), j.windowed, j.chunks, j.capped, u];
+  }
   return [PASS, "", "text too short"];
 }
 
@@ -416,11 +447,11 @@ export function ruleFor(req: Req, rules: Rule[] | undefined): Rule | undefined {
 
 export async function evaluateAll(
   req: Req, rules: Rule[] | undefined, ctx?: RulesCtx,
-): Promise<[RuleResult, string, string, Rule | undefined, boolean?, string[]?, boolean?]> {
+): Promise<[RuleResult, string, string, Rule | undefined, boolean?, string[]?, boolean?, UntrustedPart?]> {
   let lastReason = "no rules";
   for (const rule of rules ?? []) {
-    const [r, text, reason, windowed, chunks, capped] = await evaluate(req, rule, ctx);
-    if (r !== PASS) return [r, text, reason, rule, windowed, chunks, capped];
+    const [r, text, reason, windowed, chunks, capped, untrusted] = await evaluate(req, rule, ctx);
+    if (r !== PASS) return [r, text, reason, rule, windowed, chunks, capped, untrusted];
     lastReason = reason;
   }
   return [PASS, "", lastReason, undefined];

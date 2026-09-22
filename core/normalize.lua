@@ -78,6 +78,48 @@ function _M.extract_json(decoded, fields)
   return table.concat(out, "\n"), out
 end
 
+-- Tool results in the chat shapes gateways see:
+--   OpenAI Chat Completions  messages[*] with role "tool" (or legacy "function"): content
+--   Anthropic Messages       messages[*].content[*] with type "tool_result": content
+--   OpenAI Responses         input[*] with type "function_call_output": output
+local function tool_results(decoded, out)
+  local msgs = decoded.messages
+  if type(msgs) == "table" then
+    for _, m in ipairs(msgs) do
+      if type(m) == "table" then
+        if m.role == "tool" or m.role == "function" then
+          collect(m.content, out, 1)
+        elseif type(m.content) == "table" then
+          for _, block in ipairs(m.content) do
+            if type(block) == "table" and block.type == "tool_result" then collect(block.content, out, 1) end
+          end
+        end
+      end
+    end
+  end
+  local input = decoded.input
+  if type(input) == "table" then
+    for _, item in ipairs(input) do
+      if type(item) == "table" and item.type == "function_call_output" then collect(item.output, out, 1) end
+    end
+  end
+end
+
+--- Retrieved content in a decoded JSON body: tool results (when
+-- `spec.tool_results`) and the values of `spec.fields`, in that order.
+-- @param decoded table
+-- @param spec    { tool_results = bool, fields = { path, ... } }
+-- @return string (joined with "\n"), may be ""; and the list of strings found
+function _M.extract_untrusted(decoded, spec)
+  local out = {}
+  if type(decoded) ~= "table" or type(spec) ~= "table" then return "", out end
+  if spec.tool_results ~= false then tool_results(decoded, out) end
+  for _, f in ipairs(spec.fields or {}) do
+    walk(decoded, split_path(f), 1, out)
+  end
+  return table.concat(out, "\n"), out
+end
+
 -- ---------------------------------------------------------------------------
 -- Format detection. The Content-Type a client sends is a hint, not a fact:
 -- Ollama decodes JSON whatever the header says, and FastAPI parses a body
@@ -142,7 +184,8 @@ end
 -- @param json_decode  function(string) -> table|nil
 -- @return text string (the values joined with "\n"),
 --         kind ("json"|"form"|"multipart"|"text"|"binary"|"none"),
---         list of the values found (newest last), for window()
+--         list of the values found (newest last), for window(),
+--         and the decoded JSON value when kind is "json"
 function _M.extract(body, content_type, fields, json_decode)
   if type(body) ~= "string" or body == "" then return "", "none", {} end
   local raw_ct = type(content_type) == "string" and content_type or ""
@@ -157,7 +200,7 @@ function _M.extract(body, content_type, fields, json_decode)
     local ok, decoded = pcall(json_decode, body)
     if ok and type(decoded) == "table" then
       local text, out = _M.extract_json(decoded, fields)
-      return text, "json", out
+      return text, "json", out, decoded
     end
     -- declared JSON that is not: the backend rejects it too
     if declared_json then return "", "none", {} end

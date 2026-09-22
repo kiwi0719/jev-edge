@@ -2,6 +2,7 @@
 // core/golden/rules.json has one positive per always_suspect pattern and
 // fails a named case when the two drift.
 import { patternError, type Rule } from "../core/rules.js";
+import { validateUntrusted } from "../core/defaults.js";
 
 export const llmEndpoints: Rule = {
   id: "llm-endpoints",
@@ -71,6 +72,8 @@ export function resolve(spec: RuleSpec): Rule {
     const perr = patternError(p);
     if (perr) throw new Error(`rule ${out.id}: watch_paths[${i + 1}] ${perr}`);
   });
+  const [uok, uerr] = validateUntrusted(out.untrusted, `rule ${out.id}: untrusted`);
+  if (!uok) throw new Error(uerr);
   out.text_fields ??= ["messages[*].content", "prompt", "input", "query", "text"];
   out.templates ??= ["injection"];
   return out;

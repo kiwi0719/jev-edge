@@ -67,6 +67,7 @@ build = {
       ["jev.core.verdict"]   = "core/verdict.lua",
 
       ["jev.core.templates.abuse"]     = "core/templates/abuse.lua",
+      ["jev.core.templates.untrusted"] = "core/templates/untrusted.lua",
       ["jev.core.templates.injection"] = "core/templates/injection.lua",
 
       ["jev.rules.default"]        = "rules/default.lua",

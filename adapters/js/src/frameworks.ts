@@ -2,6 +2,7 @@
 // Fastify raw), Hono. All V8 hosts, so the golden vectors already cover them;
 // only the request shape and the stores differ (memory per process unless you
 // pass a Store).
+import { Buffer } from "node:buffer";
 import { createRuntime, evaluate, withVerdictHeaders, healthResponse, type Options, type Runtime } from "./runtime.js";
 import { headers as verdictHeaders, newVerdict, ERROR, SRC_ADAPTER, type Verdict } from "./core/verdict.js";
 
@@ -82,6 +83,19 @@ export interface NodeResponseLike {
   end(body?: string): unknown;
 }
 
+/** `v` as a Buffer, or undefined. TypeScript 7 no longer narrows through the
+ *  `obj is Buffer` predicate of Buffer.isBuffer, so the cast is explicit. */
+function asBuffer(v: unknown): Buffer | undefined {
+  return Buffer.isBuffer(v) ? (v as Buffer) : undefined;
+}
+
+/** UTF-8 text of a Buffer. TextDecoder, not buf.toString("utf8"): the Workers
+ *  types declare their own node:buffer, whose toString takes no encoding. */
+const utf8 = new TextDecoder("utf-8");
+function text(b: Buffer): string {
+  return utf8.decode(b);
+}
+
 function isEmptyObject(v: unknown): boolean {
   return typeof v === "object" && v !== null && !Buffer.isBuffer(v) && Object.keys(v).length === 0;
 }
@@ -124,7 +138,8 @@ async function readNodeBody(req: NodeRequestLike): Promise<[string | Buffer | nu
   // already decoded (body-parser inflates gzip / deflate / br).
   if (req.body !== undefined && req.body !== null && parsed) {
     if (typeof req.body === "string") return [req.body, Buffer.byteLength(req.body), true];
-    if (Buffer.isBuffer(req.body)) return [req.body.toString("utf8"), req.body.length, true];
+    const buf = asBuffer(req.body);
+    if (buf) return [text(buf), buf.length, true];
     if (typeof req.body === "object") {
       const ct = req.headers["content-type"];
       const s = reencode(req.body, Array.isArray(ct) ? ct.join(", ") : ct ?? "");
@@ -176,14 +191,15 @@ export function nodeMiddleware(opts: Options) {
       const method = req.method ?? "GET";
       const [body, , fromParser] = method === "GET" || method === "HEAD" ? [null, 0, false] : await readNodeBody(req);
       if (body !== null && (req.body === undefined || (req._body !== true && isEmptyObject(req.body)))) {
-        req.body = Buffer.isBuffer(body) ? body.toString("utf8") : body;
+        const b = asBuffer(body);
+        req.body = b ? text(b) : body;
       }
       // a parser already decoded it: the runtime must not try again
       if (fromParser) headers.delete("content-encoding");
       // The whole body goes to the runtime, which reads it as it reads any
       // stream: parsed whole up to max_body_bytes, head and tail past it.
       const request = new Request(url.toString(), {
-        method, headers, body: body === null ? undefined : (Buffer.isBuffer(body) ? new Uint8Array(body) : body) as BodyInit,
+        method, headers, body: body === null ? undefined : (asBuffer(body) ? new Uint8Array(asBuffer(body)!) : body) as BodyInit,
       });
       if (r.opts.health !== false && url.pathname === "/_jev/health" && method === "GET") {
         const h = healthResponse(r);

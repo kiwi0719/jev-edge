@@ -39,7 +39,7 @@ __pycache__/
 # Derived from production logs (contains fingerprints of real traffic).
 bench/datasets/labels*.csv
 *.rock
-jev-edge/
+/jev-edge/
 
 # agent worktrees
 .claude/worktrees/

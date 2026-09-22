@@ -49,6 +49,10 @@ build = {
       ["resty.jev.providers.mock"]           = "adapters/openresty/lib/resty/jev/providers/mock.lua",
       ["resty.jev.providers.openai_compat"]  = "adapters/openresty/lib/resty/jev/providers/openai_compat.lua",
 
+      -- Kong Gateway plugin (KONG_PLUGINS=bundled,jev-edge); see adapters/kong/README.md
+      ["kong.plugins.jev-edge.handler"] = "adapters/kong/kong/plugins/jev-edge/handler.lua",
+      ["kong.plugins.jev-edge.schema"]  = "adapters/kong/kong/plugins/jev-edge/schema.lua",
+
       -- Gateway-independent core, flattened the same way `make dist` does it.
       ["jev.core"]           = "core/init.lua",
       ["jev.core.breaker"]   = "core/breaker.lua",

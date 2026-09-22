@@ -95,6 +95,7 @@ rule("rockspec-modules", function(r)
   for _, f in ipairs(tracked("core", "^core/[^/]+%.lua$")) do want[#want + 1] = f end
   for _, f in ipairs(tracked("core/templates", "%.lua$")) do want[#want + 1] = f end
   for _, f in ipairs(tracked("rules", "%.lua$")) do want[#want + 1] = f end
+  for _, f in ipairs(tracked("adapters/kong/kong", "%.lua$")) do want[#want + 1] = f end
   for _, f in ipairs(want) do
     if not listed[f] then fail(r, "not in the rockspec: " .. f) end
   end

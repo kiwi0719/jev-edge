@@ -90,7 +90,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        gateway: [envoy, haproxy, apisix, forward-auth]
+        gateway: [envoy, haproxy, apisix, kong, forward-auth]
     steps:
       - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1

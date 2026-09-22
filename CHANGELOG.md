@@ -18,6 +18,9 @@ All notable changes to this project are recorded here. The format follows
 - `security` workflow: CodeQL (TypeScript, Go, Python, workflows),
   govulncheck on both Go binaries (blocks when a released fix exists) and
   `pnpm audit`. Dependabot for actions, npm, Go modules and Dockerfiles.
+- `SECURITY.md` (private reports through GitHub advisories, and what counts
+  as a vulnerability for a filter), `CODE_OF_CONDUCT.md` (Contributor
+  Covenant 2.1) and a pull request template with the CONTRIBUTING checklist.
 
 ### Changed
 - CI: core specs on Lua 5.1, 5.4, 5.5 and OpenResty's LuaJIT (plus the LuaJIT

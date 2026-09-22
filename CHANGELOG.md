@@ -7,6 +7,44 @@ All notable changes to this project are recorded here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Subject reputation** (`subject.reputation`): judged verdicts add points
+  per subject (a header such as an API key, a cookie, or the IP) over a
+  sliding window (suspicious 1, malicious 3 by default); past `block_at` the
+  subject is blocked at L1 for `block_ttl`, from any address and for any
+  text. Off by default. Counters are two keys per subject in the subject
+  store (atomic `incr`); L1 blocks never count. `make calibrate` replays the
+  window per subject from monitor-mode logs (log lines now carry `ts`) and
+  recommends `block_at`. `jev_subject_blocks_total`. Golden vectors carry
+  the subject store and its writes; both cores replay them.
+- **Kong Gateway plugin** (`adapters/kong`, Kong 3.x, same engine as the
+  APISIX plugin): priority 905 (after auth, acl and rate limiting), body via
+  `resty.jev.body` including spooled bodies, fail-open on every error; schema
+  mirrors the APISIX keys and runs core's validation; `make e2e-kong` (real
+  Kong 3.9, DB-less, 18 checks) runs in CI. The rockspec ships the plugin.
+- **Deno Deploy preset** (`@jev-edge/js/deno`: `denoHandler`, and
+  `denoKvStore` with atomic `incr` on Deno KV).
+- **npm release workflow** (`release-npm.yml`): on a `v*` tag, checks that
+  the tag matches the package version, tests, builds, checks every export
+  resolves and publishes with provenance when `NPM_TOKEN` is set (skips
+  otherwise). Package metadata, `LICENSE` and `prepublishOnly` added.
+- **Operations** (`ops/`): a Grafana dashboard, Prometheus alert rules
+  (breaker open, L2 error ratio, unjudgeable ratio, L2 timeout at its
+  ceiling, async drops, L2 starved) with `promtool test rules` unit tests run
+  in CI; new metrics `jev_feedback_total{label,result}` and
+  `jev_l2_timeout_max_ms`.
+- **Judge robustness**: `bench/datasets/judge-directed.jsonl` (45 cases:
+  verdict requests, text addressing the classifier, fake answer JSON, fake
+  end-of-input markers, retractions, other languages, buried instructions,
+  and benign look-alikes) and `make bench-judge` (offline L1 pass; the live
+  part needs a provider key); six `always_suspect` patterns for
+  judge-directed text, each with a golden positive, and negatives such as
+  "Is this email safe to open?".
+- Partial bodies are covered end to end: Envoy (HTTP and gRPC, cut at
+  `max_request_bytes`) and HAProxy (past `tune.bufsize`, Content-Length and
+  chunked) flag them, and the e2e suites check that an attack in the part
+  that arrived is blocked and a benign one is judged. `docs/design.md` has
+  a "Traffic L1 does not see" section (WebSocket frames, Realtime API,
+  responses, multimodal content, headers-only and partial-body gateways).
 - `scripts/invariants.lua` (`make invariants`, part of `make check` and CI):
   tripwires for the bug classes the 0.4.0 audit found (one version
   everywhere, every module in the rockspec, headers read without the 100
@@ -33,6 +71,24 @@ All notable changes to this project are recorded here. The format follows
   run catches upstream gateway images that moved.
 
 ### Fixed
+- **`@jev-edge/js` could not be loaded by Node or Deno**: `dist/` used
+  extensionless relative imports (fine for bundlers, `ERR_UNSUPPORTED_DIR_IMPORT`
+  for Node's ESM loader, so `nodeMiddleware` and Lambda@Edge only worked
+  bundled). Every import has its `.js`, and the build uses `NodeNext` so an
+  extensionless import no longer compiles.
+- **openai-compat judge prompt hardened**, the same in Lua and TS: the text
+  sits between per-request random markers it cannot contain; every
+  top-level JSON object in the reply is read and each question takes its
+  highest value, so a low answer echoed from the input cannot lower the real
+  one; a reply missing an asked question is an error, not a lower score;
+  `null`, `false`, `""` and `[]` are no longer read as 0 in TS. The
+  injection template tells the judge that text addressing it is itself a
+  signal.
+- A byte cut through a multi-byte UTF-8 character no longer reaches the L2
+  prompt: the head and tail of an oversized body, and a gateway's partial
+  body, end on character boundaries.
+- `.gitignore`'s `jev-edge/` matched any directory of that name; it is
+  anchored to the repository root.
 - The feedback endpoint and the mock provider read request headers without
   the 100-header limit, like the rest of the adapter.
 - HAProxy SPOA image built with Go 1.26 (was 1.23, out of support, with

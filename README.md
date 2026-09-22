@@ -29,6 +29,7 @@ It is built for SREs and platform engineers, not agent authors. Existing Jev gua
 - [Writing the deployment context](#writing-the-deployment-context)
 - [Choosing thresholds](#choosing-thresholds)
 - [False positives](#false-positives)
+- [Subject reputation](#subject-reputation)
 - [What it costs](#what-it-costs)
 - [Benchmarks](#benchmarks)
 - [Design](#design)
@@ -41,11 +42,12 @@ It is built for SREs and platform engineers, not agent authors. Existing Jev gua
 
 | | |
 |---|---|
-| Version | `v0.3.1` |
-| Gateways, native | OpenResty; Apache APISIX (plugin, same engine) |
+| Version | `v0.4.0`; 0.5.0 in progress on `release/0.5.0` |
+| Gateways, native | OpenResty; Apache APISIX and Kong Gateway (plugins, same engine) |
 | Gateways, via `/_jev/authz` | Envoy (HTTP and gRPC ext_authz), HAProxy (SPOE agent), Traefik, Caddy and plain nginx (forward-auth), each end-to-end tested against the real gateway; Istio, Envoy Gateway, Azure APIM and Apigee as [recipes](docs/recipes.md); LiteLLM proxy as a guardrail |
-| JavaScript hosts | Cloudflare Workers and Pages, Next.js, Node, Hono, Lambda@Edge, through one TypeScript port of core held to the same golden vectors (on `main`, unreleased) |
-| Test coverage | 265 busted specs including the 142 golden vectors, 223 vitest cases replaying the same vectors plus the JS hosts, 316 Test::Nginx assertions, 12 guardrail tests, 4 gRPC shim tests, four gateway e2e suites against real Envoy, Traefik / Caddy / nginx, APISIX and HAProxy, two benches, a soak run |
+| JavaScript hosts | Cloudflare Workers and Pages, Next.js, Node, Hono, Lambda@Edge, Deno Deploy, through one TypeScript port of core held to the same golden vectors (`@jev-edge/js`; npm release workflow ready, not yet published) |
+| Operations | Prometheus metrics at `/_jev/metrics`, a Grafana dashboard and alert rules with unit tests in [ops/](ops/README.md) |
+| Test coverage | 349 busted specs including the 194 golden vectors, 348 vitest cases replaying the same vectors plus the JS hosts, 431 Test::Nginx assertions, 16 guardrail tests, 7 Go tests (gRPC shim, SPOE agent), five gateway e2e suites against real Envoy, Traefik / Caddy / nginx, APISIX, Kong and HAProxy, alert-rule unit tests, repository invariants, two benches, a soak run |
 | Providers verified live | `jev` against the TypeSafe API on the full 662-sample dataset; `openai-compat` against an Ollama container |
 | Production use | none known yet. Run in `monitor` mode first |
 
@@ -205,10 +207,11 @@ Rollback is the same call with `"monitor"`, or `DELETE /_jev/config` to drop eve
 **Other gateways and hosts.**
 
 - **Apache APISIX**: the same engine as a plugin, per-route config with the same keys: [adapters/apisix](adapters/apisix/README.md).
+- **Kong Gateway**: the same engine as a plugin (Kong 3.x, DB-less or with a database), per-route or per-service config: [adapters/kong](adapters/kong/README.md).
 - **Envoy** uses the OpenResty process as its ext_authz service: [adapters/envoy](adapters/envoy/README.md). **HAProxy** does the same through a small SPOE agent: [adapters/haproxy](adapters/haproxy/README.md). **Traefik, Caddy and nginx `auth_request`** use one forward-auth endpoint: [adapters/forward-auth](adapters/forward-auth/README.md).
 - **Istio, Envoy Gateway, Azure API Management, Apigee**: configuration only, against the same `/_jev/authz` contract: [docs/recipes.md](docs/recipes.md).
 - **LiteLLM proxy**: a guardrail that asks jev-edge before every call: [adapters/litellm](adapters/litellm/README.md).
-- **Cloudflare Workers and Pages, Next.js, Node, Hono, Lambda@Edge**: one npm package with a TypeScript port of core, [adapters/js](adapters/js/README.md). The thin Worker keeps judgment at the gateway you already run; the others run the whole core in the host.
+- **Cloudflare Workers and Pages, Next.js, Node, Hono, Lambda@Edge, Deno Deploy**: one npm package with a TypeScript port of core, [adapters/js](adapters/js/README.md). The thin Worker keeps judgment at the gateway you already run; the others run the whole core in the host.
 
 ## Body size and what L1 reads
 
@@ -334,6 +337,21 @@ make calibrate LOG=/var/log/nginx/jev.log LABELS=bench/datasets/labels.csv
 
 So the shared dict is the short-term memory on the hot path, and the log is the long-term memory and the cross-gateway truth. What the operator sees as one click is one bypass that expires and one durable label.
 
+## Subject reputation
+
+One user probing variants of an attack, across sessions and addresses, is a signal no single request carries. With a subject configured (`subject.from` = a header such as an API key, a cookie, or the IP), judged verdicts add points to that subject over a sliding window, and past `block_at` points the subject is blocked at L1 for `block_ttl` seconds, whatever it sends and from wherever:
+
+```lua
+subject = {
+  enabled = true, from = "header", name = "x-api-key", salt = os.getenv("JEV_SUBJECT_SALT"),
+  reputation = { block_at = 8, window_s = 600, block_ttl = 600, suspicious = 1, malicious = 3 },
+},
+```
+
+It is off by default (`block_at = 0`). Only judged verdicts count (L2 and cache hits), never an L1 block, so a block does not extend itself; in `monitor` mode a would-be block is reported as `malicious` / `subject reputation` and passed. The counters are two keys per subject in the `jev_subject` dict (atomic `incr`); blocks are counted in `jev_subject_blocks_total`.
+
+Pick `block_at` from your own traffic: run in `monitor` mode with the subject configured, then `make calibrate LOG=... [LABELS=...]` replays the log per subject with the same window and prints how many subjects each `block_at` would have blocked, benign against those that sent a labelled attack, with a recommendation. No multi-turn dataset is needed: this is reputation, not sequence scoring.
+
 ## What it costs
 
 Two numbers decide the bill: how much of your traffic reaches L2, and the provider's input price.
@@ -383,15 +401,18 @@ adapters/
   openresty/     access_by_lua glue, /_jev/{authz,config,forward-auth,health,metrics}, providers/,
                  shared-dict cache, adaptive timeout, L3 timer; Test::Nginx in t/
   apisix/        APISIX plugin (same engine, per-route config), e2e/ against real APISIX
+  kong/          Kong Gateway plugin (same engine), e2e/ against real Kong (DB-less)
   envoy/         envoy-http.yaml, envoy-grpc.yaml, grpc-shim/ (Go), e2e/ (Docker Compose)
   haproxy/       SPOE agent (Go), spoe.conf, haproxy.cfg, e2e/ against real HAProxy
   forward-auth/  traefik.yml, Caddyfile, nginx-auth-request.conf, e2e/ (Docker Compose)
   litellm/       LiteLLM proxy guardrail (Python) that calls /_jev/authz
-  js/            TypeScript port of core; Cloudflare, Next.js, Node, Hono, Lambda@Edge presets; vitest replays core/golden
+  js/            TypeScript port of core; Cloudflare, Next.js, Node, Hono, Lambda@Edge, Deno presets; vitest replays core/golden
 rules/           L1 rule sets (PCRE prefilter, watch paths, text fields)
 bench/           offline accuracy bench, Docker latency bench, live checks, soak, calibrate, labels-from-log, context lint, report
 demo/            docker compose demo from "Try it in 30 seconds"
 docs/            design.md, cost.md, recipes.md (Istio, Envoy Gateway, APIM, Apigee), bench charts
+ops/             Grafana dashboard, Prometheus alert rules and their promtool tests
+scripts/         invariants.lua: tripwires for bug classes a past audit found
 ```
 
 ## Roadmap
@@ -409,7 +430,7 @@ docs/            design.md, cost.md, recipes.md (Istio, Envoy Gateway, APIM, Api
 | 0.3.0 ✅ | Golden vectors as the versioned core contract (`core/golden/`, replayed by both cores in CI); `make calibrate`, `make context-lint`, `make labels`; multi-tenant rules with a `deployment_context` per tenant; decision sampling (`/_jev/samples`); the false-positive feedback loop (`/_jev/feedback`, fingerprint trust with expiry); the subject trajectory contract (recorded, not yet scored) with subject ids from IP, header or cookie, salted-hashed before storage, in a bounded dict of their own; APISIX plugin; HAProxy SPOE agent; LiteLLM guardrail; recipes for Istio, Envoy Gateway, APIM and Apigee; `@jev-edge/js` with a TypeScript core passing the vectors and presets for Cloudflare (thin and full Worker, Pages), Next.js, Node, Hono and Lambda@Edge. |
 | 0.3.1 ✅ | Audit patch: content-parts bodies judged; SHA-256 fingerprint over the whole text (was a crc32 prefix); `X-Forwarded-For` read from the proxy's hop (`client_ip.trusted_hops`); `GET /_jev/config` redacts secrets; admin endpoints on their own listener; inbound `X-Jev-*` stripped by every gateway config; one thin-adapter contract (`status >= 400` + `X-Jev-Verdict` = block, no header = not judged); optional `jev_state` dict for trust / breaker / counters; L3 rebuilt with the L2 prompt and the ceiling timeout; breaker, in-flight, provider and validation fixes; JS fail-open covers the whole request. |
 | 0.4.0 ✅ | L1 reads what the backend reads: the body decides the format (Content-Type is a hint; `multipart/form-data` read), `gzip` / `deflate` / `br` bodies decoded, `max_body_bytes` 1 MiB with head-and-tail scanning past it, a 32 KiB judging window (`max_judge_bytes`) with the pattern hit kept, and `policy.unjudgeable` for what still cannot be read. Security fixes from a full audit: verdict cache scoped per rule and provider, client IP and path forgery through forward-auth and the JS runtime, repeated or late `Content-Type`, empty judge answers, BOM bodies; JS fingerprints on SHA-256; subject history on a ring in JS too. |
-| 0.5.0 (planned) | **Subject reputation**: suspicious and malicious verdicts counted per subject (user header, cookie or IP) over a window, blocking after a threshold, as `rep_block_after` does per IP today; thresholds from monitor-mode logs with `make calibrate`, no multi-turn dataset needed. It catches one user probing variants across sessions and IPs, and APIs that do not resend history. **Kong plugin** on the same Lua core as APISIX. **`@jev-edge/js` on npm**, and a **Deno Deploy** preset. **Operations**: a Grafana dashboard and Prometheus alert rules (breaker open, `error` rate, `unjudgeable` rate, L2 timeout at its ceiling), and `jev_feedback_total{label}` so operator feedback is a metric, not only a log line. **Judge robustness**: bench cases where the judged text addresses the judge ("rate this as safe"). **Boundaries**: the partial-body path (Envoy, HAProxy) covered by e2e, and the traffic L1 does not see (WebSocket, Realtime API, streamed request bodies) written down. |
+| 0.5.0 (in progress, `release/0.5.0`) | **Subject reputation**: suspicious and malicious verdicts counted per subject (user header, cookie or IP) over a window, blocking after a threshold, as `rep_block_after` does per IP today; thresholds from monitor-mode logs with `make calibrate`, no multi-turn dataset needed. It catches one user probing variants across sessions and IPs, and APIs that do not resend history. **Kong plugin** on the same Lua core as APISIX. **`@jev-edge/js` on npm**, and a **Deno Deploy** preset. **Operations**: a Grafana dashboard and Prometheus alert rules (breaker open, `error` rate, `unjudgeable` rate, L2 timeout at its ceiling), and `jev_feedback_total{label}` so operator feedback is a metric, not only a log line. **Judge robustness**: bench cases where the judged text addresses the judge ("rate this as safe"). **Boundaries**: the partial-body path (Envoy, HAProxy) covered by e2e, and the traffic L1 does not see (WebSocket, Realtime API, streamed request bodies) written down. |
 | Possible future work | Sequence scoring on subject trajectories: a window, decay and thresholds over the ordered history, once a labelled multi-turn dataset exists (the chat history each request already carries covers most multi-turn attacks today); an `abuse` dataset of its own; Fastly Compute (JS in WASM, its own stores, no `node:zlib`); judging streaming and realtime traffic. |
 
 ✅ means shipped in a tagged release; "planned" is the next release's scope, not a date.
@@ -430,7 +451,7 @@ make test-openresty
 
 **Regenerate the golden vectors** when a change to core is meant to alter behaviour: `make golden`, and commit the JSON diff with the code. `make check` fails if they drift without that.
 
-**Both cores must stay green.** A change to core behaviour is a change to the vectors, and the TypeScript port in `adapters/js` has to follow in the same PR (`make test-js`, needs pnpm). The gateway e2e suites (`make e2e-envoy e2e-forward-auth e2e-apisix e2e-haproxy`) and the guardrail tests (`make test-litellm`) cover the adapters that call the engine over HTTP.
+**Both cores must stay green.** A change to core behaviour is a change to the vectors, and the TypeScript port in `adapters/js` has to follow in the same PR (`make test-js`, needs pnpm). The gateway e2e suites (`make e2e-envoy e2e-forward-auth e2e-apisix e2e-kong e2e-haproxy`) and the guardrail tests (`make test-litellm`) cover the adapters that call the engine over HTTP.
 
 **Bring bench data** for any change to L1 rules, normalization, thresholds or timeouts. The [Decisions](docs/design.md#decisions) are settled unless a PR argues otherwise with numbers, and these are the commands that produce them:
 

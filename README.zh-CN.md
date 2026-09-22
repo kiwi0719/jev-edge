@@ -5,6 +5,7 @@
 [![CI](https://github.com/kiwi0719/jev-edge/actions/workflows/ci.yml/badge.svg)](https://github.com/kiwi0719/jev-edge/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![opm](https://img.shields.io/badge/opm-lua--resty--jev--edge-orange.svg)](https://opm.openresty.org/package/kiwi0719/lua-resty-jev-edge/)
+[![LuaRocks](https://img.shields.io/badge/luarocks-lua--resty--jev--edge-blue.svg)](https://luarocks.org/modules/kiwi719/lua-resty-jev-edge)
 [![OpenResty](https://img.shields.io/badge/OpenResty-1.21%2B-brightgreen.svg)](https://openresty.org)
 [![Release](https://img.shields.io/github/v/tag/kiwi0719/jev-edge?label=release)](https://github.com/kiwi0719/jev-edge/tags)
 
@@ -112,13 +113,21 @@ L3  异步旁路        永不阻塞响应；喂给信誉和告警
 
 ## 安装
 
-要求：OpenResty ≥ 1.21 和 [lua-resty-http](https://github.com/ledgetech/lua-resty-http) ≥ 0.17（opm 会自动拉）。
+要求：OpenResty ≥ 1.21 和 [lua-resty-http](https://github.com/ledgetech/lua-resty-http) ≥ 0.17（两个包管理器都会自动拉）。
+
+**LuaRocks** —— 如果你已经用 rockspec 管理 OpenResty 或 APISIX 的依赖，这条路更短：
+
+```bash
+luarocks install lua-resty-jev-edge
+```
 
 **opm**
 
 ```bash
 opm get kiwi0719/lua-resty-jev-edge
 ```
+
+> `0.3.1` 仍在 opm 的索引队列里。在它生效之前，请用 LuaRocks 或源码安装。
 
 **从源码**（装到 `/usr/local/openresty/lualib`，并在 `/etc/nginx/jev-edge.conf.lua` 放一份起始配置；用 `LUA_LIB_DIR=` 和 `PREFIX_CONF=` 覆盖）：
 

@@ -5,6 +5,7 @@
 [![CI](https://github.com/kiwi0719/jev-edge/actions/workflows/ci.yml/badge.svg)](https://github.com/kiwi0719/jev-edge/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![opm](https://img.shields.io/badge/opm-lua--resty--jev--edge-orange.svg)](https://opm.openresty.org/package/kiwi0719/lua-resty-jev-edge/)
+[![LuaRocks](https://img.shields.io/badge/luarocks-lua--resty--jev--edge-blue.svg)](https://luarocks.org/modules/kiwi719/lua-resty-jev-edge)
 [![OpenResty](https://img.shields.io/badge/OpenResty-1.21%2B-brightgreen.svg)](https://openresty.org)
 [![Release](https://img.shields.io/github/v/tag/kiwi0719/jev-edge?label=release)](https://github.com/kiwi0719/jev-edge/tags)
 
@@ -112,13 +113,21 @@ Guarantees the project is built around:
 
 ## Install
 
-Requirements: OpenResty ≥ 1.21 and [lua-resty-http](https://github.com/ledgetech/lua-resty-http) ≥ 0.17 (pulled in by opm).
+Requirements: OpenResty ≥ 1.21 and [lua-resty-http](https://github.com/ledgetech/lua-resty-http) ≥ 0.17 (pulled in by either package manager).
+
+**LuaRocks** — the shorter path if you already manage OpenResty or APISIX dependencies with rockspecs:
+
+```bash
+luarocks install lua-resty-jev-edge
+```
 
 **opm**
 
 ```bash
 opm get kiwi0719/lua-resty-jev-edge
 ```
+
+> `0.3.1` is still in the opm indexing queue. Until it clears, use LuaRocks or install from source.
 
 **From source** (installs into `/usr/local/openresty/lualib` and drops a starter config at `/etc/nginx/jev-edge.conf.lua`; override with `LUA_LIB_DIR=` and `PREFIX_CONF=`):
 

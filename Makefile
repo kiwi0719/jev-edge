@@ -1,4 +1,4 @@
-.PHONY: test lint check luajit-check golden golden-check calibrate labels context-lint test-js test-openresty bench bench-offline bench-chart dist opm-build install live-check live-full live-openai soak shim e2e-envoy e2e-forward-auth e2e-apisix e2e-haproxy test-litellm
+.PHONY: test lint check luajit-check golden golden-check calibrate labels context-lint test-js test-openresty bench bench-offline bench-chart dist opm-build rock-lint rock-pack rock-upload install live-check live-full live-openai soak shim e2e-envoy e2e-forward-auth e2e-apisix e2e-haproxy test-litellm
 
 test:
 	busted
@@ -150,6 +150,24 @@ opm-build: dist
 	  test -f "$$HOME/.opmrc" || printf 'github_account=%s\n' "$$(sed -n 's/^author = //p' dist.ini)" > "$$HOME/.opmrc"; \
 	  docker run --rm -v "$$(PWD)/$(DIST)":/pkg -v "$$HOME/.opmrc":/root/.opmrc:ro -w /pkg openresty/openresty:alpine-fat opm build; \
 	fi
+
+# ---------------------------------------------------------------------------
+# LuaRocks. The rockspec maps the source tree directly (no `make dist` needed);
+# uploading requires an API key from https://luarocks.org/settings/api-keys;
+# pass it once via ARGS=--api-key=<key> and luarocks stores it itself.
+# ---------------------------------------------------------------------------
+ROCKSPEC := lua-resty-jev-edge-$(VERSION)-1.rockspec
+
+rock-lint:
+	luarocks lint $(ROCKSPEC)
+
+rock-pack: rock-lint
+	luarocks pack $(ROCKSPEC)
+
+# First run needs the key: make rock-upload ARGS=--api-key=<key>
+# luarocks then saves it to ~/.luarocks/upload_config.lua for later runs.
+rock-upload: rock-lint
+	luarocks upload $(ARGS) $(ROCKSPEC)
 
 install: dist
 	mkdir -p $(LUA_LIB_DIR)/jev $(LUA_LIB_DIR)/resty

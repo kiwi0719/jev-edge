@@ -9,6 +9,7 @@
 // request with X-Jev-Verdict: error and X-Jev-Source: adapter, and is logged.
 
 import * as core from "./core";
+import { decodeBody } from "./decode";
 import { resolve as resolveRule, type RuleSpec } from "./rules";
 import { shouldSample, buildSample, type Sample } from "./sampling";
 import * as subjectMod from "./core/subject";
@@ -33,7 +34,11 @@ export interface Options {
   state?: DOStubLike | Store;
   /** Store for per-subject trajectories (KV or memory). Memory (per isolate) if absent. Only used with config.subject.enabled. */
   subjectStore?: KVLike | Store;
-  /** Header carrying the client IP (Cloudflare sets cf-connecting-ip). */
+  /** Header carrying the client IP, set by a proxy you trust to overwrite it.
+   *  Default: cf-connecting-ip on Cloudflare (a preset, or a request with the
+   *  platform's `cf` object), none elsewhere, where it is a client header.
+   *  Without one the IP is X-Forwarded-For element `client_ip.trusted_hops`
+   *  from the right, as on the OpenResty adapter. */
   clientIpHeader?: string;
   /** Called once per judged request with the verdict; wire to console.log or an analytics binding. */
   onVerdict?: (v: core.Verdict, req: Request) => void;
@@ -106,51 +111,112 @@ function consumesSubjectHeader(cfg: core.Config): boolean {
 }
 
 /** Does any rule watch this path and method? Decides whether the body is worth reading at all. */
+/**
+ * The path the origin will route on, the way nginx builds $uri: %XX decoded,
+ * duplicate slashes collapsed, `.` / `..` resolved. Watch patterns anchored at
+ * `^/v1/` must not miss `/v1/%63hat/completions` or `//v1/chat/completions`.
+ */
+export function normalizePath(pathname: string): string {
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(pathname);
+  } catch {
+    // malformed escapes: decode the valid ASCII ones, leave the rest
+    decoded = pathname.replace(/%([0-7][0-9a-fA-F])/g, (_, h: string) => String.fromCharCode(parseInt(h, 16)));
+  }
+  const out: string[] = [];
+  for (const seg of decoded.split("/")) {
+    if (seg === "" || seg === ".") continue;
+    if (seg === "..") out.pop();
+    else out.push(seg);
+  }
+  let p = "/" + out.join("/");
+  if (decoded.endsWith("/") && p !== "/") p += "/";
+  return p;
+}
+
 function isCandidate(rt: Runtime, path: string, method: string): boolean {
   const m = method.toUpperCase();
   return rt.rules.some((r) => core.rules.pathMatches(path, r.watch_paths) && (!r.methods || r.methods[m]));
 }
 
+/** Requests an adapter built from a body it only had the start of
+ *  (Lambda@Edge `bodyTruncated`): the body is a head, never the whole. */
+const truncatedBodies = new WeakSet<Request>();
+export function markTruncated(request: Request): Request {
+  truncatedBodies.add(request);
+  return request;
+}
+
+/** How far past max_body_bytes the stream is read looking for the tail. */
+const SCAN_FACTOR = 4;
+
+interface BodyRead { head: Uint8Array; tail: Uint8Array | null; size: number; complete: boolean }
+
 /**
- * Read at most `maxBytes` of a body from a clone of the request. Returns the
- * text, or null when the body is larger than that: the clone's stream is
- * cancelled at maxBytes + 1 so a missing or lying Content-Length cannot make
- * the edge buffer an unbounded body. The original request is untouched.
+ * Read a clone of the request body: whole up to `maxBytes`; past it the
+ * first `maxBytes` and a ring of the last TAIL_BYTES, reading on to at most
+ * SCAN_FACTOR x maxBytes, so a missing or lying Content-Length cannot make
+ * the edge buffer an unbounded body. `complete` is false when the read
+ * stopped before the end (the tail is then the last bytes read, not the
+ * body's). The original request is untouched.
  */
-async function readBounded(request: Request, maxBytes: number): Promise<[string | null, number]> {
+async function readBounded(request: Request, maxBytes: number): Promise<BodyRead> {
   const body = request.clone().body;
-  if (!body) return ["", 0];
+  if (!body) return { head: new Uint8Array(0), tail: null, size: 0, complete: true };
   const reader = body.getReader();
-  const chunks: Uint8Array[] = [];
+  const headChunks: Uint8Array[] = [];
+  let headLen = 0;
+  const TAIL = core.rules.TAIL_BYTES;
+  let ring = new Uint8Array(0);
   let size = 0;
+  let complete = true;
   try {
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
       size += value.byteLength;
-      if (size > maxBytes) {
+      let v = value;
+      if (headLen < maxBytes) {
+        const take = Math.min(maxBytes - headLen, v.byteLength);
+        headChunks.push(v.subarray(0, take));
+        headLen += take;
+        v = v.subarray(take);
+      }
+      if (v.byteLength > 0) {
+        const joined = new Uint8Array(Math.min(TAIL, ring.byteLength + v.byteLength));
+        const fromV = Math.min(v.byteLength, joined.byteLength);
+        const fromRing = joined.byteLength - fromV;
+        joined.set(ring.subarray(ring.byteLength - fromRing), 0);
+        joined.set(v.subarray(v.byteLength - fromV), fromRing);
+        ring = joined;
+      }
+      if (size > maxBytes * SCAN_FACTOR) {
         // Not awaited: the clone is one branch of a tee, and a tee branch's
         // cancel() only settles once the other branch (the request the app
         // will read) is cancelled as well.
         reader.cancel().catch(() => {});
-        return [null, size];
+        complete = false;
+        break;
       }
-      chunks.push(value);
     }
   } finally {
     reader.releaseLock();
   }
-  const all = new Uint8Array(size);
+  const head = new Uint8Array(headLen);
   let off = 0;
-  for (const c of chunks) {
-    all.set(c, off);
+  for (const c of headChunks) {
+    head.set(c, off);
     off += c.byteLength;
   }
-  return [new TextDecoder("utf-8", { fatal: false }).decode(all), size];
+  return { head, tail: ring.byteLength > 0 ? ring : null, size, complete };
 }
+
+const utf8 = new TextDecoder("utf-8", { fatal: false });
 
 async function readReq(request: Request, rt: Runtime): Promise<[core.Req, ProviderRequestInfo]> {
   const url = new URL(request.url);
+  const path = normalizePath(url.pathname);
   const headers: Record<string, string> = {};
   request.headers.forEach((v, k) => (headers[k] = v));
   // A client-supplied X-Jev-Subject is only meaningful when this deployment
@@ -158,29 +224,46 @@ async function readReq(request: Request, rt: Runtime): Promise<[core.Req, Provid
   // usually with hashed = true behind a thin Worker). Otherwise it is noise
   // that must not reach core, the provider or the upstream.
   if (!consumesSubjectHeader(rt.config)) delete headers[SUBJECT_HEADER];
-  const ipHeader = rt.opts.clientIpHeader ?? "cf-connecting-ip";
-  const clientIp = request.headers.get(ipHeader) ?? (request.headers.get("x-forwarded-for") ?? "").split(",")[0].trim();
-  const maxBytes = Math.max(...rt.rules.map((r) => r.max_body_bytes ?? 65536));
+  const clientIp = clientIpOf(request, rt);
+  const maxBytes = Math.max(...rt.rules.map((r) => r.max_body_bytes ?? core.rules.MAX_BODY_BYTES));
   const lenHeader = request.headers.get("content-length");
   const len = lenHeader === null ? NaN : Number(lenHeader);
+  const req: core.Req = { method: request.method, path, headers, client_ip: clientIp, body_size: Number.isFinite(len) ? len : 0 };
   let body: string | null = null;
-  let size = Number.isFinite(len) ? len : 0;
   // The body is only read for a request some rule would judge; everything
   // else passes at L1 on path or method without touching the stream.
-  if (request.body && isCandidate(rt, url.pathname, request.method) && !(Number.isFinite(len) && len > maxBytes)) {
-    const [text, seen] = await readBounded(request, maxBytes);
-    body = text;
-    size = Math.max(size, seen);
+  if (request.body && isCandidate(rt, path, request.method)) {
+    const r = await readBounded(request, maxBytes);
+    const whole = r.complete && r.size <= maxBytes && !truncatedBodies.has(request);
+    req.body_size = Math.max(req.body_size ?? 0, r.size, truncatedBodies.has(request) ? maxBytes + 1 : 0);
+    const ce = core.rules.contentEncoding(headers);
+    if (ce !== "") {
+      // decode only a body read whole: a cut compressed stream is corrupt
+      if (whole) {
+        const d = await decodeBody(r.head, ce, maxBytes);
+        if (d[0]) {
+          req.decoded = true;
+          if (d[1]) {
+            req.body_head = utf8.decode(d[0].subarray(0, maxBytes));
+            req.body_size = maxBytes + 1;
+          } else {
+            body = utf8.decode(d[0]);
+            req.body_size = d[0].byteLength;
+          }
+        }
+      }
+    } else if (whole) {
+      body = utf8.decode(r.head);
+    } else {
+      req.body_head = utf8.decode(r.head);
+      if (r.tail) req.body_tail = utf8.decode(r.tail);
+    }
   }
-  const req: core.Req = {
-    method: request.method,
-    path: url.pathname,
-    headers,
-    body: body ?? undefined,
-    body_size: body !== null ? core.normalize.byteLength(body) : size,
-    client_ip: clientIp,
-  };
-  return [req, { method: request.method, path: url.pathname, headers: request.headers, body, clientIp }];
+  if (body !== null) {
+    req.body = body;
+    req.body_size = core.normalize.byteLength(body);
+  }
+  return [req, { method: request.method, path, headers: request.headers, body, clientIp }];
 }
 
 /** Subject context for this request, or undefined: hashed id, one history read, a sink that writes without being awaited. */
@@ -195,15 +278,13 @@ async function subjectCtx(rt: Runtime, request: Request, clientIp: string, rctx?
   const id = await subjectMod.hashId(scfg, raw, subjectMod.sha256Hex);
   if (!id) return undefined;
   const store = rt.subjectStore;
-  const k = subjectMod.key(id);
   return {
     id,
-    history: await store.get(k),
+    // ring layout (incr + one key per entry) when the store has incr, so
+    // concurrent requests do not lose entries; the one-list layout otherwise
+    history: await subjectMod.loadHistory(store, id, scfg.max_entries),
     record: (e) => {
-      const p = (async () => {
-        const h = subjectMod.append(await store.get(k), e, scfg.max_entries);
-        await store.set(k, h, scfg.history_ttl ?? 3600);
-      })().catch(() => {});
+      const p = subjectMod.appendHistory(store, id, e, scfg.max_entries, scfg.history_ttl ?? 3600).catch(() => {});
       // On Workers the isolate may be torn down right after the response;
       // waitUntil keeps the write alive. Elsewhere it is plain fire-and-forget.
       if (rctx?.waitUntil) {
@@ -215,6 +296,23 @@ async function subjectCtx(rt: Runtime, request: Request, clientIp: string, rctx?
       }
     },
   };
+}
+
+/**
+ * The client address. A named header only when it is one the platform
+ * overwrites (cf-connecting-ip on Cloudflare) or the operator configured;
+ * otherwise X-Forwarded-For read from the right: proxies append, so the
+ * leftmost value is whatever the client typed. Element `trusted_hops` from
+ * the right (1 = last), as client_ip_from does on OpenResty.
+ */
+export function clientIpOf(request: Request, rt: Pick<Runtime, "opts" | "config">): string {
+  const onCf = rt.opts.platform === "cloudflare" || "cf" in request;
+  const ipHeader = rt.opts.clientIpHeader ?? (onCf ? "cf-connecting-ip" : undefined);
+  const named = ipHeader ? request.headers.get(ipHeader)?.trim() : undefined;
+  if (named) return named;
+  const hops = (request.headers.get("x-forwarded-for") ?? "").split(",").map((s) => s.trim()).filter((s) => s !== "");
+  const n = rt.config.client_ip?.trusted_hops ?? 1;
+  return hops[hops.length - n] ?? "";
 }
 
 function requestIdFor(request: Request, rt: Runtime): string {
@@ -273,7 +371,9 @@ async function evaluateInner(request: Request, rt: Runtime, requestId: string, r
     breaker: rt.breaker,
     subject,
     clock: () => Date.now() / 1000,
-    hash: core.normalize.djb2,
+    // sha256, not djb2: the fingerprint keys the verdict cache and the trust
+    // store, and a linear hash lets a few appended bytes hit a chosen value.
+    hash: core.sha256Hex,
     json_decode: (s) => JSON.parse(s),
     re_find: core.rules.reFind,
     judge: {

@@ -51,7 +51,7 @@ flowchart LR
     style edge fill:transparent,stroke:#8b949e,color:#8b949e
 ```
 
-**Decision principle:** each layer can only make a request *more* suspicious or pass it. Any layer that errors degrades to pass and records `X-Jev-Verdict: error`. The one deliberate exception is operator trust (below): a fingerprint an operator labelled a false positive passes as `safe` at L1.5, before the verdict cache. It is the only input that can lower a score, it always expires, and it exists because a person looked.
+**Decision principle:** each layer can only make a request *more* suspicious or pass it. Any layer that errors degrades to pass and records `X-Jev-Verdict: error`. One deliberate exception is operator trust (below): a fingerprint an operator labelled a false positive passes as `safe` at L1.5, before the verdict cache. It is the only input that can lower a score, it always expires, and it exists because a person looked. The other exception is also an operator's choice: `policy.unjudgeable = "block"` rejects, in `enforce` mode, a watched request L1 could not read (an undecodable encoding, a binary body, an oversized body with no text in its head or tail). By default such a request passes as `skipped`, never silently as "no text".
 
 **One contract for every implementation.** The behaviour of `core/` is pinned by the golden vectors in [core/golden/](../core/golden/README.md): hand-authored inputs, expectations produced by the Lua core, replayed by `core/spec/golden_spec.lua` and checked for drift by `make golden-check` in CI. The TypeScript port in `adapters/js` passes the same files under vitest; that is the definition of it being a port. The vectors cover normalisation, extraction, L1, policy, verdict headers and the pipeline order; they deliberately leave cache TTL precision, cross-worker breaker statistics and the adaptive timeout's value to each platform.
 
@@ -73,7 +73,7 @@ local verdict = edge.evaluate(req, {
 })
 ```
 
-`req` is a plain table the adapter assembles: `method, path, headers, body, body_size, client_ip`.
+`req` is a plain table the adapter assembles: `method, path, headers, body, body_size, client_ip`, plus `body_head` / `body_tail` for a body past `max_body_bytes` and `decoded` once a `Content-Encoding` was decoded.
 
 ## L1: cheap rules
 
@@ -84,17 +84,24 @@ Input: `req` and the configured rule sets. Output is one of:
 | `pass` | clearly normal | forward, header `skipped` |
 | `block` | clearly bad (reputation) | reject without calling Jev |
 | `suspect` | needs L2 | cache lookup, then L2 |
+| `unjudgeable` | watched, but the body cannot be read | forward as `skipped`, or reject per `policy.unjudgeable` |
 
 Evaluation is ordered by cost and short-circuits:
 
 1. **Path not watched** → `pass`. The default watch list is empty. jev-edge does nothing until a path is explicitly listed.
 2. **Reputation** (shared dict, one lookup): IP blocked within `block_ttl` → `block`; IP trusted after N consecutive safe verdicts → `pass`. This runs before anything that needs a body so headers-only forward-auth requests can still be rejected.
-3. **Method / Content-Type** not `POST|PUT|PATCH` or not json / form / text → `pass`.
-4. **Body size**: no body → `pass` ("no body"); under `min_body_bytes` (8) → `pass`; over `max_body_bytes` (64 KB) → `pass` with a log line. Large bodies are never read.
-5. **Regex prefilter**: any `always_suspect` pattern hits → `suspect`. Patterns are **PCRE**, matched case-insensitively through `ctx.re_find`. OpenResty injects `ngx.re.find` with `"ijo"`, specs inject lrexlib-pcre2, the JavaScript adapter injects JS RegExp with the `i` flag. Patterns therefore stay in the PCRE / JavaScript intersection (no lookbehind, no possessive quantifiers, no inline flags), and `core/golden/rules.json` carries one positive per pattern so a divergence fails a named case. One rule file serves every adapter. If no matcher is injected, this step is skipped with a single warning and the length check alone decides (fail-open).
-6. **Natural-language check**: extracted text at least `min_text_chars` (20) → `suspect`, else `pass`.
+3. **Method / Content-Type**: method not in `methods` (`POST|PUT|PATCH`) → `pass`. Content-Type is a hint, so this is a deny list: only a request whose every Content-Type value is a media type in `skip_content_types` (`image/`, `audio/`, `video/`, `font/`, `application/pdf`, `application/zip`, `application/gzip`) → `pass`; no Content-Type is watched. A rule that lists `content_types` keeps the old allow list instead.
+4. **Body size**: no body → `pass` ("no body"); under `min_body_bytes` (8) → `pass`. The size is the larger of the declared `Content-Length` and the bytes the adapter handed over, so a wrong or missing header cannot shrink it. No size is too large to look at: past `max_body_bytes` the body is read in part (step 6).
+5. **Content-Encoding**: a coding other than `identity` that the adapter did not decode (`req.decoded`) → `unjudgeable` ("unjudgeable: content-encoding br"). Adapters decode `gzip`, `deflate` and `br`, capped at `max_body_bytes`.
+6. **Extraction**: up to `max_body_bytes` (1 MiB) the body is parsed whole and its format decided by the body (below); `binary` → `unjudgeable` ("unjudgeable: binary body"). Past it, the first `max_body_bytes` (`req.body_head`) and the last 64 KiB (`req.body_tail`) are scanned for the string values of the text-field keys, truncated JSON included; none found → `unjudgeable` ("unjudgeable: body too large"). No text → `pass` ("no text").
+7. **Regex prefilter** over all of the extracted text: any `always_suspect` pattern hits → `suspect`. Patterns are **PCRE**, matched case-insensitively through `ctx.re_find`, which returns the match's 1-based inclusive byte span (`from, to`) or just a truthy value; the span places the hit in the judging window. OpenResty injects `ngx.re.find` with `"ijo"`, specs inject lrexlib-pcre2, the JavaScript adapter injects JS RegExp with the `i` flag. Patterns therefore stay in the PCRE / JavaScript intersection (no lookbehind, no possessive quantifiers, no inline flags), and `core/golden/rules.json` carries one positive per pattern so a divergence fails a named case. One rule file serves every adapter. If no matcher is injected, this step is skipped with a single warning and the length check alone decides (fail-open).
+8. **Natural-language check**: extracted text at least `min_text_chars` (20) → `suspect`, else `pass`.
 
-Text is extracted from JSON bodies by configurable paths (`messages[*].content`, `prompt`, `input`, `query`, `text`); form and text bodies are taken whole. Extraction failure → `pass`.
+The text of a `suspect` is cut to `max_judge_bytes` (32 KiB) before the fingerprint and L2: the `always_suspect` hit with up to 1 KiB either side, then values newest first, the one that does not fit kept as head and tail. Chat APIs resend the history every turn; earlier turns were judged when they were new. A reason for cut or partial text ends in ` (window)`, as does the L2 reason built on it.
+
+**Format is decided by the body.** A body that parses as JSON is JSON whatever the header says (Ollama and FastAPI read it that way) and text is extracted by configurable paths (`messages[*].content`, `prompt`, `input`, `query`, `text`, content-parts arrays included); declared JSON that does not parse yields no text, as the backend rejects it too. `application/x-www-form-urlencoded`, or a form-shaped body with no Content-Type, gives its field values; `multipart/form-data` gives its fields and its text or JSON file parts. Anything else that reads as text (no NUL, under 1% control bytes) is taken whole; the rest is `binary`.
+
+**`unjudgeable`** means a watched request L1 could not read. It is never judged, so the verdict is `skipped` with reason `unjudgeable: <why>`, counted in `jev_unjudged_total{reason}`. `policy.unjudgeable` decides the action: `pass` (default) forwards it, `block` rejects it in `enforce` mode.
 
 Rule sets are Lua tables, so no YAML dependency:
 
@@ -104,8 +111,9 @@ return {
   id = "llm-endpoints",
   watch_paths = { "^/v1/chat", "^/api/completions" },   -- Lua patterns, anchored prefixes
   methods = { POST = true },
-  content_types = { "application/json", "text/plain" },
-  min_body_bytes = 8, max_body_bytes = 65536,
+  skip_content_types = { "image/", "audio/", "video/", "font/", "application/pdf" },
+  min_body_bytes = 8, max_body_bytes = 1048576,          -- parsed whole; head + tail past it
+  max_judge_bytes = 32768,                               -- judging window
   text_fields = { "messages[*].content", "prompt", "input" },
   min_text_chars = 20,
   always_suspect = {                                     -- PCRE
@@ -123,7 +131,7 @@ Three key kinds in one shared dict:
 
 | Key | Built from | Default TTL | Purpose |
 |---|---|---|---|
-| `fp:<hash>` | normalized text | 300 s | exact-ish replays |
+| `fp:<scope>:<hash>` | normalized text, scoped to rule, templates, deployment context, provider, model (`core.cache_key`) | 300 s | exact-ish replays |
 | `rep:<ip>` | client IP | 600 s | per-IP verdict aggregate |
 | `rep:<ip>:<path>` | IP + path | 120 s | one endpoint being hammered |
 
@@ -178,6 +186,7 @@ policy = {
   mode = "enforce",           -- or "monitor": headers only, never block
   block_status = 403,
   block_body   = '{"error":"request rejected"}',
+  unjudgeable  = "pass",     -- or "block": reject what L1 cannot read, enforce mode only
 }
 ```
 
@@ -187,6 +196,7 @@ policy = {
 | ≥ suspect | pass + `suspicious` + L3 | same |
 | < suspect | pass + `safe` | same |
 | timeout / error | pass + `error` + L3 | same |
+| L1 `unjudgeable` | pass + `skipped`; 403 with `unjudgeable = "block"` | pass + `skipped` |
 
 Default is `monitor`.
 
@@ -195,7 +205,7 @@ Default is `monitor`.
 Triggered by an L2 timeout, a breaker skip, or a score in `[suspect, block)`. Runs in `ngx.timer.at(0, …)` with only the normalized text and fingerprint, never the raw body:
 
 1. Call Jev with a relaxed 5 s timeout.
-2. Write `fp:<hash>` so the next replay hits the cache.
+2. Write `fp:<scope>:<hash>` (the key L2 reads) so the next replay hits the cache.
 3. Update `rep:<ip>`; if `rep_block_after` is set (default 0 = off), mark the IP blocked after that many malicious verdicts so L1 rejects it directly.
 4. On malicious, fire `on_alert` (error log by default, webhook configurable).
 
@@ -237,7 +247,7 @@ Layers: core defaults < config file < runtime override in the shared dict.
 
 ## OpenResty adapter
 
-`access()` is one `pcall` around: read body (only after L1 confirmed path and method), strip inbound headers, `core.evaluate`, set upstream headers, record metrics, `ngx.exit(403)` on block. Any error inside sets `X-Jev-Verdict: error` and returns.
+`access()` is one `pcall` around: read body (only when a rule watches the path; whole up to `max_body_bytes`, head and tail past it, decoded by `resty.jev.body`), strip inbound headers, `core.evaluate`, set upstream headers, record metrics, `ngx.exit(403)` on block. Any error inside sets `X-Jev-Verdict: error` and returns.
 
 Dependencies: OpenResty ≥ 1.21, lua-resty-http ≥ 0.17, bundled lua-cjson.
 
@@ -255,7 +265,7 @@ APISIX is OpenResty, so `adapters/apisix` is one plugin file over the same modul
 
 ## HAProxy adapter
 
-HAProxy's SPOE hands the request, body included, to `adapters/haproxy/spoa`, a Go agent that calls `/_jev/authz` and sets `txn.jev.*` variables; `haproxy.cfg` turns `action=block` into a 403 and the rest into `X-Jev-*` headers. SPOE frames cap the body (`tune.bufsize`, 128 KB in the reference config); a larger body arrives truncated and is judged truncated, the one way this adapter is weaker than Envoy's ext_authz.
+HAProxy's SPOE hands the request, body included, to `adapters/haproxy/spoa`, a Go agent that calls `/_jev/authz` and sets `txn.jev.*` variables; `haproxy.cfg` turns `action=block` into a 403 and the rest into `X-Jev-*` headers. SPOE frames cap the body (`tune.bufsize`, 128 KB in the reference config). A larger body arrives truncated; the agent compares it with HAProxy's `req.body_size`, sends `X-Jev-Body-Partial: 1`, and jev-edge scans it as a head. No tail is available, the one way this adapter is weaker than Envoy's ext_authz with a matching `max_request_bytes`.
 
 ## Recipes: Istio, Envoy Gateway, APIM, Apigee
 
@@ -279,7 +289,7 @@ The one adapter that does not run the Lua core. `adapters/js` is a TypeScript po
 
 The thin preset exists because the most common Cloudflare deployment already has a gateway behind it, and two sets of thresholds is the failure mode to avoid: it runs L1 and the cache at the edge and leaves the score, the deployment context and the key at the origin. The `backend` provider translates the origin's `X-Jev-*` answer back into an answer map, so the Worker's own policy still applies (`enforce` at the edge blocks on the origin's score).
 
-What differs from nginx by platform, not by design: KV's 60 s minimum TTL and eventual consistency, the Durable Object hop for breaker state, a different fingerprint hash (SHA-256 on nginx, `djb2` in the package; caches are never shared between the two, so only collision resistance matters, and the package's runtime should be given a real hash before its cache is exposed), no `/_jev/config` hot reload (config is code), no L3 yet. The adapter README keeps the full list.
+What differs from nginx by platform, not by design: KV's 60 s minimum TTL and eventual consistency, the Durable Object hop for breaker state, no `/_jev/config` hot reload (config is code), no L3 yet. The adapter README keeps the full list.
 
 ## Subject trajectories
 
@@ -311,6 +321,8 @@ jev_cache_hits_total{kind}
 jev_l2_latency_ms_bucket{le}
 jev_breaker_state
 jev_async_dropped_total
+jev_unjudged_total{reason}
+jev_window_total
 ```
 
 ## Bench and acceptance

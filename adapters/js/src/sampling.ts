@@ -3,7 +3,7 @@
 import * as normalize from "./core/normalize";
 import { MALICIOUS, SRC_L1, type Verdict } from "./core/verdict";
 import type { Config } from "./core/defaults";
-import { pathMatches, type Req, type Rule } from "./core/rules";
+import { contentType, pathMatches, type Req, type Rule } from "./core/rules";
 
 const RANK: Record<string, number> = { skipped: -1, error: 0, safe: 1, suspicious: 2, malicious: 3 };
 
@@ -29,7 +29,7 @@ export function buildSample(cfg: Config, v: Verdict, req: Req, rules: Rule[], ri
   const rule = rules.find((r) => pathMatches(req.path ?? "", r.watch_paths) !== null); // watch_paths are Lua patterns
   let text = "";
   if (rule && typeof req.body === "string") {
-    const ct = req.headers?.["content-type"] ?? req.headers?.["Content-Type"] ?? "";
+    const ct = contentType(req.headers);
     const [extracted] = normalize.extract(req.body, ct, rule.text_fields);
     text = normalize.normalize(extracted, { prefix_bytes: cfg.sampling.text_bytes ?? 512 });
   }

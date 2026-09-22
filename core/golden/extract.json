@@ -196,6 +196,60 @@
     },
     {
       "expect": {
+        "kind": "json",
+        "text": "after null"
+      },
+      "input": {
+        "body": "{\"messages\":[null,{\"role\":\"user\",\"content\":\"after null\"}]}",
+        "content_type": "application/json",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "a null message does not end the list"
+    },
+    {
+      "expect": {
+        "kind": "json",
+        "text": "after null part"
+      },
+      "input": {
+        "body": "{\"messages\":[{\"role\":\"user\",\"content\":[null,{\"type\":\"text\",\"text\":\"after null part\"}]}]}",
+        "content_type": "application/json",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "a null content part does not end the parts"
+    },
+    {
+      "expect": {
+        "kind": "json",
+        "text": "after bom"
+      },
+      "input": {
+        "body": "﻿{\"prompt\":\"after bom\"}",
+        "content_type": "application/json",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "UTF-8 BOM before json is skipped"
+    },
+    {
+      "expect": {
         "kind": "none",
         "text": ""
       },
@@ -268,8 +322,8 @@
     },
     {
       "expect": {
-        "kind": "none",
-        "text": ""
+        "kind": "json",
+        "text": "x"
       },
       "input": {
         "body": "{\"prompt\":\"x\"}",
@@ -282,10 +336,118 @@
           "text"
         ]
       },
-      "name": "unknown content type yields nothing"
+      "name": "JSON under a non-JSON content type is read as JSON"
+    },
+    {
+      "expect": {
+        "kind": "json",
+        "text": "text json"
+      },
+      "input": {
+        "body": "{\"prompt\":\"text json\"}",
+        "content_type": "text/json",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "text/json is JSON"
+    },
+    {
+      "expect": {
+        "kind": "json",
+        "text": "bare"
+      },
+      "input": {
+        "body": "{\"prompt\":\"bare\"}",
+        "content_type": null,
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "no content type, JSON body"
+    },
+    {
+      "expect": {
+        "kind": "form",
+        "text": "bare form\n2"
+      },
+      "input": {
+        "body": "prompt=bare+form&n=2",
+        "content_type": null,
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "no content type, form body"
+    },
+    {
+      "expect": {
+        "kind": "text",
+        "text": "{not json"
+      },
+      "input": {
+        "body": "{not json",
+        "content_type": "text/plain",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "text/plain that is not JSON stays text"
+    },
+    {
+      "expect": {
+        "kind": "binary",
+        "text": ""
+      },
+      "input": {
+        "body": "\u0000\u0001\u0002\u0003binary",
+        "content_type": "application/octet-stream",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "binary body"
+    },
+    {
+      "expect": {
+        "kind": "multipart",
+        "text": "field text\nfile text"
+      },
+      "input": {
+        "body": "--B1\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nfield text\r\n--B1\r\nContent-Disposition: form-data; name=\"f\"; filename=\"a.txt\"\r\nContent-Type: text/plain\r\n\r\nfile text\r\n--B1\r\nContent-Disposition: form-data; name=\"i\"; filename=\"a.png\"\r\nContent-Type: image/png\r\n\r\n\u0000PNG\r\n--B1--\r\n",
+        "content_type": "multipart/form-data; boundary=B1",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "multipart fields and text files, binary files skipped"
     }
   ],
-  "core_version": "0.3.1",
+  "core_version": "0.4.0",
   "format_version": 1,
   "generated_by": "core/golden/gen.lua",
   "suite": "extract"

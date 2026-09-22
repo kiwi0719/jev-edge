@@ -9,10 +9,10 @@ import * as trust from "./trust";
 import * as subject from "./subject";
 import type { Config } from "./defaults";
 import type { BreakerLike } from "./breaker";
-import type { Req, Rule, CacheLike } from "./rules";
+import type { Req, Rule, CacheLike, RulesCtx } from "./rules";
 import type { JsonValue } from "./normalize";
 
-export const VERSION = "0.3.1";
+export const VERSION = "0.4.0";
 
 export interface Judge {
   call(prompt: judge.Prompt, timeoutMs: number): Promise<[judge.Answers, null] | [null, string]> | [judge.Answers, null] | [null, string];
@@ -34,7 +34,7 @@ export interface Ctx {
   clock?: () => number;
   hash: (s: string) => string;
   json_decode?: (s: string) => JsonValue;
-  re_find?: (subject: string, pattern: string) => boolean;
+  re_find?: RulesCtx["re_find"];
   log?: (level: string, msg: string) => void;
 }
 
@@ -55,14 +55,39 @@ function finish(ctx: Ctx, v: verdict.Verdict): verdict.Verdict {
   return v;
 }
 
+/** Port of core.cache_key: the verdict-cache key for a fingerprint judged under
+ *  `rule`. A score is only valid for the prompt that produced it, so the key is
+ *  scoped to the rule's templates and deployment context and to the provider
+ *  and model; trust stays keyed by fingerprint alone. */
+export function cacheKey(fp: string, rule: Rule | undefined, cfg: Config, hash: (s: string) => string): string {
+  const jev = cfg?.jev ?? {};
+  const scope = [
+    String(rule?.id ?? ""),
+    (rule?.templates ?? []).join(","),
+    String(rule?.deployment_context ?? jev.deployment_context ?? ""),
+    String(jev.provider ?? ""),
+    String(jev.model ?? ""),
+  ].join("\n");
+  return "fp:" + String(hash(scope)).slice(0, 16) + ":" + fp;
+}
+
 export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
   const cfg = ctx.config;
 
   // L1 --------------------------------------------------------------------
-  const [r, text, reason, rule] = await rulesMod.evaluateAll(req, ctx.rules, ctx);
+  const [r, text, reason, rule, windowed] = await rulesMod.evaluateAll(req, ctx.rules, ctx);
 
   if (r === rulesMod.PASS) {
     return verdict.newVerdict({ verdict: verdict.SKIPPED, source: verdict.SRC_L1, reason });
+  }
+  if (r === rulesMod.UNJUDGEABLE) {
+    // A watched request nobody read: `skipped`, blocked only when the operator
+    // chose that and the gateway enforces.
+    const block = cfg.policy.mode === "enforce" && cfg.policy.unjudgeable === "block";
+    return finish(ctx, verdict.newVerdict({
+      action: block ? verdict.ACTION_BLOCK : verdict.ACTION_PASS,
+      verdict: verdict.SKIPPED, source: verdict.SRC_L1, reason,
+    }));
   }
   if (r === rulesMod.BLOCK) {
     const action = cfg.policy.mode === "enforce" ? verdict.ACTION_BLOCK : verdict.ACTION_PASS;
@@ -90,8 +115,9 @@ export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
   }
 
   // cache -----------------------------------------------------------------
-  if (fp !== "" && ctx.cache) {
-    const hit = (await ctx.cache.get("fp:" + fp)) as { score?: unknown; reason?: string } | undefined;
+  const ckey = fp !== "" ? cacheKey(fp, rule, cfg, ctx.hash) : undefined;
+  if (ckey && ctx.cache) {
+    const hit = (await ctx.cache.get(ckey)) as { score?: unknown; reason?: string } | undefined;
     if (hit && typeof hit === "object" && typeof hit.score === "number") {
       const [action, label] = policy.decide(hit.score, cfg.policy);
       // Never async on a hit: the cached score already is the judge's
@@ -136,13 +162,25 @@ export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
     }));
   }
 
+  const [score, top, n] = judge.reduce(answers);
+  if (n === 0) {
+    // An answer with no score in it is a provider fault, not a SAFE verdict:
+    // caching score 0 would wave the same text through for fp_ttl.
+    if (ctx.breaker) await ctx.breaker.failure();
+    log(ctx, "warn", "jev-edge: L2 answer has no scores");
+    const [action, label, async] = policy.onError();
+    return finish(ctx, verdict.newVerdict({
+      action, verdict: label, async, source: verdict.SRC_L2,
+      reason: "no scores in answer", fingerprint: fp, l2_ms: elapsed,
+    }));
+  }
   if (ctx.breaker) await ctx.breaker.success();
-  const [score, top] = judge.reduce(answers);
   const [action, label, async] = policy.decide(score, cfg.policy);
-  const why = top !== "" ? `${top} ${verdict.format2(score)}` : reason;
+  // the score is for the window, not the whole text; say so
+  const why = top !== "" ? `${top} ${verdict.format2(score)}${windowed ? " (window)" : ""}` : reason;
 
-  if (fp !== "" && ctx.cache) {
-    await ctx.cache.set("fp:" + fp, { score, reason: why }, cfg.cache.fp_ttl);
+  if (ckey && ctx.cache) {
+    await ctx.cache.set(ckey, { score, reason: why }, cfg.cache.fp_ttl);
   }
 
   return finish(ctx, verdict.newVerdict({
@@ -151,6 +189,7 @@ export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
 }
 
 export { rulesMod as rules, normalize, judge, policy, verdict, trust, subject };
+export { sha256Hex } from "./sha256";
 export * as defaults from "./defaults";
 export * as breaker from "./breaker";
 export type { Req, Rule, CacheLike } from "./rules";

@@ -17,7 +17,7 @@
 | `injection` | 无 | 513 | 39 |
 | `injection` | 有 | 610 | 39 |
 
-加上 `abuse` 模板，每次调用的 token 略增；两个问题共用一个请求。用户消息越长越贵：上面是数据集里短 prompt 的数字，`rules.max_body_bytes`（64 KB）是每次调用的上限。
+加上 `abuse` 模板，每次调用的 token 略增；两个问题共用一个请求。用户消息越长越贵：上面是数据集里短 prompt 的数字，`rules.max_judge_bytes`（32 KiB 文本）是每次调用的上限。更长的文本在送 L2 之前被切成这个窗口（`jev_window_total` 统计次数），所以大 body 放进 prompt 的文本至多 32 KiB。
 
 ## 算例
 

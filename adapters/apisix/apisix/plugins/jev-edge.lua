@@ -31,12 +31,12 @@ local jev_core  = require("jev.core")
 local defaults  = require("jev.core.defaults")
 local verdict   = require("jev.core.verdict")
 local judge_mod = require("jev.core.judge")
-local normalize = require("jev.core.normalize")
 local breaker_m = require("jev.core.breaker")
 local cache_m   = require("resty.jev.cache")
 local http      = require("resty.jev.http")
 local async     = require("resty.jev.async")
 local rules_mod = require("jev.core.rules")
+local body_m    = require("resty.jev.body")
 local sampling  = require("jev.core.sampling")
 local subject_m = require("jev.core.subject")
 local cjson     = require("cjson.safe")
@@ -215,13 +215,9 @@ local function load_rules(specs)
   return out
 end
 
+-- The rule core judged with (path, method and content type all match).
 local function rule_for(rt, req)
-  for _, r in ipairs(rt.rules) do
-    for _, p in ipairs(r.watch_paths or {}) do
-      if (req.path or ""):find(p) then return r end
-    end
-  end
-  return nil
+  return rules_mod.rule_for(req, rt.rules)
 end
 
 -- Decision sampling into the shared dict ring; read it with
@@ -248,14 +244,21 @@ local function runtime_for(conf)
     end
   end
   cache = cache or cache_m.new(DICT)
-  local judge, err = http.new(cfg.jev, cache)
+  -- Breaker, adaptive timeout and in-flight counters describe one provider,
+  -- not the whole gateway: routes that call the same provider, endpoint and
+  -- model share them, a route with another provider (or a broken key on a
+  -- different endpoint) gets its own, so one cannot trip the other's breaker.
+  local st = cache:prefixed("p:" .. sha256_hex(table.concat({
+    tostring(cfg.jev.provider or ""), tostring(cfg.jev.endpoint or ""), tostring(cfg.jev.model or ""),
+  }, "\n")):sub(1, 12) .. ":")
+  local judge, err = http.new(cfg.jev, st)
   if not judge then
     core.log.error("jev-edge: ", err)
     judge = { call = function() return nil, err end }
   end
   rt = {
-    cfg = cfg, rules = load_rules(cfg.rules), judge = judge,
-    breaker = breaker_m.new(cache, ngx.now, cfg.breaker),
+    cfg = cfg, rules = load_rules(cfg.rules), judge = judge, state = st,
+    breaker = breaker_m.new(st, ngx.now, cfg.breaker),
   }
   runtimes[conf] = rt
   return rt
@@ -266,7 +269,9 @@ end
 -- ---------------------------------------------------------------------------
 
 local function build_req(rt, ctx)
-  local headers = core.request.headers(ctx)
+  -- 0 = no limit: past the default 100 the rest are dropped, and a
+  -- Content-Type sent after 100 junk headers would read as absent.
+  local headers = ngx.req.get_headers(0)
   local req = {
     method    = core.request.get_method(),
     path      = ctx.var.uri,
@@ -275,53 +280,40 @@ local function build_req(rt, ctx)
     body      = nil,
     body_size = tonumber(headers["content-length"]) or 0,
   }
+  -- whole up to max_body_bytes, head and tail past it, decoded (resty.jev.body)
   local max = 0
   for _, r in ipairs(rt.rules) do
     for _, p in ipairs(r.watch_paths or {}) do
-      if req.path:find(p) then max = math.max(max, r.max_body_bytes or 65536) break end
+      if req.path:find(p) then max = math.max(max, r.max_body_bytes or rules_mod.MAX_BODY_BYTES) break end
     end
   end
-  if max > 0 and req.body_size <= max then
-    -- get_body(max) returns nil past the cap instead of slurping a chunked body
-    local body, berr = core.request.get_body(max + 1, ctx)
-    if berr then
-      core.log.warn("jev-edge: body read: ", berr)
-      -- APISIX says "request size N is greater than the maximum size M" when a
-      -- chunked body (no Content-Length) overflows; report it as too large,
-      -- not as "no body", so L1 gives the right reason
-      if tostring(berr):find("greater than", 1, true) then req.body_size = max + 1 end
-    end
-    if body then
-      req.body_size = #body
-      req.body = (#body > max) and nil or body
-    end
-  end
+  if max > 0 then body_m.fill(req, max) end
   return req
 end
 
+-- the byte span of the match, which places the hit in the judging window
 local function re_find(subject, pattern)
-  return ngx.re.find(subject, pattern, "ijo") ~= nil
+  return ngx.re.find(subject, pattern, "ijo")
 end
 
 local function maybe_async(rt, v, req)
   if not v.async then return end
-  local rule
-  for _, r in ipairs(rt.rules) do
-    for _, p in ipairs(r.watch_paths or {}) do
-      if (req.path or ""):find(p) then rule = r break end
-    end
-    if rule then break end
-  end
+  -- L3 exists to get an answer L2 could not; while the breaker is open the
+  -- provider is the reason, and hammering it from timers only keeps it open.
+  if rt.breaker:state() ~= breaker_m.CLOSED then return end
+  local rule = rule_for(rt, req)
   if not rule then return end
-  local text = normalize.extract(req.body, req.headers["content-type"] or "", rule.text_fields, cjson.decode)
+  -- the same text L2 judged: the window, not the whole body
+  local text = rules_mod.judged_text(req, rule, { json_decode = cjson.decode, re_find = re_find })
   if text == "" then return end
   local prompt = judge_mod.build(rule.templates, text, {
     path = req.path, method = req.method,
     deployment = rule.deployment_context or rt.cfg.jev.deployment_context or "",
   })
   if not prompt then return end
-  async.schedule({ cfg = rt.cfg, cache = cache, judge = rt.judge, prompt = prompt,
-    fingerprint = v.fingerprint, client_ip = req.client_ip })
+  async.schedule({ cfg = rt.cfg, cache = cache, state = rt.state, judge = rt.judge, prompt = prompt,
+    fingerprint = v.fingerprint, client_ip = req.client_ip,
+    cache_key = v.fingerprint ~= "" and jev_core.cache_key(v.fingerprint, rule, rt.cfg, sha256_hex) or nil })
 end
 
 -- ---------------------------------------------------------------------------

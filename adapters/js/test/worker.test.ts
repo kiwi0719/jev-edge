@@ -10,7 +10,7 @@ const BENIGN = '{"messages":[{"role":"user","content":"Please write a detailed s
 function chat(body: string, headers: Record<string, string> = {}, path = "/v1/chat/completions"): Request {
   return new Request("https://edge.example" + path, {
     method: "POST",
-    headers: { "content-type": "application/json", "cf-connecting-ip": "203.0.113.7", ...headers },
+    headers: { "content-type": "application/json", "x-forwarded-for": "203.0.113.7", ...headers },
     body,
   });
 }
@@ -98,10 +98,13 @@ describe("handle", () => {
       },
     }, { highWaterMark: 0 });
     const req = new Request("https://edge.example/v1/chat/completions", { method: "POST", headers: { "content-type": "application/json", "x-jev-mock-score": "0.95" }, body: stream, duplex: "half" } as RequestInit);
-    const res = await handle(req, mockRt(), async (r) => Response.json({ verdict: r.headers.get("x-jev-verdict"), reason: r.headers.get("x-jev-reason") }));
-    const j = (await res.json()) as Record<string, string>;
-    expect(j.verdict).toBe("skipped");
-    expect(j.reason).toBe("body+too+large");
+    const rt = createRuntime({
+      config: { jev: { provider: "mock", mock_score: 0.2, mock_header: "x-jev-mock-score", timeout_ms: 400 }, policy: { mode: "enforce" } },
+      rules: [{ id: "small", extends: "llm-endpoints", max_body_bytes: 16_384 }],
+    });
+    const res = await handle(req, rt, async () => Response.json({}));
+    // read at most 4 x max_body_bytes, and the head it kept is still judged
+    expect(res.status).toBe(403);
     expect(sent).toBeLessThan(200_000);
   });
 
@@ -139,7 +142,10 @@ describe("handle", () => {
     expect(subjectId).toMatch(/^ip:[0-9a-f]{64}$/);
     expect(kept).toHaveLength(1);
     await Promise.all(kept);
-    expect(await rt.subjectStore.get("subj:" + subjectId)).toHaveLength(1);
+    // the default memory store has incr, so the write went to the ring
+    const { ringLoad } = await import("../src/core/subject");
+    expect(await ringLoad(rt.subjectStore, subjectId!, 20)).toHaveLength(1);
+    expect(await rt.subjectStore.get("subj:" + subjectId)).toBeUndefined();
   });
 
   it("fails open when the provider errors", async () => {

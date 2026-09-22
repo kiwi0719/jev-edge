@@ -74,9 +74,10 @@ function collect(node: JsonValue | undefined, out: string[], depth: number): voi
   }
   if (!isObj(node) || depth > LEAF_DEPTH) return;
   if (Array.isArray(node)) {
-    // Lua ipairs: stops at the first nil
+    // JSON null contributes nothing and does not end the array (Lua under
+    // cjson: cjson.null is a value, ipairs goes on past it)
     for (const item of node) {
-      if (item === null || item === undefined) break;
+      if (item === null || item === undefined) continue;
       collect(item, out, depth + 1);
     }
     return;
@@ -98,10 +99,10 @@ function walk(node: JsonValue | undefined, segs: Seg[], i: number, out: string[]
     child = Array.isArray(node) ? undefined : node[seg.key];
   }
   if (seg.each) {
-    // Lua ipairs: array part only, stops at the first nil
+    // Lua ipairs over a cjson array: null is a value, skipped, not the end
     if (!Array.isArray(child)) return;
     for (const item of child) {
-      if (item === null || item === undefined) break;
+      if (item === null || item === undefined) continue;
       walk(item, segs, i + 1, out);
     }
   } else {
@@ -110,12 +111,17 @@ function walk(node: JsonValue | undefined, segs: Seg[], i: number, out: string[]
 }
 
 export function extractJson(decoded: JsonValue, fields: string[]): string {
-  const out: string[] = [];
-  for (const f of fields ?? []) walk(decoded, splitPath(f), 0, out);
-  return out.join("\n");
+  return extractJsonValues(decoded, fields).join("\n");
 }
 
-export type ExtractKind = "json" | "text" | "form" | "none";
+/** The strings extractJson joins, in order (newest last), for window(). */
+export function extractJsonValues(decoded: JsonValue, fields: string[]): string[] {
+  const out: string[] = [];
+  for (const f of fields ?? []) walk(decoded, splitPath(f), 0, out);
+  return out;
+}
+
+export type ExtractKind = "json" | "text" | "form" | "multipart" | "binary" | "none";
 
 /** Lua's tonumber(h, 16) + string.char: bytes, so %C3%BC is two bytes not one char. */
 function formDecode(v: string): string {
@@ -136,34 +142,229 @@ function formDecode(v: string): string {
   return dec.decode(new Uint8Array(bytes));
 }
 
+// ---------------------------------------------------------------------------
+// Format detection (port of normalize.extract in core/normalize.lua): the
+// body decides, the Content-Type is a hint. JSON when it parses as JSON, form
+// or multipart when declared (or form-shaped with no header), text when it
+// reads as text, "binary" otherwise.
+// ---------------------------------------------------------------------------
+
+/** Lua is_text: no NUL, control bytes other than \t \n \r under 1% of the bytes. */
+export function isText(s: string): boolean {
+  if (s.includes("\0")) return false;
+  const ctl = (s.match(/[\x01-\x08\x0B\x0C\x0E-\x1F\x7F]/g) ?? []).length;
+  return ctl * 100 <= byteLength(s);
+}
+
+function formValues(body: string, out: string[]): void {
+  // Lua: body:gmatch("([^&=]+)=([^&]*)")
+  const re = /([^&=]+)=([^&]*)/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(body)) !== null) out.push(formDecode(m[2]));
+}
+
+const MAX_PARTS = 100;
+function multipartValues(body: string, contentType: string, out: string[]): void {
+  const bm = /boundary="([^"]+)"/i.exec(contentType) ?? /boundary=([^;\s,]+)/i.exec(contentType);
+  if (!bm) return;
+  const delim = "--" + bm[1];
+  let pos = body.indexOf(delim);
+  let parts = 0;
+  while (pos !== -1 && parts < MAX_PARTS) {
+    const after = pos + delim.length;
+    if (body.slice(after, after + 2) === "--") break; // closing delimiter
+    const next = body.indexOf(delim, after);
+    let part = body.slice(after, next === -1 ? body.length : next);
+    part = part.replace(/^\r?\n/, "").replace(/\r?\n$/, "");
+    const hm = /\r?\n\r?\n/.exec(part);
+    if (hm) {
+      const head = asciiLower(part.slice(0, hm.index));
+      const value = part.slice(hm.index + hm[0].length);
+      const hasFile = /filename\*?=/.test(head);
+      const pct = /content-type:[ \t\n\v\f\r]*([^\r\n;]+)/.exec(head)?.[1] ?? "";
+      if ((!hasFile || pct.startsWith("text/") || pct.includes("json")) && isText(value)) out.push(value);
+    }
+    parts++;
+    pos = next;
+  }
+}
+
+/**
+ * Extract text from a raw body. Returns the text (values joined with "\n"),
+ * the kind, and the values in order (newest last) for window().
+ */
 export function extract(
   body: string | undefined | null,
   contentType: string | undefined | null,
   fields: string[],
   jsonDecode: (s: string) => JsonValue = (s) => JSON.parse(s) as JsonValue,
-): [string, ExtractKind] {
-  if (typeof body !== "string" || body === "") return ["", "none"];
-  const ct = asciiLower(contentType ?? "");
-  if (ct.includes("application/json") || ct.includes("+json")) {
-    let decoded: JsonValue;
+): [string, ExtractKind, string[]] {
+  if (typeof body !== "string" || body === "") return ["", "none", []];
+  const rawCt = typeof contentType === "string" ? contentType : "";
+  const ct = asciiLower(rawCt);
+  // A UTF-8 BOM is not JSON, but Python's json.loads on bytes and Express's
+  // body-parser skip it: judge what the backend reads.
+  if (body.startsWith("﻿")) body = body.slice(1);
+  const declaredJson = ct.includes("json");
+  const first = /^[ \t\n\v\f\r]*([\s\S])/.exec(body)?.[1];
+  if (first === "{" || first === "[" || declaredJson) {
+    let decoded: JsonValue | undefined;
+    let ok = true;
     try {
       decoded = jsonDecode(body);
     } catch {
-      return ["", "none"];
+      ok = false;
     }
-    if (!isObj(decoded)) return ["", "none"];
-    return [extractJson(decoded, fields), "json"];
-  } else if (ct.includes("application/x-www-form-urlencoded")) {
-    const parts: string[] = [];
-    // Lua: body:gmatch("([^&=]+)=([^&]*)")
-    const re = /([^&=]+)=([^&]*)/g;
-    let m: RegExpExecArray | null;
-    while ((m = re.exec(body)) !== null) parts.push(formDecode(m[2]));
-    return [parts.join("\n"), "form"];
-  } else if (ct.includes("text/") || ct === "") {
-    return [body, "text"];
+    if (ok && isObj(decoded)) {
+      const values = extractJsonValues(decoded as JsonValue, fields);
+      return [values.join("\n"), "json", values];
+    }
+    // declared JSON that is not: the backend rejects it too
+    if (declaredJson) return ["", "none", []];
   }
-  return ["", "none"];
+  const out: string[] = [];
+  if (ct.includes("application/x-www-form-urlencoded") || (ct === "" && /^[A-Za-z0-9._~%+[\]-]+=[^ \t\n\v\f\r]*$/.test(body))) {
+    formValues(body, out);
+    return [out.join("\n"), "form", out];
+  }
+  if (ct.includes("multipart/form-data")) {
+    multipartValues(body, rawCt, out);
+    return [out.join("\n"), "multipart", out];
+  }
+  if (isText(body)) return [body, "text", [body]];
+  return ["", "binary", []];
+}
+
+// ---------------------------------------------------------------------------
+// Partial bodies: tolerant scan of JSON string values (port of scan_strings)
+// ---------------------------------------------------------------------------
+
+const ESC: Record<string, string> = { '"': '"', "\\": "\\", "/": "/", b: "\b", f: "\f", n: "\n", r: "\r", t: "\t" };
+
+function readString(s: string, i: number): [string, number] {
+  let buf = "";
+  const n = s.length;
+  while (i < n) {
+    let j = i;
+    while (j < n && s[j] !== '"' && s[j] !== "\\") j++;
+    if (j >= n) return [buf + s.slice(i), n];
+    buf += s.slice(i, j);
+    if (s[j] === '"') return [buf, j + 1];
+    const e = s[j + 1];
+    if (e === "u") {
+      const hex = /^[0-9a-fA-F]{4}/.exec(s.slice(j + 2, j + 6))?.[0];
+      if (!hex) return [buf, n];
+      let cp = parseInt(hex, 16);
+      i = j + 6;
+      if (cp >= 0xd800 && cp <= 0xdbff) {
+        const lo = /^\\u([0-9a-fA-F]{4})/.exec(s.slice(i, i + 6))?.[1];
+        const lcp = lo ? parseInt(lo, 16) : NaN;
+        if (lcp >= 0xdc00 && lcp <= 0xdfff) {
+          cp = 0x10000 + (cp - 0xd800) * 0x400 + (lcp - 0xdc00);
+          i += 6;
+        }
+      }
+      buf += String.fromCodePoint(cp);
+    } else if (e === undefined) {
+      return [buf, n];
+    } else {
+      buf += ESC[e] ?? e;
+      i = j + 2;
+    }
+  }
+  return [buf, n];
+}
+
+/** The last key of each text-field path: "messages[*].content" -> "content". */
+export function fieldKeys(fields: string[] | undefined): Set<string> {
+  const keys = new Set<string>();
+  for (const f of fields ?? []) {
+    const m = /([^.[\]*]+)[[\]*]*$/.exec(f);
+    if (m) keys.add(m[1]);
+  }
+  // content parts carry their text under "text"
+  if (keys.has("content")) keys.add("text");
+  return keys;
+}
+
+/** Collect the string values of `keys` from possibly truncated JSON. */
+export function scanStrings(s: string, keys: Set<string>, out: string[]): string[] {
+  const re = /"([A-Za-z0-9_-]+)"[ \t\n\v\f\r]*:[ \t\n\v\f\r]*"/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(s)) !== null) {
+    const [value, next] = readString(s, m.index + m[0].length);
+    if (keys.has(m[1]) && value !== "") out.push(value);
+    re.lastIndex = next;
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Judging window (port of normalize.window). Byte arithmetic on UTF-8, cuts
+// at code point boundaries, so the output matches Lua byte for byte.
+// ---------------------------------------------------------------------------
+
+const isCont = (b: Uint8Array, i: number) => i < b.length && (b[i] & 0xc0) === 0x80;
+
+/** `s` cut to at most `n` bytes at a code point boundary, from the front. */
+export function head(s: string, n: number): string {
+  if (n <= 0) return "";
+  const b = enc.encode(s);
+  if (b.length <= n) return s;
+  let e = n;
+  while (e > 0 && isCont(b, e)) e--;
+  return dec.decode(b.subarray(0, e));
+}
+
+/** `s` cut to at most `n` bytes at a code point boundary, from the back. */
+export function tail(s: string, n: number): string {
+  if (n <= 0) return "";
+  const b = enc.encode(s);
+  if (b.length <= n) return s;
+  let st = b.length - n;
+  while (st < b.length && isCont(b, st)) st++;
+  return dec.decode(b.subarray(st));
+}
+
+export const HIT_CONTEXT = 1024;
+
+/**
+ * @param from,to 1-based inclusive byte span of an always_suspect hit, or undefined
+ * @returns the text to judge, and true when it was cut
+ */
+export function window(text: string, values: string[], budget: number, from?: number, to?: number): [string, boolean] {
+  const tb = enc.encode(text);
+  if (tb.length <= budget) return [text, false];
+  const out: string[] = [];
+  let rem = budget;
+  if (from !== undefined && to !== undefined) {
+    const half = Math.floor(budget / 2);
+    const ctxb = Math.max(0, Math.min(HIT_CONTEXT, Math.floor((half - (to - from + 1)) / 2)));
+    let a = Math.max(1, from - ctxb);
+    while (a > 1 && isCont(tb, a - 1)) a--;
+    const piece = head(dec.decode(tb.subarray(a - 1)), Math.min(Math.min(to + ctxb, tb.length) - a + 1, half));
+    out.push(piece);
+    rem = rem - byteLength(piece) - 1;
+  }
+  const chosen = new Map<number, string>();
+  for (let i = values.length - 1; i >= 0; i--) {
+    if (rem <= 0) break;
+    const v = values[i];
+    const vl = byteLength(v);
+    if (vl + 1 <= rem) {
+      chosen.set(i, v);
+      rem = rem - vl - 1;
+    } else {
+      const h = head(v, Math.floor((rem - 1) / 2));
+      chosen.set(i, h + "\n" + tail(v, rem - 1 - byteLength(h) - 1));
+      rem = 0;
+    }
+  }
+  for (let i = 0; i < values.length; i++) {
+    const c = chosen.get(i);
+    if (c !== undefined) out.push(c);
+  }
+  return [out.join("\n"), true];
 }
 
 // ---------------------------------------------------------------------------
@@ -220,6 +421,8 @@ export function fingerprint(
   const o: NormalizeOpts = { strip_digits: opts?.strip_digits, strip_uuid: opts?.strip_uuid, prefix_bytes: Infinity };
   let norm = normalize(text, o);
   if (norm === "") norm = normalize(text, { strip_digits: false, strip_uuid: false, prefix_bytes: Infinity });
+  // whitespace-only text: one fingerprint for all of it, never none (Lua: tostring(text) ~= "")
+  if (norm === "" && text !== null && text !== undefined && String(text) !== "") norm = " ";
   if (norm === "") return "";
   return String(hash(norm));
 }

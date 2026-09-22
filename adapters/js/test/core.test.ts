@@ -44,6 +44,15 @@ describe("luaPatternToRegExp", () => {
     expect(patternError("[^]]")).toBeNull();
     expect(() => luaPatternToRegExp("^/v1/[")).toThrow(/malformed/);
   });
+
+  it("patternError rejects capture errors like core/rules.lua", () => {
+    expect(patternError("^/v1/(chat")).toBe("unfinished capture");
+    expect(patternError("^/v1/chat)")).toBe("invalid pattern capture");
+    expect(patternError("^/v1/%1")).toBe("invalid capture index %1");
+    expect(patternError("^/(v1%1)")).toBe("invalid capture index %1");
+    expect(patternError("^/%0")).toBe("invalid capture index %0");
+    for (const ok of ["^/v1/(chat)", "^/(v1)/%1", "^/v1/()", "^/v1/[()]", "^/v1/%(", "^/%b()"]) expect(patternError(ok)).toBeNull();
+  });
 });
 
 describe("rules.resolve", () => {
@@ -63,8 +72,11 @@ describe("rules.resolve", () => {
     expect(() => resolve({ watch_paths: [] })).toThrow(/needs an id/);
   });
 
-  it("llm-endpoints watches vendor +json", () => {
-    expect(load("llm-endpoints").content_types).toContain("+json");
+  it("llm-endpoints reads every content type but media types", () => {
+    const r = load("llm-endpoints");
+    expect(r.content_types).toBeUndefined();
+    expect(r.skip_content_types).toContain("image/");
+    expect(r.max_body_bytes).toBe(1048576);
   });
 });
 
@@ -74,8 +86,11 @@ describe("rules.evaluate body size", () => {
     const req = { method: "POST", path: "/v1/chat/completions", headers: { "content-type": "application/json" }, body, body_size: 0, client_ip: "1.2.3.4" };
     const [r] = await rulesEvaluate(req, load("llm-endpoints"), { re_find: core.rules.reFind });
     expect(r).toBe("suspect");
-    const [r2, , reason] = await rulesEvaluate({ ...req, body_size: 70000 }, load("llm-endpoints"), { re_find: core.rules.reFind });
-    expect([r2, reason]).toEqual(["pass", "body too large"]);
+    // past max_body_bytes the body is scanned, not passed
+    const [r2, , reason] = await rulesEvaluate({ ...req, body_size: 2_000_000 }, load("llm-endpoints"), { re_find: core.rules.reFind });
+    expect([r2, reason]).toEqual(["suspect", "natural language (window)"]);
+    const [r3, , reason3] = await rulesEvaluate({ ...req, body: undefined, body_size: 2_000_000 }, load("llm-endpoints"), { re_find: core.rules.reFind });
+    expect([r3, reason3]).toEqual(["unjudgeable", "unjudgeable: body too large"]);
   });
 
   it("warns once about an always_suspect pattern that does not compile", async () => {
@@ -112,7 +127,10 @@ describe("normalize.truncateBytes", () => {
     expect(fingerprint(a, { prefix_bytes: 10 }, djb2)).not.toBe(fingerprint(b, { prefix_bytes: 10 }, djb2));
     expect(fingerprint(a, { prefix_bytes: 10 }, djb2)).toBe(fingerprint(a, null, djb2));
     expect(fingerprint("12345678901234567890", null, djb2)).not.toBe("");
-    expect(fingerprint("   ", null, djb2)).toBe("");
+    expect(fingerprint("", null, djb2)).toBe("");
+    // whitespace-only text is cached like any other: one fingerprint for all of it
+    expect(fingerprint("   ", null, djb2)).not.toBe("");
+    expect(fingerprint("\n\t ".repeat(40), null, djb2)).toBe(fingerprint("   ", null, djb2));
   });
 
   it("extracts content parts to a bounded depth", () => {

@@ -13,7 +13,7 @@
 // you pass Store implementations (DynamoDB Global Tables is the usual
 // choice; it costs a round trip per lookup). Read the API key from Secrets
 // Manager at cold start and pass it in `config.jev.api_key`.
-import { createRuntime, evaluate, type Options, type Runtime } from "./runtime";
+import { createRuntime, evaluate, markTruncated, type Options, type Runtime } from "./runtime";
 import { headers as verdictHeaders, newVerdict, ERROR, SRC_ADAPTER } from "./core/verdict";
 
 export interface CfHeader { key?: string; value: string }
@@ -35,7 +35,7 @@ export interface CfResponse {
 
 const HEADER_NAMES = ["x-jev-verdict", "x-jev-score", "x-jev-source", "x-jev-reason", "x-jev-request-id", "x-jev-subject"];
 
-function toRequest(cf: CfRequest, maxBytes: number): Request {
+function toRequest(cf: CfRequest): Request {
   const headers = new Headers();
   for (const [name, values] of Object.entries(cf.headers ?? {})) {
     for (const v of values) headers.append(values[0]?.key ?? name, v.value);
@@ -44,16 +44,17 @@ function toRequest(cf: CfRequest, maxBytes: number): Request {
   headers.set("x-forwarded-for", cf.clientIp);
   const host = headers.get("host") ?? "edge.local";
   const url = "https://" + host + cf.uri + (cf.querystring ? "?" + cf.querystring : "");
-  let body: string | undefined;
+  let body: BodyInit | undefined;
+  let truncated = false;
   if (cf.body?.data) {
-    if (cf.body.bodyTruncated || cf.body.inputTruncated) {
-      headers.set("content-length", String(maxBytes + 1)); // L1: body too large, fail-open
-      body = undefined;
-    } else {
-      body = cf.body.encoding === "base64" ? Buffer.from(cf.body.data, "base64").toString("utf8") : cf.body.data;
-    }
+    // Raw bytes, not text: a compressed body is decoded by the runtime.
+    body = cf.body.encoding === "base64" ? (new Uint8Array(Buffer.from(cf.body.data, "base64")) as unknown as BodyInit) : cf.body.data;
+    // CloudFront cut it (40 KB viewer-request, 1 MB origin-request): the
+    // runtime scans it as the head of a larger body instead of parsing it.
+    truncated = cf.body.bodyTruncated === true || cf.body.inputTruncated === true;
   }
-  return new Request(url, { method: cf.method, headers, body: cf.method === "GET" || cf.method === "HEAD" ? undefined : body });
+  const request = new Request(url, { method: cf.method, headers, body: cf.method === "GET" || cf.method === "HEAD" ? undefined : body });
+  return truncated ? markTruncated(request) : request;
 }
 
 const STATUS_TEXT: Record<number, string> = {
@@ -75,8 +76,7 @@ export function lambdaEdgeHandler(opts: Options): (event: CfEvent) => Promise<Cf
     const cf = event.Records[0].cf.request;
     try {
       rt ??= createRuntime(opts);
-      const maxBytes = Math.max(...rt.rules.map((r) => r.max_body_bytes ?? 65536));
-      const { verdict, response, requestId, subjectId } = await evaluate(toRequest(cf, maxBytes), rt);
+      const { verdict, response, requestId, subjectId } = await evaluate(toRequest(cf), rt);
       if (response) {
         const headers: Record<string, CfHeader[]> = {};
         response.headers.forEach((v, k) => (headers[k] = [{ key: k, value: v }]));

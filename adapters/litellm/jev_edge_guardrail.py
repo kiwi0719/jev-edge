@@ -93,40 +93,71 @@ class JevEdgeGuardrail(CustomGuardrail):
     # ------------------------------------------------------------------
 
     @staticmethod
+    def _collect(node: Any, out: list, depth: int = 1) -> None:
+        """Every string under a content value, the way core's extractor reads
+        it (core/normalize.lua `collect`): plain strings, each part's `text`
+        (chat `text`, Responses `input_text`), and `content` nested once more
+        (Anthropic `tool_result`), to a bounded depth. Images and numbers add
+        nothing, so the body stays small and under jev-edge's size cap."""
+        if isinstance(node, str):
+            out.append(node)
+            return
+        if depth > 4:
+            return
+        if isinstance(node, list):
+            for item in node:
+                JevEdgeGuardrail._collect(item, out, depth + 1)
+        elif isinstance(node, dict):
+            if isinstance(node.get("text"), str):
+                out.append(node["text"])
+            if node.get("content") is not None:
+                JevEdgeGuardrail._collect(node["content"], out, depth + 1)
+
+    @staticmethod
     def body_for(data: dict) -> Optional[str]:
-        """Chat: {"messages": [...]} with string contents only. Completion: {"prompt": ...}."""
+        """The text of the request as a small JSON body jev-edge judges:
+        chat `messages` (string or content-part contents), and `prompt` /
+        `input` (a string, a list of strings, or Responses API input items).
+        None when there is no text at all."""
+        body: dict[str, Any] = {}
         msgs = data.get("messages")
         if isinstance(msgs, list):
             out = []
             for m in msgs:
                 if not isinstance(m, dict):
                     continue
-                content = m.get("content")
-                if isinstance(content, list):  # multimodal parts: keep the text parts
-                    content = "\n".join(p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text")
-                if isinstance(content, str):
-                    out.append({"role": m.get("role", "user"), "content": content})
+                parts: list = []
+                JevEdgeGuardrail._collect(m.get("content"), parts)
+                text = "\n".join(p for p in parts if p)
+                if text:
+                    out.append({"role": m.get("role", "user"), "content": text})
             if out:
-                return json.dumps({"messages": out})
-        prompt = data.get("prompt") or data.get("input")
-        if isinstance(prompt, list):
-            prompt = "\n".join(p for p in prompt if isinstance(p, str))
-        if isinstance(prompt, str) and prompt:
-            return json.dumps({"prompt": prompt})
-        return None
+                body["messages"] = out
+        for key in ("prompt", "input"):
+            parts = []
+            JevEdgeGuardrail._collect(data.get(key), parts)
+            text = "\n".join(p for p in parts if p)
+            if text:
+                body[key] = text
+        return json.dumps(body) if body else None
 
     @staticmethod
     def client_ip(data: dict) -> Optional[str]:
-        md = data.get("metadata") or {}
-        ip = md.get("requester_ip_address")
-        if ip:
-            return str(ip)
+        """What jev-edge gets as X-Forwarded-For: the request's whole
+        X-Forwarded-For chain when it has one, else LiteLLM's
+        ``requester_ip_address``. The chain wins because with LiteLLM's
+        ``use_x_forwarded_for`` on, requester_ip_address is the chain's
+        leftmost entry, which is whatever the client sent; jev-edge's
+        ``client_ip.trusted_hops`` picks the real hop from the whole chain."""
         psr = data.get("proxy_server_request") or {}
         headers = psr.get("headers") or {}
-        xff = headers.get("x-forwarded-for") or headers.get("X-Forwarded-For")
-        if xff:
-            return str(xff).split(",")[0].strip()
-        return None
+        xff = next((v for k, v in headers.items() if str(k).lower() == "x-forwarded-for"), None)
+        chain = ", ".join(p.strip() for p in str(xff).split(",") if p.strip()) if xff else ""
+        if chain:
+            return chain
+        md = data.get("metadata") or {}
+        ip = md.get("requester_ip_address")
+        return str(ip) if ip else None
 
     # ------------------------------------------------------------------
     # LiteLLM hook

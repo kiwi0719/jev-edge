@@ -109,3 +109,49 @@ Content-Type: application/json
 verdict=skipped score=0.00 source=l1 reason=-
 --- no_error_log
 [error]
+
+
+
+=== TEST 5: a percent-encoded original URI is decoded before the watch list
+--- http_config eval: $::HttpConfig
+--- user_files eval: ::conf()
+--- config
+location = /_jev/forward-auth { content_by_lua_block { require("resty.jev.edge").forward_auth() } }
+--- request
+POST /_jev/forward-auth
+{"messages":[{"role":"user","content":"Please summarise the attached quarterly report for me."}]}
+--- more_headers
+Content-Type: application/json
+X-Forwarded-Method: POST
+X-Forwarded-Uri: //v1/%63hat/completions
+X-Forwarded-For: 198.51.100.9
+X-Jev-Mock-Score: 0.2
+--- error_code: 200
+--- response_headers
+X-Jev-Verdict: safe
+X-Jev-Source: l2
+--- no_error_log
+[error]
+
+
+
+=== TEST 6: a client's X-Envoy-External-Address does not pick the IP forward_auth judges
+--- http_config eval: $::HttpConfig
+--- user_files eval: ::conf('policy = { mode = "enforce", block_threshold = 0.7, suspect_threshold = 0.5 },')
+--- config
+location = /_jev/forward-auth { content_by_lua_block { require("resty.jev.edge").forward_auth() } }
+location = /poison {
+    content_by_lua_block {
+        require("resty.jev.cache").new("jev_cache"):set("rep:203.0.113.77", { blocked_until = ngx.now() + 60 })
+        ngx.say("ok")
+    }
+}
+--- request eval
+["GET /poison", "GET /_jev/forward-auth"]
+--- more_headers
+X-Original-Method: POST
+X-Original-URI: /v1/chat/completions
+X-Forwarded-For: 203.0.113.77
+X-Envoy-External-Address: 198.51.100.1
+--- error_code eval
+[200, 403]

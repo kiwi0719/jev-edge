@@ -7,6 +7,7 @@
 
 local normalize = require "jev.core.normalize"
 local verdict   = require "jev.core.verdict"
+local rules_mod = require "jev.core.rules"
 
 local _M = {}
 
@@ -39,8 +40,7 @@ function _M.build(cfg, v, req, rule, extra)
   extra = extra or {}
   local text = ""
   if rule and req and req.body then
-    local ct = req.headers and (req.headers["content-type"] or req.headers["Content-Type"]) or ""
-    text = normalize.extract(req.body, ct, rule.text_fields, extra.json_decode)
+    text = normalize.extract(req.body, rules_mod.content_type(req.headers), rule.text_fields, extra.json_decode)
     text = normalize.normalize(text, { prefix_bytes = cfg.sampling.text_bytes or 512 })
   end
   return {

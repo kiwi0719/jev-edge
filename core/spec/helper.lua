@@ -31,6 +31,8 @@ function H.store()
     get = function(_, k) return data[k] end,
     set = function(_, k, v, _ttl) data[k] = v end,
     incr = function(_, k, by, _ttl) data[k] = (tonumber(data[k]) or 0) + (by or 1); return data[k] end,
+    add = function(_, k, v, _ttl) if data[k] ~= nil then return false end; data[k] = v; return true end,
+    expire = function(_, k, _ttl) return data[k] ~= nil end,
     dump = function() return data end,
   }
 end
@@ -44,6 +46,10 @@ function H.clock(start)
 end
 
 H.json = require "dkjson"
+-- Request bodies decode JSON null to a non-nil value, as cjson (cjson.null)
+-- does in production: `[null, {...}]` must not end the array at the hole
+-- dkjson would otherwise leave.
+function H.body_decode(s) return H.json.decode(s, 1, H.json.null) end
 
 -- PCRE matcher with the same contract the OpenResty adapter gives core:
 -- re_find(subject, pattern) -> truthy on a case-insensitive match.
@@ -57,7 +63,7 @@ do
       re = rex.new(pattern, CASELESS)
       compiled[pattern] = re
     end
-    return re:find(subject) ~= nil
+    return re:find(subject)   -- from, to (1-based, inclusive) or nil
   end
 end
 
@@ -72,7 +78,7 @@ function H.ctx(over)
     clock = clock.now,
     _clock = clock,
     hash = normalize.djb2,
-    json_decode = function(s) return H.json.decode(s) end,
+    json_decode = function(s) return H.body_decode(s) end,
     re_find = H.re_find,
     judge = { call = function() return { injection = 0.1 } end },
     logs = {},

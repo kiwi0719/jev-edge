@@ -44,17 +44,19 @@ end
 
 --- Reduce provider answers to one score.
 -- @param answers { [name] = number in [0,1] }
--- @return score number, top template name
+-- @return score number, top template name, count of numeric answers (0 means
+--         the provider answered nothing usable: an error, not a safe score)
 function _M.reduce(answers)
-  local best, best_name = 0, ""
+  local best, best_name, n = 0, "", 0
   for name, p in pairs(answers or {}) do
     p = tonumber(p)
-    if p and p == p and p > best then
-      best, best_name = p, name
+    if p and p == p then
+      n = n + 1
+      if p > best then best, best_name = p, name end
     end
   end
   if best > 1 then best = 1 end
-  return best, best_name
+  return best, best_name, n
 end
 
 -- Load bundled templates.

@@ -22,8 +22,8 @@ Both keep every property of the nginx deployment: L1 rules, cache, breaker, adap
 2. Configure the filter. [envoy-http.yaml](envoy-http.yaml) is a complete listener; the parts that matter:
 
    ```yaml
-   with_request_body: { max_request_bytes: 65536, allow_partial_message: true }
-   allowed_headers: { patterns: [ {exact: content-type}, {exact: content-length},
+   with_request_body: { max_request_bytes: 1048576, allow_partial_message: true }
+   allowed_headers: { patterns: [ {exact: content-type}, {exact: content-encoding}, {exact: content-length},
                                   {exact: x-forwarded-for}, {exact: x-envoy-external-address} ] }
    http_service:
      server_uri: { uri: http://jev-edge:8080, cluster: jev-edge, timeout: 2s }
@@ -33,6 +33,8 @@ Both keep every property of the nginx deployment: L1 rules, cache, breaker, adap
        allowed_client_headers:   { patterns: [ {exact: content-type} ] }
    failure_mode_allow: true
    ```
+
+   `max_request_bytes` matches `rules.max_body_bytes` (1 MiB). A larger body arrives cut to it with `x-envoy-auth-partial-body: true`, and jev-edge scans it as the head of a larger body for the text fields instead of parsing truncated JSON; the reason then ends in `(window)`, and a head with no text is `unjudgeable: body too large`. Raise both together for larger requests: see [Body size and what L1 reads](../../README.md#body-size-and-what-l1-reads). `content-encoding` must be allowed, or a compressed body cannot be decoded.
 
    `timeout` must exceed `jev.timeout_max_ms` plus network, otherwise Envoy gives up before jev-edge's own fail-open can answer. `failure_mode_allow: true` is the Envoy-level fail-open for when OpenResty itself is unreachable. Note that `failure_mode_allow` cannot add headers: a request that passed this way reaches your upstream with **no** `X-Jev-Verdict` at all (`failure_mode_allow_header_add` only adds `x-envoy-auth-failure-mode-allowed`). Treat a missing `X-Jev-Verdict` as "not judged", the same as `error`.
 
@@ -46,7 +48,7 @@ Both keep every property of the nginx deployment: L1 rules, cache, breaker, adap
 cd adapters/envoy/grpc-shim && go build -o jev-shim . && ./jev-shim -listen :9001 -upstream http://127.0.0.1:8080/_jev/authz
 ```
 
-or `docker build -t jev-shim adapters/envoy/grpc-shim`. Envoy side: [envoy-grpc.yaml](envoy-grpc.yaml), with `pack_as_bytes: true` so bodies arrive as `raw_body`.
+or `docker build -t jev-shim adapters/envoy/grpc-shim`. Envoy side: [envoy-grpc.yaml](envoy-grpc.yaml), with `pack_as_bytes: true` so bodies arrive as `raw_body`. Keep the timeouts ordered: jev-edge `timeout_max_ms` < the shim's `-timeout` (1.5 s by default) < the `grpc_service` `timeout` (2 s): when jev-edge is slow the shim gives up first and still answers `X-Jev-Verdict: error`, instead of Envoy passing the request via `failure_mode_allow` with no verdict at all.
 
 ## End-to-end test
 
@@ -58,5 +60,5 @@ Brings up one jev-edge (mock provider), a stub upstream, the shim, and two Envoy
 
 ## Not covered yet
 
-- Bodies larger than `max_request_bytes` arrive truncated with `allow_partial_message`; jev-edge treats the truncated JSON as unparseable and passes at L1. Not asserted by the e2e.
+- Bodies larger than `max_request_bytes`: Envoy sends only the head, so text that sits only in the tail is not seen. The partial-body path is not asserted by the e2e or Test::Nginx yet.
 - Streaming / gRPC upstream traffic through Envoy. jev-edge only judges buffered HTTP bodies.

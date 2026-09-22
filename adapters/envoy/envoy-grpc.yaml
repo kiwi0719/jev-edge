@@ -45,12 +45,12 @@ static_resources:
                       failure_mode_allow: true
                       failure_mode_allow_header_add: true
                       with_request_body:
-                        max_request_bytes: 65536
+                        max_request_bytes: 1048576
                         allow_partial_message: true
                         pack_as_bytes: true            # raw_body instead of a UTF-8 string
                       grpc_service:
                         envoy_grpc: { cluster_name: jev-shim }
-                        timeout: 2s
+                        timeout: 2s                    # must exceed the shim's -timeout (1500ms)
                   - name: envoy.filters.http.router
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router

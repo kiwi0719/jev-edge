@@ -51,7 +51,7 @@ local function run(spec)
     rules = { require "jev.rules.llm-endpoints" },
     cache = store, subject = subject_ctx,
     clock = function() return 1000 end,
-    hash = normalize.djb2, json_decode = H.json.decode, re_find = H.re_find,
+    hash = normalize.djb2, json_decode = H.body_decode, re_find = H.re_find,
     judge = { call = function()
       if spec.error then return nil, spec.error end
       return spec.answers or { injection = 0.1 }
@@ -69,7 +69,9 @@ describe("subject: history is accepted and ignored", function()
                       config = { policy = { mode = "enforce" } } } },
     { "l2 error",   { error = "timeout" } },
     { "l1 block",   { cache = { ["rep:203.0.113.7"] = { blocked_until = 2000 } } } },
-    { "cache hit",  { cache = { ["fp:" .. normalize.fingerprint(LONG, { prefix_bytes = 2048 }, normalize.djb2)]
+    { "cache hit",  { cache = { [core.cache_key(normalize.fingerprint(LONG, { prefix_bytes = 2048 }, normalize.djb2),
+                                  require("jev.rules.llm-endpoints"), defaults.merge(defaults.config, nil),
+                                  normalize.djb2)]
                                 = { score = 0.8, reason = "injection 0.80" } } } },
   }
 

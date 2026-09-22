@@ -187,7 +187,7 @@ func failOpen(reason string) *authv3.CheckResponse {
 func main() {
 	listen := flag.String("listen", ":9001", "gRPC listen address")
 	upstream := flag.String("upstream", "http://127.0.0.1:8080/_jev/authz", "adapter HTTP ext_authz base URL (no trailing slash)")
-	timeout := flag.Duration("timeout", 2*time.Second, "HTTP timeout to the adapter; must exceed the adapter's L2 ceiling")
+	timeout := flag.Duration("timeout", 1500*time.Millisecond, "HTTP timeout to the adapter (fail-open when exceeded); keep it above the adapter's L2 ceiling and below the ext_authz grpc_service timeout in envoy-grpc.yaml so the fail-open answer still reaches Envoy")
 	flag.Parse()
 
 	s := &server{

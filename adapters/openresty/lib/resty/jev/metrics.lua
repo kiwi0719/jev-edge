@@ -18,6 +18,10 @@ function _M.record(v)
   incr("req:" .. v.source .. ":" .. v.verdict)
   incr("action:" .. v.action)
   if v.source == "cache" then incr("cache_hit:fp") end
+  -- a watched request nobody could read, by why; a score for a window only
+  local unj = v.reason:match("^unjudgeable: (%a[%a%-]*)")
+  if unj then incr("unjudged:" .. unj) end
+  if v.reason:find("(window)", 1, true) then incr("window") end
   if v.source == "l2" then
     incr("l2_count")
     incr("l2_sum_ms", math.floor(v.l2_ms))
@@ -59,6 +63,8 @@ function _M.render()
   line("# TYPE jev_breaker_state gauge")
   line("# TYPE jev_async_dropped_total counter")
   line("# TYPE jev_l2_timeout_ms gauge")
+  line("# TYPE jev_unjudged_total counter")
+  line("# TYPE jev_window_total counter")
   for _, key in ipairs(d:get_keys(0)) do
     local val = d:get(key)
     local src, verdict = key:match("^req:([^:]+):(.+)$")
@@ -82,6 +88,10 @@ function _M.render()
       line("jev_async_dropped_total " .. val)
     elseif key == "l2_timeout_ms" then
       line("jev_l2_timeout_ms " .. val)
+    elseif key:match("^unjudged:") then
+      line(string.format('jev_unjudged_total{reason="%s"} %d', key:sub(10), val))
+    elseif key == "window" then
+      line("jev_window_total " .. val)
     end
   end
   return table.concat(out, "\n") .. "\n"

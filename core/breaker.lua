@@ -2,7 +2,9 @@
 -- Circuit breaker over tumbling windows of `window_s` seconds. State lives in
 -- an injected store so that nginx workers can share it through a shared dict.
 --
--- store interface: get(key) -> value|nil ; set(key, value, ttl_seconds)
+-- store interface: get(key) -> value|nil ; set(key, value, ttl_seconds) ;
+--   add(key, value, ttl_seconds) -> true only if the key was absent (optional;
+--   without it the half-open probe is claimed with get + set, not atomically)
 -- clock: function() -> seconds (number, may be fractional)
 
 local _M = {}
@@ -61,6 +63,9 @@ function _M.allow(self)
   if st == _M.OPEN then return false end
   -- half-open: claim the probe slot
   local key = cfg(self, "key_prefix") .. "probe"
+  if type(self.store.add) == "function" then
+    return self.store:add(key, true, cfg(self, "open_s")) and true or false
+  end
   if self.store:get(key) then return false end
   self.store:set(key, true, cfg(self, "open_s"))
   return true

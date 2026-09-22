@@ -21,11 +21,11 @@ meant to make.
 | file | suite | what it pins down |
 |---|---|---|
 | `normalize.json` | `normalize` | `normalize()` text canonicalisation and `fingerprint()` with the reference djb2 hash |
-| `extract.json` | `extract` | text extraction from JSON, form and text bodies by content type and field paths |
-| `rules.json` | `rules` | every L1 decision of the shipped `llm-endpoints` rule set, including one positive per `always_suspect` pattern |
+| `extract.json` | `extract` | text extraction and the detected `kind` (`json`, `form`, `multipart`, `text`, `binary`, `none`): the body decides the format, the content type is a hint |
+| `rules.json` | `rules` | every L1 decision of the shipped `llm-endpoints` rule set (`pass`, `block`, `suspect`, `unjudgeable`), including one positive per `always_suspect` pattern, head-and-tail scanning past `max_body_bytes` and the `max_judge_bytes` window |
 | `policy.json` | `policy` | score to action / label / async mapping, threshold edges, error and skipped events |
 | `verdict.json` | `verdict` | verdict defaults, clamping, header rendering, reason encoding |
-| `evaluate.json` | `evaluate` | the whole pipeline with every IO scripted: L1, cache, breaker, L2, policy, cache writes, prompt contents, subject trajectory |
+| `evaluate.json` | `evaluate` | the whole pipeline with every IO scripted: L1, cache, breaker, L2, policy (`policy.unjudgeable` included), cache writes, prompt contents, subject trajectory |
 
 Each file is `{ format_version, core_version, suite, generated_by, cases: [ { name, input, expect } ] }`.
 `format_version` changes only when the shape of `input` or `expect` changes; `core_version` records which core produced the file and is informational.
@@ -34,6 +34,7 @@ Each file is `{ format_version, core_version, suite, generated_by, cases: [ { na
 
 An implementation replays a case by constructing its IO from `input` exactly as `core/spec/golden_spec.lua` does:
 
+- **`req`**: handed to core as-is: `method, path, headers, body, body_size, client_ip`, and where a case needs them `decoded` (the adapter decoded the `Content-Encoding`; `body` is the decoded body), `body_head` and `body_tail` (the first `max_body_bytes` and the last 64 KiB of a body past `max_body_bytes`, when that is all the adapter has). A case with a whole `body` and a larger `body_size` leaves the head and tail cut to core; a case with neither `body` nor `body_head` is a gateway that forwarded headers only.
 - **`cache`**: a key-value map preloaded into the cache double. Reads return the stored value; writes are recorded as `{ value, ttl }` under the key and appear in `expect.cache_writes`.
 - **`clock`**: the value the injected clock returns, in seconds. It never advances inside a case, so `l2_ms` is always 0.
 - **`rules`**: rule set ids, loaded from `rules/<id>`.
@@ -41,15 +42,15 @@ An implementation replays a case by constructing its IO from `input` exactly as 
 - **`judge`**: `{ answers }` returns that map from the judge call; `{ error }` returns `nil, error`. `expect.judge_calls` counts calls and `expect.prompt` records the prompt the core built: `text`, `context` and the sorted question names.
 - **`subject`**: `null` means no subject context injected at all. Otherwise `{ id, history }` is passed as `ctx.subject` together with a `record` sink that captures the single entry the core hands over; that entry (or `null`) is `expect.subject_record`. **`history` must change nothing**: several cases pass a non-empty one and expect the same verdict as their subject-less twin. This version records trajectories, it does not score on them.
 - **`breaker`**: `null` means no breaker injected. `"open"` is a breaker whose open period has not elapsed at `clock`; `"closed"` is a healthy one.
-- **`hash`** is the reference djb2 (`normalize.djb2`), **`json_decode`** is any RFC 8259 parser, **`re_find`** is a case-insensitive regex search.
+- **`hash`** is the reference djb2 (`normalize.djb2`), **`json_decode`** is any RFC 8259 parser, **`re_find`** is a case-insensitive regex search that returns the match's 1-based inclusive **byte** span `from, to` (UTF-8 bytes, not UTF-16 indices), or nothing. A bare truthy value still decides L1, but the judging window can then not place the hit, and the cases over `max_judge_bytes` will not match.
 
 ## What parity covers and what it does not
 
 **Covered by the vectors** (must match byte for byte):
 
 - normalisation, fingerprinting with the reference hash, text extraction
-- L1 decisions: path watch list, method and content-type filters, body size bounds, reputation lookups, `always_suspect` patterns, natural-language length
-- policy: thresholds, mode, the async flag, error and skipped events
+- L1 decisions: path watch list, method and `skip_content_types` / `content_types` filters, body size bounds, reputation lookups, `Content-Encoding` without `decoded`, format detection, head-and-tail scanning past `max_body_bytes`, `unjudgeable` and its reasons, `always_suspect` patterns, natural-language length, the `max_judge_bytes` window and the ` (window)` reason suffix
+- policy: thresholds, mode, the async flag, error and skipped events; an `unjudgeable` L1 result is `skipped` with action `pass`, or `block` only when `policy.unjudgeable = "block"` and the mode is `enforce`
 - verdict structure, header names and values, reason encoding and truncation
 - the order in which the pipeline consults L1, cache, breaker and L2, and what it writes to the cache
 - the subject trajectory entry: its fields, which exits produce one (every exit that made a decision; not L1 pass), and that a supplied `history` is ignored
@@ -61,6 +62,7 @@ An implementation replays a case by constructing its IO from `input` exactly as 
 - the adaptive timeout's numeric value; only that `jev.timeout_ms` is what the judge receives
 - the production hash (OpenResty and APISIX use SHA-256; a port may use any function that is collision-resistant, because the fingerprint keys the verdict cache and the trust store); the vectors use djb2 so the *normalised text* is what is compared
 - HTTP transport: provider request bodies, retries, header casing on the wire
+- reading the request body: where head and tail come from (memory, a temp file, a stream), `Content-Encoding` decoding and its libraries; core only sees the resulting `req`
 
 ## Regex portability
 

@@ -29,7 +29,7 @@ local trust     = require "jev.core.trust"
 local verdict   = require "jev.core.verdict"
 local subject   = require "jev.core.subject"
 
-local _M = { _VERSION = "0.3.1" }
+local _M = { _VERSION = "0.4.0" }
 
 local function log(ctx, level, msg)
   if ctx.log then ctx.log(level, msg) end
@@ -48,14 +48,45 @@ local function finish(ctx, v)
   return v
 end
 
+--- Verdict-cache key for a fingerprint judged under `rule`.
+-- A score is only valid for the prompt that produced it: the same text judged
+-- with another rule's templates or deployment context, or by another
+-- provider or model, may score differently, so each gets its own entry
+-- (a lenient tenant's SAFE must not be replayed on a strict one). Trust
+-- stays keyed by fingerprint alone: an operator vouches for the text.
+-- @param fp   fingerprint (non-empty)
+-- @param rule the rule L1 matched
+-- @param cfg  merged config
+-- @param hash the ctx.hash the fingerprint was made with
+function _M.cache_key(fp, rule, cfg, hash)
+  local jev = cfg and cfg.jev or {}
+  local scope = table.concat({
+    tostring(rule and rule.id or ""),
+    table.concat(rule and rule.templates or {}, ","),
+    tostring(rule and rule.deployment_context or jev.deployment_context or ""),
+    tostring(jev.provider or ""),
+    tostring(jev.model or ""),
+  }, "\n")
+  return "fp:" .. tostring(hash(scope)):sub(1, 16) .. ":" .. fp
+end
+
 function _M.evaluate(req, ctx)
   local cfg = ctx.config
 
   -- L1 ------------------------------------------------------------------
-  local r, text, reason, rule = rules_mod.evaluate_all(req, ctx.rules, ctx)
+  local r, text, reason, rule, windowed = rules_mod.evaluate_all(req, ctx.rules, ctx)
 
   if r == rules_mod.PASS then
     return verdict.new({ verdict = verdict.SKIPPED, source = verdict.SRC_L1, reason = reason })
+  end
+  if r == rules_mod.UNJUDGEABLE then
+    -- A watched request nobody read. Not judged, so `skipped`; blocked only
+    -- when the operator chose that and the gateway enforces.
+    local block = cfg.policy.mode == "enforce" and cfg.policy.unjudgeable == "block"
+    return finish(ctx, verdict.new({
+      action = block and verdict.ACTION_BLOCK or verdict.ACTION_PASS,
+      verdict = verdict.SKIPPED, source = verdict.SRC_L1, reason = reason,
+    }))
   end
   if r == rules_mod.BLOCK then
     local action = (cfg.policy.mode == "enforce") and verdict.ACTION_BLOCK or verdict.ACTION_PASS
@@ -85,8 +116,9 @@ function _M.evaluate(req, ctx)
   end
 
   -- cache ---------------------------------------------------------------
-  if fp ~= "" and ctx.cache then
-    local hit = ctx.cache:get("fp:" .. fp)
+  local ckey = fp ~= "" and _M.cache_key(fp, rule, cfg, ctx.hash) or nil
+  if ckey and ctx.cache then
+    local hit = ctx.cache:get(ckey)
     if type(hit) == "table" and type(hit.score) == "number" then
       local action, label = policy.decide(hit.score, cfg.policy)
       -- Never async on a hit: the cached score already is the judge's
@@ -133,13 +165,25 @@ function _M.evaluate(req, ctx)
       fingerprint = fp, l2_ms = elapsed }))
   end
 
+  local score, top, n = judge.reduce(answers)
+  if n == 0 then
+    -- An answer with no score in it is a provider fault, not a SAFE verdict:
+    -- caching score 0 would wave the same text through for fp_ttl.
+    if ctx.breaker then ctx.breaker:failure() end
+    log(ctx, "warn", "jev-edge: L2 answer has no scores")
+    local action, label, async = policy.on_error()
+    return finish(ctx, verdict.new({ action = action, verdict = label, async = async,
+      source = verdict.SRC_L2, reason = "no scores in answer",
+      fingerprint = fp, l2_ms = elapsed }))
+  end
   if ctx.breaker then ctx.breaker:success() end
-  local score, top = judge.reduce(answers)
   local action, label, async = policy.decide(score, cfg.policy)
   local why = top ~= "" and (top .. " " .. string.format("%.2f", score)) or reason
+  -- the score is for the window, not the whole text; say so
+  if windowed and top ~= "" then why = why .. " (window)" end
 
-  if fp ~= "" and ctx.cache then
-    ctx.cache:set("fp:" .. fp, { score = score, reason = why }, cfg.cache.fp_ttl)
+  if ckey and ctx.cache then
+    ctx.cache:set(ckey, { score = score, reason = why }, cfg.cache.fp_ttl)
   end
 
   return finish(ctx, verdict.new({

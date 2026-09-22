@@ -1,19 +1,32 @@
 // Port of core/rules.lua: L1, cheap and short-circuiting.
-import { extract, byteLength, type JsonValue } from "./normalize";
+import { extract, byteLength, head, tail, fieldKeys, scanStrings, window, type JsonValue } from "./normalize";
 
-export type RuleResult = "pass" | "block" | "suspect";
+export type RuleResult = "pass" | "block" | "suspect" | "unjudgeable";
 export const PASS: RuleResult = "pass";
 export const BLOCK: RuleResult = "block";
 export const SUSPECT: RuleResult = "suspect";
+/** A watched request L1 cannot read; policy.unjudgeable decides (see core/rules.lua). */
+export const UNJUDGEABLE: RuleResult = "unjudgeable";
+
+export const MAX_BODY_BYTES = 1048576;
+export const MAX_JUDGE_BYTES = 32768;
+export const TAIL_BYTES = 65536;
+export const SKIP_CONTENT_TYPES = [
+  "image/", "audio/", "video/", "font/", "application/pdf", "application/zip", "application/gzip",
+];
 
 export interface Rule {
   id: string;
   /** Lua patterns in the rule files; the subset used (anchors, literals, %-escapes) converts 1:1. */
   watch_paths: string[];
   methods?: Record<string, boolean>;
+  /** Allow list (the pre-0.4 behaviour); without it, skip_content_types applies. */
   content_types?: string[];
+  /** Media types never judged; everything else is read and the body decides the format. */
+  skip_content_types?: string[];
   min_body_bytes?: number;
   max_body_bytes?: number;
+  max_judge_bytes?: number;
   text_fields: string[];
   min_text_chars?: number;
   always_suspect?: string[];
@@ -24,10 +37,16 @@ export interface Rule {
 export interface Req {
   method?: string;
   path?: string;
-  headers?: Record<string, string | undefined>;
+  /** A repeated header may arrive as a list (Lua's ngx.req.get_headers does this). */
+  headers?: Record<string, string | string[] | undefined>;
   body?: string | null;
   body_size?: number;
   client_ip?: string;
+  /** Past max_body_bytes: the first bytes and the last bytes (not overlapping) the adapter kept. */
+  body_head?: string | null;
+  body_tail?: string | null;
+  /** true when the adapter decoded the Content-Encoding and `body` is the decoded body. */
+  decoded?: boolean;
 }
 
 export interface CacheLike {
@@ -39,7 +58,8 @@ export interface RulesCtx {
   cache?: CacheLike;
   clock?: () => number;
   json_decode?: (s: string) => JsonValue;
-  re_find?: (subject: string, pattern: string) => boolean;
+  /** Truthy on a match; a [from, to] 1-based inclusive UTF-8 byte span places the hit in the judging window. */
+  re_find?: (subject: string, pattern: string) => boolean | readonly [number, number] | null;
   log?: (level: string, msg: string) => void;
 }
 
@@ -52,12 +72,27 @@ export interface RulesCtx {
 export function patternError(p: string): string | null {
   const n = p.length;
   let i = 0;
+  // captures in opening order; true once closed (see the Lua original)
+  const caps: boolean[] = [];
   while (i < n) {
     const c = p[i];
-    if (c === "%") {
+    if (c === "(") {
+      if (caps.length >= 32) return "too many captures";
+      caps.push(false);
+      i++;
+    } else if (c === ")") {
+      const open = caps.lastIndexOf(false);
+      if (open < 0) return "invalid pattern capture";
+      caps[open] = true;
+      i++;
+    } else if (c === "%") {
       const d = p[i + 1];
       if (d === undefined) return "malformed pattern (ends with '%')";
-      if (d === "b") {
+      if (d >= "0" && d <= "9") {
+        const l = Number(d);
+        if (l === 0 || !caps[l - 1]) return "invalid capture index %" + d;
+        i += 2;
+      } else if (d === "b") {
         if (i + 3 >= n) return "malformed pattern (missing arguments to '%b')";
         i += 4;
       } else if (d === "f") {
@@ -90,6 +125,7 @@ export function patternError(p: string): string | null {
       i++;
     }
   }
+  if (caps.includes(false)) return "unfinished capture";
   return null;
 }
 
@@ -169,7 +205,7 @@ export function pathMatches(s: string, patterns: string[] | undefined): string |
 
 let warned = false;
 const badPatterns = new Set<string>();
-function textMatches(s: string, patterns: string[] | undefined, ctx: RulesCtx | undefined): string | null {
+function textMatches(s: string, patterns: string[] | undefined, ctx: RulesCtx | undefined): [string, number?, number?] | null {
   if (!patterns || patterns.length === 0) return null;
   const reFind = ctx?.re_find;
   if (!reFind) {
@@ -181,7 +217,9 @@ function textMatches(s: string, patterns: string[] | undefined, ctx: RulesCtx | 
   }
   for (const p of patterns) {
     try {
-      if (reFind(s, p)) return p;
+      const hit = reFind(s, p);
+      if (Array.isArray(hit)) return [p, hit[0], hit[1]];
+      if (hit) return [p];
     } catch (e) {
       // a pattern the engine rejects is skipped, like pcall in Lua, but an
       // operator should hear about it once instead of losing the prefilter silently
@@ -196,25 +234,106 @@ function textMatches(s: string, patterns: string[] | undefined, ctx: RulesCtx | 
   return null;
 }
 
-function ctAllowed(ct: string | undefined, allowed: string[] | undefined): boolean {
-  if (!allowed || allowed.length === 0) return true;
-  const c = (ct ?? "").toLowerCase();
-  for (const a of allowed) if (c.includes(a)) return true;
-  return false;
+/** Port of rules.content_type: the Content-Type as one string; a repeated
+ *  header's values are joined so it is watched when any of them is. */
+export function contentType(headers: Req["headers"]): string {
+  if (!headers || typeof headers !== "object") return "";
+  let ct: unknown = headers["content-type"];
+  if (ct === undefined || ct === null) ct = headers["Content-Type"];
+  if (Array.isArray(ct)) ct = ct.filter((v) => typeof v === "string").join(", ");
+  return typeof ct === "string" ? ct : "";
 }
 
-/** Case-insensitive regex search with the same contract the OpenResty adapter gives core. */
+/** Port of rules.content_encoding: the codings, lowercased, without "identity"; "" when none. */
+export function contentEncoding(headers: Req["headers"]): string {
+  if (!headers || typeof headers !== "object") return "";
+  let ce: unknown = headers["content-encoding"];
+  if (ce === undefined || ce === null) ce = headers["Content-Encoding"];
+  if (Array.isArray(ce)) ce = ce.join(",");
+  if (typeof ce !== "string") return "";
+  return (ce.toLowerCase().match(/[^,\s]+/g) ?? []).filter((t) => t !== "identity").join(", ");
+}
+
+function ctWatched(ct: string, rule: Rule): boolean {
+  const c = ct.toLowerCase();
+  const allowed = rule.content_types;
+  if (allowed && allowed.length > 0) {
+    for (const a of allowed) if (c.includes(a)) return true;
+    return false;
+  }
+  // deny list: watched unless every value of the header is a skipped type
+  const skip = rule.skip_content_types ?? SKIP_CONTENT_TYPES;
+  let any = false;
+  for (const raw of c.split(",")) {
+    const v = raw.replace(/^[ \t\n\v\f\r]+|[ \t\n\v\f\r]+$/g, "");
+    if (v === "") continue;
+    any = true;
+    if (!skip.some((sk) => v.startsWith(sk))) return true;
+  }
+  return !any;
+}
+
+/**
+ * Case-insensitive regex search with the same contract the OpenResty adapter
+ * gives core: the 1-based inclusive UTF-8 byte span of the first match.
+ */
 const reCache = new Map<string, RegExp>();
-export function reFind(subject: string, pattern: string): boolean {
+export function reFind(subject: string, pattern: string): readonly [number, number] | null {
   let re = reCache.get(pattern);
   if (!re) {
     re = new RegExp(pattern, "i");
     reCache.set(pattern, re);
   }
-  return re.test(subject);
+  const m = re.exec(subject);
+  if (!m) return null;
+  const from = byteLength(subject.slice(0, m.index)) + 1;
+  return [from, from + byteLength(m[0]) - 1];
 }
 
-export async function evaluate(req: Req, rule: Rule, ctx?: RulesCtx): Promise<[RuleResult, string, string]> {
+// Port of judged() in core/rules.lua.
+async function judged(
+  req: Req, rule: Rule, ctx: RulesCtx | undefined, ct: string, size: number,
+): Promise<{ text: string; unj?: string; hit?: string; windowed?: boolean }> {
+  const max = rule.max_body_bytes ?? MAX_BODY_BYTES;
+  let values: string[];
+  let text: string;
+  let partial = false;
+  if (size > max) {
+    let hd = req.body_head ?? undefined;
+    let tl = req.body_tail ?? undefined;
+    if (hd === undefined && typeof req.body === "string") {
+      hd = head(req.body, max);
+      const rest = req.body.slice(hd.length);
+      if (rest !== "") tl = tail(rest, TAIL_BYTES);
+    }
+    if (hd === undefined) return { text: "", unj: "unjudgeable: body too large" };
+    const keys = fieldKeys(rule.text_fields);
+    values = scanStrings(hd, keys, []);
+    if (tl !== undefined) scanStrings(tl, keys, values);
+    if (values.length === 0) return { text: "", unj: "unjudgeable: body too large" };
+    text = values.join("\n");
+    partial = true;
+  } else {
+    let kind: string;
+    [text, kind, values] = extract(req.body, ct, rule.text_fields, ctx?.json_decode);
+    if (kind === "binary") return { text: "", unj: "unjudgeable: binary body" };
+  }
+  if (text === "") return { text: "" };
+  const hit = textMatches(text, rule.always_suspect, ctx);
+  const [w, cut] = window(text, values, rule.max_judge_bytes ?? MAX_JUDGE_BYTES, hit?.[1], hit?.[2]);
+  return { text: w, hit: hit?.[0], windowed: cut || partial };
+}
+
+/** Port of rules.judged_text: the text evaluate() judges under `rule` ("" when none). */
+export async function judgedText(req: Req, rule: Rule | undefined, ctx?: RulesCtx): Promise<string> {
+  if (!rule || !req) return "";
+  const declared = Number(req.body_size);
+  const size = Math.max(Number.isFinite(declared) ? declared : 0, typeof req.body === "string" ? byteLength(req.body) : 0);
+  const r = await judged(req, rule, ctx, contentType(req.headers), size);
+  return r.text;
+}
+
+export async function evaluate(req: Req, rule: Rule, ctx?: RulesCtx): Promise<[RuleResult, string, string, boolean?]> {
   // 1. path watch list
   if (!pathMatches(req.path ?? "", rule.watch_paths)) return [PASS, "", "path not watched"];
 
@@ -228,36 +347,53 @@ export async function evaluate(req: Req, rule: Rule, ctx?: RulesCtx): Promise<[R
     }
   }
 
-  // 3. method + content type
+  // 3. method + content type (deny list of media types unless content_types allows)
   if (rule.methods && !rule.methods[(req.method ?? "").toUpperCase()]) return [PASS, "", "method not watched"];
-  const ct = req.headers ? (req.headers["content-type"] ?? req.headers["Content-Type"] ?? "") : "";
-  if (!ctAllowed(ct, rule.content_types)) return [PASS, "", "content-type not watched"];
+  const ct = contentType(req.headers);
+  if (!ctWatched(ct, rule)) return [PASS, "", "content-type not watched"];
 
   // 4. body size: the larger of what the adapter declared and what it handed
   //    over, so a wrong or missing Content-Length cannot shrink the body
   //    (bytes, like Lua's #body).
   const declared = Number(req.body_size);
   const size = Math.max(Number.isFinite(declared) ? declared : 0, typeof req.body === "string" ? byteLength(req.body) : 0);
-  if (size === 0 && (req.body === undefined || req.body === null)) return [PASS, "", "no body"];
+  if (size === 0 && (req.body === undefined || req.body === null) && (req.body_head === undefined || req.body_head === null)) {
+    return [PASS, "", "no body"];
+  }
   if (size < (rule.min_body_bytes ?? 8)) return [PASS, "", "body too small"];
-  if (size > (rule.max_body_bytes ?? 65536)) return [PASS, "", "body too large"];
 
-  // 5+6. extract text, regex prefilter, natural-language length
-  const [text] = extract(req.body, ct, rule.text_fields, ctx?.json_decode);
-  if (text === "") return [PASS, "", "no text"];
-  const hit = textMatches(text, rule.always_suspect, ctx);
-  if (hit) return [SUSPECT, text, "pattern: " + hit];
-  if (byteLength(text) >= (rule.min_text_chars ?? 20)) return [SUSPECT, text, "natural language"];
+  // 5. an encoded body is only readable once the adapter decoded it
+  const ce = contentEncoding(req.headers);
+  if (ce !== "" && !req.decoded) return [UNJUDGEABLE, "", "unjudgeable: content-encoding " + ce];
+
+  // 6+7. extract, prefilter over all of it, judging window, length
+  const j = await judged(req, rule, ctx, ct, size);
+  if (j.unj) return [UNJUDGEABLE, "", j.unj];
+  if (j.text === "") return [PASS, "", "no text"];
+  const tag = j.windowed ? " (window)" : "";
+  if (j.hit) return [SUSPECT, j.text, "pattern: " + j.hit + tag, j.windowed];
+  if (byteLength(j.text) >= (rule.min_text_chars ?? 20)) return [SUSPECT, j.text, "natural language" + tag, j.windowed];
   return [PASS, "", "text too short"];
+}
+
+/** Port of rules.rule_for: the first rule whose path, method and content type all match. */
+export function ruleFor(req: Req, rules: Rule[] | undefined): Rule | undefined {
+  const ct = contentType(req.headers);
+  for (const r of rules ?? []) {
+    if (pathMatches(req.path ?? "", r.watch_paths)
+      && !(r.methods && !r.methods[(req.method ?? "").toUpperCase()])
+      && ctWatched(ct, r)) return r;
+  }
+  return undefined;
 }
 
 export async function evaluateAll(
   req: Req, rules: Rule[] | undefined, ctx?: RulesCtx,
-): Promise<[RuleResult, string, string, Rule | undefined]> {
+): Promise<[RuleResult, string, string, Rule | undefined, boolean?]> {
   let lastReason = "no rules";
   for (const rule of rules ?? []) {
-    const [r, text, reason] = await evaluate(req, rule, ctx);
-    if (r !== PASS) return [r, text, reason, rule];
+    const [r, text, reason, windowed] = await evaluate(req, rule, ctx);
+    if (r !== PASS) return [r, text, reason, rule, windowed];
     lastReason = reason;
   }
   return [PASS, "", lastReason, undefined];

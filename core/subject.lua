@@ -149,7 +149,15 @@ function _M.key(id) return _M.KEY_PREFIX .. tostring(id) end
 -- keeps one counter per subject (`incr`, atomic) and one key per entry,
 -- `subj:<id>:<n % max>`, so a write is two atomic dict operations and needs
 -- neither a lock nor a timer. Reading is `max` gets, newest last.
--- store: { get, set, incr = fn(self, key, by, ttl) -> new value|nil }
+-- Each slot holds `{ n = <sequence>, e = <entry> }`; a reader keeps a slot
+-- only when its sequence is the one it expects there, so a slot still holding
+-- the previous lap (read between another worker's incr and set) or written
+-- under a different max_entries is a hole, not a misplaced entry.
+-- store: { get, set, incr = fn(self, key, by, ttl) -> new value|nil,
+--          expire = fn(self, key, ttl) (optional) }
+-- `incr` sets the ttl only when it creates the counter; `expire` extends it
+-- on every append so an active subject keeps its history for `ttl` after
+-- its last request, not after its first.
 -- ---------------------------------------------------------------------------
 
 function _M.ring_append(store, id, e, max_entries, ttl)
@@ -159,7 +167,8 @@ function _M.ring_append(store, id, e, max_entries, ttl)
   local key = _M.key(id)
   local n = store:incr(key .. ":n", 1, t)
   if not n then return false end
-  return store:set(key .. ":" .. ((n - 1) % max), e, t)
+  if type(store.expire) == "function" then store:expire(key .. ":n", t) end
+  return store:set(key .. ":" .. ((n - 1) % max), { n = n, e = e }, t)
 end
 
 function _M.ring_load(store, id, max_entries)
@@ -171,9 +180,9 @@ function _M.ring_load(store, id, max_entries)
   local out = {}
   local first = math.max(1, n - max + 1)
   for i = first, n do
-    local e = store:get(key .. ":" .. ((i - 1) % max))
-    -- an evicted or expired slot is a hole, not an error; skip it
-    if type(e) == "table" then out[#out + 1] = e end
+    local s = store:get(key .. ":" .. ((i - 1) % max))
+    -- an evicted, expired, stale or foreign slot is a hole, not an error
+    if type(s) == "table" and s.n == i and type(s.e) == "table" then out[#out + 1] = s.e end
   end
   if #out == 0 then return nil end
   return out

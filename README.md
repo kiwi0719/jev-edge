@@ -25,6 +25,7 @@ It is built for SREs and platform engineers, not agent authors. Existing Jev gua
 - [Try it in 30 seconds](#try-it-in-30-seconds)
 - [How it works](#how-it-works)
 - [Install](#install)
+- [Body size and what L1 reads](#body-size-and-what-l1-reads)
 - [Writing the deployment context](#writing-the-deployment-context)
 - [Choosing thresholds](#choosing-thresholds)
 - [False positives](#false-positives)
@@ -209,6 +210,31 @@ Rollback is the same call with `"monitor"`, or `DELETE /_jev/config` to drop eve
 - **LiteLLM proxy**: a guardrail that asks jev-edge before every call: [adapters/litellm](adapters/litellm/README.md).
 - **Cloudflare Workers and Pages, Next.js, Node, Hono, Lambda@Edge**: one npm package with a TypeScript port of core, [adapters/js](adapters/js/README.md). The thin Worker keeps judgment at the gateway you already run; the others run the whole core in the host.
 
+## Body size and what L1 reads
+
+L1 reads a watched request the way the backend will: the body decides the format, a compressed body is decoded, and a body too large to parse whole is still scanned. A request it cannot read at all is reported as such, never passed silently as "no text".
+
+**`max_body_bytes` is 1 MiB** (it was 64 KB before 0.4.0), nginx's default `client_max_body_size`. Up to it the body is parsed whole. Past it, only its first `max_body_bytes` and its last 64 KiB are scanned for the values of the text fields (`content`, `prompt`, `input`, ...); the verdict's reason then ends in `(window)`. The 1 MiB covers long-context chat with pasted documents; raise it for vision or RAG traffic with inline base64 files, where requests of several MB are normal. Everything below must agree, or the smallest limit wins:
+
+| Where | Setting | Note |
+|---|---|---|
+| `jev-edge.conf.lua` | `rules = { { id = "big", extends = "llm-endpoints", max_body_bytes = 4 * 1048576 } }` | the rule L1 applies; per tenant rule if you have several |
+| nginx / OpenResty | `client_max_body_size 4m;` | past it nginx answers 413 before jev-edge runs |
+| nginx / OpenResty | `client_body_buffer_size` | bodies above it go to a temp file; jev-edge reads head and tail from it without loading the file |
+| Envoy | `with_request_body.max_request_bytes` | past it Envoy sends a cut body with `x-envoy-auth-partial-body: true`, which jev-edge scans as a head (`allow_partial_message: true`) |
+| HAProxy | `tune.bufsize` | per-connection memory; past it the SPOE agent marks the body partial and it is scanned as a head |
+| Traefik | no `maxBodySize` | past it Traefik denies with 401 on its own; cap sizes with a `buffering` middleware instead |
+| APISIX | plugin `rules`, and `nginx_config.http.client_max_body_size` in `config.yaml` | same as nginx |
+| `@jev-edge/js` | `rules: [{ id: "big", extends: "llm-endpoints", max_body_bytes: 4 * 1048576 }]` | past it the runtime reads on to 4 x the limit for the tail; Workers cap request size by plan |
+
+**`max_judge_bytes` is 32 KiB**: the text fingerprinted and sent to L2. Longer text is cut to a window: the `always_suspect` hit (all of the text is scanned for it) with 1 KiB either side, then messages newest first; the one that does not fit keeps its head and tail. Chat APIs resend the history every turn, and earlier turns were judged when they were new. Raising it costs tokens on every long request; `jev_window_total` counts how often it is hit.
+
+**Content-Type is a hint.** Every type except media (`skip_content_types`: `image/`, `audio/`, `video/`, `font/`, PDF, zip, gzip) is read: a body that parses as JSON is JSON whatever the header says (Ollama and FastAPI read it that way), forms and `multipart/form-data` fields are read (text file parts too), other text is taken whole. A rule that lists `content_types` keeps the old allow list.
+
+**Content-Encoding** `gzip`, `deflate` and `br` are decoded (Express's body-parser inflates them), capped at `max_body_bytes` so a small compressed body cannot expand into memory. OpenResty and APISIX use zlib (linked into nginx) and libbrotlidec through FFI: install `brotli-libs` (Alpine) or `libbrotli1` (Debian) for `br`. The JS runtime uses `DecompressionStream`, and `node:zlib` for `br` where it exists.
+
+**Unjudgeable.** An encoding that cannot be decoded, a binary body, or a body over the limit with no text in its head or tail is passed as `X-Jev-Verdict: skipped` with `X-Jev-Reason: unjudgeable: <why>` and counted in `jev_unjudged_total{reason}`. Set `policy.unjudgeable = "block"` to reject these in enforce mode: normal SDKs send none of them, so once the metric is quiet in monitor mode it is the stricter choice.
+
 ## Writing the deployment context
 
 `jev.deployment_context` is one paragraph that tells Jev what your assistant is *for*. With it, the question Jev answers changes from "does this text look like an attack" to "is this message a misuse of *this* service". On the same 662 texts and the same model that moved AUC from 0.983 to 0.996 and cut the miss rate at threshold 0.5 from 37% to 5%. Nothing else in the config comes close.
@@ -382,6 +408,7 @@ docs/            design.md, cost.md, recipes.md (Istio, Envoy Gateway, APIM, Api
 | 0.2.0 ✅ | Gateways beyond OpenResty, same engine: Envoy HTTP ext_authz (`/_jev/authz`) and gRPC ext_authz (`grpc-shim`); `/_jev/forward-auth` for Traefik ForwardAuth (body forwarded, full verdicts), Caddy `forward_auth` and nginx `auth_request` (headers only: path, method, reputation). Docker Compose e2e against every real gateway. `demo/`. License moved to Apache 2.0. |
 | 0.3.0 ✅ | Golden vectors as the versioned core contract (`core/golden/`, replayed by both cores in CI); `make calibrate`, `make context-lint`, `make labels`; multi-tenant rules with a `deployment_context` per tenant; decision sampling (`/_jev/samples`); the false-positive feedback loop (`/_jev/feedback`, fingerprint trust with expiry); the subject trajectory contract (recorded, not yet scored) with subject ids from IP, header or cookie, salted-hashed before storage, in a bounded dict of their own; APISIX plugin; HAProxy SPOE agent; LiteLLM guardrail; recipes for Istio, Envoy Gateway, APIM and Apigee; `@jev-edge/js` with a TypeScript core passing the vectors and presets for Cloudflare (thin and full Worker, Pages), Next.js, Node, Hono and Lambda@Edge. |
 | 0.3.1 ✅ | Audit patch: content-parts bodies judged; SHA-256 fingerprint over the whole text (was a crc32 prefix); `X-Forwarded-For` read from the proxy's hop (`client_ip.trusted_hops`); `GET /_jev/config` redacts secrets; admin endpoints on their own listener; inbound `X-Jev-*` stripped by every gateway config; one thin-adapter contract (`status >= 400` + `X-Jev-Verdict` = block, no header = not judged); optional `jev_state` dict for trust / breaker / counters; L3 rebuilt with the L2 prompt and the ceiling timeout; breaker, in-flight, provider and validation fixes; JS fail-open covers the whole request. |
+| 0.4.0 ✅ | L1 reads what the backend reads: the body decides the format (Content-Type is a hint; `multipart/form-data` read), `gzip` / `deflate` / `br` bodies decoded, `max_body_bytes` 1 MiB with head-and-tail scanning past it, a 32 KiB judging window (`max_judge_bytes`) with the pattern hit kept, and `policy.unjudgeable` for what still cannot be read. Security fixes from a full audit: verdict cache scoped per rule and provider, client IP and path forgery through forward-auth and the JS runtime, repeated or late `Content-Type`, empty judge answers, BOM bodies; JS fingerprints on SHA-256; subject history on a ring in JS too. |
 | Possible future work | Scoring on subject trajectories: the window, decay and thresholds chosen from recorded trajectories and a multi-turn dataset (shared with the `abuse` template, which gets its own dataset at the same time); Fastly Compute and Deno Deploy once the vectors have survived a real core change; a Grafana dashboard for the metrics and the feedback log |
 
 ✅ means shipped in a tagged release.

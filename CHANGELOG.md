@@ -6,6 +6,159 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-23
+
+L1 now reads a watched request the way the backend will, and reports the
+requests it still cannot read instead of passing them as "no text". Plus the
+fixes from a full audit of 0.3.1. Four changes alter what an existing
+deployment sees; read **Changed** before upgrading.
+
+### Changed
+- **`max_body_bytes` is 1 MiB (was 64 KB)**, nginx's default
+  `client_max_body_size`. Bodies up to it are parsed whole. Past it the body is
+  no longer passed as "body too large": its first `max_body_bytes` and last
+  64 KiB are scanned for the text fields' string values (truncated JSON
+  included) and judged, with ` (window)` at the end of the reason. Where to
+  raise it (rule, nginx, Envoy, HAProxy, Traefik, APISIX, JS) is in README
+  "Body size and what L1 reads"; every limit on the path has to agree.
+- **Content-Type is a hint, not a gate.** `llm-endpoints` lists
+  `skip_content_types` (media: `image/`, `audio/`, `video/`, `font/`, PDF,
+  zip, gzip) instead of an allow list, and the body decides the format: JSON
+  when it parses as JSON whatever the header (Ollama and FastAPI read it that
+  way; `text/json`, none, `application/octet-stream` were "not watched"),
+  forms and `multipart/form-data` fields (text file parts too), other text
+  whole. A rule that lists `content_types` keeps the allow list.
+- **Text over `max_judge_bytes` (new, 32 KiB) is judged on a window**: the
+  `always_suspect` hit (all of the text is scanned for it) with 1 KiB either
+  side, then values newest first. The fingerprint and L2 see the window; so
+  does L3 (`rules.judged_text`). `ctx.re_find` should return the match's byte
+  span (`from, to`, as `ngx.re.find` does) so the hit lands in the window.
+- **Verdict-cache keys** are `fp:<scope>:<fingerprint>` (see Security); the
+  cache refills after the upgrade. Subject history in the JS runtime moves to
+  ring keys, so earlier KV history is not read again.
+
+### Added
+- **`Content-Encoding` gzip, deflate and br are decoded** before L1
+  (`resty.jev.decode` through FFI to zlib and libbrotlidec; `DecompressionStream`
+  and `node:zlib` in JS), capped at `max_body_bytes` so a small compressed body
+  cannot expand into memory. Express's body-parser inflates request bodies by
+  default, so a compressed prompt used to reach the app unjudged. `br` needs
+  `brotli-libs` (Alpine) or `libbrotli1` (Debian) on OpenResty images.
+- **`policy.unjudgeable = "pass" | "block"`** (default `pass`) for a watched
+  request L1 cannot read: an encoding it cannot decode, a binary body, or an
+  oversized body with no text in its head or tail. It is passed as
+  `X-Jev-Verdict: skipped` with `X-Jev-Reason: unjudgeable: <why>`, or
+  rejected in enforce mode with `block`. Metrics: `jev_unjudged_total{reason}`,
+  `jev_window_total`.
+- Gateways that hand over part of a body say so, and jev-edge scans it as a
+  head: Envoy's `x-envoy-auth-partial-body` (example configs now allow 1 MiB
+  and forward `content-encoding`), and the HAProxy SPOA agent's
+  `X-Jev-Body-Partial` from HAProxy's declared body size (new `size` arg in
+  `spoe.conf`).
+- `nextMiddleware(request, event)` forwards Next's event, so `waitUntil` keeps
+  the subject write alive.
+
+### Security
+- **A repeated `Content-Type` header no longer skips judging.** OpenResty and
+  APISIX hand a repeated header to Lua as a list; L1 called `:lower()` on it,
+  raised, and the adapter failed open with `X-Jev-Verdict: error`. The values
+  are now joined (`rules.content_type`) and the content type is watched when
+  any of them is.
+- **The verdict cache is scoped to the prompt that produced the score.** The
+  key was `fp:<fingerprint>`, so a SAFE judged under a lenient tenant rule,
+  deployment context, provider or model (an APISIX route with
+  `provider = "mock"`) was replayed on a strict one. The key is now
+  `fp:<scope>:<fingerprint>` (`core.cache_key`), scope = rule id, templates,
+  deployment context, provider and model. L3 writes the same key. Trust stays
+  keyed by fingerprint alone. Cached verdicts from earlier versions are not
+  read again; the cache refills.
+- **A judge answer with no score is an error, not SAFE.** `{"answers":{}}` or
+  only non-numeric values reduced to score 0, counted as a breaker success
+  and was cached as SAFE for `fp_ttl`. It now takes the `on_error` path and
+  writes nothing (L2 and L3). `judge.reduce` returns the count of numeric
+  answers as a third value.
+- **A UTF-8 BOM before a JSON body no longer hides the text.** cjson rejects
+  it, extraction returned "no text" and L1 passed, while Python and Express
+  backends skip the BOM and read the prompt.
+- **The JS runtime fingerprints with SHA-256.** 0.3.1 said it did; it still
+  passed `djb2`, so a few appended letters could land an attack on a cached
+  SAFE fingerprint. `core.sha256Hex` (synchronous, same hex as
+  `resty.sha256`) is now the runtime's hash.
+- **Watch paths match the path the origin routes on.** `forward_auth` (from
+  `X-Forwarded-Uri` / `X-Original-URI`) and the JS runtime now percent-decode
+  the path and collapse duplicate slashes before the watch list, as nginx
+  does for `$uri`; `/v1/%63hat/completions` and `//v1/chat/completions` were
+  "path not watched" while the backend served `/v1/chat/completions`.
+- **Cloudflare Workers forward to the configured upstream only.** The
+  forwarding URL was `new URL(path, upstream)`, and a request path starting
+  with `//` made that a different host (an open proxy, unjudged).
+- **The LiteLLM guardrail keeps every text form core judges.** It kept only
+  `type == "text"` parts and string `input` items, so Responses API input,
+  `input_text` parts and Anthropic `tool_result` arrived empty or were
+  skipped without a call; a `prompt` next to `messages` was ignored.
+
+- **The client cannot pick the IP or path it is judged under.**
+  `forward_auth` no longer reads `X-Envoy-External-Address` (only Envoy sets
+  it; `authz` still does). The HAProxy SPOA agent, the Caddyfile and the
+  nginx `auth_request` conf drop client copies of `X-Envoy-External-Address`
+  and `X-Real-IP`, and the nginx sub-request sets `X-Forwarded-Uri` /
+  `X-Forwarded-Method` itself: a client's `X-Forwarded-Uri: /healthz` made the
+  request "path not watched" and skipped the reputation block. The JS runtime
+  reads `X-Forwarded-For` from the right (`client_ip.trusted_hops`), trusts
+  `cf-connecting-ip` only on Cloudflare (or a configured `clientIpHeader`),
+  and the Node middleware appends the socket address like any proxy. The
+  LiteLLM guardrail forwards the whole `X-Forwarded-For` chain, not its
+  client-written first entry.
+- **More than 100 request headers no longer hide `Content-Type`.** OpenResty
+  and APISIX read all headers (`ngx.req.get_headers(0)`); past the default
+  100 the rest were dropped and L1 passed "content-type not watched".
+- **A JSON `null` in `messages` or in content parts no longer ends the list.**
+  The JS port stopped there (it followed the test decoder, which leaves a
+  hole, not cjson, which keeps `null` as a value); the Lua specs now decode
+  bodies the way cjson does.
+- **The Node middleware judges the body the app will read.** A form parsed by
+  `express.urlencoded()` was re-encoded as JSON and yielded no text; Express
+  4's `json()` placeholder `{}` for a body it did not parse was judged instead
+  of the stream; and a stream that had fully arrived but was not yet read
+  (`req.complete`) was taken for consumed, so the request was not judged.
+
+- **LiteLLM guardrail: the whole `X-Forwarded-For` chain wins over
+  `requester_ip_address`**, which LiteLLM may itself take from the
+  client-written first entry (`use_x_forwarded_for`).
+
+### Fixed
+- JS subject history is a ring (one atomic counter, one key per entry), as
+  on OpenResty: concurrent requests no longer lose entries. Atomic on the
+  memory store and the Durable Object; best effort on KV. Stores without
+  `incr` keep the list layout.
+- APISIX picks the rule for L3 and sampling by path, method and content type
+  (`rules.rule_for`), like the OpenResty adapter; it used path alone.
+- APISIX keeps breaker, adaptive timeout and in-flight counters per provider,
+  endpoint and model instead of one set for every route, and skips L3 while
+  the breaker is not closed.
+- `jev_tokens_total` is recorded: the usage callback was called with an
+  extra argument and dropped every sample.
+- Subject trajectories: the ring counter's ttl is extended on every append
+  (it expired `history_ttl` after the subject's first request, however
+  active), and each slot carries its sequence number so a read between
+  another worker's `incr` and `set`, or after `max_entries` changed, skips
+  the slot instead of returning a stale entry.
+- The breaker's half-open probe is claimed with an atomic `add` where the
+  store has one, so exactly one worker probes.
+- `watch_paths` validation rejects capture errors (unbalanced parentheses,
+  back-references to a missing or open capture), which lstrlib only raises
+  once a request reaches them, silently failing that rule open.
+- Whitespace-only text has a fingerprint, so it is cached like any other
+  text instead of costing a judge call per request.
+- nginx `auth_request`: a deny answers with a JSON body; the README says
+  `block_status` must be 401 or 403 there (anything else becomes a 500).
+- Traefik: `maxBodySize` removed from the example; past it Traefik denied
+  with 401 instead of letting jev-edge pass the request as "body too large".
+- Envoy gRPC shim: default timeout 1.5 s, below Envoy's 2 s, so a slow
+  jev-edge still yields `X-Jev-Verdict: error` instead of a silent pass.
+- Makefile: Docker targets mount `$(CURDIR)`; `$$(PWD)` only worked on
+  case-insensitive filesystems.
+
 ## [0.3.1] - 2026-09-22
 
 Patch release from a full audit of 0.3.0. Everything below is a fix; there is

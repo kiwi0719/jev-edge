@@ -51,7 +51,7 @@ flowchart LR
     style edge fill:transparent,stroke:#8b949e,color:#8b949e
 ```
 
-**决策原则：** 每一层只能让请求*更*可疑，或者放行。任何一层出错都退化为放行，并记录 `X-Jev-Verdict: error`。唯一有意的例外是运维信任（见下）：运维标为误报的指纹在 L1.5、判定缓存之前以 `safe` 放行。它是唯一能降低分数的输入，永远会过期，存在的理由是有人看过。
+**决策原则：** 每一层只能让请求*更*可疑，或者放行。任何一层出错都退化为放行，并记录 `X-Jev-Verdict: error`。一个有意的例外是运维信任（见下）：运维标为误报的指纹在 L1.5、判定缓存之前以 `safe` 放行。它是唯一能降低分数的输入，永远会过期，存在的理由是有人看过。另一个例外同样由运维选择：`policy.unjudgeable = "block"` 在 `enforce` 模式下拒绝 L1 读不了的受监控请求（解不开的编码、二进制 body、超大且开头和结尾都没有文本的 body）。默认这类请求以 `skipped` 放行，绝不会被当作"没有文本"悄悄放过。
 
 **所有实现共用一份契约。** `core/` 的行为由 [core/golden/](../core/golden/README.md) 里的 golden vectors 钉死：输入手写，期望由 Lua core 产出，`core/spec/golden_spec.lua` 回放，CI 里 `make golden-check` 检查漂移。`adapters/js` 里的 TypeScript 移植在 vitest 下通过同一批文件；这就是"移植"的定义。向量覆盖归一化、提取、L1、策略、判定头和流水线顺序；缓存 TTL 精度、跨 worker 的熔断统计和自适应超时的具体值有意留给各平台。
 
@@ -73,7 +73,7 @@ local verdict = edge.evaluate(req, {
 })
 ```
 
-`req` 是 adapter 组装的普通 table：`method, path, headers, body, body_size, client_ip`。
+`req` 是 adapter 组装的普通 table：`method, path, headers, body, body_size, client_ip`，body 超过 `max_body_bytes` 时另有 `body_head` / `body_tail`，解码过 `Content-Encoding` 后有 `decoded`。
 
 ## L1：便宜规则
 
@@ -84,17 +84,24 @@ local verdict = edge.evaluate(req, {
 | `pass` | 明确正常 | 转发，头为 `skipped` |
 | `block` | 明确恶意（信誉） | 不调 Jev 直接拒绝 |
 | `suspect` | 需要 L2 | 查缓存，再进 L2 |
+| `unjudgeable` | 受监控，但 body 读不了 | 以 `skipped` 转发，或按 `policy.unjudgeable` 拒绝 |
 
 求值按代价排序，短路：
 
 1. **路径不在监控列表** → `pass`。默认监控列表为空，不显式列出路径 jev-edge 什么都不做。
 2. **信誉**（shared dict，一次查找）：IP 在 `block_ttl` 内被封 → `block`；IP 连续 N 次判定 safe 后被信任 → `pass`。它排在所有需要 body 的步骤之前，只转发头的 forward-auth 请求也能被拒绝。
-3. **方法 / Content-Type** 不是 `POST|PUT|PATCH`，或不是 json / form / text → `pass`。
-4. **body 大小**：没有 body → `pass`（"no body"）；低于 `min_body_bytes`（8）→ `pass`；高于 `max_body_bytes`（64 KB）→ `pass` 并打一条日志。大 body 永远不会被读取。
-5. **正则预筛**：命中任何 `always_suspect` 模式 → `suspect`。模式是 **PCRE**，通过 `ctx.re_find` 大小写不敏感地匹配。OpenResty 注入带 `"ijo"` 的 `ngx.re.find`，spec 注入 lrexlib-pcre2，JavaScript adapter 注入带 `i` 标志的 JS RegExp。因此模式只用 PCRE 和 JavaScript 的交集（不用 lookbehind、占有量词、内联标志），`core/golden/rules.json` 给每条模式一个命中样本，引擎差异会让一个具名用例失败。一份规则文件三个 adapter 共用。没有注入匹配器时跳过本步并告警一次，只靠长度判断（fail-open）。
-6. **自然语言检查**：抽取的文本长度达到 `min_text_chars`（20）→ `suspect`，否则 `pass`。
+3. **方法 / Content-Type**：方法不在 `methods`（`POST|PUT|PATCH`）里 → `pass`。Content-Type 只是提示，所以这里是黑名单：只有每个 Content-Type 值都是 `skip_content_types` 里的媒体类型（`image/`、`audio/`、`video/`、`font/`、`application/pdf`、`application/zip`、`application/gzip`）的请求 → `pass`；没有 Content-Type 的也会监控。列了 `content_types` 的规则改为保持旧的白名单。
+4. **body 大小**：没有 body → `pass`（"no body"）；低于 `min_body_bytes`（8）→ `pass`。大小取声明的 `Content-Length` 和 adapter 交来的字节数中较大者，错误或缺失的头无法把它变小。没有大到不看的 body：超过 `max_body_bytes` 的只读一部分（第 6 步）。
+5. **Content-Encoding**：`identity` 以外、adapter 没有解码（`req.decoded`）的编码 → `unjudgeable`（"unjudgeable: content-encoding br"）。adapter 解码 `gzip`、`deflate` 和 `br`，上限为 `max_body_bytes`。
+6. **抽取**：不超过 `max_body_bytes`（1 MiB）的 body 整体解析，格式由 body 决定（见下）；`binary` → `unjudgeable`（"unjudgeable: binary body"）。超过的，扫描前 `max_body_bytes` 字节（`req.body_head`）和最后 64 KiB（`req.body_tail`），取文本字段键的字符串值，截断的 JSON 也能扫；一个都没找到 → `unjudgeable`（"unjudgeable: body too large"）。没有文本 → `pass`（"no text"）。
+7. **正则预筛**，作用于抽取出的全部文本：命中任何 `always_suspect` 模式 → `suspect`。模式是 **PCRE**，通过 `ctx.re_find` 大小写不敏感地匹配，它返回匹配的字节区间（从 1 开始、闭区间的 `from, to`），或只返回真值；区间决定命中处在判定窗口里的位置。OpenResty 注入带 `"ijo"` 的 `ngx.re.find`，spec 注入 lrexlib-pcre2，JavaScript adapter 注入带 `i` 标志的 JS RegExp。因此模式只用 PCRE 和 JavaScript 的交集（不用 lookbehind、占有量词、内联标志），`core/golden/rules.json` 给每条模式一个命中样本，引擎差异会让一个具名用例失败。一份规则文件所有 adapter 共用。没有注入匹配器时跳过本步并告警一次，只靠长度判断（fail-open）。
+8. **自然语言检查**：抽取的文本长度达到 `min_text_chars`（20）→ `suspect`，否则 `pass`。
 
-JSON body 按可配置的路径抽取文本（`messages[*].content`、`prompt`、`input`、`query`、`text`）；form 和 text body 整体取用。抽取失败 → `pass`。
+`suspect` 的文本在做指纹和送 L2 之前被切到 `max_judge_bytes`（32 KiB）：`always_suspect` 命中处及其前后各至多 1 KiB，然后按值从新到旧，放不下的那条保留开头和结尾。聊天 API 每一轮都重发历史；之前的轮次在它们是最新一轮时已经判定过。文本被切过或只读了一部分时，理由以 ` (window)` 结尾，基于它的 L2 理由也一样。
+
+**格式由 body 决定。** 能解析成 JSON 的 body 就是 JSON，不管头怎么写（Ollama 和 FastAPI 就是这么读的），按可配置的路径抽取文本（`messages[*].content`、`prompt`、`input`、`query`、`text`，含 content-parts 数组）；声明为 JSON 却解析不了的不出文本，后端也会拒绝它。`application/x-www-form-urlencoded`，或没有 Content-Type 但形似 form 的 body，取字段值；`multipart/form-data` 取字段以及文本或 JSON 的文件部分。其余读起来是文本的（无 NUL，控制字节低于 1%）整体取用；剩下的是 `binary`。
+
+**`unjudgeable`** 表示 L1 读不了的受监控请求。它从不被判定，所以 verdict 是 `skipped`，理由为 `unjudgeable: <原因>`，计入 `jev_unjudged_total{reason}`。动作由 `policy.unjudgeable` 决定：`pass`（默认）转发，`block` 在 `enforce` 模式下拒绝。
 
 规则集是 Lua table，不引入 YAML 依赖：
 
@@ -104,8 +111,9 @@ return {
   id = "llm-endpoints",
   watch_paths = { "^/v1/chat", "^/api/completions" },   -- Lua pattern，锚定前缀
   methods = { POST = true },
-  content_types = { "application/json", "text/plain" },
-  min_body_bytes = 8, max_body_bytes = 65536,
+  skip_content_types = { "image/", "audio/", "video/", "font/", "application/pdf" },
+  min_body_bytes = 8, max_body_bytes = 1048576,          -- 整体解析；超过则扫开头 + 结尾
+  max_judge_bytes = 32768,                               -- 判定窗口
   text_fields = { "messages[*].content", "prompt", "input" },
   min_text_chars = 20,
   always_suspect = {                                     -- PCRE
@@ -123,7 +131,7 @@ return {
 
 | Key | 来源 | 默认 TTL | 用途 |
 |---|---|---|---|
-| `fp:<hash>` | 归一化文本 | 300 s | 近似重放 |
+| `fp:<scope>:<hash>` | 归一化文本，按规则、模板、部署上下文、provider、模型区分（`core.cache_key`） | 300 s | 近似重放 |
 | `rep:<ip>` | 客户端 IP | 600 s | 单 IP 判定聚合 |
 | `rep:<ip>:<path>` | IP + 路径 | 120 s | 同一端点被刷 |
 
@@ -178,6 +186,7 @@ policy = {
   mode = "enforce",           -- 或 "monitor"：只打头，从不拦截
   block_status = 403,
   block_body   = '{"error":"request rejected"}',
+  unjudgeable  = "pass",     -- 或 "block"：拒绝 L1 读不了的请求，仅 enforce 模式
 }
 ```
 
@@ -187,6 +196,7 @@ policy = {
 | ≥ suspect | 放行 + `suspicious` + L3 | 同左 |
 | < suspect | 放行 + `safe` | 同左 |
 | 超时 / 错误 | 放行 + `error` + L3 | 同左 |
+| L1 `unjudgeable` | 放行 + `skipped`；`unjudgeable = "block"` 时 403 | 放行 + `skipped` |
 
 默认是 `monitor`。
 
@@ -195,7 +205,7 @@ policy = {
 由 L2 超时、熔断跳过、或分数落在 `[suspect, block)` 区间触发。在 `ngx.timer.at(0, …)` 里运行，只带归一化文本和指纹，从不带原始 body：
 
 1. 用放宽到 5 s 的超时调 Jev。
-2. 写 `fp:<hash>`，下一次重放直接命中缓存。
+2. 写 `fp:<scope>:<hash>`（与 L2 读的是同一个 key），下一次重放直接命中缓存。
 3. 更新 `rep:<ip>`；如果设置了 `rep_block_after`（默认 0 = 关闭），达到该次数的恶意判定后把 IP 标记为封禁，L1 直接拒绝。
 4. 判定恶意时触发 `on_alert`（默认写 error 日志，可配 webhook）。
 
@@ -237,7 +247,7 @@ X-Jev-Request-Id: nginx 的 $request_id，用于关联 L3 结果
 
 ## OpenResty adapter
 
-`access()` 是一个 `pcall` 包住的整体：读 body（仅在 L1 确认路径和方法之后）、剥入站头、`core.evaluate`、写上游头、记指标、拦截时 `ngx.exit(403)`。内部任何错误都写 `X-Jev-Verdict: error` 然后返回。
+`access()` 是一个 `pcall` 包住的整体：读 body（仅当有规则监控该路径；不超过 `max_body_bytes` 整体读，超过读开头和结尾，由 `resty.jev.body` 解码）、剥入站头、`core.evaluate`、写上游头、记指标、拦截时 `ngx.exit(403)`。内部任何错误都写 `X-Jev-Verdict: error` 然后返回。
 
 依赖：OpenResty ≥ 1.21、lua-resty-http ≥ 0.17、自带的 lua-cjson。
 
@@ -255,7 +265,7 @@ APISIX 就是 OpenResty，所以 `adapters/apisix` 是在 nginx adapter 同一�
 
 ## HAProxy adapter
 
-HAProxy 的 SPOE 把请求连 body 交给 `adapters/haproxy/spoa`，一个调 `/_jev/authz` 并设置 `txn.jev.*` 变量的 Go agent；`haproxy.cfg` 把 `action=block` 变成 403，其余变成 `X-Jev-*` 头。SPOE 帧限制 body 大小（`tune.bufsize`，参考配置 128 KB）；更大的 body 截断到达、截断判定，这是该 adapter 唯一弱于 Envoy ext_authz 的地方。
+HAProxy 的 SPOE 把请求连 body 交给 `adapters/haproxy/spoa`，一个调 `/_jev/authz` 并设置 `txn.jev.*` 变量的 Go agent；`haproxy.cfg` 把 `action=block` 变成 403，其余变成 `X-Jev-*` 头。SPOE 帧限制 body 大小（`tune.bufsize`，参考配置 128 KB）。更大的 body 截断到达；agent 把它和 HAProxy 的 `req.body_size` 比较，发送 `X-Jev-Body-Partial: 1`，jev-edge 把它当开头扫描。拿不到结尾，这是该 adapter 唯一弱于设了匹配 `max_request_bytes` 的 Envoy ext_authz 的地方。
 
 ## 配方：Istio、Envoy Gateway、APIM、Apigee
 
@@ -279,7 +289,7 @@ HAProxy 的 SPOE 把请求连 body 交给 `adapters/haproxy/spoa`，一个调 `/
 
 薄预设的存在是因为最常见的 Cloudflare 部署后面本来就有网关，而两套阈值正是要避免的故障模式：它在边缘跑 L1 和缓存，把分数、部署上下文和 key 留在源站。`backend` provider 把源站的 `X-Jev-*` 答案翻译回答案表，所以 Worker 自己的 policy 仍然生效（边缘的 `enforce` 会按源站的分数拦截）。
 
-与 nginx 的差异来自平台而不是设计：KV 最小 60 秒 TTL 和最终一致性、熔断状态多一跳 Durable Object、指纹哈希不同（nginx 上是 SHA-256，包里是 `djb2`；两边永远不共享缓存，所以只有抗碰撞性重要）、没有 `/_jev/config` 热更新（配置即代码）、暂无 L3。完整清单在 adapter 的 README 里。
+与 nginx 的差异来自平台而不是设计：KV 最小 60 秒 TTL 和最终一致性、熔断状态多一跳 Durable Object、没有 `/_jev/config` 热更新（配置即代码）、暂无 L3。完整清单在 adapter 的 README 里。
 
 ## 主体轨迹
 
@@ -311,6 +321,8 @@ jev_cache_hits_total{kind}
 jev_l2_latency_ms_bucket{le}
 jev_breaker_state
 jev_async_dropped_total
+jev_unjudged_total{reason}
+jev_window_total
 ```
 
 ## Bench 与验收

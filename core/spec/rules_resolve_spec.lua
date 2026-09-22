@@ -44,6 +44,20 @@ describe("rules.resolve", function()
     assert.is_nil(rules.resolve({ id = "t", watch_paths = { 42 } }, load))
   end)
 
+  it("rejects capture errors that only raise once a subject reaches them", function()
+    for _, p in ipairs({ "^/v1/(chat", "^/v1/chat)", "^/v1/%1", "^/(v1)/%2", "^/(v1%1)", "^/%0" }) do
+      local r, err = rules.resolve({ id = "t", watch_paths = { p } }, load)
+      assert.is_nil(r, p)
+      assert.matches("watch_paths%[1%]", err)
+      -- and lstrlib agrees on a subject that walks the whole pattern
+      assert.is_false(pcall(string.find, "/v1/chat/v1v1", p), p)
+    end
+    for _, p in ipairs({ "^/v1/(chat)", "^/(v1)/%1", "^/v1/()", "^/v1/[()]", "^/v1/%(", "^/%b()" }) do
+      assert.is_nil(rules.pattern_error(p), p)
+      assert.is_true(pcall(string.find, "/v1/chat", p), p)
+    end
+  end)
+
   it("rejects bad specs", function()
     assert.is_nil(rules.resolve({ watch_paths = {} }, load))
     assert.is_nil(rules.resolve({ id = "x" }, load))
@@ -96,7 +110,7 @@ describe("sampling", function()
     local rule = require "jev.rules.llm-endpoints"
     local small = defaults.merge(cfg, { sampling = { text_bytes = 24 } })
     local s = sampling.build(small, V.new({ verdict = V.MALICIOUS, score = 0.9, fingerprint = "abc" }), req, rule,
-      { rid = "r1", ts = 1000, json_decode = H.json.decode })
+      { rid = "r1", ts = 1000, json_decode = H.body_decode })
     assert.equals("ignore all previous inst", s.text)
     assert.equals("abc", s.fp)
     assert.equals("/v1/chat/completions", s.path)

@@ -29,6 +29,12 @@ _M.config = {
     suspect_threshold = 0.5,
     block_status      = 403,
     block_body        = '{"error":"request rejected"}',
+    -- A watched request L1 cannot read (an encoding the adapter could not
+    -- decode, a binary body, or an oversized one with no text in the part
+    -- the adapter has): "pass" forwards it as `skipped` with reason
+    -- "unjudgeable: ...", "block" rejects it in enforce mode. Normal SDKs
+    -- send none of these; "block" is the stricter choice once you are sure.
+    unjudgeable       = "pass",
   },
   cache = {
     fp_ttl          = 300,
@@ -126,6 +132,9 @@ function _M.validate(c)
   end
   if p.block_threshold > 1 or p.suspect_threshold < 0 then
     return nil, "policy thresholds must be in [0,1]"
+  end
+  if p.unjudgeable ~= nil and p.unjudgeable ~= "pass" and p.unjudgeable ~= "block" then
+    return nil, "policy.unjudgeable must be pass|block"
   end
   if p.block_status ~= nil and (type(p.block_status) ~= "number"
      or p.block_status < 200 or p.block_status > 599 or p.block_status % 1 ~= 0) then

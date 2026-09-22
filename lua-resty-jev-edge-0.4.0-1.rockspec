@@ -1,10 +1,10 @@
 rockspec_format = "3.0"
 package = "lua-resty-jev-edge"
-version = "0.3.1-1"
+version = "0.4.0-1"
 
 source = {
    url = "git+https://github.com/kiwi0719/jev-edge",
-   tag = "v0.3.1",
+   tag = "v0.4.0",
 }
 
 description = {
@@ -37,8 +37,10 @@ build = {
       ["resty.jev.edge"]     = "adapters/openresty/lib/resty/jev/edge.lua",
       ["resty.jev.adaptive"] = "adapters/openresty/lib/resty/jev/adaptive.lua",
       ["resty.jev.async"]    = "adapters/openresty/lib/resty/jev/async.lua",
+      ["resty.jev.body"]     = "adapters/openresty/lib/resty/jev/body.lua",
       ["resty.jev.cache"]    = "adapters/openresty/lib/resty/jev/cache.lua",
       ["resty.jev.config"]   = "adapters/openresty/lib/resty/jev/config.lua",
+      ["resty.jev.decode"]   = "adapters/openresty/lib/resty/jev/decode.lua",
       ["resty.jev.http"]     = "adapters/openresty/lib/resty/jev/http.lua",
       ["resty.jev.loader"]   = "adapters/openresty/lib/resty/jev/loader.lua",
       ["resty.jev.metrics"]  = "adapters/openresty/lib/resty/jev/metrics.lua",

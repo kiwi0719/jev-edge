@@ -44,18 +44,23 @@ export function build(names: string[] | undefined, text: string, context: Prompt
  * tie the winning template name is unspecified on both implementations; the
  * score is not.
  */
-export function reduce(answers: Answers | null | undefined): [number, string] {
+/** Returns [score, top template, count of numeric answers]; a count of 0 means
+ *  the provider answered nothing usable -- an error, not a safe score. */
+export function reduce(answers: Answers | null | undefined): [number, string, number] {
   let best = 0;
   let bestName = "";
+  let n = 0;
   for (const [name, raw] of Object.entries(answers ?? {})) {
-    const p = typeof raw === "number" ? raw : Number(raw);
     if (typeof raw !== "number" && typeof raw !== "string") continue; // Lua tonumber(table/bool) -> nil
+    if (typeof raw === "string" && raw.trim() === "") continue; // Lua tonumber("") -> nil; Number("") is 0
+    const p = typeof raw === "number" ? raw : Number(raw);
     if (Number.isNaN(p)) continue;
+    n++;
     if (p > best) {
       best = p;
       bestName = name;
     }
   }
   if (best > 1) best = 1;
-  return [best, bestName];
+  return [best, bestName, n];
 }

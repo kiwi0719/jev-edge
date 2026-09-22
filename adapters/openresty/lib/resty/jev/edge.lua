@@ -7,7 +7,8 @@ require("resty.jev.loader")()
 local core      = require "jev.core"
 local verdict   = require "jev.core.verdict"
 local judge_mod = require "jev.core.judge"
-local normalize = require "jev.core.normalize"
+local rules_mod = require "jev.core.rules"
+local body_m    = require "resty.jev.body"
 local breaker_m = require "jev.core.breaker"
 local config    = require "resty.jev.config"
 local cache_m   = require "resty.jev.cache"
@@ -19,7 +20,7 @@ local subject_m = require "jev.core.subject"
 local trust     = require "jev.core.trust"
 local cjson     = require "cjson.safe"
 
-local _M = { _VERSION = "0.3.1" }
+local _M = { _VERSION = "0.4.0" }
 
 local CACHE_DICT = "jev_cache"
 -- Safety-critical state (trust grants, breaker, in-flight counters, adaptive
@@ -89,14 +90,17 @@ local function ensure_runtime(cfg)
   end
 end
 
+-- the byte span of the match (from, to), which places the hit in the
+-- judging window; nil when there is none
 local function re_find(subject, pattern)
-  local from = ngx.re.find(subject, pattern, "ijo")
-  return from ~= nil
+  return ngx.re.find(subject, pattern, "ijo")
 end
 
 local function build_req(rules, over)
   over = over or {}
-  local headers = ngx.req.get_headers()
+  -- 0 = no limit: past the default 100 the rest are dropped, and a
+  -- Content-Type sent after 100 junk headers would read as absent.
+  local headers = ngx.req.get_headers(0)
   local req = {
     method    = over.method or ngx.req.get_method(),
     path      = over.path or ngx.var.uri,
@@ -105,37 +109,24 @@ local function build_req(rules, over)
     body      = nil,
     body_size = tonumber(headers["content-length"]) or 0,
   }
-  -- Only read the body when some rule could possibly want it.
+  -- Only read the body when some rule could possibly want it: whole up to
+  -- max_body_bytes, head and tail past it, decoded (resty.jev.body).
   local max = 0
   for _, r in ipairs(rules) do
     local ok = false
     for _, p in ipairs(r.watch_paths or {}) do
       if req.path:find(p) then ok = true break end
     end
-    if ok then max = math.max(max, r.max_body_bytes or 65536) end
+    if ok then max = math.max(max, r.max_body_bytes or rules_mod.MAX_BODY_BYTES) end
   end
-  if max > 0 and req.body_size <= max then
-    ngx.req.read_body()
-    local body = ngx.req.get_body_data()
-    if not body then
-      local file = ngx.req.get_body_file()
-      if file then
-        local f = io.open(file, "rb")
-        if f then
-          -- read at most max+1 bytes: a chunked body has no Content-Length, so
-          -- the size gate above could not see it; do not slurp it whole.
-          body = f:read(max + 1)
-          f:close()
-        end
-      end
-    end
-    if body then
-      req.body_size = #body
-      if #body > max then
-        req.body = nil   -- rules see body_size > max and pass ("body too large")
-      else
-        req.body = body
-      end
+  if max > 0 then
+    body_m.fill(req, max)
+    -- The gateway in front sent only part of the body (Envoy's
+    -- allow_partial_message, HAProxy past tune.bufsize): scan it as the head
+    -- of a larger body instead of parsing truncated JSON as a whole.
+    if over.partial and req.body then
+      req.body_head, req.body = req.body, nil
+      req.body_size = math.max(req.body_size or 0, max + 1)
     end
   end
   return req
@@ -150,40 +141,16 @@ local function set_headers(v)
   ngx.req.set_header("X-Jev-Request-Id", ngx.var.request_id or "")
 end
 
--- The rule core judged with: the first one whose path, method and content
--- type all match, which is the first one evaluate_all did not PASS on those
--- gates. Path alone is not enough: a tenant rule can match the path and
--- still hand the request to the general rule on method or content type.
-local function rule_for(req, rules)
-  local ct = (req.headers["content-type"] or ""):lower()
-  for _, r in ipairs(rules) do
-    local hit = false
-    for _, p in ipairs(r.watch_paths or {}) do
-      if (req.path or ""):find(p) then hit = true break end
-    end
-    if hit and r.methods and not r.methods[(req.method or ""):upper()] then hit = false end
-    if hit and r.content_types and #r.content_types > 0 then
-      local ok = false
-      for _, a in ipairs(r.content_types) do
-        if ct:find(a, 1, true) then ok = true break end
-      end
-      hit = ok
-    end
-    if hit then return r end
-  end
-  return nil
-end
-
 local function maybe_async(cfg, v, req, rules)
   if not v.async or not judge then return end
   -- L3 exists to get an answer L2 could not; while the breaker is open the
   -- provider is the reason, and hammering it from timers only keeps it open.
   if breaker and breaker:state() ~= breaker_m.CLOSED then return end
-  -- rebuild the prompt from the request; core does not hand it back
-  local rule = rule_for(req, rules)
+  -- rebuild the prompt from the request; core does not hand it back. The
+  -- same text L2 judged: the window, not the whole body.
+  local rule = rules_mod.rule_for(req, rules)
   if not rule then return end
-  local ct = req.headers["content-type"] or ""
-  local text = normalize.extract(req.body, ct, rule.text_fields, cjson.decode)
+  local text = rules_mod.judged_text(req, rule, { json_decode = cjson.decode, re_find = re_find })
   if text == "" then return end
   -- Same prompt L2 built, deployment context included: L3's verdict replaces
   -- L2's in the cache, so it must not be judged with less context.
@@ -195,6 +162,7 @@ local function maybe_async(cfg, v, req, rules)
   local ok, err = async.schedule({
     cfg = cfg, cache = cache, state = state_store(), judge = judge, prompt = prompt,
     fingerprint = v.fingerprint, client_ip = req.client_ip,
+    cache_key = v.fingerprint ~= "" and core.cache_key(v.fingerprint, rule, cfg, sha256_hex) or nil,
   })
   if not ok and err ~= "disabled" then metrics.incr_async_dropped() end
 end
@@ -204,7 +172,7 @@ end
 local function maybe_sample(cfg, v, req, rules)
   if not sampling.should_sample(cfg, v, math.random) then return end
   local ok, err = pcall(function()
-    local s = sampling.build(cfg, v, req, rule_for(req, rules),
+    local s = sampling.build(cfg, v, req, rules_mod.rule_for(req, rules),
       { rid = ngx.var.request_id, ts = ngx.now(), json_decode = cjson.decode })
     sampling.store(cfg, cache, s)
     if cfg.sampling.log then ngx.log(ngx.INFO, "jev-edge sample: ", cjson.encode(s)) end
@@ -488,10 +456,12 @@ end
 -- The client address as seen by the proxy in front of us. Proxies append to
 -- X-Forwarded-For, so the client's own (forgeable) value is leftmost and the
 -- address the trusted hop saw is rightmost: element `trusted_hops` from the
--- right (1 = last). Envoy's x-envoy-external-address is already that value.
-local function client_ip_from(h, cfg)
+-- right (1 = last). Envoy's x-envoy-external-address is already that value,
+-- but only Envoy sets it: `envoy` is true for authz() alone. Traefik, Caddy
+-- and nginx pass a client's copy of it through to forward_auth().
+local function client_ip_from(h, cfg, envoy)
   local function first(v) if type(v) == "table" then return v[1] end return v end
-  local ext = first(h["x-envoy-external-address"])
+  local ext = envoy and first(h["x-envoy-external-address"])
   if type(ext) == "string" and ext ~= "" then return (ext:match("^%s*(%S+)")) end
   local xff = first(h["x-forwarded-for"])
   if type(xff) ~= "string" or xff == "" then
@@ -506,10 +476,12 @@ local function client_ip_from(h, cfg)
   return ip or ngx.var.remote_addr
 end
 
--- Path normalisation for headers that carry the original URI: collapse
--- duplicate slashes and resolve `.` / `..` the way nginx does for $uri, so a
--- watch pattern anchored at `^/v1/` sees the path the backend will serve.
+-- Path normalisation for headers that carry the original URI: decode %XX,
+-- collapse duplicate slashes and resolve `.` / `..` the way nginx does for
+-- $uri, so a watch pattern anchored at `^/v1/` sees the path the backend will
+-- serve (`/v1/%63hat/completions` is `/v1/chat/completions` to it).
 local function normalize_path(path)
+  path = path:gsub("%%(%x%x)", function(h) return string.char(tonumber(h, 16)) end)
   local out = {}
   for seg in path:gmatch("[^/]+") do
     if seg == ".." then
@@ -563,9 +535,13 @@ function _M.authz(prefix)
   if uri:sub(1, #prefix) == prefix then path = uri:sub(#prefix + 1) end
   if path == "" then path = "/" end
   -- Envoy sets x-envoy-external-address / x-forwarded-for; nginx sees Envoy's IP.
-  local client_ip = client_ip_from(ngx.req.get_headers(), cfg)
+  local h = ngx.req.get_headers(0)
+  local client_ip = client_ip_from(h, cfg, true)
+  -- set by Envoy (with_request_body.allow_partial_message) and the HAProxy
+  -- SPOA agent, which both strip client copies
+  local partial = h["x-envoy-auth-partial-body"] == "true" or h["x-jev-body-partial"] == "1"
 
-  return respond_authz(cfg, rules, { path = path, client_ip = client_ip }, "authz")
+  return respond_authz(cfg, rules, { path = path, client_ip = client_ip, partial = partial }, "authz")
 end
 
 --- content_by_lua for generic forward-auth: Traefik ForwardAuth, Caddy
@@ -578,7 +554,7 @@ end
 function _M.forward_auth()
   local cfg = config.current()
   local rules = config.rules()
-  local h = ngx.req.get_headers()
+  local h = ngx.req.get_headers(0)
   local function first(v) if type(v) == "table" then return v[1] end return v end
   local method = first(h["x-forwarded-method"] or h["x-original-method"]) or ngx.req.get_method()
   -- nginx auth_request subrequests inherit the main request, so $request_uri

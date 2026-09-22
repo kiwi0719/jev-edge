@@ -7,9 +7,20 @@ return {
   id = "llm-endpoints",
   watch_paths = { "^/v1/chat", "^/v1/completions", "^/api/chat", "^/api/completions" },
   methods = { POST = true, PUT = true, PATCH = true },
-  content_types = { "application/json", "+json", "text/plain", "application/x-www-form-urlencoded" },
+  -- Media types that are never a prompt. Any other Content-Type (or none) is
+  -- read and the body decides the format: backends parse JSON whatever the
+  -- header says. List `content_types = { ... }` instead for an allow list.
+  skip_content_types = { "image/", "audio/", "video/", "font/", "application/pdf", "application/zip",
+                         "application/gzip" },
   min_body_bytes = 8,
-  max_body_bytes = 65536,
+  -- Bodies up to this size are parsed whole: 1 MiB, nginx's default
+  -- client_max_body_size. Past it only the head and tail are scanned. Raise
+  -- it with client_max_body_size (and your gateway's body buffer) for
+  -- long-context or vision traffic; see README "Body size".
+  max_body_bytes = 1048576,
+  -- Text over this many bytes is cut to a window before the fingerprint and
+  -- L2: the always_suspect hit, then the newest messages.
+  max_judge_bytes = 32768,
   text_fields = { "messages[*].content", "prompt", "input", "query", "text" },
   min_text_chars = 20,
   always_suspect = {

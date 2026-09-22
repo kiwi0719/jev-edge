@@ -21,6 +21,11 @@ export interface NextResponseLike {
   next(init?: { request?: { headers?: Headers } }): Response;
 }
 
+/** The subset of NextFetchEvent (middleware's second argument) this module needs. */
+export interface NextFetchEventLike {
+  waitUntil(p: Promise<unknown>): void;
+}
+
 /**
  * middleware.ts:
  *
@@ -32,15 +37,17 @@ export interface NextResponseLike {
  * Allowed requests continue with X-Jev-* on the request headers (read them in
  * the route handler); blocked ones get the 403 from the middleware. Next
  * buffers the body for middleware, so `request.text()` works on the edge and
- * Node runtimes alike.
+ * Node runtimes alike. Next passes a `NextFetchEvent` as the second
+ * argument; its `waitUntil` keeps the subject write alive after the response.
  */
 export function nextMiddleware(opts: Options, NextResponse: NextResponseLike) {
   const rt = runtimeOnce(opts);
-  return async (request: Request): Promise<Response> => {
+  return async (request: Request, event?: NextFetchEventLike): Promise<Response> => {
     const r = rt();
     const url = new URL(request.url);
     if (r.opts.health !== false && url.pathname === "/_jev/health" && request.method === "GET") return healthResponse(r);
-    const { verdict, response, requestId, subjectId } = await evaluate(request, r); // never throws: fails open
+    // the event is a RequestCtx as is: evaluate calls event.waitUntil(p)
+    const { verdict, response, requestId, subjectId } = await evaluate(request, r, event); // never throws: fails open
     if (response) return response;
     const forwarded = withVerdictHeaders(request, verdict, requestId, subjectId);
     return NextResponse.next({ request: { headers: forwarded.headers } });
@@ -65,6 +72,8 @@ export interface NodeRequestLike {
   readableEnded?: boolean;
   complete?: boolean;
   readable?: boolean;
+  /** body-parser's flag: true once it has read and parsed the stream. */
+  _body?: boolean;
 }
 
 export interface NodeResponseLike {
@@ -73,27 +82,56 @@ export interface NodeResponseLike {
   end(body?: string): unknown;
 }
 
+function isEmptyObject(v: unknown): boolean {
+  return typeof v === "object" && v !== null && !Buffer.isBuffer(v) && Object.keys(v).length === 0;
+}
+
+/** A parsed body back in the wire format its Content-Type names, so the
+ *  extractor reads it the way it would read the raw body. */
+function reencode(body: object, contentType: string): string {
+  if (contentType.toLowerCase().includes("application/x-www-form-urlencoded")) {
+    const p = new URLSearchParams();
+    for (const [k, v] of Object.entries(body)) {
+      for (const x of Array.isArray(v) ? v : [v]) {
+        p.append(k, typeof x === "object" && x !== null ? JSON.stringify(x) : String(x));
+      }
+    }
+    return p.toString();
+  }
+  return JSON.stringify(body);
+}
+
 /**
  * The request body as text plus its size in bytes. From `req.body` when a
- * parser ran first; otherwise the stream is read to completion and buffered
- * whole, because the app behind this middleware still needs it. A body over
- * `max` is still buffered and handed on as `req.body` unchanged; only the
- * evaluation drops it (L1 passes it as "body too large"). Cap the size before
- * this middleware (a proxy limit, or a body parser with `limit`) if unbounded
- * uploads can reach this route. Returns [null, 0] when there is no body to
- * read: no stream, or a stream something else already consumed.
+ * parser actually read the stream (body-parser sets `req._body`; any parser
+ * that left the stream ended counts too), re-encoded in the request's own
+ * content type; otherwise the stream is read to completion and buffered
+ * whole, because the app behind this middleware still needs it. Express 4's
+ * json() sets `req.body = {}` for a body it does not parse without reading
+ * it: that placeholder is not the body. A body over `max` is still buffered
+ * and handed on as `req.body` unchanged; only the evaluation drops it (L1
+ * passes it as "body too large"). Cap the size before this middleware (a
+ * proxy limit, or a body parser with `limit`) if unbounded uploads can reach
+ * this route. Returns [null, 0] when there is no body to read: no stream, or
+ * a stream something else already consumed.
  */
-async function readNodeBody(req: NodeRequestLike): Promise<[string | null, number]> {
-  if (req.body !== undefined) {
-    if (typeof req.body === "string") return [req.body, Buffer.byteLength(req.body)];
-    if (Buffer.isBuffer(req.body)) return [req.body.toString("utf8"), req.body.length];
-    if (typeof req.body === "object" && req.body !== null) {
-      const s = JSON.stringify(req.body);
-      return [s, Buffer.byteLength(s)];
+async function readNodeBody(req: NodeRequestLike): Promise<[string | Buffer | null, number, boolean]> {
+  // `complete` is not "consumed": node sets it once the whole body has
+  // arrived, often before anyone reads it. Only an ended stream is gone.
+  const streamGone = typeof req.on !== "function" || req.readableEnded === true || req.readable === false;
+  const parsed = req._body === true || streamGone;
+  // The third value: true when a parser produced the body, which it has
+  // already decoded (body-parser inflates gzip / deflate / br).
+  if (req.body !== undefined && req.body !== null && parsed) {
+    if (typeof req.body === "string") return [req.body, Buffer.byteLength(req.body), true];
+    if (Buffer.isBuffer(req.body)) return [req.body.toString("utf8"), req.body.length, true];
+    if (typeof req.body === "object") {
+      const ct = req.headers["content-type"];
+      const s = reencode(req.body, Array.isArray(ct) ? ct.join(", ") : ct ?? "");
+      return [s, Buffer.byteLength(s), true];
     }
   }
-  if (typeof req.on !== "function") return [null, 0];
-  if (req.readableEnded === true || req.complete === true || req.readable === false) return [null, 0];
+  if (streamGone) return [null, 0, false];
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let size = 0;
@@ -101,7 +139,8 @@ async function readNodeBody(req: NodeRequestLike): Promise<[string | null, numbe
       size += c.length;
       chunks.push(c);
     });
-    req.on("end", () => resolve([Buffer.concat(chunks).toString("utf8"), size]));
+    // raw bytes: a compressed body is decoded by the runtime, not mangled into a string here
+    req.on("end", () => resolve([Buffer.concat(chunks), size, false]));
     req.on("error", reject);
   });
 }
@@ -121,7 +160,6 @@ export function nodeMiddleware(opts: Options) {
   return async (req: NodeRequestLike & { jev?: Verdict }, res: NodeResponseLike, next: (err?: unknown) => void): Promise<void> => {
     try {
       const r = rt();
-      const max = Math.max(...r.rules.map((x) => x.max_body_bytes ?? 65536));
       const host = (req.headers.host as string) ?? "localhost";
       const url = new URL(req.url ?? "/", "http://" + host);
       const headers = new Headers();
@@ -129,16 +167,24 @@ export function nodeMiddleware(opts: Options) {
         if (v === undefined) continue;
         headers.set(k, Array.isArray(v) ? v.join(", ") : v);
       }
-      if (!headers.has("x-forwarded-for") && req.socket?.remoteAddress) headers.set("x-forwarded-for", req.socket.remoteAddress);
+      // Append the peer like any proxy does: with trusted_hops = 1 the client
+      // IP is the socket's address, never a value the client wrote.
+      if (req.socket?.remoteAddress) {
+        const xff = headers.get("x-forwarded-for");
+        headers.set("x-forwarded-for", xff ? xff + ", " + req.socket.remoteAddress : req.socket.remoteAddress);
+      }
       const method = req.method ?? "GET";
-      const [body, size] = method === "GET" || method === "HEAD" ? [null, 0] : await readNodeBody(req);
-      if (body !== null && req.body === undefined) req.body = body;
-      // Over the limit the body stays on req.body for the app but is not
-      // handed to the evaluation: Content-Length alone lets L1 pass it as
-      // "body too large", the same fail-open as the other hosts.
-      const tooLarge = body !== null && size > max;
-      if (tooLarge) headers.set("content-length", String(size));
-      const request = new Request(url.toString(), { method, headers, body: tooLarge ? undefined : body ?? undefined });
+      const [body, , fromParser] = method === "GET" || method === "HEAD" ? [null, 0, false] : await readNodeBody(req);
+      if (body !== null && (req.body === undefined || (req._body !== true && isEmptyObject(req.body)))) {
+        req.body = Buffer.isBuffer(body) ? body.toString("utf8") : body;
+      }
+      // a parser already decoded it: the runtime must not try again
+      if (fromParser) headers.delete("content-encoding");
+      // The whole body goes to the runtime, which reads it as it reads any
+      // stream: parsed whole up to max_body_bytes, head and tail past it.
+      const request = new Request(url.toString(), {
+        method, headers, body: body === null ? undefined : (Buffer.isBuffer(body) ? new Uint8Array(body) : body) as BodyInit,
+      });
       if (r.opts.health !== false && url.pathname === "/_jev/health" && method === "GET") {
         const h = healthResponse(r);
         res.statusCode = 200;

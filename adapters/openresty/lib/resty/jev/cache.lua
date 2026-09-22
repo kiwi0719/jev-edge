@@ -54,4 +54,32 @@ function _M.incr(self, key, by, ttl)
   return self.dict:incr(key, by or 1, 0, tonumber(ttl) or 0)
 end
 
+--- Atomic set-if-absent: true only for the caller that created the key.
+function _M.add(self, key, value, ttl)
+  if not self.dict then return false end
+  if type(value) == "table" then value = cjson.encode(value) end
+  local ok = self.dict:add(key, value, tonumber(ttl) or 0)
+  return ok and true or false
+end
+
+--- Reset a key's ttl (incr only sets one when it creates the key).
+function _M.expire(self, key, ttl)
+  if not self.dict or not self.dict.expire then return false end
+  return self.dict:expire(key, tonumber(ttl) or 0)
+end
+
+--- The same store with every key under `prefix`: one dict holding
+-- independent breaker / adaptive / in-flight state for several runtimes.
+function _M.prefixed(self, prefix)
+  local base = self
+  local p = tostring(prefix)
+  return {
+    get    = function(_, k) return base:get(p .. k) end,
+    set    = function(_, k, v, ttl) return base:set(p .. k, v, ttl) end,
+    incr   = function(_, k, by, ttl) return base:incr(p .. k, by, ttl) end,
+    add    = function(_, k, v, ttl) return base:add(p .. k, v, ttl) end,
+    expire = function(_, k, ttl) return base:expire(p .. k, ttl) end,
+  }
+end
+
 return _M

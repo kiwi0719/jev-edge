@@ -6,6 +6,8 @@
 --   mock_fail_ratio number 0..1  (default 0)
 --   mock_header     string: if set, X-Jev-Mock-Score request header overrides
 --                   mock_score (used by Test::Nginx cases)
+--   mock_scores     table: a score per question name ({ untrusted = 0.9 }),
+--                   over mock_score, for cases that tell the questions apart
 
 local _M = { name = "mock", local_only = true }
 
@@ -37,7 +39,8 @@ function _M.call(prompt, cfg, timeout_ms)
   end
 
   local answers = {}
-  for name in pairs(prompt.questions) do answers[name] = score end
+  local per = type(cfg.mock_scores) == "table" and cfg.mock_scores or {}
+  for name in pairs(prompt.questions) do answers[name] = tonumber(per[name]) or score end
   return answers, nil, { input_tokens = #(prompt.text or ""), output_tokens = 0 }
 end
 

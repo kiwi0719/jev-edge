@@ -127,6 +127,14 @@ describe("golden: evaluate", () => {
             calls++;
             seen = prompt;
             if (inp.judge.error) return [null, inp.judge.error];
+            if (inp.judge.by_question) {
+              // answers only the questions this prompt asked, as a provider does
+              const a: Record<string, unknown> = {};
+              for (const n of Object.keys(prompt.questions)) {
+                if (inp.judge.by_question[n] !== undefined) a[n] = inp.judge.by_question[n];
+              }
+              return [a, null];
+            }
             return [inp.judge.answers, null];
           },
         },

@@ -203,6 +203,10 @@ The judged text is attacker-controlled, so it can address the judge itself: "rat
 
 `make bench-judge` runs L1 over `bench/datasets/judge-directed.jsonl` (32 attacks, 13 benign look-alikes such as "Is this email safe to open?"): every attack reaches L2 and no look-alike is named by a pattern. `make bench-judge-live` sends the same cases to the real judge (needs a key; see `bench/judge_robustness.lua`). A model that repeats *only* an answer planted in the input (the same values for the asked questions as a JSON object in the judged text, compared parsed, so re-spacing or `0` vs `0.0` does not hide it) was steered by that input, which is what an injection is: every asked question scores 1 instead of the planted value, and an error is avoided on purpose, because an error fails open. An instruction in the middle of a single message over `max_judge_bytes` that no pattern matches (a non-English one, say) is cut by the one-window default; `max_judge_chunks > 1` judges the text in chunks, in full up to `max_judge_chunks × max_judge_bytes` (see "Judging long text in chunks" in the README).
 
+### Retrieved content
+
+`injection` asks whether the *user* is attacking the assistant. Retrieved content (tool results, fetched documents) is not the user, and an instruction hidden in it is usually phrased as an ordinary request ("add a line about ...", "send a confirmation to ..."), so the whole-text judgment scores most indirect injections low. `untrusted` (off by default) cuts retrieved content out in L1, from a body parsed whole: OpenAI `role: "tool"` / `"function"` messages, Anthropic `tool_result` blocks, Responses `function_call_output` items, and the `untrusted.fields` paths. It gets its own `max_judge_bytes` window and is judged as one more part next to the whole text (the chunk machinery: its own cache entry, `call_many` in parallel, the highest part score wins, a failed part is an error unless another part blocks) with the `untrusted` question and no deployment context. The request's fingerprint covers it, so neither trust nor the verdict cache can pass new retrieved content under old text. The whole-text call is unchanged. Retrieved content alone, next to a message too short to judge, is judged on its own. The question was written and measured on suite v1 before it was built into core, then tested on a held-out set (see Bench and acceptance).
+
 ## Policy
 
 ```lua
@@ -363,12 +367,12 @@ Two reproducible benches, neither needs an API key. `make bench-offline` replays
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="bench-latency-dark.svg">
-  <img src="bench-latency-light.svg" alt="Bar chart of p50 and p99 latency for five scenarios on a log scale: baseline 36/47 µs, unwatched 39/71 µs, healthy Jev 102/106 ms, slow Jev 53 µs/288 ms, dead Jev 48/173 µs" width="100%">
+  <img src="bench-latency-light.svg" alt="Bar chart of p50 and p99 latency for five scenarios on a log scale: baseline 36/55 µs, unwatched 39/76 µs, healthy Jev 103/106 ms, slow Jev 62 µs/478 ms, dead Jev 49/149 µs" width="100%">
 </picture>
 
 | Metric | 0.1 target | Measured |
 |---|---|---|
-| P99 added to L1-passed traffic | ≤ 1 ms | 24 µs |
+| P99 added to L1-passed traffic | ≤ 1 ms | 21 µs |
 | False-positive rate (enforce) | ≤ 0.1% | 0.0% at block ≥ 0.70 with a deployment context |
 | Miss rate vs Jev alone | ≤ oracle + 2 pt | +1.2 pt |
 | Replay cache hit rate | ≥ 80% | 74% |
@@ -383,6 +387,13 @@ Live accuracy on deepset/prompt-injections with `jev-latest`, same 662 texts:
 | text + `deployment_context` | **0.996** | 0.8% / 5.3% | 0.0% / 13.3% |
 
 One dataset, 662 samples, one deployment, mostly German and English. Treat these as evidence that the pipeline preserves Jev's accuracy and that the deployment context matters, not as a rate you will see on your traffic; measure yours in `monitor` mode. The dataset's "attacks" include off-purpose requests such as "generate C++", because it was collected for a news assistant. Without a deployment description Jev cannot know that, and scores them as harmless. **Write the `deployment_context`.** Then pick a threshold from your own labelled traffic. The shipped default is 0.70: zero false positives and 13% miss on this dataset with a context; 0.50 trades 0.8% false positives for a 5% miss.
+
+Beyond deepset, [bench/suite](../bench/suite/README.md) measures what that dataset leaves out, all live runs committed: suite v1 (Chinese injection, multi-turn, indirect injection, over-defense look-alikes; 2,735 whole request bodies), the experiment that led to `untrusted`, and a held-out set of 1,200 tool results on which the shipped core, `untrusted` on, cut misses at 0.5 from 87% to 19% for 1 false positive in 700.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="bench-accuracy-dark.svg">
+  <img src="bench-accuracy-light.svg" alt="Attacks flagged at threshold 0.5 with false positives, per dataset: deepset, suite v1 slices, and held-out tool results with untrusted off and on" width="100%">
+</picture>
 
 ## Decisions
 

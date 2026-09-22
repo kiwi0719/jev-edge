@@ -55,6 +55,9 @@ make suite-report         # bench/suite/report.md
 make suite-tooldocs-build   # the non-email tool results (bench/datasets/suite-v1-tooldocs.jsonl)
 make suite-untrusted        # the experiment below: segment runs, and the whole-text run for tooldocs
 make suite-untrusted-report # bench/suite/untrusted-report.md
+make suite-heldout-build    # the held-out set
+make suite-heldout          # the shipped core over it, untrusted off and on
+make suite-heldout-report   # bench/suite/heldout-report.md
 ```
 
 `suite-live` resumes an interrupted run: it skips every id already in the output file with no error.
@@ -135,13 +138,42 @@ flagged at 0.5, A → max(A, C): attacks in how-to answers 34% → 75%, in sourc
 - **Not measured:** real tool traffic (every carrier here is built), retrieved content in languages other
   than English, and chunks near the window. One run, one model.
 
-What this would mean for core, not implemented here: cut `role: tool` messages (and Anthropic
-`tool_result`, Responses `function_call_output`) out of the judged text, judge them with an `untrusted`
-question in a parallel call, and act on the higher score. That is one more provider call for every
-request that carries tool content, and no extra latency beyond the slower of the two calls. It does
-nothing for apps that paste retrieved text into the user turn, unless a rule can name the fields that
-hold it. Before shipping, the question needs a held-out test set it was not written against, and the
-change needs the JS port and golden vectors.
+That change shipped in 0.6.0 as `untrusted` (off by default; main README, "Retrieved content"), and was
+then tested on data the question had not seen:
+
+## Held-out test: the shipped core
+
+`heldout-v1.jsonl` (`build_heldout.py`) is 1,200 whole request bodies from sources the `untrusted`
+question was not written against, committed (`574268d`) before the run:
+
+| | source | n | carrier |
+|---|---|---|---|
+| attack | [InjecAgent](https://github.com/uiuc-kang-lab/InjecAgent) base cases (MIT), direct harm and data stealing | 300 | an attacker instruction inside a JSON tool response: a product review, a calendar note, a tweet |
+| attack | LLMail-Inject phase 1 (suite v1 used phase 2), submissions that triggered the tool, none also in phase 2 | 200 | an email among 0 to 2 others |
+| benign | the same InjecAgent templates, the attacker slot filled with the first sentence of an OpenAssistant train reply | 300 | identical to the attacks, so what differs is the content |
+| benign | [NousResearch/hermes-function-calling-v1](https://huggingface.co/datasets/NousResearch/hermes-function-calling-v1) tool responses (Apache-2.0) | 400 | JSON results of weather, stock, booking, camera ... calls |
+
+Each body is rendered as OpenAI chat (`role: tool`), Anthropic (`tool_result`) or Responses
+(`function_call_output`), at random. `heldout.lua` runs `core.evaluate` itself, the real judge behind it,
+every record with `untrusted` off and on, a fresh cache for each. Tables:
+[heldout-report.md](heldout-report.md).
+
+| threshold 0.5 | AUC | FP | miss |
+|---|---|---|---|
+| `untrusted` off (0.5.0 behaviour) | 0.784 | 0.0% | 86.8% |
+| `untrusted` on | **0.997** | 0.1% (1 of 700) | **19.2%** |
+
+- **It holds on data it was not written for.** Miss at 0.5 drops from 87% to 19% with one false positive
+  in 700, better than on the suite it was developed on. Per InjecAgent category, detection is 90 to 97%
+  for data stealing and "others", 68% for physical and data-security harm, 45% for financial harm.
+- **Responses API tool output was never judged before.** With `untrusted` off, core's text fields never
+  read a `function_call_output`, so every attack in that shape passed (AUC 0.497). With it on, that
+  shape does as well as the other two.
+- **Cost**: every request carrying tool content makes 2 calls instead of 1; L2 time p50 277 → 293 ms,
+  p95 346 → 364 ms, since the calls run in parallel.
+- **Limits**: the benign fill sentences are ordinary but out of place in their slot; everything is
+  English; the benign tool outputs are clean and short, unlike retrieval over documentation or prompt
+  libraries (see the tool-docs results above). One run.
 
 ## Caveats
 

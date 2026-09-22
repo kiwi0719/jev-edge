@@ -7,12 +7,12 @@ import * as policy from "./policy.js";
 import * as verdict from "./verdict.js";
 import * as trust from "./trust.js";
 import * as subject from "./subject.js";
-import type { Config } from "./defaults.js";
+import { untrustedSpec, type Config } from "./defaults.js";
 import type { BreakerLike } from "./breaker.js";
 import type { Req, Rule, CacheLike, RulesCtx } from "./rules.js";
 import type { JsonValue } from "./normalize.js";
 
-export const VERSION = "0.5.0";
+export const VERSION = "0.6.0";
 
 export type JudgeResult = [judge.Answers, null] | [null, string];
 
@@ -64,41 +64,55 @@ async function finish(ctx: Ctx, v: verdict.Verdict): Promise<verdict.Verdict> {
  *  `rule`. A score is only valid for the prompt that produced it, so the key is
  *  scoped to the rule's templates and deployment context and to the provider
  *  and model; trust stays keyed by fingerprint alone. */
-export function cacheKey(fp: string, rule: Rule | undefined, cfg: Config, hash: (s: string) => string): string {
+export function cacheKey(
+  fp: string, rule: Rule | undefined, cfg: Config, hash: (s: string) => string,
+  over?: { templates?: string[]; deployment?: string },
+): string {
   const jev = cfg?.jev ?? {};
+  const templates = over?.templates ?? rule?.templates ?? [];
+  const deployment = over?.deployment ?? rule?.deployment_context ?? jev.deployment_context ?? "";
   const scope = [
     String(rule?.id ?? ""),
-    (rule?.templates ?? []).join(","),
-    String(rule?.deployment_context ?? jev.deployment_context ?? ""),
+    templates.join(","),
+    String(deployment),
     String(jev.provider ?? ""),
     String(jev.model ?? ""),
   ].join("\n");
   return "fp:" + String(hash(scope)).slice(0, 16) + ":" + fp;
 }
 
-// Port of judge_chunks in core/init.lua: each chunk its own cache entry, the
-// misses judged together, the highest chunk score wins; a failed chunk makes
-// the request an error unless another chunk already blocks.
-async function judgeChunks(
-  req: Req, ctx: Ctx, rule: Rule, chunks: string[], capped: boolean, fp: string, ckey: string | undefined, reason: string,
+// Port of UNTRUSTED_SEP in core/init.lua: what the request's fingerprint covers
+// when it carries retrieved content.
+const UNTRUSTED_SEP = "\n<untrusted content>\n";
+
+interface Part {
+  text: string;
+  templates: string[];
+  context: judge.PromptContext;
+  over?: { templates?: string[]; deployment?: string };
+}
+
+// Port of judge_parts in core/init.lua: each part (a chunk, or the retrieved
+// content) its own cache entry, the misses judged together, the highest part
+// score wins; a failed part makes the request an error unless another part
+// already blocks.
+async function judgeParts(
+  ctx: Ctx, rule: Rule, parts: Part[], suffix: string, fp: string, ckey: string | undefined, reason: string,
 ): Promise<verdict.Verdict> {
   const cfg = ctx.config;
   const scores: (number | undefined)[] = [];
   const tops: string[] = [];
   const pending: { i: number; prompt: judge.Prompt; ck?: string }[] = [];
-  const context = {
-    path: req.path ?? "", method: req.method ?? "",
-    deployment: rule.deployment_context ?? cfg.jev.deployment_context ?? "",
-  };
-  for (let i = 0; i < chunks.length; i++) {
-    const cfp = normalize.fingerprint(chunks[i], { prefix_bytes: cfg.cache.fp_prefix_bytes }, ctx.hash);
-    const ck = cfp !== "" ? cacheKey(cfp, rule, cfg, ctx.hash) : undefined;
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i];
+    const cfp = normalize.fingerprint(part.text, { prefix_bytes: cfg.cache.fp_prefix_bytes }, ctx.hash);
+    const ck = cfp !== "" ? cacheKey(cfp, rule, cfg, ctx.hash, part.over) : undefined;
     const hit = ck && ctx.cache ? ((await ctx.cache.get(ck)) as { score?: unknown; reason?: string } | undefined) : undefined;
     if (hit && typeof hit === "object" && typeof hit.score === "number") {
       scores[i] = hit.score;
       tops[i] = /^(\S+)/.exec(String(hit.reason ?? ""))?.[1] ?? "";
     } else {
-      const [prompt, perr] = judge.build(rule.templates, chunks[i], context);
+      const [prompt, perr] = judge.build(part.templates, part.text, part.context);
       if (!prompt) {
         log(ctx, "error", "jev-edge: " + perr);
         const [action, label, async] = policy.onError();
@@ -139,7 +153,7 @@ async function judgeChunks(
 
   let best: number | undefined;
   let top = "";
-  for (let i = 0; i < chunks.length; i++) {
+  for (let i = 0; i < parts.length; i++) {
     const s = scores[i];
     if (s !== undefined && (best === undefined || s > best)) {
       best = s;
@@ -156,7 +170,7 @@ async function judgeChunks(
   const score = best ?? 0;
   const [action, label, async] = policy.decide(score, cfg.policy);
   let why = top !== "" ? `${top} ${verdict.format2(score)}` : reason;
-  if (top !== "") why += capped ? " (window)" : ` (${chunks.length} chunks)`;
+  if (top !== "") why += suffix;
   if (ckey && ctx.cache) await ctx.cache.set(ckey, { score, reason: why }, cfg.cache.fp_ttl);
   return finish(ctx, verdict.newVerdict({
     action, verdict: label, score, async, source: verdict.SRC_L2, reason: why, fingerprint: fp, l2_ms: elapsed,
@@ -167,7 +181,7 @@ export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
   const cfg = ctx.config;
 
   // L1 --------------------------------------------------------------------
-  const [r, text, reason, rule, windowed, chunks, capped] = await rulesMod.evaluateAll(req, ctx.rules, ctx);
+  const [r, text, reason, rule, windowed, chunks, capped, untrusted] = await rulesMod.evaluateAll(req, ctx.rules, ctx);
 
   if (r === rulesMod.PASS) {
     return verdict.newVerdict({ verdict: verdict.SKIPPED, source: verdict.SRC_L1, reason });
@@ -186,7 +200,9 @@ export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
     return finish(ctx, verdict.newVerdict({ action, verdict: verdict.MALICIOUS, score: 1, source: verdict.SRC_L1, reason }));
   }
 
-  const fp = normalize.fingerprint(text, { prefix_bytes: cfg.cache.fp_prefix_bytes }, ctx.hash);
+  const fp = normalize.fingerprint(untrusted ? text + UNTRUSTED_SEP + untrusted.text : text,
+    { prefix_bytes: cfg.cache.fp_prefix_bytes }, ctx.hash);
+  const uspec = untrusted ? untrustedSpec(cfg, rule) : undefined;
 
   // trust -----------------------------------------------------------------
   // An operator called this exact text a false positive. Checked before the
@@ -207,7 +223,9 @@ export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
   }
 
   // cache -----------------------------------------------------------------
-  const ckey = fp !== "" ? cacheKey(fp, rule, cfg, ctx.hash) : undefined;
+  const ckey = fp !== "" ? cacheKey(fp, rule, cfg, ctx.hash, uspec && {
+    templates: [(rule?.templates ?? []).join(","), "+" + uspec.templates.join(",")],
+  }) : undefined;
   if (ckey && ctx.cache) {
     const hit = (await ctx.cache.get(ckey)) as { score?: unknown; reason?: string } | undefined;
     if (hit && typeof hit === "object" && typeof hit.score === "number") {
@@ -237,7 +255,28 @@ export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
         reason: "unjudgeable: text over max_judge_chunks", fingerprint: fp,
       }));
     }
-    return judgeChunks(req, ctx, rule!, chunks, capped === true, fp, ckey, reason);
+  }
+  if ((chunks && chunks.length > 1) || untrusted) {
+    const context = {
+      path: req.path ?? "", method: req.method ?? "",
+      deployment: rule!.deployment_context ?? cfg.jev.deployment_context ?? "",
+    };
+    const parts: Part[] = [];
+    if (!untrusted?.only) {
+      for (const c of chunks && chunks.length > 1 ? chunks : [text]) parts.push({ text: c, templates: rule!.templates, context });
+    }
+    let suffix = "";
+    if (chunks && chunks.length > 1) suffix = capped ? " (window)" : ` (${chunks.length} chunks)`;
+    else if (windowed || untrusted?.windowed) suffix = " (window)";
+    if (untrusted && uspec) {
+      // asked without the deployment context, the way the question was measured
+      parts.push({
+        text: untrusted.text, templates: uspec.templates,
+        context: { path: req.path ?? "", method: req.method ?? "", deployment: "" },
+        over: { templates: uspec.templates, deployment: "" },
+      });
+    }
+    return judgeParts(ctx, rule!, parts, suffix, fp, ckey, reason);
   }
   const [prompt, perr] = judge.build(rule!.templates, text, {
     path: req.path ?? "",

@@ -4,6 +4,7 @@
 
 local normalize = require "jev.core.normalize"
 local subject   = require "jev.core.subject"
+local defaults  = require "jev.core.defaults"
 
 local _M = {}
 
@@ -120,14 +121,31 @@ local function ct_watched(ct, rule)
   return not any
 end
 
+-- Retrieved content (tool results, untrusted.fields) when untrusted judging is
+-- on for `rule`, cut to its own judging window. Only from a body parsed whole:
+-- past max_body_bytes there is no JSON structure to find it in.
+-- @return { text, windowed } or nil
+local function untrusted_part(decoded, rule, ctx)
+  local spec = defaults.untrusted_spec(ctx and ctx.config, rule)
+  if not spec.enabled or type(decoded) ~= "table" then return nil end
+  local utext, uvalues = normalize.extract_untrusted(decoded, spec)
+  if utext == "" then return nil end
+  local windowed
+  utext, windowed = normalize.window(utext, uvalues, rule.max_judge_bytes or _M.MAX_JUDGE_BYTES)
+  return { text = utext, windowed = windowed and true or false }
+end
+
 -- Text to judge from the body (or, past max_body_bytes, from the head and
 -- tail the adapter handed over), cut to the judging window.
 -- @return text, reason-or-nil, hit pattern, windowed, chunks (list, when
---         judged in more than one piece), capped (chunks did not cover it all)
+--         judged in more than one piece), capped (chunks did not cover it all),
+--         untrusted ({ text, windowed } when untrusted judging is on and the
+--         body carries retrieved content)
 local function judged(req, rule, ctx, ct, size)
   local max = rule.max_body_bytes or _M.MAX_BODY_BYTES
   local values, text
   local partial = false
+  local untrusted
   if size > max then
     local head, tail = req.body_head, req.body_tail
     if not head and req.body then
@@ -145,11 +163,12 @@ local function judged(req, rule, ctx, ct, size)
     if #values == 0 then return nil, "unjudgeable: body too large" end
     text, partial = table.concat(values, "\n"), true
   else
-    local kind
-    text, kind, values = normalize.extract(req.body, ct, rule.text_fields, ctx and ctx.json_decode)
+    local kind, decoded
+    text, kind, values, decoded = normalize.extract(req.body, ct, rule.text_fields, ctx and ctx.json_decode)
     if kind == "binary" then return nil, "unjudgeable: binary body" end
+    untrusted = untrusted_part(decoded, rule, ctx)
   end
-  if text == "" then return "" end
+  if text == "" then return "", nil, nil, nil, nil, nil, untrusted end
   local hit, from, to = text_matches(text, rule.always_suspect, ctx)
   local budget = rule.max_judge_bytes or _M.MAX_JUDGE_BYTES
   local maxc = math.floor(tonumber(rule.max_judge_chunks) or 1)
@@ -159,7 +178,7 @@ local function judged(req, rule, ctx, ct, size)
     -- window over everything older (capped: some of the text is not judged)
     local pieces, starts = normalize.chunks(text, budget)
     if #pieces <= maxc then
-      return table.concat(pieces, "\n"), nil, hit, partial, pieces, false
+      return table.concat(pieces, "\n"), nil, hit, partial, pieces, false, untrusted
     end
     local first_kept = #pieces - (maxc - 1) + 1
     local older = text:sub(1, starts[first_kept] - 1):gsub("\n$", "")
@@ -167,11 +186,11 @@ local function judged(req, rule, ctx, ct, size)
     local win = normalize.window(older, { older }, budget, inside and from or nil, inside and to or nil)
     local out = { win }
     for k = first_kept, #pieces do out[#out + 1] = pieces[k] end
-    return table.concat(out, "\n"), nil, hit, true, out, true
+    return table.concat(out, "\n"), nil, hit, true, out, true, untrusted
   end
   local windowed
   text, windowed = normalize.window(text, values, budget, from, to)
-  return text, nil, hit, windowed or partial
+  return text, nil, hit, windowed or partial, nil, nil, untrusted
 end
 
 --- Evaluate one rule set against a request.
@@ -179,7 +198,8 @@ end
 -- @param rule rule table (see rules/*.lua)
 -- @param ctx  { cache = {get=fn}, json_decode = fn, clock = fn,
 --               re_find = fn(subject, pcre) -> truthy on match (case-insensitive) }
--- @return result, text, reason
+-- @return result, text, reason, windowed, chunks, capped, untrusted ({ text,
+--         windowed } of retrieved content to judge on its own, or nil)
 function _M.evaluate(req, rule, ctx)
   -- 1. path watch list
   if not path_matches(req.path or "", rule.watch_paths) then
@@ -233,18 +253,28 @@ function _M.evaluate(req, rule, ctx)
 
   -- 6+7. extract text (whole body, or head + tail past max_body_bytes), regex
   --      prefilter over all of it, judging window, natural-language length
-  local text, unj, hit, windowed, chunks, capped = judged(req, rule, ctx, ct, size)
+  local text, unj, hit, windowed, chunks, capped, untrusted = judged(req, rule, ctx, ct, size)
   if unj then return _M.UNJUDGEABLE, "", unj end
-  if text == "" then
+  local min_chars = rule.min_text_chars or 20
+  -- retrieved content is judged on its own when there is enough of it, even
+  -- beside a short message or none (an untrusted.fields value outside text_fields)
+  if untrusted and #untrusted.text < min_chars then untrusted = nil end
+  if text == "" and not untrusted then
     return _M.PASS, "", "no text"
   end
   local tag = windowed and " (window)" or ""
   if chunks and not capped then tag = " (" .. #chunks .. " chunks)" end
   if hit then
-    return _M.SUSPECT, text, "pattern: " .. hit .. tag, windowed, chunks, capped
+    return _M.SUSPECT, text, "pattern: " .. hit .. tag, windowed, chunks, capped, untrusted
   end
-  if #text >= (rule.min_text_chars or 20) then
-    return _M.SUSPECT, text, "natural language" .. tag, windowed, chunks, capped
+  if #text >= min_chars then
+    return _M.SUSPECT, text, "natural language" .. tag, windowed, chunks, capped, untrusted
+  end
+  if untrusted then
+    -- the text alone would have passed: only the retrieved content is judged
+    untrusted.only = true
+    return _M.SUSPECT, text, "retrieved content" .. (untrusted.windowed and " (window)" or ""),
+      windowed, chunks, capped, untrusted
   end
   return _M.PASS, "", "text too short"
 end
@@ -364,6 +394,8 @@ function _M.resolve(spec, load)
     local perr = _M.pattern_error(p)
     if perr then return nil, "rule " .. out.id .. ": watch_paths[" .. i .. "] " .. perr end
   end
+  local uok, uerr = defaults.validate_untrusted(out.untrusted, "rule " .. out.id .. ": untrusted")
+  if not uok then return nil, uerr end
   if not out.text_fields then out.text_fields = { "messages[*].content", "prompt", "input", "query", "text" } end
   if not out.templates then out.templates = { "injection" } end
   return out
@@ -401,8 +433,8 @@ end
 function _M.evaluate_all(req, rules, ctx)
   local last_reason = "no rules"
   for _, rule in ipairs(rules or {}) do
-    local r, text, reason, windowed, chunks, capped = _M.evaluate(req, rule, ctx)
-    if r ~= _M.PASS then return r, text, reason, rule, windowed, chunks, capped end
+    local r, text, reason, windowed, chunks, capped, untrusted = _M.evaluate(req, rule, ctx)
+    if r ~= _M.PASS then return r, text, reason, rule, windowed, chunks, capped, untrusted end
     last_reason = reason
   end
   return _M.PASS, "", last_reason, nil

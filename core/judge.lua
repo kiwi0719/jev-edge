@@ -60,7 +60,7 @@ function _M.reduce(answers)
 end
 
 -- Load bundled templates.
-for _, name in ipairs({ "injection", "abuse" }) do
+for _, name in ipairs({ "injection", "abuse", "untrusted" }) do
   local ok, t = pcall(require, "jev.core.templates." .. name)
   if ok and type(t) == "table" then _M.register(name, t) end
 end

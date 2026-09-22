@@ -142,6 +142,11 @@ describe("golden: evaluate", function()
         judge = { call = function(prompt)
           calls = calls + 1; seen = prompt
           if inp.judge.error then return nil, inp.judge.error end
+          if inp.judge.by_question then
+            local a = {}
+            for n in pairs(prompt.questions) do a[n] = inp.judge.by_question[n] end
+            return a
+          end
           return inp.judge.answers
         end },
         log = function() end,

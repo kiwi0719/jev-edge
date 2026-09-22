@@ -28,8 +28,9 @@ local policy    = require "jev.core.policy"
 local trust     = require "jev.core.trust"
 local verdict   = require "jev.core.verdict"
 local subject   = require "jev.core.subject"
+local defaults  = require "jev.core.defaults"
 
-local _M = { _VERSION = "0.5.0" }
+local _M = { _VERSION = "0.6.0" }
 
 local function log(ctx, level, msg)
   if ctx.log then ctx.log(level, msg) end
@@ -59,39 +60,49 @@ end
 -- @param rule the rule L1 matched
 -- @param cfg  merged config
 -- @param hash the ctx.hash the fingerprint was made with
-function _M.cache_key(fp, rule, cfg, hash)
+-- @param over optional { templates, deployment }: the question this entry
+--             answers when it is not the rule's own (retrieved content)
+function _M.cache_key(fp, rule, cfg, hash, over)
   local jev = cfg and cfg.jev or {}
+  local templates = over and over.templates or (rule and rule.templates) or {}
+  local deployment = over and over.deployment
+  if deployment == nil then deployment = rule and rule.deployment_context or jev.deployment_context or "" end
   local scope = table.concat({
     tostring(rule and rule.id or ""),
-    table.concat(rule and rule.templates or {}, ","),
-    tostring(rule and rule.deployment_context or jev.deployment_context or ""),
+    table.concat(templates, ","),
+    tostring(deployment),
     tostring(jev.provider or ""),
     tostring(jev.model or ""),
   }, "\n")
   return "fp:" .. tostring(hash(scope)):sub(1, 16) .. ":" .. fp
 end
 
--- Judge text that did not fit one window, chunk by chunk (rule.max_judge_chunks).
--- Each chunk has its own verdict-cache entry, so the unchanged history of a
--- long conversation is not paid for again on every turn; the misses go to the
--- judge together (ctx.judge.call_many, in parallel, when the adapter has it).
--- The request's score is the highest chunk score. A chunk the judge failed on
--- turns the request into an error unless another chunk already blocks.
-local function judge_chunks(req, ctx, rule, chunks, capped, fp, ckey, reason)
+-- Joins the whole text and the retrieved content into what the request's
+-- fingerprint covers: trust and the verdict cache must not treat a request
+-- with new retrieved content as one already judged.
+local UNTRUSTED_SEP = "\n<untrusted content>\n"
+
+-- Judge a request in parts: text that did not fit one window, chunk by chunk
+-- (rule.max_judge_chunks), and retrieved content with its own question
+-- (untrusted.enabled). Each part has its own verdict-cache entry, so the
+-- unchanged history of a long conversation (earlier tool results included)
+-- is not paid for again on every turn; the misses go to the judge together
+-- (ctx.judge.call_many, in parallel, when the adapter has it). The request's
+-- score is the highest part score. A part the judge failed on turns the
+-- request into an error unless another part already blocks.
+-- @param parts  list of { text, templates, context, over } (over: cache_key's)
+-- @param suffix appended to the reason when a part answered
+local function judge_parts(ctx, rule, parts, suffix, fp, ckey, reason)
   local cfg = ctx.config
   local scores, tops, pending = {}, {}, {}
-  local context = {
-    path = req.path or "", method = req.method or "",
-    deployment = rule.deployment_context or cfg.jev.deployment_context or "",
-  }
-  for i, c in ipairs(chunks) do
-    local cfp = normalize.fingerprint(c, { prefix_bytes = cfg.cache.fp_prefix_bytes }, ctx.hash)
-    local ck = cfp ~= "" and _M.cache_key(cfp, rule, cfg, ctx.hash) or nil
+  for i, part in ipairs(parts) do
+    local cfp = normalize.fingerprint(part.text, { prefix_bytes = cfg.cache.fp_prefix_bytes }, ctx.hash)
+    local ck = cfp ~= "" and _M.cache_key(cfp, rule, cfg, ctx.hash, part.over) or nil
     local hit = ck and ctx.cache and ctx.cache:get(ck)
     if type(hit) == "table" and type(hit.score) == "number" then
       scores[i], tops[i] = hit.score, tostring(hit.reason or ""):match("^(%S+)") or ""
     else
-      local prompt, perr = judge.build(rule.templates, c, context)
+      local prompt, perr = judge.build(part.templates, part.text, part.context)
       if not prompt then
         log(ctx, "error", "jev-edge: " .. perr)
         local action, label, async = policy.on_error()
@@ -135,7 +146,7 @@ local function judge_chunks(req, ctx, rule, chunks, capped, fp, ckey, reason)
   end
 
   local best, top = nil, ""
-  for i = 1, #chunks do
+  for i = 1, #parts do
     if scores[i] and (not best or scores[i] > best) then best, top = scores[i], tops[i] end
   end
   if err and not (best and best >= cfg.policy.block_threshold) then
@@ -147,7 +158,7 @@ local function judge_chunks(req, ctx, rule, chunks, capped, fp, ckey, reason)
 
   local action, label, async = policy.decide(best, cfg.policy)
   local why = top ~= "" and (top .. " " .. string.format("%.2f", best)) or reason
-  if top ~= "" then why = why .. (capped and " (window)" or (" (" .. #chunks .. " chunks)")) end
+  if top ~= "" then why = why .. suffix end
   if ckey and ctx.cache then
     ctx.cache:set(ckey, { score = best, reason = why }, cfg.cache.fp_ttl)
   end
@@ -161,7 +172,7 @@ function _M.evaluate(req, ctx)
   local cfg = ctx.config
 
   -- L1 ------------------------------------------------------------------
-  local r, text, reason, rule, windowed, chunks, capped = rules_mod.evaluate_all(req, ctx.rules, ctx)
+  local r, text, reason, rule, windowed, chunks, capped, untrusted = rules_mod.evaluate_all(req, ctx.rules, ctx)
 
   if r == rules_mod.PASS then
     return verdict.new({ verdict = verdict.SKIPPED, source = verdict.SRC_L1, reason = reason })
@@ -183,7 +194,9 @@ function _M.evaluate(req, ctx)
     }))
   end
 
-  local fp = normalize.fingerprint(text, { prefix_bytes = cfg.cache.fp_prefix_bytes }, ctx.hash)
+  local fp = normalize.fingerprint(untrusted and (text .. UNTRUSTED_SEP .. untrusted.text) or text,
+    { prefix_bytes = cfg.cache.fp_prefix_bytes }, ctx.hash)
+  local uspec = untrusted and defaults.untrusted_spec(cfg, rule)
 
   -- trust ---------------------------------------------------------------
   -- An operator called this exact text a false positive. Checked before the
@@ -203,7 +216,9 @@ function _M.evaluate(req, ctx)
   end
 
   -- cache ---------------------------------------------------------------
-  local ckey = fp ~= "" and _M.cache_key(fp, rule, cfg, ctx.hash) or nil
+  local ckey = fp ~= "" and _M.cache_key(fp, rule, cfg, ctx.hash, uspec and {
+    templates = { table.concat(rule.templates or {}, ","), "+" .. table.concat(uspec.templates, ",") },
+  }) or nil
   if ckey and ctx.cache then
     local hit = ctx.cache:get(ckey)
     if type(hit) == "table" and type(hit.score) == "number" then
@@ -238,7 +253,31 @@ function _M.evaluate(req, ctx)
         reason = "unjudgeable: text over max_judge_chunks", fingerprint = fp,
       }))
     end
-    return judge_chunks(req, ctx, rule, chunks, capped, fp, ckey, reason)
+  end
+  if (chunks and #chunks > 1) or untrusted then
+    local context = {
+      path = req.path or "", method = req.method or "",
+      deployment = rule.deployment_context or cfg.jev.deployment_context or "",
+    }
+    local parts = {}
+    if not (untrusted and untrusted.only) then
+      for _, c in ipairs((chunks and #chunks > 1) and chunks or { text }) do
+        parts[#parts + 1] = { text = c, templates = rule.templates, context = context }
+      end
+    end
+    local suffix = ""
+    if chunks and #chunks > 1 then
+      suffix = capped and " (window)" or (" (" .. #chunks .. " chunks)")
+    elseif windowed or (untrusted and untrusted.windowed) then
+      suffix = " (window)"
+    end
+    if untrusted then
+      -- asked without the deployment context, the way the question was measured
+      parts[#parts + 1] = { text = untrusted.text, templates = uspec.templates,
+        context = { path = req.path or "", method = req.method or "", deployment = "" },
+        over = { templates = uspec.templates, deployment = "" } }
+    end
+    return judge_parts(ctx, rule, parts, suffix, fp, ckey, reason)
   end
   local prompt, perr = judge.build(rule.templates, text, {
     path = req.path or "", method = req.method or "",

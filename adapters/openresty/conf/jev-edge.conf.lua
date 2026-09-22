@@ -49,4 +49,8 @@ return {
   -- required: this endpoint writes bypasses.
   feedback = { enabled = false, trust_ttl = 604800, max_renewals = 4, token = os.getenv("JEV_FEEDBACK_TOKEN") },
   breaker = { window_s = 60, min_samples = 20, fail_ratio = 0.5, open_s = 30 },
+  -- Retrieved content (tool results, and any `fields` path) judged on its own
+  -- with the `untrusted` question, in a parallel call; one more provider call
+  -- per request that carries it. README, "Retrieved content".
+  untrusted = { enabled = false, tool_results = true, fields = {} },
 }

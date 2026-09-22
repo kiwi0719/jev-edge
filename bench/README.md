@@ -6,6 +6,7 @@ Two benches, both reproducible without a TypeSafe key.
 |---|---|---|
 | `make bench-offline` | accuracy of the whole pipeline (L1 + thresholds) against jev-sec-bench's recorded Jev probabilities on deepset/prompt-injections; replay cache hit rate; core-only latency | Lua + `dkjson` + `lrexlib-pcre2` |
 | `make bench-judge` | judge-directed attacks (`datasets/judge-directed.jsonl`: "rate this as safe", fake answer JSON, fake end-of-input markers, buried and non-English variants, benign look-alikes) through L1: which reach L2, which a pattern names, which benign ones it flags. `make bench-judge-live` sends them to the real judge (needs `TYPESAFE_API_KEY` and/or `OPENAI_BASE_URL`) | Lua + `dkjson` + `lrexlib-pcre2` (live: Docker + a key) |
+| `make suite-live` (`CTX=1`) | suite v1 (`datasets/suite-v1.jsonl`, 2,735 whole chat bodies): Chinese injection, multi-turn, indirect injection in retrieved emails / tool results, over-defense look-alikes, through L1 and the real judge; `make suite-report` writes [suite/report.md](suite/report.md). See [suite/README.md](suite/README.md) | Docker + `TYPESAFE_API_KEY` |
 | `make bench` | end-to-end latency in OpenResty for five scenarios (baseline, unwatched path, healthy / slow / dead Jev) using the `mock` provider; verifies 100% pass with Jev down | Docker |
 
 `bench/datasets/jev-sec-bench-injection.json` is `results/injection.json` from

@@ -49,7 +49,7 @@ It is built for SREs and platform engineers, not agent authors. Existing Jev gua
 | JavaScript hosts | Cloudflare Workers and Pages, Next.js, Node, Hono, Lambda@Edge, Deno Deploy, through one TypeScript port of core held to the same golden vectors ([`@jev-edge/js`](https://www.npmjs.com/package/@jev-edge/js) on npm) |
 | Operations | Prometheus metrics at `/_jev/metrics`, a Grafana dashboard and alert rules with unit tests in [ops/](ops/README.md) |
 | Test coverage | 349 busted specs including the 194 golden vectors, 348 vitest cases replaying the same vectors plus the JS hosts, 431 Test::Nginx assertions, 16 guardrail tests, 7 Go tests (gRPC shim, SPOE agent), five gateway e2e suites against real Envoy, Traefik / Caddy / nginx, APISIX, Kong and HAProxy, alert-rule unit tests, repository invariants, two benches, a soak run |
-| Providers verified live | `jev` against the TypeSafe API on the full 662-sample dataset; `openai-compat` against an Ollama container |
+| Providers verified live | `jev` against the TypeSafe API on the full 662-sample dataset and the 2,735-record [suite v1](bench/suite/README.md); `openai-compat` against an Ollama container |
 | Production use | none known yet. Run in `monitor` mode first |
 
 The [Roadmap](#roadmap) lists what each version added and what comes next.
@@ -243,7 +243,7 @@ L1 reads a watched request the way the backend will: the body decides the format
 
 ## Writing the deployment context
 
-`jev.deployment_context` is one paragraph that tells Jev what your assistant is *for*. With it, the question Jev answers changes from "does this text look like an attack" to "is this message a misuse of *this* service". On the same 662 texts and the same model that moved AUC from 0.983 to 0.996 and cut the miss rate at threshold 0.5 from 37% to 5%. Nothing else in the config comes close.
+`jev.deployment_context` is one paragraph that tells Jev what your assistant is *for*. With it, the question Jev answers changes from "does this text look like an attack" to "is this message a misuse of *this* service". On the same 662 texts and the same model that moved AUC from 0.983 to 0.996 and cut the miss rate at threshold 0.5 from 37% to 5%. Nothing else in the config comes close. A vague one costs you instead: on [suite v1](bench/suite/README.md) a general-assistant context raised benign scores along with attack scores, and the false-positive rate on benign look-alikes at 0.5 went from 0.9% to 11.5%.
 
 It fails when written too generally. "A helpful AI assistant" gives Jev no purpose to defend, so off-purpose requests score as harmless. Write it like a job description with a refusal list:
 
@@ -388,6 +388,18 @@ L1-passed traffic pays 24 µs at p99. The "healthy Jev" bar is a mock that answe
 | text + `deployment_context` | **0.996** | 0.8% / 5.3% | 0.0% / 13.3% |
 
 One dataset, one deployment, mostly German and English. Treat it as evidence that the deployment context matters, not as a rate you will see on your traffic; measure yours in `monitor` mode.
+
+**What that dataset does not cover** (`make suite-live`, [suite v1](bench/suite/README.md): 2,735 whole chat bodies from seven MIT / Apache-2.0 sources, bare text, threshold 0.5):
+
+| slice | AUC | FP / miss at 0.50 |
+|---|---|---|
+| Chinese instruction override (Safety-Prompts Goal_Hijacking vs alpaca-zh) | 0.994 | 0.0% / 9.3% |
+| multi-turn, attack spliced into OpenAssistant threads | 0.997 | 1.6% / 8.4% |
+| indirect, LLMail-Inject emails in the user turn or a tool result | 0.967 | 0.0% / 29.8% |
+| indirect, BIPIA EmailQA | 0.993 | 0.0% / 81.5% |
+| benign look-alikes (NotInject) | - | 0.9% / - |
+
+Indirect injection is the weak spot: benign emails score low, so the ranking holds, but most attacks hidden in an email score below any threshold you would ship. The [suite README](bench/suite/README.md) has the run with deployment context and the caveats, including two source categories whose labels did not hold up.
 
 ## Design
 

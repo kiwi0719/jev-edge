@@ -1,4 +1,4 @@
-.PHONY: test lint check invariants luajit-check golden golden-check calibrate labels context-lint test-js test-openresty bench bench-offline bench-judge bench-judge-live bench-chart dist opm-build rock-lint rock-pack rock-upload install live-check live-full live-openai soak shim e2e-envoy e2e-forward-auth e2e-apisix e2e-kong e2e-haproxy test-litellm
+.PHONY: test lint check invariants luajit-check golden golden-check calibrate labels context-lint test-js test-openresty bench bench-offline bench-judge bench-judge-live bench-chart dist opm-build rock-lint rock-pack rock-upload install live-check live-full live-openai soak shim e2e-envoy e2e-forward-auth e2e-apisix e2e-kong e2e-haproxy test-litellm suite-fetch suite-build suite-live suite-report
 
 test:
 	busted
@@ -100,6 +100,25 @@ live-full:
 	docker run --rm --env-file .env -e JEV_DEPLOYMENT_CONTEXT -v "$(CURDIR)":/work jev-edge-test sh -c \
 	  'resty --http-conf "lua_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt; lua_ssl_verify_depth 5;" \
 	   -I /work/adapters/openresty/lib -I /work /work/bench/live_full.lua'
+
+# Suite v1 (bench/suite/README.md): Chinese, multi-turn, indirect injection and
+# over-defense look-alikes as whole chat bodies. suite-build needs Python +
+# pyarrow and the sources suite-fetch downloads; the built suite is committed.
+suite-fetch:
+	sh bench/suite/fetch.sh
+
+suite-build:
+	python3 bench/suite/build.py --raw bench/suite/raw
+
+# Costs provider calls: every record, both templates, ~2.7k calls per run.
+# CTX=1 sends each record's deployment context. Resumes an interrupted run.
+suite-live:
+	docker run --rm --env-file .env -v "$(CURDIR)":/work jev-edge-test sh -c \
+	  'resty --http-conf "lua_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt; lua_ssl_verify_depth 5;" \
+	   -I /work/adapters/openresty/lib -I /work /work/bench/suite/live.lua $(if $(CTX),--ctx)'
+
+suite-report:
+	lua bench/suite/report.lua > bench/suite/report.md
 
 # openai-compat provider against an Ollama container on the jev-net network:
 #   docker network create jev-net; docker run -d --rm --name ollama --network jev-net ollama/ollama

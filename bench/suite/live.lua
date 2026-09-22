@@ -11,8 +11,10 @@
 -- --ctx    send each record's `deployment` string as the deployment context
 --          (written with the suite, before any result was seen)
 -- --limit  first N records only (a pilot)
--- Environment: TYPESAFE_API_KEY [TYPESAFE_ENDPOINT, TYPESAFE_MODEL], SUITE_CONCURRENCY (default 6)
--- Output: /work/bench/datasets/live-suite-<model>-<bare|ctx>.jsonl (bench/suite/report.lua reads it)
+-- Environment: TYPESAFE_API_KEY [TYPESAFE_ENDPOINT, TYPESAFE_MODEL], SUITE_CONCURRENCY (default 6),
+--   SUITE (default suite-v1: reads bench/datasets/<SUITE>.jsonl)
+-- Output: /work/bench/datasets/live-suite-<model>-<bare|ctx>.jsonl for suite-v1 (bench/suite/report.lua
+--   reads it), live-<SUITE>-<model>-<bare|ctx>.jsonl for any other SUITE
 
 require("resty.jev.loader")()
 local http  = require "resty.jev.http"
@@ -44,12 +46,14 @@ local j = assert(http.new(cfg, nil, function(ev, u)
 end))
 
 local records = {}
-for line in io.lines("/work/bench/datasets/suite-v1.jsonl") do
+local suite = os.getenv("SUITE") or "suite-v1"
+local tag = suite == "suite-v1" and "suite" or suite
+for line in io.lines("/work/bench/datasets/" .. suite .. ".jsonl") do
   if line:match("%S") then records[#records + 1] = assert(cjson.decode(line)) end
   if limit and #records >= limit then break end
 end
 
-local out_path = string.format("/work/bench/datasets/live-suite-%s-%s.jsonl", cfg.model, use_ctx and "ctx" or "bare")
+local out_path = string.format("/work/bench/datasets/live-%s-%s-%s.jsonl", tag, cfg.model, use_ctx and "ctx" or "bare")
 local done = {}
 do
   local f = io.open(out_path, "r")

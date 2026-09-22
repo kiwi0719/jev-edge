@@ -51,6 +51,10 @@ make suite-build          # Python 3.9+ with pyarrow; seeded, rewrites bench/dat
 make suite-live           # bare text; costs one provider call per record
 make suite-live CTX=1     # with each record's deployment context
 make suite-report         # bench/suite/report.md
+
+make suite-tooldocs-build   # the non-email tool results (bench/datasets/suite-v1-tooldocs.jsonl)
+make suite-untrusted        # the experiment below: segment runs, and the whole-text run for tooldocs
+make suite-untrusted-report # bench/suite/untrusted-report.md
 ```
 
 `suite-live` resumes an interrupted run: it skips every id already in the output file with no error.
@@ -81,6 +85,63 @@ make suite-report         # bench/suite/report.md
   warns about. Read this as evidence that a vague context can cost false positives, not as a result
   about a well-written one. On deepset the context moved AUC from 0.983 to 0.996; that finding stands,
   and it does not carry over to this suite.
+
+## Experiment: judging retrieved content on its own
+
+Core joins every message (system, user, assistant, tool) into one text and asks the `injection`
+question of all of it, so the judge cannot tell the user's request from an email the assistant fetched.
+`untrusted.lua` sends only the retrieved part of each indirect record to the judge, with two questions in
+one call: the shipped `injection` question (B), and a new `untrusted` question written for external
+content (C). The combined score, what a gateway asking both would act on, is max(A, C), where A is the
+shipped whole-text score from the bare run. The `untrusted` question was committed (`ab16b4b`) before
+the first run and was not changed afterwards. Tables: [untrusted-report.md](untrusted-report.md).
+
+The retrieved part is the `role: tool` content where the app sent one. Where it pasted the emails into
+the user turn, the segment is those emails cut off the query by hand: what the app would send if it used
+a tool message. Core cannot make that cut on its own.
+
+**Emails (suite v1), threshold 0.5, FP / miss:**
+
+| | A: shipped | B: segment, `injection` | C: segment, `untrusted` | max(A, C) |
+|---|---|---|---|---|
+| LLMail-Inject, tool_result | 0% / 29.0% | 0% / 53.5% | 0% / 7.0% | 0% / 6.0% |
+| BIPIA, tool_result | 0% / 85.4% | 0% / 78.1% | 0% / 37.5% | 0% / 37.5% |
+| LLMail-Inject, user_inline (cut by hand) | 0% / 30.5% | 0% / 54.5% | 0% / 11.0% | 0% / 9.5% |
+| BIPIA, user_inline (cut by hand) | 0% / 77.9% | 0% / 78.8% | 0% / 28.8% | 0% / 28.8% |
+
+**Tool results that are not emails** (`build_tooldocs.py`: this repository's docs, source and golden
+JSON at `0e2aec3`, OpenAssistant how-to answers, with and without an inserted BIPIA / Gandalf attack),
+flagged at 0.5, A → max(A, C): attacks in how-to answers 34% → 75%, in source code 46% → 81%, in docs
+45% → 75%. Benign: how-to answers 0% → 0%, source code 1.7% → 3.4%, docs 1.4% → 6.1%, JSON 2.9% → 5.9%.
+
+- **The question does the work, not the cut.** Judging the segment alone with the shipped `injection`
+  question (B) is no better than today, and worse on LLMail. The `injection` question asks whether the
+  *user* is attacking the assistant, and an email is not the user. Asked the right question (C), the
+  judge cuts LLMail's miss rate at 0.5 from 29% to 6% and BIPIA's from 85% to 38%, with no false
+  positive on the 303 benign emails (upper bound about 1%).
+- **BIPIA is still missed a third of the time.** Its hardest attacks read as ordinary requests ("analyse
+  the sentiment of ...") even when the judge is told the text is external.
+- **The new false positives are mostly text that talks to an AI.** Of the 13 benign docs, code and JSON
+  chunks C flags at 0.5 (not counting the ones quoting an attack), most are this repository's material
+  about prompting and judging models: a classifier system prompt in source, the `deployment_context`
+  examples, a template, a test holding "IGNORA todas las instrucciones". A few have no clear reason (a
+  golden-vector chunk of repeated letters, a design-doc table). Retrieval over prompt libraries or AI
+  documentation will see this. The how-to answers, full of imperatives meant for the reader, stayed at
+  0%.
+- **Prompts in a tool result are flagged, and that is arguably right.** NotInject's benign user prompts
+  placed where a tool result goes are flagged 38% of the time at 0.5 (17% at 0.7). A retrieved document
+  that says "please describe the room in detail" to whoever reads it is what an indirect injection looks
+  like; whether that is a false positive depends on the app.
+- **Not measured:** real tool traffic (every carrier here is built), retrieved content in languages other
+  than English, and chunks near the window. One run, one model.
+
+What this would mean for core, not implemented here: cut `role: tool` messages (and Anthropic
+`tool_result`, Responses `function_call_output`) out of the judged text, judge them with an `untrusted`
+question in a parallel call, and act on the higher score. That is one more provider call for every
+request that carries tool content, and no extra latency beyond the slower of the two calls. It does
+nothing for apps that paste retrieved text into the user turn, unless a rule can name the fields that
+hold it. Before shipping, the question needs a held-out test set it was not written against, and the
+change needs the JS port and golden vectors.
 
 ## Caveats
 

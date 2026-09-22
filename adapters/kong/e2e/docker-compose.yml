@@ -1,0 +1,31 @@
+# Kong end-to-end: real Kong (DB-less, declarative kong.yml) with the jev-edge
+# plugin in front of a stub app that echoes the X-Jev-* headers it received.
+# The repo is mounted at /opt/jev-edge.
+#   :9380  Kong proxy
+name: jev-e2e-kong
+services:
+  kong:
+    image: kong:3.9
+    volumes:
+      - ../../..:/opt/jev-edge:ro
+      - ./kong.yml:/kong/kong.yml:ro
+    environment:
+      KONG_DATABASE: "off"
+      KONG_DECLARATIVE_CONFIG: /kong/kong.yml
+      KONG_PLUGINS: bundled,jev-edge
+      KONG_LUA_PACKAGE_PATH: "/opt/jev-edge/adapters/kong/?.lua;/opt/jev-edge/adapters/openresty/lib/?.lua;/opt/jev-edge/?.lua;/opt/jev-edge/?/init.lua;;"
+      # Kong injects `lua_shared_dict <value>;`; the second dict rides on the same line
+      KONG_NGINX_HTTP_LUA_SHARED_DICT: "jev_cache 16m; lua_shared_dict jev_subject 4m"
+      KONG_NGINX_MAIN_ENV: TYPESAFE_API_KEY
+      KONG_PROXY_LISTEN: "0.0.0.0:8000"
+      KONG_ADMIN_LISTEN: "off"
+      KONG_LOG_LEVEL: notice
+      KONG_PROXY_ACCESS_LOG: "off"
+      KONG_PROXY_ERROR_LOG: /dev/stderr
+    ports: ["9380:8000"]
+    depends_on: [app]
+  app:
+    image: jev-edge-test
+    volumes:
+      - ../../envoy/e2e/app.conf:/tmp/app/conf/nginx.conf:ro
+    command: ["sh", "-c", "mkdir -p /tmp/app/logs && openresty -p /tmp/app -c /tmp/app/conf/nginx.conf -g 'daemon off;'"]

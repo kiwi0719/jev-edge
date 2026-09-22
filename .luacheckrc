@@ -14,6 +14,11 @@ files["adapters/apisix/"] = {
   globals = { "ngx" },
 }
 
+files["adapters/kong/"] = {
+  globals = { "ngx", "kong" },
+  self = false,   -- Kong calls phase handlers as methods: function Plugin:access(conf)
+}
+
 files["bench/"] = {
   globals = { "ngx" },
   max_line_length = 200,   -- report strings

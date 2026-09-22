@@ -1,0 +1,50 @@
+# Declarative config for the e2e (DB-less). One route with the plugin in
+# enforce mode (mock provider, X-Jev-Mock-Score overrides the score), one on
+# a path no rule watches, one without the plugin.
+_format_version: "3.0"
+services:
+  - name: app
+    url: http://app:8081
+    routes:
+      - name: llm
+        paths: ["/v1"]
+        strip_path: false
+        plugins:
+          - name: jev-edge
+            config:
+              jev:
+                provider: mock
+                mock_score: 0.2
+                mock_header: x-jev-mock-score
+                timeout_ms: 300
+              rules: ["llm-endpoints"]
+              policy:
+                mode: enforce
+                block_threshold: 0.7
+                suspect_threshold: 0.5
+                block_body: '{"error":"blocked by jev-edge"}'
+              cache:
+                fp_ttl: 0.001
+              log_line: true
+      # rules_json: an inline tenant rule ahead of the stock one, the shape
+      # the APISIX plugin and the Lua config file take as `rules`
+      - name: tenant
+        paths: ["/v1/billing"]
+        strip_path: false
+        plugins:
+          - name: jev-edge
+            config:
+              jev: { provider: mock, mock_score: 0.2, mock_header: x-jev-mock-score, timeout_ms: 300 }
+              rules_json: '[{"id":"billing","extends":"llm-endpoints","watch_paths":["^/v1/billing"]},"llm-endpoints"]'
+              policy: { mode: enforce }
+      - name: healthz
+        paths: ["/healthz"]
+        strip_path: false
+        plugins:
+          - name: jev-edge
+            config:
+              jev: { provider: mock, mock_score: 0.2, timeout_ms: 300 }
+              policy: { mode: enforce }
+      - name: plain
+        paths: ["/plain"]
+        strip_path: false

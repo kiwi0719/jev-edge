@@ -107,7 +107,59 @@ _M.config = {
     fail_ratio  = 0.5,
     open_s      = 30,
   },
+  -- Retrieved content judged on its own. Off by default. On, the text an app
+  -- fetched for its assistant (tool results, and the `fields` below) is also
+  -- sent to the judge in a parallel call with the `untrusted` question,
+  -- without the deployment context, and the request gets the higher of the
+  -- two scores. Costs one more provider call per request that carries such
+  -- content. The whole-text judgment is unchanged. A rule's own `untrusted`
+  -- table overrides these keys for that rule. Measured in bench/suite
+  -- (README, "Experiment: judging retrieved content on its own").
+  untrusted = {
+    enabled      = false,
+    -- OpenAI `role: "tool"` / `"function"` messages, Anthropic `tool_result`
+    -- content blocks, Responses API `function_call_output` items
+    tool_results = true,
+    -- JSON paths (text_fields syntax) whose values are retrieved content the
+    -- app sends outside a tool message, e.g. { "documents[*].text", "context" }.
+    -- Retrieved text pasted into the user's message cannot be told apart.
+    fields       = {},
+    templates    = { "untrusted" },
+  },
 }
+
+--- The untrusted-content settings for `rule`: config.untrusted with the
+-- rule's own `untrusted` table over it.
+function _M.untrusted_spec(cfg, rule)
+  local base = (cfg and cfg.untrusted) or _M.config.untrusted
+  local over = rule and rule.untrusted
+  if type(over) ~= "table" then return base end
+  local out = {}
+  for k, v in pairs(base) do out[k] = v end
+  for k, v in pairs(over) do out[k] = v end
+  return out
+end
+
+--- Type check for an untrusted table (config section or a rule's override).
+function _M.validate_untrusted(u, where)
+  if u == nil then return true end
+  if type(u) ~= "table" then return nil, where .. " must be a table" end
+  for _, k in ipairs({ "enabled", "tool_results" }) do
+    if u[k] ~= nil and type(u[k]) ~= "boolean" then return nil, where .. "." .. k .. " must be true|false" end
+  end
+  for _, k in ipairs({ "fields", "templates" }) do
+    if u[k] ~= nil then
+      if type(u[k]) ~= "table" then return nil, where .. "." .. k .. " must be a list of strings" end
+      for i, v in ipairs(u[k]) do
+        if type(v) ~= "string" or v == "" then
+          return nil, where .. "." .. k .. "[" .. i .. "] must be a non-empty string"
+        end
+      end
+    end
+  end
+  if u.templates ~= nil and #u.templates == 0 then return nil, where .. ".templates must not be empty" end
+  return true
+end
 
 local function is_list(t)
   return type(t) == "table" and #t > 0 and next(t, #t) == nil
@@ -259,6 +311,8 @@ function _M.validate(c)
   if max_ms ~= nil and (type(max_ms) ~= "number" or max_ms < c.jev.timeout_ms) then
     return nil, "jev.timeout_max_ms must be >= timeout_ms"
   end
+  local uok, uerr = _M.validate_untrusted(c.untrusted, "untrusted")
+  if not uok then return nil, uerr end
   return true
 end
 

@@ -113,6 +113,17 @@ local schema = {
         block_body        = { type = "string" },
       },
     },
+    -- retrieved content judged on its own (core/defaults.lua `untrusted`)
+    untrusted = {
+      type = "object",
+      properties = {
+        enabled      = { type = "boolean" },
+        tool_results = { type = "boolean" },
+        fields       = { type = "array", items = { type = "string", minLength = 1 } },
+        templates    = { type = "array", minItems = 1,
+                         items = { type = "string", enum = { "untrusted", "injection", "abuse" } } },
+      },
+    },
     cache = {
       type = "object",
       properties = {

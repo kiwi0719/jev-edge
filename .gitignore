@@ -46,3 +46,6 @@ bench/datasets/labels*.csv
 
 # e2e configs derived from the reference ones by run.sh
 adapters/*/e2e/.gen/
+
+# suite v1 sources (bench/suite/fetch.sh)
+bench/suite/raw/

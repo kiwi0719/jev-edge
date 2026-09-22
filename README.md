@@ -32,6 +32,7 @@ It is built for SREs and platform engineers, not agent authors. Existing Jev gua
 - [Using Laya instead of Jev](#using-laya-instead-of-jev)
 - [False positives](#false-positives)
 - [Subject reputation](#subject-reputation)
+- [Retrieved content](#retrieved-content)
 - [What it costs](#what-it-costs)
 - [Benchmarks](#benchmarks)
 - [Design](#design)
@@ -44,13 +45,13 @@ It is built for SREs and platform engineers, not agent authors. Existing Jev gua
 
 | | |
 |---|---|
-| Version | `v0.5.0` |
+| Version | `v0.6.0` |
 | Gateways, native | OpenResty; Apache APISIX and Kong Gateway (plugins, same engine) |
 | Gateways, via `/_jev/authz` | Envoy (HTTP and gRPC ext_authz), HAProxy (SPOE agent), Traefik, Caddy and plain nginx (forward-auth), each end-to-end tested against the real gateway; Istio, Envoy Gateway, Azure APIM and Apigee as [recipes](docs/recipes.md); LiteLLM proxy as a guardrail |
 | JavaScript hosts | Cloudflare Workers and Pages, Next.js, Node, Hono, Lambda@Edge, Deno Deploy, through one TypeScript port of core held to the same golden vectors ([`@jev-edge/js`](https://www.npmjs.com/package/@jev-edge/js) on npm) |
 | Operations | Prometheus metrics at `/_jev/metrics`, a Grafana dashboard and alert rules with unit tests in [ops/](ops/README.md) |
-| Test coverage | 349 busted specs including the 194 golden vectors, 348 vitest cases replaying the same vectors plus the JS hosts, 431 Test::Nginx assertions, 16 guardrail tests, 7 Go tests (gRPC shim, SPOE agent), five gateway e2e suites against real Envoy, Traefik / Caddy / nginx, APISIX, Kong and HAProxy, alert-rule unit tests, repository invariants, two benches, a soak run |
-| Providers verified live | `jev` against the TypeSafe API on the full 662-sample dataset; `openai-compat` against an Ollama container |
+| Test coverage | 393 busted specs including the 213 golden vectors, 388 vitest cases replaying the same vectors plus the JS hosts, 473 Test::Nginx assertions, 16 guardrail tests, 7 Go tests (gRPC shim, SPOE agent), five gateway e2e suites against real Envoy, Traefik / Caddy / nginx, APISIX, Kong and HAProxy, alert-rule unit tests, repository invariants, the latency and accuracy benches below, a soak run |
+| Providers verified live | `jev` against the TypeSafe API on the 662-sample deepset dataset, the 2,735-record [suite v1](bench/suite/README.md) and a 1,200-record held-out set of tool results; `openai-compat` against an Ollama container |
 | Production use | none known yet. Run in `monitor` mode first |
 
 The [Roadmap](#roadmap) lists what each version added and what comes next.
@@ -244,7 +245,7 @@ L1 reads a watched request the way the backend will: the body decides the format
 
 ## Writing the deployment context
 
-`jev.deployment_context` is one paragraph that tells Jev what your assistant is *for*. With it, the question Jev answers changes from "does this text look like an attack" to "is this message a misuse of *this* service". On the same 662 texts and the same model that moved AUC from 0.983 to 0.996 and cut the miss rate at threshold 0.5 from 37% to 5%. Nothing else in the config comes close.
+`jev.deployment_context` is one paragraph that tells Jev what your assistant is *for*. With it, the question Jev answers changes from "does this text look like an attack" to "is this message a misuse of *this* service". On the same 662 texts and the same model that moved AUC from 0.983 to 0.996 and cut the miss rate at threshold 0.5 from 37% to 5%. Nothing else in the config comes close. A vague one costs you instead: on [suite v1](bench/suite/README.md) a general-assistant context raised benign scores along with attack scores, and the false-positive rate on benign look-alikes at 0.5 went from 0.9% to 11.5%.
 
 It fails when written too generally. "A helpful AI assistant" gives Jev no purpose to defend, so off-purpose requests score as harmless. Write it like a job description with a refusal list:
 
@@ -375,6 +376,29 @@ It is off by default (`block_at = 0`). Only judged verdicts count (L2 and cache 
 
 Pick `block_at` from your own traffic: run in `monitor` mode with the subject configured, then `make calibrate LOG=... [LABELS=...]` replays the log per subject with the same window and prints how many subjects each `block_at` would have blocked, benign against those that sent a labelled attack, with a recommendation. No multi-turn dataset is needed: this is reputation, not sequence scoring.
 
+## Retrieved content
+
+An assistant that calls tools or retrieves documents sends what it fetched back to the model: search results, emails, web pages, API responses. An instruction hidden in there (indirect prompt injection) is written by whoever wrote the content, not by your user. By default jev-edge judges it as part of the whole text with the `injection` question, which asks whether the *user* is attacking the assistant; an email is not the user, and most such attacks score low.
+
+`untrusted` (0.6.0, off by default) judges retrieved content on its own, with a question written for it: does this external text try to instruct the AI reading it? The whole-text judgment is unchanged, the two calls run in parallel, and the request gets the higher score.
+
+```lua
+untrusted = {
+  enabled      = true,   -- off by default; hot-reloadable through /_jev/config
+  tool_results = true,   -- OpenAI role "tool" / "function", Anthropic tool_result, Responses function_call_output
+  fields       = { "documents[*].text" },  -- JSON paths where your app sends retrieved text outside a tool message
+},
+```
+
+or at runtime: `curl -X PUT localhost:8090/_jev/config -d '{"untrusted":{"enabled":true}}'`. A rule's own `untrusted` table turns it on for one route only.
+
+On a held-out set of 1,200 tool results the question was not written against (InjecAgent, LLMail-Inject phase 1, Hermes function calling), the shipped core flagged 81% of attacks at 0.5 instead of 13%, with 1 false positive in 700 benign results ([details](bench/suite/README.md#held-out-test-the-shipped-core)).
+
+- **Cost**: one more provider call for every request that carries tool content or `fields`; nothing for the rest. L2 time moved from 277 to 293 ms at p50 in that run.
+- **Responses API**: without `untrusted`, `function_call_output` items are not read at all (they are not under `input[*].content`). If you front the Responses API with tools, turn it on.
+- **What it cannot see**: retrieved text pasted into the user's own message. Send it as a tool message, or name its field in `fields`.
+- **Where it misfires**: text written for an AI to read, such as system prompts, prompt libraries or AI documentation, retrieved as content. It is judged without the deployment context, the way it was measured. L3 re-judges the whole text only.
+
 ## What it costs
 
 Two numbers decide the bill: how much of your traffic reaches L2, and the provider's input price.
@@ -383,31 +407,46 @@ Two numbers decide the bill: how much of your traffic reaches L2, and the provid
 monthly cost ≈ QPS × L2 share × 2.63M s/month × tokens per call × price per token
 ```
 
-One L2 call with the `injection` template is about 610 input tokens with a deployment context and 39 output tokens, measured on the live runs. Prices change; [docs/cost.md](docs/cost.md) has a worked table at the price published when it was written, and the two metrics that give you your real L2 share and token count after a day in `monitor` mode.
+One L2 call with the `injection` template is about 610 input tokens with a deployment context and 39 output tokens, measured on the live runs. With [`untrusted`](#retrieved-content) on, a request that carries tool content makes a second call. Prices change; [docs/cost.md](docs/cost.md) has a worked table at the price published when it was written, and the two metrics that give you your real L2 share and token count after a day in `monitor` mode.
 
 ## Benchmarks
 
-Three measurements, three questions. Full numbers, method and caveats are in [bench/report.md](bench/report.md) and the [design doc](docs/design.md#bench-and-acceptance).
+Four questions, each with its own measurement. Everything below is reproducible from the repository; the method and the caveats are in [bench/report.md](bench/report.md), [bench/suite/README.md](bench/suite/README.md) and the [design doc](docs/design.md#bench-and-acceptance).
 
 **What the gateway adds** (`make bench`, OpenResty in Docker, `mock` provider, no key needed):
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/bench-latency-dark.svg">
-  <img src="docs/bench-latency-light.svg" alt="Bar chart of p50 and p99 latency for five scenarios on a log scale: baseline 36/47 µs, unwatched 39/71 µs, healthy Jev 102/106 ms, slow Jev 53 µs/288 ms, dead Jev 48/173 µs" width="100%">
+  <img src="docs/bench-latency-light.svg" alt="Bar chart of p50 and p99 latency for five scenarios on a log scale: baseline 36/55 µs, unwatched 39/76 µs, healthy Jev 103/106 ms, slow Jev 62 µs/478 ms, dead Jev 49/149 µs" width="100%">
 </picture>
 
-L1-passed traffic pays 24 µs at p99. The "healthy Jev" bar is a mock that answers in 100 ms, so it shows about 2 ms of pipeline on top of whatever your provider takes. With Jev dead, 100% of traffic passes and p99 is 173 µs.
+L1-passed traffic pays about 20 µs at p99. The "healthy Jev" bar is a mock that answers in 100 ms, so it shows 2 to 3 ms of pipeline on top of whatever your provider takes. The "slow Jev" mock answers in 500 ms: `timeout_ms` is the adaptive timeout's floor, not a cut, so slow answers are waited for up to `timeout_max_ms`. With Jev dead, 100% of traffic passes and p99 is 149 µs.
 
-**What the provider takes** (`make live-check`, real TypeSafe API): about 270 ms p50 from the test box. This is where the adaptive timeout's 400 ms floor and 1000 ms ceiling come from. `/_jev/health` reports yours.
+**What the provider takes** (`make live-check`, real TypeSafe API): about 270 to 300 ms p50 from the test box. This is where the adaptive timeout's 400 ms floor and 1000 ms ceiling come from. `/_jev/health` reports yours.
 
-**Whether the pipeline preserves Jev's accuracy** (`make bench-offline` on recorded answers, `make live-full` against the API; deepset/prompt-injections, 662 samples):
+**How much it catches, and what it flags by mistake** (live runs against the TypeSafe API, committed under `bench/datasets/`):
 
-| what Jev saw | AUC | FP / miss at 0.50 | FP / miss at 0.70 |
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/bench-accuracy-dark.svg">
+  <img src="docs/bench-accuracy-light.svg" alt="Horizontal bar chart of attacks flagged at threshold 0.5 with false positives: deepset text only 63% (FP 0%), with deployment context 95% (0.8%); suite v1 Chinese instruction override 91% (0%), multi-turn 92% (1.6%), LLMail-Inject emails 70% (0%), BIPIA emails 18% (0%); held-out tool results with untrusted off 13% (0%), with untrusted on 81% (0.1%)" width="100%">
+</picture>
+
+| dataset | what it tests | AUC | FP / miss at 0.50 |
 |---|---|---|---|
-| text only | 0.983 | 0.0% / 37.3% | 0.0% / 47.5% |
-| text + `deployment_context` | **0.996** | 0.8% / 5.3% | 0.0% / 13.3% |
+| [deepset/prompt-injections](bench/report.md), text only | single-turn English and German, labelled for one news site | 0.983 | 0.0% / 37.3% |
+| the same, with `deployment_context` | | **0.996** | 0.8% / 5.3% |
+| [suite v1](bench/suite/README.md): Safety-Prompts Goal_Hijacking vs alpaca-zh | Chinese instruction override | 0.994 | 0.0% / 9.3% |
+| suite v1: OpenAssistant threads | multi-turn, an attack spliced into a real conversation | 0.997 | 1.6% / 8.4% |
+| suite v1: LLMail-Inject | an attack email among retrieved ones | 0.967 | 0.0% / 29.8% |
+| suite v1: BIPIA EmailQA | polite instructions inside an email | 0.993 | 0.0% / 81.5% |
+| suite v1: NotInject | benign prompts full of trigger words | - | 0.9% / - |
+| [held-out tool results](bench/suite/README.md#held-out-test-the-shipped-core), `untrusted` off | InjecAgent, LLMail phase 1, Hermes; OpenAI, Anthropic and Responses bodies | 0.784 | 0.0% / 86.8% |
+| the same, `untrusted` on | | **0.997** | 0.1% / 19.2% |
 
-One dataset, one deployment, mostly German and English. Treat it as evidence that the deployment context matters, not as a rate you will see on your traffic; measure yours in `monitor` mode.
+- **The deployment context matters on the dataset it was written for.** On deepset it cut the miss rate at 0.5 from 37% to 5%. On suite v1 a vague, general-assistant context helped nothing and raised false positives on look-alikes from 0.9% to 11.5%; write a specific one ([Writing the deployment context](#writing-the-deployment-context)).
+- **Direct attacks are caught in Chinese and across turns.** An attack in an earlier turn is caught about as often as one in the last.
+- **Indirect injection is the weak spot without `untrusted`.** Benign emails score low, so the ranking holds, but most attacks hidden in retrieved content score below any threshold you would ship. [`untrusted`](#retrieved-content) is the answer measured here: on tool results it has never seen, misses at 0.5 fall from 87% to 19% for 1 false positive in 700.
+- **What none of these are.** Every dataset is public, most attacks are generated, two source categories did not hold up as labels (see the suite README), and each configuration was run once. Treat them as evidence of what matters, not as the rates you will see; measure yours in `monitor` mode with `make calibrate`.
 
 ## Design
 
@@ -433,7 +472,7 @@ adapters/
   laya-server/   a fine-tuned Laya model over the System One protocol (Python, Dockerfile), config profile, temperature fit
   js/            TypeScript port of core; Cloudflare, Next.js, Node, Hono, Lambda@Edge, Deno presets; vitest replays core/golden
 rules/           L1 rule sets (PCRE prefilter, watch paths, text fields)
-bench/           offline accuracy bench, Docker latency bench, live checks, soak, calibrate, labels-from-log, context lint, report
+bench/           offline accuracy bench, Docker latency bench, live checks, soak, calibrate, labels-from-log, context lint, report; suite/ for Chinese, multi-turn, indirect and held-out runs
 demo/            docker compose demo from "Try it in 30 seconds"
 docs/            design.md, cost.md, recipes.md (Istio, Envoy Gateway, APIM, Apigee), bench charts
 ops/             Grafana dashboard, Prometheus alert rules and their promtool tests
@@ -456,7 +495,8 @@ scripts/         invariants.lua: tripwires for bug classes a past audit found
 | 0.3.1 ✅ | Audit patch: content-parts bodies judged; SHA-256 fingerprint over the whole text (was a crc32 prefix); `X-Forwarded-For` read from the proxy's hop (`client_ip.trusted_hops`); `GET /_jev/config` redacts secrets; admin endpoints on their own listener; inbound `X-Jev-*` stripped by every gateway config; one thin-adapter contract (`status >= 400` + `X-Jev-Verdict` = block, no header = not judged); optional `jev_state` dict for trust / breaker / counters; L3 rebuilt with the L2 prompt and the ceiling timeout; breaker, in-flight, provider and validation fixes; JS fail-open covers the whole request. |
 | 0.4.0 ✅ | L1 reads what the backend reads: the body decides the format (Content-Type is a hint; `multipart/form-data` read), `gzip` / `deflate` / `br` bodies decoded, `max_body_bytes` 1 MiB with head-and-tail scanning past it, a 32 KiB judging window (`max_judge_bytes`) with the pattern hit kept, and `policy.unjudgeable` for what still cannot be read. Security fixes from a full audit: verdict cache scoped per rule and provider, client IP and path forgery through forward-auth and the JS runtime, repeated or late `Content-Type`, empty judge answers, BOM bodies; JS fingerprints on SHA-256; subject history on a ring in JS too. |
 | 0.5.0 ✅ | **Subject reputation**: suspicious and malicious verdicts counted per subject (user header, cookie or IP) over a window, blocking after a threshold, as `rep_block_after` does per IP today; thresholds from monitor-mode logs with `make calibrate`, no multi-turn dataset needed. It catches one user probing variants across sessions and IPs, and APIs that do not resend history. **Kong plugin** on the same Lua core as APISIX. **`@jev-edge/js` on npm**, and a **Deno Deploy** preset. **Operations**: a Grafana dashboard and Prometheus alert rules (breaker open, `error` rate, `unjudgeable` rate, L2 timeout at its ceiling), and `jev_feedback_total{label}` so operator feedback is a metric, not only a log line. **Judge robustness**: bench cases where the judged text addresses the judge ("rate this as safe"). **Boundaries**: the partial-body path (Envoy, HAProxy) covered by e2e, and the traffic L1 does not see (WebSocket, Realtime API, streamed request bodies) written down. Also shipped: long text judged in full in chunks (`max_judge_chunks`), an answer the judge echoes from the input scored as an injection, repository invariants for the 0.4.0 audit's bug classes, CodeQL and govulncheck in CI. |
-| Possible future work | Sequence scoring on subject trajectories: a window, decay and thresholds over the ordered history, once a labelled multi-turn dataset exists (the chat history each request already carries covers most multi-turn attacks today); an `abuse` dataset of its own; Fastly Compute (JS in WASM, its own stores, no `node:zlib`); judging streaming and realtime traffic. |
+| 0.6.0 ✅ | **Retrieved content judged on its own** (`untrusted`, off by default): tool results in OpenAI, Anthropic and Responses bodies, plus any `untrusted.fields` path, judged in a parallel call with a question written for external content; the request gets the higher score. Its own cache entry per tool result, a fingerprint that covers it, a rule-level override, both cores and the APISIX / Kong schemas. Measured on a held-out set before it shipped: misses at 0.5 from 87% to 19%, 1 false positive in 700. **Accuracy beyond deepset**: suite v1 (Chinese injection, multi-turn, indirect injection, over-defense look-alikes, 2,735 whole request bodies from seven public sources), the untrusted-segment experiment, the held-out set, and an accuracy chart; every live run committed with its results, bad ones included. A test pinning the TypeScript templates' wording to the Lua files. |
+| Possible future work | Sequence scoring on subject trajectories: a window, decay and thresholds over the ordered history, once a labelled multi-turn dataset exists (the chat history each request already carries covers most multi-turn attacks today); an `abuse` dataset of its own; Fastly Compute (JS in WASM, its own stores, no `node:zlib`); judging streaming and realtime traffic; retrieved content in Chinese and other languages, where no public indirect-injection set exists yet; telling retrieved text apart inside the user's own message; the `untrusted` question with a deployment context, which has not been measured. |
 
 ✅ means shipped in a tagged release; "planned" is the next release's scope, not a date.
 

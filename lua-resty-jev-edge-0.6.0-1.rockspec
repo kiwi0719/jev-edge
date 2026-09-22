@@ -1,10 +1,10 @@
 rockspec_format = "3.0"
 package = "lua-resty-jev-edge"
-version = "0.5.0-1"
+version = "0.6.0-1"
 
 source = {
    url = "git+https://github.com/kiwi0719/jev-edge",
-   tag = "v0.5.0",
+   tag = "v0.6.0",
 }
 
 description = {
@@ -68,6 +68,7 @@ build = {
       ["jev.core.verdict"]   = "core/verdict.lua",
 
       ["jev.core.templates.abuse"]     = "core/templates/abuse.lua",
+      ["jev.core.templates.untrusted"] = "core/templates/untrusted.lua",
       ["jev.core.templates.injection"] = "core/templates/injection.lua",
 
       ["jev.rules.default"]        = "rules/default.lua",

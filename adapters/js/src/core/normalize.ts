@@ -121,6 +121,47 @@ export function extractJsonValues(decoded: JsonValue, fields: string[]): string[
   return out;
 }
 
+// Port of tool_results() in core/normalize.lua. Tool results in the chat shapes
+// gateways see:
+//   OpenAI Chat Completions  messages[*] with role "tool" (or legacy "function"): content
+//   Anthropic Messages       messages[*].content[*] with type "tool_result": content
+//   OpenAI Responses         input[*] with type "function_call_output": output
+function toolResults(decoded: JsonValue, out: string[]): void {
+  if (!isObj(decoded) || Array.isArray(decoded)) return;
+  const msgs = decoded.messages;
+  if (Array.isArray(msgs)) {
+    for (const m of msgs) {
+      if (!isObj(m) || Array.isArray(m)) continue;
+      if (m.role === "tool" || m.role === "function") {
+        collect(m.content, out, 1);
+      } else if (Array.isArray(m.content)) {
+        for (const block of m.content) {
+          if (isObj(block) && !Array.isArray(block) && block.type === "tool_result") collect(block.content, out, 1);
+        }
+      }
+    }
+  }
+  const input = decoded.input;
+  if (Array.isArray(input)) {
+    for (const item of input) {
+      if (isObj(item) && !Array.isArray(item) && item.type === "function_call_output") collect(item.output, out, 1);
+    }
+  }
+}
+
+/**
+ * Port of extract_untrusted: retrieved content in a decoded JSON body, tool
+ * results (unless `spec.tool_results` is false) and the values of
+ * `spec.fields`, in that order. Returns the values (newest last).
+ */
+export function extractUntrustedValues(decoded: JsonValue | undefined, spec: { tool_results?: boolean; fields?: string[] }): string[] {
+  const out: string[] = [];
+  if (!isObj(decoded)) return out;
+  if (spec.tool_results !== false) toolResults(decoded, out);
+  for (const f of spec.fields ?? []) walk(decoded, splitPath(f), 0, out);
+  return out;
+}
+
 export type ExtractKind = "json" | "text" | "form" | "multipart" | "binary" | "none";
 
 /** Lua's tonumber(h, 16) + string.char: bytes, so %C3%BC is two bytes not one char. */
@@ -191,14 +232,15 @@ function multipartValues(body: string, contentType: string, out: string[]): void
 
 /**
  * Extract text from a raw body. Returns the text (values joined with "\n"),
- * the kind, and the values in order (newest last) for window().
+ * the kind, the values in order (newest last) for window(), and the decoded
+ * JSON value when the kind is "json".
  */
 export function extract(
   body: string | undefined | null,
   contentType: string | undefined | null,
   fields: string[],
   jsonDecode: (s: string) => JsonValue = (s) => JSON.parse(s) as JsonValue,
-): [string, ExtractKind, string[]] {
+): [string, ExtractKind, string[], JsonValue?] {
   if (typeof body !== "string" || body === "") return ["", "none", []];
   const rawCt = typeof contentType === "string" ? contentType : "";
   const ct = asciiLower(rawCt);
@@ -217,7 +259,7 @@ export function extract(
     }
     if (ok && isObj(decoded)) {
       const values = extractJsonValues(decoded as JsonValue, fields);
-      return [values.join("\n"), "json", values];
+      return [values.join("\n"), "json", values, decoded as JsonValue];
     }
     // declared JSON that is not: the backend rejects it too
     if (declaredJson) return ["", "none", []];

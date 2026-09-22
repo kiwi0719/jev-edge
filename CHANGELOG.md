@@ -6,6 +6,13 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-23
+
+Retrieved content judged on its own, accuracy measured beyond deepset, and
+Laya as an L2 judge with a System One conformance suite. Nothing changes for
+an existing deployment unless it opts in (`untrusted.enabled`,
+`provider = "laya"`); every existing golden vector is unchanged.
+
 ### Added
 - **Laya as an L2 judge.** `provider = "laya"` (Lua and JS) sends the jev
   System One request to a server you run; its scores stay apart from jev's in
@@ -33,12 +40,70 @@ All notable changes to this project are recorded here. The format follows
   `make calibrate` refuses a log that mixes judges until `PROVIDER=` /
   `MODEL=` (`--provider` / `--model`) picks one, since their scores are not
   comparable.
+- **Retrieved content judged on its own** (`untrusted`, off by default, hot
+  reloadable, overridable per rule). L1 cuts retrieved content out of a body
+  parsed whole: OpenAI `role: "tool"` / `"function"` messages, Anthropic
+  `tool_result` blocks, Responses `function_call_output` items, and any
+  `untrusted.fields` JSON path. It gets its own judging window and is judged
+  in a parallel call with the new `untrusted` question, without the deployment
+  context; the whole-text judgment is unchanged and the request gets the
+  higher score. Its own cache entry (tool results repeated in a conversation's
+  history are not paid for again), a request fingerprint that covers it (trust
+  and the verdict cache cannot pass new retrieved content under old text), and
+  retrieved content judged alone next to a message too short to judge
+  (reason `retrieved content`). Lua and TypeScript cores, 12 new golden vectors
+  (`judge.by_question` in the vector format answers only the questions a
+  prompt asked), APISIX and Kong schemas, the starter config, and Test::Nginx
+  cases through the OpenResty adapter (hot toggle through `/_jev/config`, the
+  Responses shape, a malformed section refused; the `mock` provider takes
+  `mock_scores` per question for them). On a held-out
+  set of 1,200 tool results the question was not written against, the shipped
+  core with it on cut misses at 0.5 from 86.8% to 19.2% with 1 false positive
+  in 700; one more call per request carrying tool content, L2 p50 277 → 293 ms.
+- **Held-out set** (`bench/datasets/heldout-v1.jsonl`, `make suite-heldout`):
+  InjecAgent and LLMail-Inject phase 1 attacks against benign InjecAgent
+  templates and Hermes function-calling results, rendered as OpenAI, Anthropic
+  or Responses bodies, run end to end through `core.evaluate`. Committed
+  before the run.
+- **The untrusted-segment experiment** (`make suite-untrusted`): the question
+  measured on suite v1's indirect records and on non-email tool results
+  (`suite-v1-tooldocs`), committed before its first run. It showed that the
+  question, not separating the text, does the work.
+- **Accuracy chart** (`docs/bench-accuracy-*.svg`, `make bench-chart`), drawn
+  from the committed live results.
+- **Template wording pinned across cores**: a vitest case compares every
+  TypeScript template to its `core/templates/*.lua` file.
+- **Suite v1: accuracy beyond deepset.** `bench/datasets/suite-v1.jsonl`, 2,735
+  whole chat request bodies from seven MIT / Apache-2.0 sources: Chinese
+  instruction attacks (Safety-Prompts) against Chinese benign instructions,
+  over-defense look-alikes (NotInject), indirect injection in retrieved emails
+  and tool results (LLMail-Inject, BIPIA), and attacks spliced into real
+  multi-turn threads (OpenAssistant, Gandalf). `make suite-fetch` /
+  `suite-build` / `suite-live [CTX=1]` / `suite-report`. First live run
+  committed with its results: strong on Chinese override and multi-turn, weak
+  on indirect injection (BIPIA 81.5% miss at 0.5), and the general-assistant
+  deployment context raised false positives instead of helping. See
+  `bench/suite/README.md`, including two source categories whose labels did
+  not hold up.
+
+### Changed
+- **The latency chart is redrawn from a new run**, and its "hard cut at
+  300 ms" label is gone: `timeout_ms` is the adaptive timeout's floor, so the
+  slow-provider scenario waits up to `timeout_max_ms` (p99 478 ms against a
+  500 ms mock). The 0.5.0 code gives the same 475 ms; the old chart no longer
+  matched the code it described.
 
 ### Fixed
 - **CodeQL `js/incomplete-url-substring-sanitization`** in
   `adapters/js/test/worker.test.ts`: the fetch stub matched the judge by URL
   prefix, which `api.typesafe.ai.example` also passes; it compares the parsed
   host now. Test-only, no runtime change.
+
+### Known gap
+- Without `untrusted`, Responses API `function_call_output` items are not
+  judged at all (their text is under `output`, which no default text field
+  reads). The held-out run shows every attack in that shape passing with it
+  off. Turn `untrusted` on when fronting the Responses API with tools.
 
 ## [0.5.0] - 2026-09-23
 

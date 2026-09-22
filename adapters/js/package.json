@@ -1,6 +1,6 @@
 {
   "name": "@jev-edge/js",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "jev-edge for JavaScript runtimes: Cloudflare Workers and Pages, Next.js, Node, Hono, Lambda@Edge, Deno Deploy. Same core contract as the OpenResty adapter.",
   "keywords": [
     "jev-edge",

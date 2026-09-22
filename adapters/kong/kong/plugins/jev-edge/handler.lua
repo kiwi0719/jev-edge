@@ -39,7 +39,7 @@ local HEADER_NAMES = { "X-Jev-Verdict", "X-Jev-Score", "X-Jev-Source", "X-Jev-Re
 local DEFAULT_BLOCK_BODY = '{"error":"request rejected"}'
 
 local JevEdge = {
-  VERSION  = "0.5.0",
+  VERSION  = "0.6.0",
   -- 905: after authentication (key-auth 1250, jwt 1450, basic-auth 1100, ...),
   -- ip-restriction (990), request-size-limiting (951), acl (950) and
   -- rate-limiting (910), so a request that is refused anyway never costs a

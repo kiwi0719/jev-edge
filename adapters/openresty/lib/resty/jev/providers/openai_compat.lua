@@ -126,7 +126,8 @@ function _M.build_request(prompt, cfg, nonce)
       ["Authorization"] = cfg.api_key and ("Bearer " .. cfg.api_key) or nil,
     },
     body = body,
-    ctx  = { questions = wanted },
+    -- the judged text too: parse_response checks the reply is not an echo of it
+    ctx  = { questions = wanted, text = prompt.text },
   }
 end
 
@@ -167,6 +168,41 @@ local function prob(v)
   if n < 0 then return 0 end
   if n > 1 then return 1 end
   return n
+end
+
+-- The answer values an object gives for the asked questions, as one
+-- comparable string ("injection=0|abuse=0.2"), or nil when it answers none.
+local function answer_sig(o, names)
+  local parts, any = {}, false
+  for _, name in ipairs(names) do
+    local v = prob(o[name])
+    if v then any = true end
+    parts[#parts + 1] = name .. "=" .. (v and string.format("%.6g", v) or "-")
+  end
+  return any and table.concat(parts, "|") or nil
+end
+
+--- true when a reply object is a copy of an answer planted in the judged
+-- text: the same values for the asked questions as a JSON object found in
+-- the input. A model that repeats the input's own verdict was steered by it,
+-- which is what an injection is; the caller scores it as one. Compared on
+-- parsed values, so re-spacing or 0 vs 0.0 does not hide the copy.
+function _M.echoes_input(content, text, wanted)
+  if type(text) ~= "string" or not text:find("{", 1, true) then return false end
+  local names = sorted_names(wanted)
+  local planted = {}
+  for _, src in ipairs(json_objects(text)) do
+    local o = cjson.decode(src)
+    local sig = type(o) == "table" and answer_sig(o, names)
+    if sig then planted[sig] = true end
+  end
+  if next(planted) == nil then return false end
+  for _, src in ipairs(json_objects(content)) do
+    local o = cjson.decode(src)
+    local sig = type(o) == "table" and answer_sig(o, names)
+    if sig and planted[sig] then return true end
+  end
+  return false
 end
 
 --- Reduce the reply text to { [question] = probability }.
@@ -228,6 +264,15 @@ function _M.parse_response(status, body, _cfg, ctx)
       for k, v in pairs(o) do if type(k) == "string" and prob(v) then wanted[k] = true end end
     end
     if next(wanted) == nil then return nil, "openai-compat: content is not JSON" end
+  end
+  -- a reply that copies an answer planted in the input: the judge was steered,
+  -- so every asked question scores 1 (an error would fail open, which is
+  -- exactly what the planted answer is for)
+  if ctx and _M.echoes_input(content, ctx.text, wanted) then
+    local out = {}
+    for name in pairs(wanted) do out[name] = 1 end
+    if ngx then ngx.log(ngx.WARN, "jev-edge: openai-compat judge echoed an answer planted in the input") end
+    return out
   end
   local out, err = _M.parse_content(content, wanted)
   if not out then return nil, err end

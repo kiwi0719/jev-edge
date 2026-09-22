@@ -253,6 +253,53 @@ export function parseOpenaiContent(content: string, wanted: string[]): JudgeResu
   return [out, null];
 }
 
+/** The answer values an object gives for the asked questions, as one
+ *  comparable string, or undefined when it answers none (port of answer_sig). */
+function answerSig(o: Record<string, unknown>, names: string[]): string | undefined {
+  let any = false;
+  const parts = names.map((name) => {
+    const v = prob(Object.prototype.hasOwnProperty.call(o, name) ? o[name] : undefined);
+    if (v !== undefined) any = true;
+    return name + "=" + (v !== undefined ? String(v) : "-");
+  });
+  return any ? parts.join("|") : undefined;
+}
+
+function objectsOf(s: string): Record<string, unknown>[] {
+  const out: Record<string, unknown>[] = [];
+  for (const src of jsonObjects(s)) {
+    try {
+      const o = JSON.parse(src) as unknown;
+      if (o && typeof o === "object" && !Array.isArray(o)) out.push(o as Record<string, unknown>);
+    } catch {
+      // not JSON: skip it
+    }
+  }
+  return out;
+}
+
+/**
+ * true when a reply object is a copy of an answer planted in the judged text:
+ * the same values for the asked questions as a JSON object in the input. A
+ * model that repeats the input's own verdict was steered by it, which is what
+ * an injection is; the caller scores it as one. Port of echoes_input in
+ * providers/openai_compat.lua; compared on parsed values, not on spelling.
+ */
+export function echoesInput(content: string, text: string | undefined, wanted: string[]): boolean {
+  if (typeof text !== "string" || !text.includes("{")) return false;
+  const names = [...wanted].sort();
+  const planted = new Set<string>();
+  for (const o of objectsOf(text)) {
+    const sig = answerSig(o, names);
+    if (sig) planted.add(sig);
+  }
+  if (planted.size === 0) return false;
+  return objectsOf(content).some((o) => {
+    const sig = answerSig(o, names);
+    return sig !== undefined && planted.has(sig);
+  });
+}
+
 export const openaiCompat: Provider = {
   name: "openai-compat",
   async call(prompt, cfg, timeoutMs) {
@@ -288,7 +335,15 @@ export const openaiCompat: Provider = {
       return [null, errorString(e, timeoutMs)];
     }
     if (typeof content !== "string") return [null, "openai-compat: no content"];
-    return parseOpenaiContent(content, Object.keys(prompt.questions));
+    const wanted = Object.keys(prompt.questions);
+    // a reply that copies an answer planted in the input: the judge was
+    // steered, so every asked question scores 1 (an error would fail open,
+    // which is exactly what the planted answer is for)
+    if (echoesInput(content, prompt.text, wanted)) {
+      console.warn("jev-edge: openai-compat judge echoed an answer planted in the input");
+      return [Object.fromEntries(wanted.map((n) => [n, 1])), null];
+    }
+    return parseOpenaiContent(content, wanted);
   },
 };
 

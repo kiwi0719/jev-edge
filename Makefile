@@ -15,7 +15,7 @@ lint:
 LUAJIT ?= luajit
 luajit-check:
 	@for f in $$(find core rules -name '*.lua' -not -path '*/spec/*'); do \
-	  $(LUAJIT) -bl $$f >/dev/null || exit 1; done; echo "luajit ok"
+	  $(LUAJIT) -e "assert(loadfile('$$f'))" || exit 1; done; echo "luajit ok"
 
 check: lint invariants luajit-check golden-check test
 

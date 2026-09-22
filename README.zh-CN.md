@@ -31,6 +31,7 @@ jev-edge 跑在 nginx / OpenResty 或 Apache APISIX 里，站在 Envoy、Istio�
 - [选阈值](#选阈值)
 - [误报](#误报)
 - [主体信誉](#主体信誉)
+- [检索内容](#检索内容)
 - [花多少钱](#花多少钱)
 - [Bench](#bench)
 - [设计](#设计)
@@ -43,13 +44,13 @@ jev-edge 跑在 nginx / OpenResty 或 Apache APISIX 里，站在 Envoy、Istio�
 
 | | |
 |---|---|
-| 版本 | `v0.5.0` |
+| 版本 | `v0.6.0` |
 | 网关，原生 | OpenResty；Apache APISIX 和 Kong Gateway（插件，同一套引擎） |
 | 网关，走 `/_jev/authz` | Envoy（HTTP 和 gRPC ext_authz）、HAProxy（SPOE agent）、Traefik、Caddy 和普通 nginx（forward-auth），各自对真实网关做了端到端测试；Istio、Envoy Gateway、Azure APIM 和 Apigee 以[配方](docs/recipes.zh-CN.md)形式提供；LiteLLM proxy 作为 guardrail |
 | JavaScript 宿主 | Cloudflare Workers 和 Pages、Next.js、Node、Hono、Lambda@Edge、Deno Deploy，共用一份受同一批 golden vectors 约束的 TypeScript core 移植（npm 上的 [`@jev-edge/js`](https://www.npmjs.com/package/@jev-edge/js)） |
 | 运维 | `/_jev/metrics` 暴露 Prometheus 指标，[ops/](ops/README.zh-CN.md) 里有 Grafana dashboard 和带单元测试的告警规则 |
-| 测试覆盖 | 349 个 busted spec（含 194 个 golden vectors）、348 个 vitest 用例（回放同一批向量加 JS 宿主）、431 条 Test::Nginx 断言、16 个 guardrail 测试、7 个 Go 测试（gRPC shim、SPOE agent）、对真实 Envoy、Traefik / Caddy / nginx、APISIX、Kong 和 HAProxy 的五套端到端、告警规则单元测试、仓库不变量检查、两套 bench、一次 soak |
-| provider 真实联调 | `jev` 对 TypeSafe API 跑完 662 条全量数据集和 2,735 条的 [suite v1](bench/suite/README.md)；`openai-compat` 对 Ollama 容器 |
+| 测试覆盖 | 393 个 busted spec（含 213 个 golden vectors）、388 个 vitest 用例（回放同一批向量加 JS 宿主）、473 条 Test::Nginx 断言、16 个 guardrail 测试、7 个 Go 测试（gRPC shim、SPOE agent）、对真实 Envoy、Traefik / Caddy / nginx、APISIX、Kong 和 HAProxy 的五套端到端、告警规则单元测试、仓库不变量检查、下文的延迟与准确率 bench、一次 soak |
+| provider 真实联调 | `jev` 对 TypeSafe API 跑完 662 条 deepset 数据集、2,735 条的 [suite v1](bench/suite/README.md) 和 1,200 条 tool 结果的留出测试集；`openai-compat` 对 Ollama 容器 |
 | 生产使用 | 目前没有已知案例。先用 `monitor` 模式跑 |
 
 各版本加了什么、接下来做什么见[路线图](#路线图)。
@@ -355,6 +356,29 @@ subject = {
 
 `block_at` 从你自己的流量里定：配好主体，先跑 `monitor` 模式，然后 `make calibrate LOG=... [LABELS=...]` 会用同样的时间窗按主体回放日志，列出每个 `block_at` 会拦下多少主体，并把正常主体和发过带标签攻击的主体分开统计，最后给出建议值。不需要多轮数据集：这是信誉，不是序列打分。
 
+## 检索内容
+
+会调用工具或检索文档的助手，会把取回的内容再发给模型：搜索结果、邮件、网页、API 返回。藏在里面的指令（间接提示注入）是内容的作者写的，不是你的用户写的。默认情况下 jev-edge 把它当作整段文本的一部分，用 `injection` 问题来判；这个问题问的是"*用户*是不是在攻击助手"，而一封邮件并不是用户，所以这类攻击大多得分很低。
+
+`untrusted`（0.6.0 起，默认关闭）会把检索内容单独拿出来，用一个专门为它写的问题来判：这段外部文本有没有在指挥读它的 AI？整段文本的判定保持不变，两次调用并行，请求取两者中的较高分。
+
+```lua
+untrusted = {
+  enabled      = true,   -- 默认关闭；可以通过 /_jev/config 热更新
+  tool_results = true,   -- OpenAI 的 role "tool" / "function"、Anthropic 的 tool_result、Responses 的 function_call_output
+  fields       = { "documents[*].text" },  -- 你的应用在 tool 消息之外放检索文本的 JSON 路径
+},
+```
+
+也可以运行时打开：`curl -X PUT localhost:8090/_jev/config -d '{"untrusted":{"enabled":true}}'`。在某条 rule 里写自己的 `untrusted` 表，就只对那条路由生效。
+
+在一个 1,200 条 tool 结果的留出测试集上（InjecAgent、LLMail-Inject 第一阶段、Hermes function calling，这个问题写的时候都没见过），发布版 core 在阈值 0.5 下抓到的攻击从 13% 升到 81%，700 条良性结果里只有 1 条误报（[详情](bench/suite/README.md#held-out-test-the-shipped-core)）。
+
+- **代价**：每个带 tool 内容或 `fields` 的请求多一次 provider 调用，其他请求不变。那次运行里 L2 耗时 p50 从 277 ms 到 293 ms。
+- **Responses API**：不开 `untrusted` 时，`function_call_output` 根本不会被读到（它不在 `input[*].content` 下）。如果你在带工具的 Responses API 前面部署，请打开它。
+- **看不到的**：直接粘进用户消息里的检索文本。把它作为 tool 消息发送，或者在 `fields` 里写明它的字段。
+- **容易误判的**：本来就是写给 AI 读的文本被当作内容检索回来，比如系统提示词、提示词库、AI 相关文档。它按测量时的方式，不带部署上下文判定。L3 只复审整段文本。
+
 ## 花多少钱
 
 账单由两个数决定：多少流量到达 L2，以及 provider 的输入价格。
@@ -363,43 +387,46 @@ subject = {
 月成本 ≈ QPS × L2 占比 × 2.63M 秒/月 × 每次调用 token 数 × 每 token 价格
 ```
 
-一次带部署上下文的 `injection` 模板 L2 调用约 610 个输入 token、39 个输出 token，来自 live 跑的实测。价格会变，[docs/cost.zh-CN.md](docs/cost.zh-CN.md) 有按写作时公布价格算的一张表，以及 `monitor` 模式跑一天后拿到真实 L2 占比和 token 数的两个指标。
+一次带部署上下文的 `injection` 模板 L2 调用约 610 个输入 token、39 个输出 token，来自 live 跑的实测。打开 [`untrusted`](#检索内容) 后，带 tool 内容的请求会多一次调用。价格会变，[docs/cost.zh-CN.md](docs/cost.zh-CN.md) 有按写作时公布价格算的一张表，以及 `monitor` 模式跑一天后拿到真实 L2 占比和 token 数的两个指标。
 
 ## Bench
 
-三类测量，三个问题。完整数字、方法和注意事项在 [bench/report.md](bench/report.md) 和[设计文档](docs/design.zh-CN.md#bench-与验收)。
+四个问题，各有各的测量。下面的一切都能在仓库里复现；方法和注意事项见 [bench/report.md](bench/report.md)、[bench/suite/README.md](bench/suite/README.md) 和[设计文档](docs/design.zh-CN.md#bench-与验收)。
 
 **网关加了多少**（`make bench`，Docker 里的 OpenResty，`mock` provider，不需要 key）：
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/bench-latency-dark.svg">
-  <img src="docs/bench-latency-light.svg" alt="五个场景 p50 与 p99 延迟的对数坐标柱状图：基线 36/47 µs，未监控路径 39/71 µs，健康 Jev 102/106 ms，缓慢 Jev 53 µs/288 ms，宕机 Jev 48/173 µs" width="100%">
+  <img src="docs/bench-latency-light.svg" alt="五个场景 p50 与 p99 延迟的对数坐标柱状图：基线 36/55 µs，未监控路径 39/76 µs，健康 Jev 103/106 ms，缓慢 Jev 62 µs/478 ms，宕机 Jev 49/149 µs" width="100%">
 </picture>
 
-L1 放行的流量 p99 多花 24 µs。"健康 Jev"那组是一个 100 ms 应答的 mock，所以它显示的是在 provider 耗时之上约 2 ms 的流水线开销。Jev 宕机时 100% 流量放行，p99 173 µs。
+L1 放行的流量 p99 大约多花 20 µs。"健康 Jev"那组是一个 100 ms 应答的 mock，所以它显示的是在 provider 耗时之上 2 到 3 ms 的流水线开销。"缓慢 Jev"的 mock 500 ms 才应答：`timeout_ms` 是自适应超时的下限，不是硬切断，所以慢应答会一直等到 `timeout_max_ms`。Jev 宕机时 100% 流量放行，p99 149 µs。
 
-**provider 花多少**（`make live-check`，真实 TypeSafe API）：从测试机看 p50 约 270 ms。自适应超时的 400 ms 下限和 1000 ms 上限就是从这来的。`/_jev/health` 会报告你的。
+**provider 花多少**（`make live-check`，真实 TypeSafe API）：从测试机看 p50 约 270 到 300 ms。自适应超时的 400 ms 下限和 1000 ms 上限就是从这来的。`/_jev/health` 会报告你的。
 
-**流水线有没有保住 Jev 的准确率**（`make bench-offline` 回放记录的答案，`make live-full` 打真实 API；deepset/prompt-injections，662 条）：
+**抓到多少、误报多少**（对 TypeSafe API 的真实运行，结果提交在 `bench/datasets/` 下）：
 
-| Jev 看到的 | AUC | 0.50 下 FP / 漏报 | 0.70 下 FP / 漏报 |
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/bench-accuracy-dark.svg">
+  <img src="docs/bench-accuracy-light.svg" alt="阈值 0.5 下攻击检出率与误报的横向柱状图：deepset 只有文本 63%（误报 0%），带部署上下文 95%（0.8%）；suite v1 中文指令劫持 91%（0%），多轮 92%（1.6%），LLMail-Inject 邮件 70%（0%），BIPIA 邮件 18%（0%）；留出的 tool 结果 untrusted 关闭 13%（0%），打开 81%（0.1%）" width="100%">
+</picture>
+
+| 数据集 | 测什么 | AUC | 0.50 下 FP / 漏报 |
 |---|---|---|---|
-| 只有文本 | 0.983 | 0.0% / 37.3% | 0.0% / 47.5% |
-| 文本 + `deployment_context` | **0.996** | 0.8% / 5.3% | 0.0% / 13.3% |
+| [deepset/prompt-injections](bench/report.md)，只有文本 | 单轮英语和德语，为一家新闻网站标注 | 0.983 | 0.0% / 37.3% |
+| 同上，带 `deployment_context` | | **0.996** | 0.8% / 5.3% |
+| [suite v1](bench/suite/README.md)：Safety-Prompts Goal_Hijacking 对 alpaca-zh | 中文指令劫持 | 0.994 | 0.0% / 9.3% |
+| suite v1：OpenAssistant 对话 | 多轮，攻击插入真实对话 | 0.997 | 1.6% / 8.4% |
+| suite v1：LLMail-Inject | 攻击邮件混在检索到的邮件里 | 0.967 | 0.0% / 29.8% |
+| suite v1：BIPIA EmailQA | 邮件里客气的指令 | 0.993 | 0.0% / 81.5% |
+| suite v1：NotInject | 满是触发词的良性提示 | - | 0.9% / - |
+| [留出的 tool 结果](bench/suite/README.md#held-out-test-the-shipped-core)，`untrusted` 关闭 | InjecAgent、LLMail 第一阶段、Hermes；OpenAI、Anthropic、Responses 三种请求体 | 0.784 | 0.0% / 86.8% |
+| 同上，`untrusted` 打开 | | **0.997** | 0.1% / 19.2% |
 
-一个数据集、一种部署、主要是德语和英语。把它当作"部署上下文很重要"的证据，不要当作你流量上会看到的比率；用 `monitor` 模式量你自己的。
-
-**这个数据集没覆盖到的**（`make suite-live`，[suite v1](bench/suite/README.md)：2,735 个完整的 chat 请求体，来自七个 MIT / Apache-2.0 数据源，只有文本，阈值 0.5）：
-
-| 切片 | AUC | 0.50 下 FP / 漏报 |
-|---|---|---|
-| 中文指令劫持（Safety-Prompts Goal_Hijacking 对 alpaca-zh） | 0.994 | 0.0% / 9.3% |
-| 多轮，攻击插入 OpenAssistant 对话 | 0.997 | 1.6% / 8.4% |
-| 间接注入，LLMail-Inject 邮件放在 user 消息或 tool 结果里 | 0.967 | 0.0% / 29.8% |
-| 间接注入，BIPIA EmailQA | 0.993 | 0.0% / 81.5% |
-| 良性近似样本（NotInject） | - | 0.9% / - |
-
-间接注入是短板：良性邮件分数很低，所以排序没问题，但藏在邮件里的攻击大多低于任何你会上线的阈值。带部署上下文的那一轮结果和各项局限见 [suite README](bench/suite/README.md)，其中包括两个源标签站不住的类别。
+- **部署上下文在它所针对的数据集上很重要。** 在 deepset 上，它把 0.5 下的漏报率从 37% 降到 5%。在 suite v1 上，一段泛泛的通用助手上下文没有带来任何提升，反而把良性近似样本的误报从 0.9% 推到 11.5%；要写具体的（见[写好部署上下文](#写好部署上下文)）。
+- **直接攻击在中文和多轮里都能抓到。** 攻击放在较早的轮次里，被抓到的概率和放在最后一轮差不多。
+- **不开 `untrusted` 时，间接注入是短板。** 良性邮件分数很低，所以排序没问题，但藏在检索内容里的攻击大多低于任何你会上线的阈值。[`untrusted`](#检索内容) 就是这里测出来的解法：在它从未见过的 tool 结果上，0.5 下的漏报从 87% 降到 19%，700 条里 1 条误报。
+- **这些数字不是什么。** 每个数据集都是公开的，大部分攻击是生成的，有两个源类别的标签站不住（见 suite README），每种配置只跑了一次。把它们当作"什么因素重要"的证据，不要当作你会看到的比率；用 `monitor` 模式和 `make calibrate` 量你自己的。
 
 ## 设计
 
@@ -423,7 +450,7 @@ adapters/
   litellm/       调 /_jev/authz 的 LiteLLM proxy guardrail（Python）
   js/            core 的 TypeScript 移植；Cloudflare、Next.js、Node、Hono、Lambda@Edge、Deno 预设；vitest 回放 core/golden
 rules/           L1 规则集（PCRE 预筛、监控路径、文本字段）
-bench/           离线准确率 bench、Docker 延迟 bench、live 检查、soak、calibrate、labels-from-log、context lint、报告
+bench/           离线准确率 bench、Docker 延迟 bench、live 检查、soak、calibrate、labels-from-log、context lint、报告；suite/ 放中文、多轮、间接注入和留出测试
 demo/            "30 秒试一下"用的 docker compose demo
 docs/            design、cost、recipes（Istio、Envoy Gateway、APIM、Apigee）、bench 图表
 ops/             Grafana dashboard、Prometheus 告警规则及其 promtool 测试
@@ -446,7 +473,8 @@ scripts/         invariants.lua：针对过去审计发现的各类 bug 的检�
 | 0.3.1 ✅ | 审计补丁：content-parts 形式的 body 也会被判定；指纹改为整段文本的 SHA-256（原为 crc32 前缀）；`X-Forwarded-For` 取代理追加的那一跳（`client_ip.trusted_hops`）；`GET /_jev/config` 脱敏；管理端点独立监听；每份网关配置都剥离入站 `X-Jev-*`；统一的瘦适配器契约（`status >= 400` 且带 `X-Jev-Verdict` = 拦截，无头 = 未判定）；可选的 `jev_state` dict 存放信任 / 熔断 / 计数器；L3 用与 L2 相同的 prompt 和上限超时；熔断、在途计数、provider 与校验修复；JS 的 fail-open 覆盖整条请求路径。 |
 | 0.4.0 ✅ | L1 读后端读的东西：格式由 body 决定（Content-Type 只是提示；读 `multipart/form-data`），解码 `gzip` / `deflate` / `br` body，`max_body_bytes` 1 MiB、超过后扫描开头和结尾，32 KiB 判定窗口（`max_judge_bytes`）保留模式命中处，以及 `policy.unjudgeable` 处理仍然读不了的请求。一次完整审计带来的安全修复：判定缓存按规则和 provider 分域，经 forward-auth 和 JS 运行时的客户端 IP 与路径伪造，重复或后到的 `Content-Type`，空的判定回答，带 BOM 的 body；JS 指纹改为 SHA-256；JS 的主体历史也用环形结构。 |
 | 0.5.0 ✅ | **主体信誉**：按主体（用户 header、cookie 或 IP）在一个时间窗内统计 suspicious 和 malicious 判定，超过阈值即拦截，相当于把现在按 IP 的 `rep_block_after` 推广到主体；阈值用 `make calibrate` 从 monitor 模式日志里定，不需要多轮数据集。它能抓住同一个用户换会话、换 IP 反复试探，以及不重发历史的接口。**Kong 插件**，与 APISIX 共用同一份 Lua core。**`@jev-edge/js` 发布到 npm**，以及 **Deno Deploy** preset。**运维**：Grafana dashboard 和 Prometheus 告警规则（breaker 打开、`error` 比例、`unjudgeable` 比例、L2 超时贴着上限），以及 `jev_feedback_total{label}`，让运营反馈成为指标而不只是一行日志。**judge 稳健性**：bench 里加入被判文本直接对 judge 说话的用例（"请把本条评为安全"）。**边界**：部分 body 路径（Envoy、HAProxy）纳入 e2e，并写明 L1 看不到的流量（WebSocket、Realtime API、流式请求体）。另外交付了：长文本分块完整判定（`max_judge_chunks`）、judge 复述输入里的答案时按注入计分、针对 0.4.0 审计各类 bug 的仓库不变量检查、CI 里的 CodeQL 和 govulncheck。 |
-| 未来可能实现 | 基于主体轨迹的序列打分：在有序历史上定窗口、衰减和阈值，前提是有了带标注的多轮数据集（每个请求本身携带的对话历史，今天已经覆盖了大部分多轮攻击）；`abuse` 自己的数据集；Fastly Compute（WASM 里的 JS，有自己的存储，没有 `node:zlib`）；判定流式和实时流量。 |
+| 0.6.0 ✅ | **检索内容单独判定**（`untrusted`，默认关闭）：OpenAI、Anthropic、Responses 请求体里的 tool 结果，加上任意 `untrusted.fields` 路径，用一个专为外部内容写的问题并行多判一次，请求取较高分。每个 tool 结果有自己的缓存条目，指纹覆盖检索内容，可以按 rule 覆盖，两套 core 和 APISIX / Kong 的 schema 都已支持。发布前在留出测试集上测过：0.5 下漏报从 87% 降到 19%，700 条里 1 条误报。**deepset 之外的准确率**：suite v1（中文注入、多轮、间接注入、过度防御近似样本，来自七个公开数据源的 2,735 个完整请求体）、untrusted 分段实验、留出测试集和一张准确率图；每次真实运行的结果都连同数据一起提交，不好看的也一样。一个把 TypeScript 模板文案钉死到 Lua 文件的测试。 |
+| 未来可能实现 | 基于主体轨迹的序列打分：在有序历史上定窗口、衰减和阈值，前提是有了带标注的多轮数据集（每个请求本身携带的对话历史，今天已经覆盖了大部分多轮攻击）；`abuse` 自己的数据集；Fastly Compute（WASM 里的 JS，有自己的存储，没有 `node:zlib`）；判定流式和实时流量；中文等其他语言的检索内容（目前还没有公开的间接注入数据集）；在用户自己的消息里区分出检索文本；带部署上下文的 `untrusted` 问题（尚未测量）。 |
 
 ✅ 表示已随某个 tag 发布；"计划中"是下一个版本的范围，不是日期。
 

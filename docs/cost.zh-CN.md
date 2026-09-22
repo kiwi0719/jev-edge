@@ -19,6 +19,8 @@
 
 加上 `abuse` 模板，每次调用的 token 略增；两个问题共用一个请求。用户消息越长越贵：上面是数据集里短 prompt 的数字，`rules.max_judge_bytes`（32 KiB 文本）是每次调用的上限。更长的文本在送 L2 之前被切成这个窗口（`jev_window_total` 统计次数），所以大 body 放进 prompt 的文本至多 32 KiB。
 
+打开 `untrusted` 后（README "检索内容"），带 tool 结果或 `untrusted.fields` 的请求会多一次调用：只送检索文本，问 `untrusted` 问题，不带部署上下文。这类请求按两次算；对话历史里重复出现的 tool 结果，从第二轮起命中缓存。
+
 ## 算例
 
 TypeSafe 在 2026-09-22 公布的输入价格是 **每十亿输入 token $42**；没有列输出价格，每次调用 39 个输出 token 在任何合理单价下都可以忽略。**做预算前先去 [typesafe.ai](https://typesafe.ai/) 核对当前价格**，这张表不会随价格变动而更新。

@@ -1,4 +1,4 @@
-.PHONY: test lint check invariants luajit-check golden golden-check calibrate labels context-lint test-js test-openresty bench bench-offline bench-judge bench-judge-live bench-chart dist opm-build rock-lint rock-pack rock-upload install live-check live-full live-openai soak shim e2e-envoy e2e-forward-auth e2e-apisix e2e-kong e2e-haproxy test-litellm suite-fetch suite-build suite-live suite-report suite-tooldocs-build suite-untrusted suite-untrusted-report
+.PHONY: test lint check invariants luajit-check golden golden-check calibrate labels context-lint test-js test-openresty bench bench-offline bench-judge bench-judge-live bench-chart dist opm-build rock-lint rock-pack rock-upload install live-check live-full live-openai soak shim e2e-envoy e2e-forward-auth e2e-apisix e2e-kong e2e-haproxy test-litellm suite-fetch suite-build suite-live suite-report suite-tooldocs-build suite-untrusted suite-untrusted-report suite-heldout-build suite-heldout suite-heldout-report
 
 test:
 	busted
@@ -82,9 +82,11 @@ bench:
 	docker build -q -t jev-edge-test -f adapters/openresty/Dockerfile.test adapters/openresty
 	docker run --rm --init -v "$(CURDIR)":/work jev-edge-test sh /work/bench/run.sh
 
-# Redraw docs/bench-latency-*.svg from a results.txt (default: the 4-connection run).
+# Redraw docs/bench-latency-*.svg from a results.txt (default: the 4-connection run)
+# and docs/bench-accuracy-*.svg from the live results committed under bench/datasets.
 bench-chart:
 	lua bench/chart.lua $${RESULTS:-bench/out-c4/results.txt} docs
+	lua bench/chart_accuracy.lua docs
 
 # One real round trip + 60-sample latency/agreement check against the provider.
 # Needs TYPESAFE_API_KEY in .env (gitignored). Costs ~40k input tokens.
@@ -134,6 +136,21 @@ suite-untrusted:
 
 suite-untrusted-report:
 	lua bench/suite/untrusted_report.lua > bench/suite/untrusted-report.md
+
+# Held-out test for untrusted judging in the shipped core (bench/suite/README.md):
+# heldout-v1 through core.evaluate with the real judge, untrusted off and on.
+# ~3.6k calls. suite-heldout-build needs InjecAgent, Hermes and LLMail phase 1
+# in bench/suite/raw (see build_heldout.py).
+suite-heldout-build:
+	python3 bench/suite/build_heldout.py --raw bench/suite/raw
+
+suite-heldout:
+	docker run --rm --env-file .env -v "$(CURDIR)":/work jev-edge-test sh -c \
+	  'resty --http-conf "lua_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt; lua_ssl_verify_depth 5;" \
+	   -I /work/adapters/openresty/lib -I /work /work/bench/suite/heldout.lua'
+
+suite-heldout-report:
+	lua bench/suite/heldout_report.lua > bench/suite/heldout-report.md
 
 # openai-compat provider against an Ollama container on the jev-net network:
 #   docker network create jev-net; docker run -d --rm --name ollama --network jev-net ollama/ollama

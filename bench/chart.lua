@@ -41,7 +41,7 @@ local function render(mode, c)
   w('<?xml version="1.0" encoding="UTF-8"?>')
   w(string.format('<svg xmlns="http://www.w3.org/2000/svg" width="%d" height="%d" viewBox="0 0 %d %d" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12">', W, H, W, H))
   w(string.format('<text x="%d" y="22" font-size="14" font-weight="600" fill="%s">Request latency by scenario, 4 connections, log scale</text>', L, c.txt))
-  w(string.format('<text x="%d" y="38" fill="%s">wrk against OpenResty in Docker, mock provider. Hard cut at 300 ms.</text>', L, c.mut))
+  w(string.format('<text x="%d" y="38" fill="%s">wrk against OpenResty in Docker, mock provider. timeout_ms = 300 is the adaptive floor, not a cut.</text>', L, c.mut))
   for e = lo, hi do
     local v, yy = 10 ^ e, y(10 ^ e)
     w(string.format('<line x1="%d" x2="%d" y1="%.1f" y2="%.1f" stroke="%s" stroke-width="1"/>', L, L + pw, yy, yy, c.grid))
@@ -49,7 +49,7 @@ local function render(mode, c)
   end
   local yc = y(300000)
   w(string.format('<line x1="%d" x2="%d" y1="%.1f" y2="%.1f" stroke="%s" stroke-width="1" stroke-dasharray="4 3"/>', L, L + pw, yc, yc, c.mut))
-  w(string.format('<text x="%d" y="%.1f" text-anchor="end" fill="%s">timeout_ms = 300</text>', L + pw, yc - 5, c.mut))
+  w(string.format('<text x="%d" y="%.1f" text-anchor="end" fill="%s">timeout_ms = 300 (floor)</text>', L + pw, yc - 5, c.mut))
   local n = #order
   local gw = pw / n
   local bw = math.min(34, gw * 0.28)

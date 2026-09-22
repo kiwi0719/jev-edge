@@ -203,6 +203,10 @@ return {
 
 `make bench-judge` 用 L1 跑 `bench/datasets/judge-directed.jsonl`（32 条攻击、13 条相似的正常请求，比如“Is this email safe to open?”）：所有攻击都进入 L2，没有一条正常请求被模式命中。`make bench-judge-live` 把同样的用例发给真实判定器（需要密钥，见 `bench/judge_robustness.lua`）。如果模型*只*复述了输入里植入的答案（对被问的问题给出的值，和被判文本里某个 JSON 对象完全相同；按解析后的值比较，所以改空格或 `0` 与 `0.0` 之类的写法藏不住），说明它被输入牵着走了，这正是注入：每个被问的问题记 1，而不是植入的那个值；这里刻意不按错误处理，因为错误会 fail-open。超过 `max_judge_bytes` 的单条消息中间的指令，如果没有模式命中（比如非英文），在默认的单窗口下会被截掉；`max_judge_chunks > 1` 会分块判定，`max_judge_chunks × max_judge_bytes` 以内的文本全部判到（见 README 的“长文本分块判定”）。
 
+### 检索内容
+
+`injection` 问的是*用户*是不是在攻击助手。检索内容（tool 结果、取回的文档）不是用户，藏在里面的指令通常写得像普通请求（"加一句关于……的话""给……发一封确认"），所以整段文本的判定会把大部分间接注入打成低分。`untrusted`（默认关闭）在 L1 把检索内容从完整解析的 body 里切出来：OpenAI 的 `role: "tool"` / `"function"` 消息、Anthropic 的 `tool_result` 块、Responses 的 `function_call_output` 条目，以及 `untrusted.fields` 指定的路径。它有自己的 `max_judge_bytes` 窗口，作为整段文本之外的另一部分送审（复用切块机制：各自的缓存条目，`call_many` 并行，取最高分，某一部分失败时除非另一部分已经拦截，否则整体按错误处理），问的是 `untrusted` 问题，不带部署上下文。请求的指纹覆盖检索内容，所以信任和判定缓存都不能让新的检索内容借旧文本的名义通过。整段文本的那次调用保持不变。消息短到不值得判、旁边只有检索内容时，只判检索内容。这个问题先在 suite v1 上写好并测过，再放进 core，然后在留出测试集上验证（见"Bench 与验收"）。
+
 ## 策略
 
 ```lua
@@ -363,12 +367,12 @@ jev_window_total
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="bench-latency-dark.svg">
-  <img src="bench-latency-light.svg" alt="五个场景 p50 与 p99 延迟的对数坐标柱状图：基线 36/47 µs，未监控路径 39/71 µs，健康 Jev 102/106 ms，缓慢 Jev 53 µs/288 ms，宕机 Jev 48/173 µs" width="100%">
+  <img src="bench-latency-light.svg" alt="五个场景 p50 与 p99 延迟的对数坐标柱状图：基线 36/55 µs，未监控路径 39/76 µs，健康 Jev 103/106 ms，缓慢 Jev 62 µs/478 ms，宕机 Jev 49/149 µs" width="100%">
 </picture>
 
 | 指标 | 0.1 目标 | 实测 |
 |---|---|---|
-| L1 放行流量的 P99 增量 | ≤ 1 ms | 24 µs |
+| L1 放行流量的 P99 增量 | ≤ 1 ms | 21 µs |
 | 误杀率（enforce） | ≤ 0.1% | 有部署上下文、block ≥ 0.70 时 0.0% |
 | 漏过率相对 Jev 单独 | ≤ oracle + 2 pt | +1.2 pt |
 | 重放缓存命中率 | ≥ 80% | 74% |
@@ -383,6 +387,13 @@ jev_window_total
 | 文本 + `deployment_context` | **0.996** | 0.8% / 5.3% | 0.0% / 13.3% |
 
 一个数据集、662 条样本、一种部署、以德语和英语为主。把这些数字当作"流水线保住了 Jev 的准确率、部署上下文很关键"的证据，而不是你的流量上会看到的比率；用 `monitor` 模式测你自己的。这个数据集的"攻击"里包含"generate C++"这类偏离用途的请求，因为它是为一个新闻助手收集的。没有部署描述，Jev 无从知道这一点，会把它们打成无害。**写好 `deployment_context`。** 然后从自己标注过的流量里选阈值。默认值 0.70：有上下文时在这个数据集上零误杀、13% 漏过；0.50 用 0.8% 的误杀换 5% 的漏过。
+
+deepset 之外，[bench/suite](../bench/suite/README.md) 测的是那个数据集没覆盖到的部分，所有真实运行的结果都已提交：suite v1（中文注入、多轮、间接注入、过度防御近似样本；2,735 个完整请求体）、促成 `untrusted` 的那次实验，以及一个 1,200 条 tool 结果的留出测试集。在留出测试集上，打开 `untrusted` 的发布版 core 把 0.5 下的漏报从 87% 降到 19%，700 条里 1 条误报。
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="bench-accuracy-dark.svg">
+  <img src="bench-accuracy-light.svg" alt="各数据集在阈值 0.5 下的攻击检出率与误报：deepset、suite v1 各切片、留出的 tool 结果（untrusted 关闭与打开）" width="100%">
+</picture>
 
 ## 已定决策
 

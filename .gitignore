@@ -43,3 +43,6 @@ jev-edge/
 
 # agent worktrees
 .claude/worktrees/
+
+# e2e configs derived from the reference ones by run.sh
+adapters/*/e2e/.gen/

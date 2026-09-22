@@ -125,7 +125,21 @@ local function build_req(rules, over)
     -- allow_partial_message, HAProxy past tune.bufsize): scan it as the head
     -- of a larger body instead of parsing truncated JSON as a whole.
     if over.partial and req.body then
-      req.body_head, req.body = req.body, nil
+      -- The gateway cuts at a byte count, so the head can end inside a UTF-8
+      -- sequence (a client picks where with its padding). Drop that
+      -- incomplete sequence: invalid UTF-8 in the L2 prompt can make the
+      -- provider reject the call, and a provider error fails open.
+      local b = req.body
+      for i = #b, math.max(1, #b - 3), -1 do
+        local c = b:byte(i)
+        if c < 0x80 then break end
+        if c >= 0xC0 then
+          local need = c >= 0xF0 and 4 or c >= 0xE0 and 3 or 2
+          if #b - i + 1 < need then b = b:sub(1, i - 1) end
+          break
+        end
+      end
+      req.body_head, req.body = b, nil
       req.body_size = math.max(req.body_size or 0, max + 1)
     end
   end

@@ -278,9 +278,16 @@ function readString(s: string, i: number): [string, number] {
 /** The last key of each text-field path: "messages[*].content" -> "content". */
 export function fieldKeys(fields: string[] | undefined): Set<string> {
   const keys = new Set<string>();
+  // Lua: f:match("([^%.%[%]%*]+)[%[%]%*]*$") -- the last run of name
+  // characters before any trailing "[", "]" or "*". A linear scan, not a
+  // regex: the unanchored pattern backtracks quadratically on long input.
+  const special = (c: string) => c === "." || c === "[" || c === "]" || c === "*";
   for (const f of fields ?? []) {
-    const m = /([^.[\]*]+)[[\]*]*$/.exec(f);
-    if (m) keys.add(m[1]);
+    let end = f.length;
+    while (end > 0 && (f[end - 1] === "[" || f[end - 1] === "]" || f[end - 1] === "*")) end--;
+    let start = end;
+    while (start > 0 && !special(f[start - 1])) start--;
+    if (end > start) keys.add(f.slice(start, end));
   }
   // content parts carry their text under "text"
   if (keys.has("content")) keys.add("text");

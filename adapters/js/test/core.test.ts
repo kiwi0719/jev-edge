@@ -206,3 +206,16 @@ describe("breaker", () => {
     expect(await b.state()).toBe(CLOSED);
   });
 });
+
+describe("normalize.fieldKeys", () => {
+  it("matches core/normalize.lua field_keys, in linear time", () => {
+    const want: Record<string, string> = {
+      "messages[*].content": "content,text", "prompt": "prompt", "input.text": "text", "a.": "", "[*]": "",
+      "x[*]": "x", "a.b[*].c[*]": "c", "": "", "...": "", "a*b": "b", "a]b[": "b",
+    };
+    for (const [c, w] of Object.entries(want)) expect([...core.normalize.fieldKeys([c])].sort().join(","), c).toBe(w);
+    const t0 = Date.now();
+    core.normalize.fieldKeys([")".repeat(200000)]);
+    expect(Date.now() - t0).toBeLessThan(200);
+  });
+});

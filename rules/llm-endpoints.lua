@@ -16,7 +16,7 @@ return {
   -- Bodies up to this size are parsed whole: 1 MiB, nginx's default
   -- client_max_body_size. Past it only the head and tail are scanned. Raise
   -- it with client_max_body_size (and your gateway's body buffer) for
-  -- long-context or vision traffic; see README "Body size".
+  -- long-context or vision traffic; see docs/design.md "Body size".
   max_body_bytes = 1048576,
   -- Text over this many bytes is cut to a window before the fingerprint and
   -- L2: the always_suspect hit, then the newest messages.

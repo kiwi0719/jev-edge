@@ -48,12 +48,12 @@
 <text x="20" y="278" font-weight="600" fill="#1f2328">held-out tool results, the shipped core</text>
 <text x="240" y="303" text-anchor="end" fill="#1f2328">untrusted off</text>
 <rect x="250" y="291" width="400" height="16" rx="3" fill="#eaeef2"/>
-<rect x="250" y="291" width="52.8" height="16" rx="3" fill="#2a78d6"/>
-<text x="296.8" y="303" text-anchor="end" fill="#ffffff" font-weight="600">13%</text>
-<text x="705" y="303" text-anchor="middle" fill="#59636e">0%</text>
+<rect x="250" y="291" width="88.8" height="16" rx="3" fill="#2a78d6"/>
+<text x="332.8" y="303" text-anchor="end" fill="#ffffff" font-weight="600">22%</text>
+<text x="705" y="303" text-anchor="middle" fill="#59636e">0.1%</text>
 <text x="240" y="329" text-anchor="end" fill="#1f2328">untrusted on</text>
 <rect x="250" y="317" width="400" height="16" rx="3" fill="#eaeef2"/>
-<rect x="250" y="317" width="323.2" height="16" rx="3" fill="#eb6834"/>
-<text x="567.2" y="329" text-anchor="end" fill="#ffffff" font-weight="600">81%</text>
+<rect x="250" y="317" width="324.0" height="16" rx="3" fill="#eb6834"/>
+<text x="568.0" y="329" text-anchor="end" fill="#ffffff" font-weight="600">81%</text>
 <text x="705" y="329" text-anchor="middle" fill="#59636e">0.1%</text>
 </svg>

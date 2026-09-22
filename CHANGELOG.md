@@ -6,6 +6,53 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-09-23
+
+Two security fixes, a gap in what L1 reads, and documentation that is quicker
+to read. The Responses fix is the one behaviour change without opting in:
+Responses API tool output now reaches L2 as part of the whole text.
+
+### Security
+- **In-flight overflow no longer trips the breaker.** A call refused by the
+  gateway's own `max_inflight` cap (`judge.BUSY`, "max_inflight exceeded")
+  was recorded as a breaker failure, so a burst of about 85 concurrent
+  requests with distinct text could open the breaker and switch L2 (and L3)
+  off for every path and tenant for `open_s`, repeatable every 30 s. Such a
+  call never reached the provider and is now not recorded at all; when a
+  request is judged in parts (chunks, retrieved content), a busy part no
+  longer turns answered parts into a failure. The request still passes as
+  `verdict=error`. Lua and JS cores.
+
+### Fixed
+- **Responses API tool results are judged.** The default text fields never
+  read a Responses `function_call_output` (its text is under `output`), so
+  with `untrusted` off every tool result in that shape went unjudged (0.6.0
+  held-out: AUC 0.497, every attack passing). `input[*].output` is a default
+  text field now (`llm-endpoints`, `default`, and the fallback for inline
+  rules), as OpenAI `role: tool` and Anthropic `tool_result` content already
+  were. Judged only as whole text, most attacks in it still pass (0.6.1
+  held-out: AUC 0.966, 72% missed at 0.5); turn `untrusted` on for tool
+  traffic.
+
+### Removed
+- **IP trust at L1.** `core/rules.lua` and `rules.ts` passed any IP whose
+  reputation entry had `trusted_until`, but nothing ever wrote it; the L3
+  `safe` counter that would have fed it is gone too. Reputation now only
+  blocks: a run of safe verdicts must not let an attacker warm up an IP and
+  skip L2. Golden vector `ip trusted` is now `ip trust is not a bypass`.
+
+### Changed
+- **README cut to a five-minute read**: what jev-edge is, a quick look, how it
+  works, install, the benchmark table. The operating guide (body size,
+  deployment context, thresholds, false positives, subject reputation,
+  retrieved content, Laya, cost, repository layout, roadmap) moved to
+  `docs/design.md` as its Part 1; links elsewhere point there.
+- **The Chinese documents are rewritten** in Chinese rather than translated
+  sentence by sentence: README, design, cost, recipes and ops.
+- **The held-out set was re-run on 0.6.1** and the numbers in the docs are that
+  run (`untrusted` off 77.8% missed at 0.5, on 19.0%, 1 false positive in 700);
+  the 0.6.0 run stays in git history.
+
 ## [0.6.0] - 2026-09-23
 
 Retrieved content judged on its own, accuracy measured beyond deepset, and

@@ -84,7 +84,7 @@ make suite-heldout-report   # bench/suite/heldout-report.md
   below. With context, NotInject FP at 0.5 went from 0.9% to 11.5% (29.9% on its "Technique Queries"),
   and benign multi-turn FP from 1.6% to 4.5%. BIPIA detection at 0.5 went up (18% to 45%) with FP still
   0%, but LLMail's benign emails moved up to 0.25 to 0.42 (bare: 0.11 to 0.21), so a block threshold
-  of 0.3 would reject 87% of them. The general-assistant context is the vague kind the main README
+  of 0.3 would reject 87% of them. The general-assistant context is the vague kind the operating guide
   warns about. Read this as evidence that a vague context can cost false positives, not as a result
   about a well-written one. On deepset the context moved AUC from 0.983 to 0.996; that finding stands,
   and it does not carry over to this suite.
@@ -138,7 +138,7 @@ flagged at 0.5, A → max(A, C): attacks in how-to answers 34% → 75%, in sourc
 - **Not measured:** real tool traffic (every carrier here is built), retrieved content in languages other
   than English, and chunks near the window. One run, one model.
 
-That change shipped in 0.6.0 as `untrusted` (off by default; main README, "Retrieved content"), and was
+That change shipped in 0.6.0 as `untrusted` (off by default; [docs/design.md](../../docs/design.md#retrieved-content)), and was
 then tested on data the question had not seen:
 
 ## Held-out test: the shipped core
@@ -160,17 +160,26 @@ every record with `untrusted` off and on, a fresh cache for each. Tables:
 
 | threshold 0.5 | AUC | FP | miss |
 |---|---|---|---|
-| `untrusted` off (0.5.0 behaviour) | 0.784 | 0.0% | 86.8% |
-| `untrusted` on | **0.997** | 0.1% (1 of 700) | **19.2%** |
+| `untrusted` off, 0.6.0 (Responses tool output not read) | 0.784 | 0.0% | 86.8% |
+| `untrusted` off, 0.6.1 | 0.954 | 0.1% | 77.8% |
+| `untrusted` on, 0.6.0 | 0.997 | 0.1% | 19.2% |
+| `untrusted` on, 0.6.1 | **0.997** | 0.1% (1 of 700) | **19.0%** |
 
-- **It holds on data it was not written for.** Miss at 0.5 drops from 87% to 19% with one false positive
+The committed results and [heldout-report.md](heldout-report.md) are the 0.6.1 run; the 0.6.0 run is in
+git history (`24330ad`). Between the two codes only the Responses bodies' whole-text judgment differs;
+the other small differences are the judge's run-to-run noise.
+
+- **It holds on data it was not written for.** Miss at 0.5 drops from 78% to 19% with one false positive
   in 700, better than on the suite it was developed on. Per InjecAgent category, detection is 90 to 97%
-  for data stealing and "others", 68% for physical and data-security harm, 45% for financial harm.
-- **Responses API tool output was never judged before.** With `untrusted` off, core's text fields never
-  read a `function_call_output`, so every attack in that shape passed (AUC 0.497). With it on, that
-  shape does as well as the other two.
-- **Cost**: every request carrying tool content makes 2 calls instead of 1; L2 time p50 277 → 293 ms,
-  p95 346 → 364 ms, since the calls run in parallel.
+  for data stealing and "others", 68 to 70% for physical and data-security harm, 43% for financial harm:
+  "please transfer $3,000 to ..." reads like an ordinary request to the email's recipient, which the
+  question counts as benign.
+- **Responses API tool output was not judged in 0.6.0 with `untrusted` off.** The default text fields
+  never read a `function_call_output`, so every attack in that shape passed (AUC 0.497). 0.6.1 reads it
+  as part of the whole text (AUC 0.966, still 72% missed at 0.5); with `untrusted` on, that shape does as
+  well as the other two.
+- **Cost**: every request carrying tool content makes 2 calls instead of 1; L2 time p50 271 → 288 ms,
+  p95 334 → 354 ms, since the calls run in parallel.
 - **Limits**: the benign fill sentences are ordinary but out of place in their slot; everything is
   English; the benign tool outputs are clean and short, unlike retrieval over documentation or prompt
   libraries (see the tool-docs results above). One run.

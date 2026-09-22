@@ -34,7 +34,7 @@ Both keep every property of the nginx deployment: L1 rules, cache, breaker, adap
    failure_mode_allow: true
    ```
 
-   `max_request_bytes` matches `rules.max_body_bytes` (1 MiB). A larger body arrives cut to it with `x-envoy-auth-partial-body: true`, and jev-edge scans it as the head of a larger body for the text fields instead of parsing truncated JSON; the reason then ends in `(window)`, and a head with no text is `unjudgeable: body too large`. Raise both together for larger requests: see [Body size and what L1 reads](../../README.md#body-size-and-what-l1-reads). `content-encoding` must be allowed, or a compressed body cannot be decoded.
+   `max_request_bytes` matches `rules.max_body_bytes` (1 MiB). A larger body arrives cut to it with `x-envoy-auth-partial-body: true`, and jev-edge scans it as the head of a larger body for the text fields instead of parsing truncated JSON; the reason then ends in `(window)`, and a head with no text is `unjudgeable: body too large`. Raise both together for larger requests: see [Body size and what L1 reads](../../docs/design.md#body-size-and-what-l1-reads). `content-encoding` must be allowed, or a compressed body cannot be decoded.
 
    `timeout` must exceed `jev.timeout_max_ms` plus network, otherwise Envoy gives up before jev-edge's own fail-open can answer. `failure_mode_allow: true` is the Envoy-level fail-open for when OpenResty itself is unreachable. Note that `failure_mode_allow` cannot add headers: a request that passed this way reaches your upstream with **no** `X-Jev-Verdict` at all (`failure_mode_allow_header_add` only adds `x-envoy-auth-failure-mode-allowed`). Treat a missing `X-Jev-Verdict` as "not judged", the same as `error`.
 

@@ -24,7 +24,7 @@ Answer:
 Two properties every recipe must keep:
 
 - **Fail-open.** If jev-edge is unreachable or slow, allow the request and mark it `X-Jev-Verdict: error`. Every gateway below has a switch for this; it is set in every snippet.
-- **Body size.** jev-edge parses a body up to `rules.max_body_bytes` (1 MiB) whole; past it, it scans the first `max_body_bytes` and the last 64 KiB for the text fields. Give the gateway the same cap. A gateway that forwards only part of a larger body must say so: Envoy-based ones (Istio, Envoy Gateway) send `x-envoy-auth-partial-body: true` with `allowPartialMessage`, and jev-edge scans that body as a head. A cut body with no flag is parsed as if whole, and truncated JSON yields no text. Details in the README, [Body size and what L1 reads](../README.md#body-size-and-what-l1-reads).
+- **Body size.** jev-edge parses a body up to `rules.max_body_bytes` (1 MiB) whole; past it, it scans the first `max_body_bytes` and the last 64 KiB for the text fields. Give the gateway the same cap. A gateway that forwards only part of a larger body must say so: Envoy-based ones (Istio, Envoy Gateway) send `x-envoy-auth-partial-body: true` with `allowPartialMessage`, and jev-edge scans that body as a head. A cut body with no flag is parsed as if whole, and truncated JSON yields no text. Details in the README, [Body size and what L1 reads](design.md#body-size-and-what-l1-reads).
 
 The nginx side is one location:
 

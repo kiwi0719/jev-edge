@@ -12,7 +12,7 @@ import type { BreakerLike } from "./breaker.js";
 import type { Req, Rule, CacheLike, RulesCtx } from "./rules.js";
 import type { JsonValue } from "./normalize.js";
 
-export const VERSION = "0.6.0";
+export const VERSION = "0.6.1";
 
 export type JudgeResult = [judge.Answers, null] | [null, string];
 

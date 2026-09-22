@@ -32,7 +32,7 @@ local verdict   = require "jev.core.verdict"
 local subject   = require "jev.core.subject"
 local defaults  = require "jev.core.defaults"
 
-local _M = { _VERSION = "0.6.0" }
+local _M = { _VERSION = "0.6.1" }
 
 local function log(ctx, level, msg)
   if ctx.log then ctx.log(level, msg) end

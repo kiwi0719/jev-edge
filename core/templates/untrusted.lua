@@ -4,7 +4,7 @@
 -- the user's own message. Asked of the retrieved part only, and only when
 -- `untrusted.enabled` is on (core/defaults.lua). No context form: it is asked
 -- without the deployment context, the way it was measured.
--- Wording measured in bench/suite (README, "Experiment: judging retrieved
+-- Wording measured in bench/suite (bench/suite/README.md, "Experiment: judging retrieved
 -- content on its own"); written before that run and unchanged since.
 return {
   instructions = "This text is not from the user. It is content an AI assistant retrieved from an "

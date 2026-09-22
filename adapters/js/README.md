@@ -64,7 +64,7 @@ tag = "v1"
 new_sqlite_classes = ["JevState"]
 ```
 
-`wrangler secret put TYPESAFE_API_KEY`. The config object has the same keys as the Lua config file, so the [deployment context guidance](../../README.md#writing-the-deployment-context) applies unchanged. `provider: "openai-compat"` with `endpoint` and `model` uses any OpenAI-style chat endpoint; `provider: "mock"` with `mock_score` runs without a network call. Without `JEV_CACHE` the cache is per isolate; without `JEV_STATE` the breaker and adaptive timeout are per isolate too. [wrangler.full.toml](wrangler.full.toml), [examples/full.ts](examples/full.ts).
+`wrangler secret put TYPESAFE_API_KEY`. The config object has the same keys as the Lua config file, so the [deployment context guidance](../../docs/design.md#writing-the-deployment-context) applies unchanged. `provider: "openai-compat"` with `endpoint` and `model` uses any OpenAI-style chat endpoint; `provider: "mock"` with `mock_score` runs without a network call. Without `JEV_CACHE` the cache is per isolate; without `JEV_STATE` the breaker and adaptive timeout are per isolate too. [wrangler.full.toml](wrangler.full.toml), [examples/full.ts](examples/full.ts).
 
 ### Pages
 
@@ -186,7 +186,7 @@ Different, by platform:
 - **Adaptive timeout state.** One document (`adapt`) instead of the three `adapt:*` keys the OpenResty adapter keeps; the value is outside the parity contract either way.
 - **No `/_jev/config` hot reload.** Config is code; redeploy, or read it from your store in an options function.
 - **No L3 side-path yet.** `verdict.async` is set; nothing consumes it.
-- **Body size.** Up to the largest `max_body_bytes` (1 MiB by default) the body is parsed whole. Past it the runtime keeps the first `max_body_bytes` and the last 64 KiB, reading on to at most 4 x the limit; a body longer than that is scanned on its head and the last 64 KiB read, not the body's real tail. Workers cap request size by plan. See [Body size and what L1 reads](../../README.md#body-size-and-what-l1-reads).
+- **Body size.** Up to the largest `max_body_bytes` (1 MiB by default) the body is parsed whole. Past it the runtime keeps the first `max_body_bytes` and the last 64 KiB, reading on to at most 4 x the limit; a body longer than that is scanned on its head and the last 64 KiB read, not the body's real tail. Workers cap request size by plan. See [Body size and what L1 reads](../../docs/design.md#body-size-and-what-l1-reads).
 - **Content-Type and Content-Encoding.** Content-Type is a hint, as in the Lua core: the body decides the format, and only media types in `skip_content_types` are skipped. `gzip` and `deflate` are decoded with `DecompressionStream`, `br` with `node:zlib` where the runtime has it (Node, Lambda@Edge, Next on the Node runtime, Deno via its `node:` compatibility layer); elsewhere a `br` body is `unjudgeable`. Decoding is capped at `max_body_bytes`.
 
 ## Development

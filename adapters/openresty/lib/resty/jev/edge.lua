@@ -20,7 +20,7 @@ local subject_m = require "jev.core.subject"
 local trust     = require "jev.core.trust"
 local cjson     = require "cjson.safe"
 
-local _M = { _VERSION = "0.6.0" }
+local _M = { _VERSION = "0.6.1" }
 
 local CACHE_DICT = "jev_cache"
 -- Safety-critical state (trust grants, breaker, in-flight counters, adaptive

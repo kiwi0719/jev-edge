@@ -2,8 +2,10 @@ name: release-npm
 
 # Publishes adapters/js as @jev-edge/js. A tag push `vX.Y.Z` publishes when
 # X.Y.Z is the version in adapters/js/package.json; a manual run is a dry run
-# unless `dry_run` is unticked. Without the NPM_TOKEN secret the job builds,
-# tests and packs, then stops with a notice instead of failing.
+# unless `dry_run` is unticked. Authentication is npm trusted publishing: npm
+# trusts this repository's release-npm.yml through GitHub's OIDC token, so no
+# npm token is stored anywhere (configured on npmjs.com, package settings ->
+# Trusted Publisher). A version already on npm is skipped with a notice.
 
 on:
   push:
@@ -17,7 +19,7 @@ on:
 
 permissions:
   contents: read
-  id-token: write # npm provenance: the OIDC token that signs the attestation
+  id-token: write # trusted publishing and provenance: GitHub's OIDC token
 
 concurrency:
   group: release-npm-${{ github.ref }}
@@ -40,8 +42,8 @@ jobs:
           node-version: 22
           cache: pnpm
           cache-dependency-path: adapters/js/pnpm-lock.yaml
-          # writes an .npmrc that reads NODE_AUTH_TOKEN
-          registry-url: "https://registry.npmjs.org"
+          # no registry-url: its .npmrc reads NODE_AUTH_TOKEN, and trusted
+          # publishing needs no token at all
 
       - name: Tag matches package.json version
         if: github.ref_type == 'tag'
@@ -83,21 +85,22 @@ jobs:
           pnpm pack --pack-destination "$RUNNER_TEMP"
           tar -tzf "$RUNNER_TEMP"/jev-edge-js-*.tgz
 
-      - name: NPM_TOKEN present?
-        id: token
-        env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Already on npm?
+        id: exists
         run: |
-          if [ -z "$NPM_TOKEN" ]; then
-            echo "::notice::NPM_TOKEN is not set; built, tested and packed, not published"
-            echo "present=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "present=true" >> "$GITHUB_OUTPUT"
+          v="$(node -p "require('./package.json').version")"
+          if npm view "@jev-edge/js@$v" version >/dev/null 2>&1; then
+            echo "::notice::@jev-edge/js@$v is already on npm; nothing to publish"
+            echo "yes=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Publish
-        if: steps.token.outputs.present == 'true'
+      # trusted publishing needs npm >= 11.5.1 (Node 22 ships npm 10)
+      - name: npm for trusted publishing
+        if: steps.exists.outputs.yes != 'true'
+        run: npm install -g "npm@>=11.5.1" && npm --version
+
+      - name: Publish (trusted publishing, with provenance)
+        if: steps.exists.outputs.yes != 'true'
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && '--dry-run' || '' }}
-        run: pnpm publish --access public --provenance --no-git-checks $DRY_RUN
+        run: npm publish --access public --provenance $DRY_RUN

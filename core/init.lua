@@ -29,7 +29,7 @@ local trust     = require "jev.core.trust"
 local verdict   = require "jev.core.verdict"
 local subject   = require "jev.core.subject"
 
-local _M = { _VERSION = "0.4.0" }
+local _M = { _VERSION = "0.5.0" }
 
 local function log(ctx, level, msg)
   if ctx.log then ctx.log(level, msg) end

@@ -6,6 +6,15 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-23
+
+Subject reputation, a Kong plugin, a Deno preset and the npm package, an
+operations kit, judge robustness (including long text judged in chunks),
+and CI that runs the previous audit's bug classes as tripwires. Nothing
+changes for an existing deployment unless it opts in (`subject.reputation`,
+`max_judge_chunks`); the openai-compat judge now treats an echoed planted
+answer as an injection and an incomplete reply as an error.
+
 ### Added
 - **Subject reputation** (`subject.reputation`): judged verdicts add points
   per subject (a header such as an API key, a cookie, or the IP) over a

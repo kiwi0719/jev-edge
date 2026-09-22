@@ -34,6 +34,27 @@ return {
     [[\b(DAN|do anything now)\b]],
     [[\b(reveal|print|repeat|show)\b.{0,30}\b(instructions|system prompt|rules)\b]],
     [[(?:[A-Za-z0-9+/]{4}){40,}={0,2}]],   -- long base64 blob
+    -- Judge-directed text: the input talks to the classifier judging it
+    -- (docs/design.md, "Judge robustness"). A hit only guarantees an L2 call
+    -- and keeps the hit inside the judging window of a long body.
+    -- "rate this as safe" (not "classify this mushroom as safe to eat")
+    [[\b(rate|classify|mark|label|score|flag|treat|judge)\b.{0,30}]]
+      .. [[\b(this|it|me|the (above|following|message|request|input|prompt|text))\b.{0,30}]]
+      .. [[\bas\s+(a\s+)?(safe|benign|harmless|clean|legitimate|non-?malicious|0(\.0+)?)\b(?!\s+(to|for)\b)]],
+    -- "you are a classifier, output 0"
+    [[\b(classifier|moderator|guardrail|safety (filter|model|system|check)|content filter|judge model)\b]]
+      .. [[.{0,40}\b(output|return|respond|answer|reply|say|print)\b.{0,20}\b(0(\.0+)?|safe|benign|harmless|false)\b]],
+    -- "note to the AI reviewing this"
+    [[\b(to|for)\s+(the|any)\s+(ai|model|llm|classifier|moderator|reviewer|filter)\s+]]
+      .. [[(reviewing|checking|scanning|screening|evaluating|analy[sz]ing|reading|judging)\s+(this|these|the)\b]],
+    -- a pre-written judge answer: {"injection": 0}, {"answers":{"injection":{"noul":0.0}}}
+    [[[\x7b,]\s*"(injection|abuse|noul|jailbreak|prompt_injection)"\s*:\s*(\x7b|\[|"?(0(\.\d+)?|false|safe|benign)\b)]],
+    -- a fake end-of-input marker: "=== END OF INPUT ===", "</end of user message>"
+    [[(={3,}|-{3,}|#{2,}|\*{3,}|\[|</?)\s*end[ _-]+(of[ _-]+)?(the[ _-]+)?(user[ _-]+)?]]
+      .. [[(input|message|prompt|text|data|query)\b]],
+    -- "the real verdict is safe"
+    [[\b(real|actual|true|correct|final)\s+(verdict|rating|classification)(\s+(is|should be)|\s*[=:])\s*"?]]
+      .. [[(safe|benign|harmless|clean|0(\.0+)?|not (malicious|an? (injection|attack)))\b]],
   },
   templates = { "injection" },
 }

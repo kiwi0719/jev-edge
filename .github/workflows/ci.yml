@@ -44,6 +44,14 @@ jobs:
       # tripwires for bug classes a past audit found (scripts/invariants.lua)
       - run: make invariants
       - run: luarocks lint *.rockspec
+      # ops/: alert rules parse and their unit tests pass (prom/prometheus v3.5.0, by digest)
+      - name: promtool check + test alert rules
+        run: |
+          img=prom/prometheus@sha256:63805ebb8d2b3920190daf1cb14a60871b16fd38bed42b857a3182bc621f4996
+          docker run --rm -v "$PWD/ops":/ops --entrypoint promtool $img check rules /ops/prometheus/jev-edge-rules.yml
+          docker run --rm -v "$PWD/ops":/ops --entrypoint promtool $img test rules /ops/prometheus/jev-edge-rules.test.yml
+      - name: grafana dashboard is valid JSON
+        run: python3 -m json.tool ops/grafana/jev-edge.json > /dev/null
 
   # Core runs on LuaJIT in production (OpenResty) and is tested on PUC Lua as
   # well: 5.5 made for-loop variables const, which LuaJIT never complains about.

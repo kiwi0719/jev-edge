@@ -91,13 +91,12 @@ soak:
 
 # Envoy: gRPC shim build and the two-transport end-to-end (Docker Compose).
 shim:
-	cd adapters/envoy/grpc-shim && go vet ./... && go build -o jev-shim .
+	cd adapters/envoy/grpc-shim && go vet ./... && go test ./... && go build -o jev-shim .
 
 e2e-envoy:
 	docker build -q -t jev-edge-test -f adapters/openresty/Dockerfile.test adapters/openresty
 	sh adapters/envoy/e2e/run.sh
 
-# Traefik / Caddy / nginx forward-auth end-to-end (Docker Compose).
 e2e-apisix:
 	docker build -q -t jev-edge-test -f adapters/openresty/Dockerfile.test adapters/openresty
 	sh adapters/apisix/e2e/run.sh
@@ -110,6 +109,7 @@ e2e-haproxy:
 test-litellm:
 	cd adapters/litellm && python3 -m pytest -q
 
+# Traefik / Caddy / nginx forward-auth end-to-end (Docker Compose).
 e2e-forward-auth:
 	docker build -q -t jev-edge-test -f adapters/openresty/Dockerfile.test adapters/openresty
 	sh adapters/forward-auth/e2e/run.sh

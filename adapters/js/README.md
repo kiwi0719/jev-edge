@@ -3,7 +3,7 @@
 One npm package, `@jev-edge/js`, one TypeScript port of core, several hosts. The port is held to the repository's golden vectors: [test/golden.test.ts](test/golden.test.ts) replays [core/golden/*.json](../../core/golden/README.md), the same files the Lua core replays under busted. A verdict computed here and one computed on nginx for the same request are the same verdict.
 
 ```
-npm install @jev-edge/js      # or pnpm add / yarn add
+npm install @jev-edge/js      # or pnpm add / yarn add; Node 20+ (global crypto)
 ```
 
 | host | export | what it is |
@@ -101,7 +101,7 @@ app.use("/v1", nodeMiddleware({ config: { jev: { provider: "jev", api_key: proce
 app.post("/v1/chat/completions", (req, res) => { /* req.jev, req.headers["x-jev-verdict"] */ });
 ```
 
-Mount it before the routes that carry natural language. If `express.json()` ran first the parsed body is re-serialised for evaluation; otherwise the stream is read (up to `max_body_bytes`) and exposed as `req.body` for the handlers. A block ends the response with the 403; a middleware error fails open with `x-jev-verdict: error`.
+Mount it before the routes that carry natural language. If `express.json()` ran first the parsed body is re-serialised for evaluation; otherwise the stream is read to completion and exposed, unchanged, as `req.body` (string) for the handlers. A body over the largest `max_body_bytes` is still handed to the app as-is; only the evaluation skips it (L1 passes it as `body too large`). The middleware never truncates or replaces what the app receives, so put a size limit in front of it (a proxy limit, or a body parser with `limit`) if unbounded uploads can reach the route. A stream something else already consumed (`req.readableEnded`) is treated as "no body" instead of waiting for it. A block ends the response with the 403; a middleware error fails open with `x-jev-verdict: error` and `x-jev-source: adapter`.
 
 ## Hono
 
@@ -112,6 +112,8 @@ const app = new Hono();
 app.use("/v1/*", honoMiddleware({ config: { … } }));
 app.post("/v1/chat/completions", (c) => c.json({ verdict: c.get("jev") }));
 ```
+
+`c.req.raw` is replaced with the request carrying the verdict's `X-Jev-*` (client-supplied ones removed), and the same headers are set on the response.
 
 ## AWS Lambda@Edge
 
@@ -135,9 +137,11 @@ const rt = createRuntime({ config: { … }, cache: env.JEV_CACHE, state: env.JEV
 return handle(request, rt, (req) => fetch(req));
 ```
 
-`evaluate(request, rt)` returns the verdict without forwarding. `GET /_jev/health` is served by `handle` unless `health: false`.
+`evaluate(request, rt)` returns the verdict without forwarding; both take an optional `{ waitUntil }` (a Workers `ExecutionContext`) so the subject write outlives the response. `GET /_jev/health` is served by `handle` unless `health: false`.
 
-**Subjects.** `config.subject = { enabled: true, from: "cookie", name: "sid", salt: env.JEV_SUBJECT_SALT }` gives every request a hashed subject id (SHA-256 over the salt and the value; the raw cookie or header is never stored) and records its trajectory in `subjectStore` (KV or memory), `max_entries` per subject for `history_ttl`. The thin Worker forwards the id as `X-Jev-Subject`; configure the origin with `subject = { enabled = true, from = "header", name = "x-jev-subject", hashed = true }`.
+**Fail-open.** `evaluate` never throws. Whatever fails between "we have a Request" and "we have a verdict" (the body read, the subject store, the judge, `onVerdict`, building the block response) passes the request with `X-Jev-Verdict: error`, `X-Jev-Source: adapter` and a `console.error` line, the same contract as `access()` in the OpenResty adapter. Every preset inherits it. The body is only read for a request some rule watches (path and method), and never beyond the largest `max_body_bytes` + 1, whatever `Content-Length` says. Inbound `X-Jev-*` headers are dropped before forwarding, `X-Jev-Subject` included unless `config.subject` is set to consume it (`from: "header", name: "x-jev-subject"`); `cf-ray` is used as the request id only under the Cloudflare presets.
+
+**Subjects.** `config.subject = { enabled: true, from: "cookie", name: "sid", salt: env.JEV_SUBJECT_SALT }` gives every request a hashed subject id (`<from>:` + SHA-256 hex over `salt \0 value`; the raw cookie or header is never stored, values over 512 bytes are dropped) and records its trajectory in `subjectStore` (KV or memory), `max_entries` per subject for `history_ttl`. The OpenResty adapter uses SHA-256 as well since 0.3.1, so the same salt and value give the same id on both. The id is forwarded upstream as `X-Jev-Subject` (the thin Worker also sends it with the `/_jev/authz` call); configure the origin with `subject = { enabled = true, from = "header", name = "x-jev-subject", hashed = true }`. With `hashed = true` only values of the form `<letters>:<hex>` are accepted as ids; anything else is ignored.
 
 **Tenants and sampling.** `rules` accepts rule set ids, complete `Rule` objects, or `{ id, extends, watch_paths, deployment_context, ... }` inline rules, first match wins, same as the Lua config. `config.sampling` plus an `onSample(sample, request)` option gives you the sampled decisions (normalized text, fingerprint, score, verdict); write them to KV, a log or an analytics binding. There is no `/_jev/samples` endpoint here because storage is yours.
 
@@ -150,11 +154,13 @@ Different, by platform:
 | | cache | breaker + adaptive timeout | notes |
 |---|---|---|---|
 | nginx / APISIX | shared dict, exact TTL, all workers | shared dict | reference |
-| Cloudflare Workers | KV: 60 s minimum TTL, eventually consistent | Durable Object, one hop per L2 call | per isolate without the bindings |
+| Cloudflare Workers | KV: 60 s minimum TTL, eventually consistent | Durable Object: the breaker and adaptive read-modify-write run inside `JevState`, one hop per operation, atomic | per isolate without the bindings |
 | Next.js on Vercel, Node, Hono | memory per process / isolate | memory | pass a `Store` to share |
 | Lambda@Edge | memory per execution environment | memory | no env vars; key from Secrets Manager |
 
-- **Fingerprint hash.** nginx uses `crc32_long`; this package uses the reference `djb2`. Caches are never shared between the two, so it does not matter.
+- **Fingerprint hash.** nginx uses `crc32_long`; this package uses the reference `djb2`. Caches are never shared between the two, so it does not matter. Since 0.3.1 the fingerprint covers the whole normalized text on both; `cache.fp_prefix_bytes` only bounds sampled text.
+- **Byte truncation of sampled text.** Lua's `s:sub(1, n)` keeps the bytes of a code point split at `n`; this package drops the partial code point, so the sampled text is never longer than `n` bytes and never contains U+FFFD. The golden normalize vectors cut on ASCII and agree; only a logged sample that ends inside a multi-byte character differs, by at most three bytes.
+- **Adaptive timeout state.** One document (`adapt`) instead of the three `adapt:*` keys the OpenResty adapter keeps; the value is outside the parity contract either way.
 - **No `/_jev/config` hot reload.** Config is code; redeploy, or read it from your store in an options function.
 - **No L3 side-path yet.** `verdict.async` is set; nothing consumes it.
 - **Body size.** Requests over the largest `max_body_bytes` (64 KB by default) are not read; L1 passes them with `body too large` from `Content-Length`.
@@ -163,7 +169,7 @@ Different, by platform:
 
 ```
 pnpm install
-pnpm test          # 116 golden cases + worker and host tests
+pnpm test          # 142 golden cases + core, worker and host tests
 pnpm typecheck
 pnpm build         # dist/ for publishing
 ```

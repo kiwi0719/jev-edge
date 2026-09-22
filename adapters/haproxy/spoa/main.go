@@ -3,9 +3,16 @@
 //
 // HAProxy sends one message per request with method, path, client IP,
 // content type and (with `option http-buffer-request`) the body. The agent
-// sets txn.jev.verdict / score / source / reason / action / rid; haproxy.cfg
-// turns action=block into a 403 and copies the rest to X-Jev-* headers.
-// Any failure to reach jev-edge sets verdict=error, action=pass (fail-open).
+// sets txn.jev.verdict / score / source / reason / action / rid / status;
+// haproxy.cfg turns action=block into a deny (status from txn.jev.status)
+// and copies the rest to X-Jev-* headers.
+//
+// Contract: only an answer carrying X-Jev-Verdict is trusted. 200 with the
+// header is a decision; any status >= 400 with the header is a block, with
+// that status in txn.jev.status; anything else, and any failure to reach
+// jev-edge, sets verdict=error, action=pass (fail-open). Paths containing
+// "..", "%2e" or "//" are never forwarded (they could reach the adapter's
+// admin endpoints next to /_jev/authz) and fail open too.
 package main
 
 import (
@@ -17,6 +24,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -29,7 +37,7 @@ import (
 var (
 	listen   = flag.String("listen", ":9000", "SPOE listen address")
 	upstream = flag.String("upstream", "http://127.0.0.1:8080/_jev/authz", "jev-edge authz URL prefix")
-	timeout  = flag.Duration("timeout", 2*time.Second, "per-check timeout (fail-open when exceeded)")
+	timeout  = flag.Duration("timeout", 1500*time.Millisecond, "per-check timeout (fail-open when exceeded); keep it below spoe.conf's `timeout processing` so the fail-open answer still reaches HAProxy")
 	message  = flag.String("message", "check-request", "SPOE message name")
 )
 
@@ -51,7 +59,26 @@ func str(v interface{}) string {
 }
 
 func failOpen(reason string) map[string]string {
-	return map[string]string{"verdict": "error", "score": "0.00", "source": "adapter", "reason": reason, "action": "pass"}
+	return map[string]string{"verdict": "error", "score": "0.00", "source": "adapter", "reason": reason, "action": "pass", "rid": "", "status": "0"}
+}
+
+// safePath rejects anything that could escape /_jev/authz/ once normalised:
+// dot segments, encoded dots and doubled slashes.
+func safePath(p string) bool {
+	if p == "" || p[0] != '/' {
+		return false
+	}
+	return !strings.Contains(p, "..") && !strings.Contains(strings.ToLower(p), "%2e") && !strings.Contains(p, "//")
+}
+
+// headers HAProxy or the HTTP client own; never copied from req.hdrs
+var skipHeader = map[string]bool{
+	"host": true, "content-length": true, "transfer-encoding": true, "connection": true,
+	"x-forwarded-for": true, "content-type": true, "expect": true, "accept-encoding": true,
+	"te": true, "upgrade": true, "keep-alive": true, "proxy-connection": true,
+	// never trust a client-supplied verdict
+	"x-jev-verdict": true, "x-jev-score": true, "x-jev-source": true, "x-jev-reason": true,
+	"x-jev-request-id": true, "x-jev-subject": true,
 }
 
 func setVars(req *request.Request, vars map[string]string) {
@@ -77,8 +104,16 @@ func handler(req *request.Request) {
 	if path == "" {
 		path = "/"
 	}
+	if i := strings.IndexByte(path, '?'); i >= 0 {
+		path = path[:i]
+	}
 	if method == "" {
 		method = "POST"
+	}
+	if !safePath(path) {
+		log.Printf("jev-spoa: refusing path %q, failing open", path)
+		setVars(req, failOpen("bad path"))
+		return
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
@@ -98,8 +133,7 @@ func handler(req *request.Request) {
 			continue
 		}
 		name := strings.TrimSpace(line[:i])
-		switch strings.ToLower(name) {
-		case "host", "content-length", "transfer-encoding", "connection", "x-forwarded-for", "content-type":
+		if skipHeader[strings.ToLower(name)] {
 			continue
 		}
 		hreq.Header.Add(name, strings.TrimSpace(line[i+1:]))
@@ -119,6 +153,11 @@ func handler(req *request.Request) {
 	defer res.Body.Close()
 	io.Copy(io.Discard, io.LimitReader(res.Body, 4096))
 
+	if res.Header.Get("X-Jev-Verdict") == "" {
+		log.Printf("jev-spoa: jev-edge answered %d without X-Jev-Verdict, failing open", res.StatusCode)
+		setVars(req, failOpen(fmt.Sprintf("http %d", res.StatusCode)))
+		return
+	}
 	vars := map[string]string{
 		"verdict": res.Header.Get("X-Jev-Verdict"),
 		"score":   res.Header.Get("X-Jev-Score"),
@@ -126,16 +165,17 @@ func handler(req *request.Request) {
 		"reason":  res.Header.Get("X-Jev-Reason"),
 		"rid":     res.Header.Get("X-Jev-Request-Id"),
 		"action":  "pass",
+		"status":  "0",
 	}
 	switch {
-	case res.StatusCode == 403:
+	case res.StatusCode == 200:
+	case res.StatusCode >= 400:
 		vars["action"] = "block"
-	case res.StatusCode != 200:
+		vars["status"] = strconv.Itoa(res.StatusCode)
+	default:
 		log.Printf("jev-spoa: jev-edge answered %d, failing open", res.StatusCode)
-		vars["verdict"], vars["source"], vars["reason"] = "error", "adapter", fmt.Sprintf("http %d", res.StatusCode)
-	}
-	if vars["verdict"] == "" {
-		vars["verdict"] = "error"
+		setVars(req, failOpen(fmt.Sprintf("http %d", res.StatusCode)))
+		return
 	}
 	setVars(req, vars)
 }

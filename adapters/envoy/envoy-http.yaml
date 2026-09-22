@@ -11,6 +11,10 @@ static_resources:
                 "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
                 stat_prefix: ingress
                 use_remote_address: true
+                # collapse "/a/../b", "%2e%2e" and "//" before the path reaches
+                # ext_authz, so it cannot be steered at the adapter's admin endpoints
+                normalize_path: true
+                merge_slashes: true
                 route_config:
                   name: local
                   virtual_hosts:
@@ -20,6 +24,20 @@ static_resources:
                         - match: { prefix: "/" }
                           route: { cluster: app }
                 http_filters:
+                  # never trust a client-supplied verdict: a route-level
+                  # request_headers_to_remove runs at the router, after ext_authz has
+                  # set the real verdict; this filter runs before ext_authz instead
+                  - name: envoy.filters.http.header_mutation
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutation
+                      mutations:
+                        request_mutations:
+                          - remove: x-jev-verdict
+                          - remove: x-jev-score
+                          - remove: x-jev-reason
+                          - remove: x-jev-source
+                          - remove: x-jev-request-id
+                          - remove: x-jev-subject
                   - name: envoy.filters.http.ext_authz
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz

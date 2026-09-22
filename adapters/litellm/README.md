@@ -32,8 +32,8 @@ LiteLLM proxy is where a lot of LLM traffic actually flows, and it has a guardra
 
 - Chat requests: `{"messages": [...]}` with the string contents of every message (text parts of multimodal messages are kept, images dropped). Completion requests: `{"prompt": "..."}`. `X-Forwarded-For` carries the caller's IP from LiteLLM's `requester_ip_address` metadata, so jev-edge's reputation and L3 work per client, not per proxy.
 - Every request gets `metadata.jev_verdict` with `verdict`, `score`, `source`, `reason`, `action` and `request_id`. It shows up in LiteLLM's spend logs and callbacks.
-- With `enforce: true`, a 403 from jev-edge raises `HTTPException(403, {"error": "request rejected", "jev": {...}})` and the call never reaches the model. With `enforce: false` the request continues annotated; use this for the monitor week and read the scores from the logs.
-- Fail-open: connection errors, timeouts and non-200 / non-403 answers annotate `verdict: error` and let the call through. Requests without text (tool-only calls, embeddings) are `skipped` without a round trip.
+- With `enforce: true`, a block from jev-edge (status >= 400 with `X-Jev-Verdict`, 403 by default) raises `HTTPException(<that status>, {"error": "request rejected", "jev": {...}})` and the call never reaches the model. With `enforce: false` the request continues annotated; use this for the monitor week and read the scores from the logs.
+- Fail-open: only an answer carrying `X-Jev-Verdict` is trusted. Connection errors, timeouts and any answer without the header (a 404 or 5xx from something that is not jev-edge) annotate `verdict: error` and let the call through. Requests without text (tool-only calls, embeddings) are `skipped` without a round trip.
 
 ## Thresholds
 

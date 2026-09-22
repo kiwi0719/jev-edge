@@ -29,6 +29,21 @@ describe("rules.resolve", function()
     assert.equals("messages[*].content", r.text_fields[1])
   end)
 
+  it("copies a rule set loaded by id so callers cannot mutate the module", function()
+    local a = rules.resolve("llm-endpoints", load)
+    local b = rules.resolve("llm-endpoints", load)
+    assert.are_not.equal(a, b)
+    a.templates = { "abuse" }
+    assert.same({ "injection" }, b.templates)
+  end)
+
+  it("rejects malformed watch_paths patterns at resolve time", function()
+    local r, err = rules.resolve({ id = "t", watch_paths = { "^/v1/[" } }, load)
+    assert.is_nil(r)
+    assert.matches("watch_paths%[1%]", err)
+    assert.is_nil(rules.resolve({ id = "t", watch_paths = { 42 } }, load))
+  end)
+
   it("rejects bad specs", function()
     assert.is_nil(rules.resolve({ watch_paths = {} }, load))
     assert.is_nil(rules.resolve({ id = "x" }, load))

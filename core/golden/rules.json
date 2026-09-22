@@ -186,6 +186,75 @@
     },
     {
       "expect": {
+        "reason": "natural language",
+        "result": "suspect",
+        "text": "Please write a detailed summary of the attached quarterly report."
+      },
+      "input": {
+        "cache": {},
+        "clock": 1000,
+        "req": {
+          "body": "{\"messages\":[{\"role\":\"user\",\"content\":\"Please write a detailed summary of the attached quarterly report.\"}]}",
+          "body_size": 108,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/vnd.api+json"
+          },
+          "method": "POST",
+          "path": "/v1/chat/completions"
+        },
+        "rule": "llm-endpoints"
+      },
+      "name": "vendor +json content type is watched"
+    },
+    {
+      "expect": {
+        "reason": "natural language",
+        "result": "suspect",
+        "text": "Please write a detailed summary of the attached quarterly report."
+      },
+      "input": {
+        "cache": {},
+        "clock": 1000,
+        "req": {
+          "body": "{\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Please write a detailed summary of the attached quarterly report.\"}]}]}",
+          "body_size": 43,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/v1/chat/completions"
+        },
+        "rule": "llm-endpoints"
+      },
+      "name": "content parts are judged"
+    },
+    {
+      "expect": {
+        "reason": "natural language",
+        "result": "suspect",
+        "text": "Please write a detailed summary of the attached quarterly report."
+      },
+      "input": {
+        "cache": {},
+        "clock": 1000,
+        "req": {
+          "body": "{\"messages\":[{\"role\":\"user\",\"content\":\"Please write a detailed summary of the attached quarterly report.\"}]}",
+          "body_size": 0,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/v1/chat/completions"
+        },
+        "rule": "llm-endpoints"
+      },
+      "name": "declared body_size smaller than the body does not shrink it"
+    },
+    {
+      "expect": {
         "reason": "no body",
         "result": "pass",
         "text": ""
@@ -866,7 +935,7 @@
       "name": "ignore without instructions is not a pattern"
     }
   ],
-  "core_version": "0.3.0",
+  "core_version": "0.3.1",
   "format_version": 1,
   "generated_by": "core/golden/gen.lua",
   "suite": "rules"

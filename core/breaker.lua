@@ -1,6 +1,6 @@
 -- core/breaker.lua
--- Sliding-window circuit breaker. State lives in an injected store so that
--- nginx workers can share it through a shared dict.
+-- Circuit breaker over tumbling windows of `window_s` seconds. State lives in
+-- an injected store so that nginx workers can share it through a shared dict.
 --
 -- store interface: get(key) -> value|nil ; set(key, value, ttl_seconds)
 -- clock: function() -> seconds (number, may be fractional)
@@ -77,6 +77,9 @@ local function record(self, ok)
     if ok then
       self.store:set(cfg(self, "key_prefix") .. "state", { state = _M.CLOSED }, 0)
       self.store:set(cfg(self, "key_prefix") .. "probe", nil, 0)
+      -- The window that tripped us is still full of failures; start the
+      -- closed period from a clean count or the next success re-trips.
+      self.store:set(key, { ok = 1, fail = 0 }, cfg(self, "window_s") * 2)
     else
       self:trip(now)
     end

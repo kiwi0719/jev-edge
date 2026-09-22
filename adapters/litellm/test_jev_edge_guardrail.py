@@ -9,15 +9,15 @@ import pytest
 from jev_edge_guardrail import JevEdgeBlocked, JevEdgeGuardrail
 
 
-def fake_authz(status: int = 200, verdict: str = "safe", score: str = "0.20", reason: str = "injection+0.20"):
+def fake_authz(status: int = 200, verdict: str = "safe", score: str = "0.20", reason: str = "injection+0.20", with_verdict: bool = True):
     seen = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen["path"] = request.url.path
         seen["xff"] = request.headers.get("x-forwarded-for")
         seen["body"] = json.loads(request.content)
-        headers = {"X-Jev-Verdict": verdict, "X-Jev-Score": score, "X-Jev-Source": "l2", "X-Jev-Reason": reason}
-        body = '{"error":"request rejected"}' if status == 403 else ""
+        headers = {"X-Jev-Verdict": verdict, "X-Jev-Score": score, "X-Jev-Source": "l2", "X-Jev-Reason": reason} if with_verdict else {}
+        body = '{"error":"request rejected"}' if status >= 400 else ""
         return httpx.Response(status, headers=headers, content=body)
 
     return httpx.MockTransport(handler), seen
@@ -72,10 +72,42 @@ def test_unreachable_fails_open():
 
 
 def test_5xx_fails_open():
-    transport, _ = fake_authz(status=502)
+    transport, _ = fake_authz(status=502, with_verdict=False)
     g = JevEdgeGuardrail(jev_edge_url="http://jev-edge:8080", transport=transport)
     out = run(g.async_pre_call_hook({}, None, dict(CHAT), "completion"))
     assert out["metadata"]["jev_verdict"]["verdict"] == "error"
+
+
+def test_any_status_without_verdict_header_fails_open():
+    for status in (200, 403, 404):
+        transport, _ = fake_authz(status=status, with_verdict=False)
+        g = JevEdgeGuardrail(jev_edge_url="http://jev-edge:8080", transport=transport)
+        out = run(g.async_pre_call_hook({}, None, dict(CHAT), "completion"))
+        v = out["metadata"]["jev_verdict"]
+        assert v["verdict"] == "error" and v["action"] == "pass" and v["source"] == "adapter"
+
+
+def test_block_uses_jev_edge_status():
+    transport, _ = fake_authz(status=429, verdict="malicious", score="0.95")
+    g = JevEdgeGuardrail(jev_edge_url="http://jev-edge:8080", transport=transport)
+    with pytest.raises(Exception) as ei:
+        run(g.async_pre_call_hook({}, None, dict(CHAT), "completion"))
+    assert ei.value.status_code == 429
+    assert ei.value.detail["jev"]["status"] == 429
+
+
+def test_3xx_with_verdict_fails_open():
+    transport, _ = fake_authz(status=302, verdict="safe")
+    g = JevEdgeGuardrail(jev_edge_url="http://jev-edge:8080", transport=transport)
+    out = run(g.async_pre_call_hook({}, None, dict(CHAT), "completion"))
+    assert out["metadata"]["jev_verdict"]["verdict"] == "error"
+
+
+def test_reason_is_percent_decoded():
+    transport, _ = fake_authz(reason="l1%3A+body+too+large+%2860%25%29")
+    g = JevEdgeGuardrail(jev_edge_url="http://jev-edge:8080", transport=transport)
+    out = run(g.async_pre_call_hook({}, None, dict(CHAT), "completion"))
+    assert out["metadata"]["jev_verdict"]["reason"] == "l1: body too large (60%)"
 
 
 def test_completion_prompt_and_multimodal_text_parts():

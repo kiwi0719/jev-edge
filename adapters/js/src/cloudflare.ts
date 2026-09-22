@@ -11,7 +11,7 @@
 //                         OpenAI-compatible endpoint) as the provider.
 //   pagesMiddleware(opts) same as fullWorker, exported as a Pages Functions
 //                         middleware: `export const onRequest = pagesMiddleware({...})`.
-import { createRuntime, handle, type Options, type Runtime } from "./runtime";
+import { createRuntime, handle, type Options, type Runtime, type RequestCtx } from "./runtime";
 import { JevState, type KVLike, type DOStubLike } from "./cf/stores";
 
 export { JevState };
@@ -31,7 +31,7 @@ type Resolve<E> = Options | ((env: E) => Options);
 function runtimeFor<E extends WorkerEnv>(resolve: Resolve<E>, env: E, cache: WeakMap<object, Runtime>): Runtime {
   const hit = cache.get(env);
   if (hit) return hit;
-  const o = typeof resolve === "function" ? resolve(env) : { ...resolve };
+  const o: Options = { ...(typeof resolve === "function" ? resolve(env) : resolve), platform: "cloudflare" };
   if (!o.cache && env.JEV_CACHE) o.cache = env.JEV_CACHE;
   if (!o.state && env.JEV_STATE) o.state = env.JEV_STATE.get(env.JEV_STATE.idFromName("jev-edge"));
   if (env.TYPESAFE_API_KEY) o.config = { ...o.config, jev: { api_key: env.TYPESAFE_API_KEY, ...o.config?.jev } };
@@ -47,10 +47,10 @@ function runtimeFor<E extends WorkerEnv>(resolve: Resolve<E>, env: E, cache: Wea
  */
 export function thinWorker<E extends WorkerEnv = WorkerEnv>(
   opts: Resolve<E> & { origin?: string; upstream?: string } = {},
-): { fetch(request: Request, env: E): Promise<Response> } {
+): { fetch(request: Request, env: E, ctx?: RequestCtx): Promise<Response> } {
   const cache = new WeakMap<object, Runtime>();
   return {
-    async fetch(request, env) {
+    async fetch(request, env, ctx) {
       const o = typeof opts === "function" ? opts(env) : opts;
       const origin = (opts as { origin?: string }).origin ?? env.JEV_ORIGIN;
       if (!origin) throw new Error("thinWorker: origin (or env.JEV_ORIGIN) is required");
@@ -63,7 +63,7 @@ export function thinWorker<E extends WorkerEnv = WorkerEnv>(
         const u = new URL(req.url);
         const target = new URL(u.pathname + u.search, upstream);
         return fetch(new Request(target.toString(), req));
-      });
+      }, ctx);
     },
   };
 }
@@ -75,15 +75,15 @@ export function thinWorker<E extends WorkerEnv = WorkerEnv>(
  */
 export function fullWorker<E extends WorkerEnv = WorkerEnv>(
   opts: Resolve<E> & { upstream: string },
-): { fetch(request: Request, env: E): Promise<Response> } {
+): { fetch(request: Request, env: E, ctx?: RequestCtx): Promise<Response> } {
   const cache = new WeakMap<object, Runtime>();
   return {
-    async fetch(request, env) {
+    async fetch(request, env, ctx) {
       const rt = runtimeFor(opts, env, cache);
       return handle(request, rt, (req) => {
         const u = new URL(req.url);
         return fetch(new Request(new URL(u.pathname + u.search, opts.upstream).toString(), req));
-      });
+      }, ctx);
     },
   };
 }
@@ -91,10 +91,11 @@ export function fullWorker<E extends WorkerEnv = WorkerEnv>(
 /** Pages Functions middleware: `export const onRequest = pagesMiddleware({...})` in functions/_middleware.ts. */
 export function pagesMiddleware<E extends WorkerEnv = WorkerEnv>(
   opts: Resolve<E> = {},
-): (context: { request: Request; env: E; next: (req?: Request) => Promise<Response> }) => Promise<Response> {
+): (context: { request: Request; env: E; next: (req?: Request) => Promise<Response>; waitUntil?: (p: Promise<unknown>) => void }) => Promise<Response> {
   const cache = new WeakMap<object, Runtime>();
   return async (context) => {
     const rt = runtimeFor(opts, context.env, cache);
-    return handle(context.request, rt, (req) => context.next(req));
+    const ctx: RequestCtx | undefined = context.waitUntil ? { waitUntil: (p) => context.waitUntil!(p) } : undefined;
+    return handle(context.request, rt, (req) => context.next(req), ctx);
   };
 }

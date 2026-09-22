@@ -20,6 +20,11 @@ Without a body the verdict is `skipped` with reason `no body` and nothing is sen
 
 If you run Caddy or plain nginx and want real judgment, put jev-edge's OpenResty in the request path instead (`access_by_lua`) and let Caddy / nginx proxy to it.
 
+Two rules every config here follows, whatever the gateway:
+
+- **Strip inbound `X-Jev-*`.** The verdict headers are set by the gateway after the sub-request; a client must not be able to pre-fill them. The Caddyfile uses `request_header -X-Jev-*`, traefik.yml a `headers` middleware with empty `customRequestHeaders` ahead of `forwardAuth`, and nginx `proxy_set_header` for every header (an empty value removes it).
+- **Fail-open means "not judged".** On a deny the gateway returns jev-edge's status and body (any status >= 400 with `X-Jev-Verdict`, 403 by default). When jev-edge is unreachable, Traefik and Caddy deny (there is no fail-open switch in forward-auth), and nginx's `auth_request` returns 500 unless you add `error_page 500 = @allow`-style handling; either way, an upstream request without `X-Jev-Verdict` was not judged. Keep `/_jev/config`, `/_jev/samples` and the other admin endpoints on a separate server block or port so they are never reachable through the gateway's path.
+
 ## Notes per gateway
 
 **Traefik.** `authRequestHeaders` limits what is forwarded; keep `Content-Type` and `Content-Length` or L1 will not recognise the body. `authResponseHeaders` must list the `X-Jev-*` headers or they never reach your service. Traefik strips nothing on deny: a 403 from jev-edge is returned to the client with jev-edge's body.

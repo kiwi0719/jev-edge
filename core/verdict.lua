@@ -52,13 +52,18 @@ function _M.headers(v)
   }
 end
 
---- URL-encode and truncate a reason for header transport (<= 200 bytes).
+--- URL-encode and truncate a reason for header transport (<= 200 bytes of
+--- encoded output, never cut inside a %XX escape).
+_M.REASON_MAX = 200
 function _M.encode_reason(s)
   s = tostring(s or "")
-  if #s > 200 then s = s:sub(1, 200) end
-  return (s:gsub("[^%w%-%._~ ]", function(c)
+  local enc = s:gsub("[^%w%-%._~ ]", function(c)
     return string.format("%%%02X", string.byte(c))
-  end):gsub(" ", "+"))
+  end):gsub(" ", "+")
+  if #enc > _M.REASON_MAX then
+    enc = enc:sub(1, _M.REASON_MAX):gsub("%%%x?$", "")
+  end
+  return enc
 end
 
 return _M

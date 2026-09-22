@@ -39,11 +39,11 @@ It is built for SREs and platform engineers, not agent authors. Existing Jev gua
 
 | | |
 |---|---|
-| Version | `v0.3.0` |
+| Version | `v0.3.1` |
 | Gateways, native | OpenResty; Apache APISIX (plugin, same engine) |
 | Gateways, via `/_jev/authz` | Envoy (HTTP and gRPC ext_authz), HAProxy (SPOE agent), Traefik, Caddy and plain nginx (forward-auth), each end-to-end tested against the real gateway; Istio, Envoy Gateway, Azure APIM and Apigee as [recipes](docs/recipes.md); LiteLLM proxy as a guardrail |
 | JavaScript hosts | Cloudflare Workers and Pages, Next.js, Node, Hono, Lambda@Edge, through one TypeScript port of core held to the same golden vectors (on `main`, unreleased) |
-| Test coverage | 242 busted specs including the 116 golden vectors, 175 vitest cases replaying the same vectors plus the JS hosts, 233 Test::Nginx assertions, 8 guardrail tests, four gateway e2e suites against real Envoy, Traefik / Caddy / nginx, APISIX and HAProxy, two benches, a soak run |
+| Test coverage | 262 busted specs including the 142 golden vectors, 223 vitest cases replaying the same vectors plus the JS hosts, 316 Test::Nginx assertions, 12 guardrail tests, 4 gRPC shim tests, four gateway e2e suites against real Envoy, Traefik / Caddy / nginx, APISIX and HAProxy, two benches, a soak run |
 | Providers verified live | `jev` against the TypeSafe API on the full 662-sample dataset; `openai-compat` against an Ollama container |
 | Production use | none known yet. Run in `monitor` mode first |
 
@@ -86,7 +86,7 @@ HTTP/1.1 403 Forbidden
 {"error":"request rejected"}
 ```
 
-The compose log shows one JSON line per judged request. `curl localhost:8080/_jev/health` reports the provider and timeout state, and `curl -X PUT localhost:8080/_jev/config -d '{"policy":{"mode":"monitor"}}'` flips to monitor mode without a reload. To judge with the real model, `export TYPESAFE_API_KEY=...` before `docker compose up`; the same config switches to the `jev` provider. Everything the demo runs is four short files in [demo/](demo/).
+The compose log shows one JSON line per judged request. `curl localhost:8090/_jev/health` reports the provider and timeout state, and `curl -X PUT localhost:8090/_jev/config -d '{"policy":{"mode":"monitor"}}'` flips to monitor mode without a reload. To judge with the real model, `export TYPESAFE_API_KEY=...` before `docker compose up`; the same config switches to the `jev` provider. Everything the demo runs is four short files in [demo/](demo/).
 
 ## How it works
 
@@ -135,6 +135,7 @@ git clone https://github.com/kiwi0719/jev-edge && cd jev-edge && sudo make insta
 
 ```nginx
 lua_shared_dict jev_cache  64m;
+lua_shared_dict jev_state   4m;   # trust, breaker, in-flight counters: never evicted by the verdict cache
 lua_shared_dict jev_config  1m;
 lua_shared_dict jev_metrics 4m;
 env TYPESAFE_API_KEY;
@@ -163,7 +164,7 @@ return {
 5. Reload nginx and check the provider from the box itself. This makes one real call and reports latency, the effective timeout and the breaker state:
 
 ```bash
-curl -s localhost:8080/_jev/health
+curl -s localhost:8090/_jev/health
 ```
 
 6. Send a request:
@@ -186,7 +187,7 @@ It prints the score distribution, AUC, false-positive and miss rates per thresho
 8. Switch to `enforce` with one call, no reload:
 
 ```bash
-curl -X PUT localhost:8080/_jev/config -d '{"policy":{"mode":"enforce"}}'
+curl -X PUT localhost:8090/_jev/config -d '{"policy":{"mode":"enforce"}}'
 ```
 
 Rollback is the same call with `"monitor"`, or `DELETE /_jev/config` to drop every runtime override.
@@ -279,7 +280,7 @@ Under a few hundred labelled requests the rates are a direction, not a measureme
 Someone on call decides a blocked request was legitimate. That decision has to reach two places: the gateway, now, so the same text stops being blocked; and the labels, so the next calibration knows about it. `POST /_jev/feedback` does both.
 
 ```bash
-curl -s localhost:8080/_jev/feedback -H 'X-Jev-Token: '"$JEV_FEEDBACK_TOKEN" \
+curl -s localhost:8090/_jev/feedback -H 'X-Jev-Token: '"$JEV_FEEDBACK_TOKEN" \
      -d '{"fp":"17e77570","label":"benign","by":"alice","rid":"ab12..."}'
 ```
 
@@ -336,7 +337,7 @@ One dataset, one deployment, mostly German and English. Treat it as evidence tha
 
 The full design lives in [docs/design.md](docs/design.md): scope, architecture, each of the three layers, the cache, policy, verdict headers, hot reload, the degradation matrix, the three adapters, observability, the acceptance table and the seven settled decisions. Read [Decisions](docs/design.md#decisions) before proposing a change to L1 rules, thresholds or fail-open behaviour.
 
-**Parity across implementations.** Core has one behavioural contract, the golden vectors in [core/golden/](core/golden/README.md): 116 cases covering normalisation, extraction, every L1 decision, policy edges, verdict headers and the whole pipeline with scripted IO. Both cores replay them, the Lua one under busted and the TypeScript one under vitest, and CI fails when either drifts. A verdict on nginx and a verdict on a Worker for the same request are the same verdict. What the vectors guarantee and what they leave to each platform (cache TTL precision, breaker statistics across workers, the adaptive timeout's value) is spelled out in that README and in the [JavaScript adapter's](adapters/js/README.md#what-is-the-same-as-nginx-and-what-is-not) own list.
+**Parity across implementations.** Core has one behavioural contract, the golden vectors in [core/golden/](core/golden/README.md): 142 cases covering normalisation, extraction, every L1 decision, policy edges, verdict headers and the whole pipeline with scripted IO. Both cores replay them, the Lua one under busted and the TypeScript one under vitest, and CI fails when either drifts. A verdict on nginx and a verdict on a Worker for the same request are the same verdict. What the vectors guarantee and what they leave to each platform (cache TTL precision, breaker statistics across workers, the adaptive timeout's value) is spelled out in that README and in the [JavaScript adapter's](adapters/js/README.md#what-is-the-same-as-nginx-and-what-is-not) own list.
 
 ## Repository layout
 
@@ -371,6 +372,7 @@ docs/            design.md, cost.md, recipes.md (Istio, Envoy Gateway, APIM, Api
 | 0.1.1 ✅ | live-verified providers, adaptive timeout with ceiling, `/_jev/health`, `deployment_context`, soak + full live bench |
 | 0.2.0 ✅ | Gateways beyond OpenResty, same engine: Envoy HTTP ext_authz (`/_jev/authz`) and gRPC ext_authz (`grpc-shim`); `/_jev/forward-auth` for Traefik ForwardAuth (body forwarded, full verdicts), Caddy `forward_auth` and nginx `auth_request` (headers only: path, method, reputation). Docker Compose e2e against every real gateway. `demo/`. License moved to Apache 2.0. |
 | 0.3.0 ✅ | Golden vectors as the versioned core contract (`core/golden/`, replayed by both cores in CI); `make calibrate`, `make context-lint`, `make labels`; multi-tenant rules with a `deployment_context` per tenant; decision sampling (`/_jev/samples`); the false-positive feedback loop (`/_jev/feedback`, fingerprint trust with expiry); the subject trajectory contract (recorded, not yet scored) with subject ids from IP, header or cookie, salted-hashed before storage, in a bounded dict of their own; APISIX plugin; HAProxy SPOE agent; LiteLLM guardrail; recipes for Istio, Envoy Gateway, APIM and Apigee; `@jev-edge/js` with a TypeScript core passing the vectors and presets for Cloudflare (thin and full Worker, Pages), Next.js, Node, Hono and Lambda@Edge. |
+| 0.3.1 ✅ | Audit patch: content-parts bodies judged; SHA-256 fingerprint over the whole text (was a crc32 prefix); `X-Forwarded-For` read from the proxy's hop (`client_ip.trusted_hops`); `GET /_jev/config` redacts secrets; admin endpoints on their own listener; inbound `X-Jev-*` stripped by every gateway config; one thin-adapter contract (`status >= 400` + `X-Jev-Verdict` = block, no header = not judged); optional `jev_state` dict for trust / breaker / counters; L3 rebuilt with the L2 prompt and the ceiling timeout; breaker, in-flight, provider and validation fixes; JS fail-open covers the whole request. |
 | Possible future work | Scoring on subject trajectories: the window, decay and thresholds chosen from recorded trajectories and a multi-turn dataset (shared with the `abuse` template, which gets its own dataset at the same time); Fastly Compute and Deno Deploy once the vectors have survived a real core change; a Grafana dashboard for the metrics and the feedback log |
 
 ✅ means shipped in a tagged release.

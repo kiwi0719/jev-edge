@@ -17,8 +17,9 @@ jev-edge 把整套判定暴露成 OpenResty adapter 上的一个 HTTP 端点 `/_
 | 状态 | 头 | 含义 |
 |---|---|---|
 | 200 | `X-Jev-Verdict`、`X-Jev-Score`、`X-Jev-Source`、`X-Jev-Reason`、`X-Jev-Request-Id` | 放行；把这些头拷到上游请求 |
-| 403 | 同样的头，JSON body | 拦截；把状态和 body 原样返回客户端 |
+| >= 400 且带 `X-Jev-Verdict`（`policy.block_status`，默认 403） | 同样的头，JSON body | 拦截；把状态和 body 原样返回客户端 |
 | 200 且 `X-Jev-Verdict: error` | | jev-edge 无法判定（provider 挂了、熔断打开）；放行 |
+| 其他 | 没有 `X-Jev-Verdict` | 不是 jev-edge 的答复（404、某个代理的 5xx）；放行，见下文 |
 
 每条配方都必须保住的两个性质：
 
@@ -30,6 +31,16 @@ nginx 这边只有一个 location：
 ```nginx
 location /_jev/authz/ { content_by_lua_block { require("resty.jev.edge").authz() } }
 ```
+
+## 薄 adapter 契约
+
+所有只转发 `/_jev/authz` 的 adapter（Envoy、gRPC shim、HAProxy 的 agent、LiteLLM guardrail、下面的配方）对答复必须这样处理：
+
+- **200** = 判定结果在头里，拷到上游。
+- **>= 400 且带 `X-Jev-Verdict`** = 拦截；把该状态和 body 返回客户端。
+- **其他**（没有 `X-Jev-Verdict`、3xx、超时、连接错误）= 未判定；fail-open，标 `X-Jev-Verdict: error`，能设的话再加 `X-Jev-Source: adapter`。
+- **剥掉入站 `X-Jev-*`**（verdict、score、source、reason、request-id、subject），上游看到的必须是网关设的，客户端不能预填；用覆盖，不要追加。
+- **管理端点不能经过网关路径。** `/_jev/config`、`/_jev/samples`、`/_jev/feedback`、`/_jev/health`、`/_jev/metrics` 就在 `/_jev/authz` 旁边；用单独的 server block 或端口暴露，含 `..`、`%2e` 或 `//` 的路径一律不转发。
 
 ## Istio
 

@@ -14,7 +14,7 @@
 // choice; it costs a round trip per lookup). Read the API key from Secrets
 // Manager at cold start and pass it in `config.jev.api_key`.
 import { createRuntime, evaluate, type Options, type Runtime } from "./runtime";
-import { headers as verdictHeaders } from "./core/verdict";
+import { headers as verdictHeaders, newVerdict, ERROR, SRC_ADAPTER } from "./core/verdict";
 
 export interface CfHeader { key?: string; value: string }
 export interface CfRequest {
@@ -33,7 +33,7 @@ export interface CfResponse {
   body?: string;
 }
 
-const HEADER_NAMES = ["x-jev-verdict", "x-jev-score", "x-jev-source", "x-jev-reason", "x-jev-request-id"];
+const HEADER_NAMES = ["x-jev-verdict", "x-jev-score", "x-jev-source", "x-jev-reason", "x-jev-request-id", "x-jev-subject"];
 
 function toRequest(cf: CfRequest, maxBytes: number): Request {
   const headers = new Headers();
@@ -56,31 +56,48 @@ function toRequest(cf: CfRequest, maxBytes: number): Request {
   return new Request(url, { method: cf.method, headers, body: cf.method === "GET" || cf.method === "HEAD" ? undefined : body });
 }
 
+const STATUS_TEXT: Record<number, string> = {
+  400: "Bad Request", 401: "Unauthorized", 403: "Forbidden", 404: "Not Found", 406: "Not Acceptable",
+  418: "I'm a teapot", 422: "Unprocessable Entity", 429: "Too Many Requests", 451: "Unavailable For Legal Reasons",
+  500: "Internal Server Error", 503: "Service Unavailable",
+};
+
+function setJevHeaders(cf: CfRequest, hdrs: Record<string, string>, requestId: string, subjectId?: string): void {
+  for (const h of HEADER_NAMES) delete cf.headers[h];
+  for (const [k, v] of Object.entries(hdrs)) cf.headers[k.toLowerCase()] = [{ key: k, value: v }];
+  cf.headers["x-jev-request-id"] = [{ key: "X-Jev-Request-Id", value: requestId }];
+  if (subjectId) cf.headers["x-jev-subject"] = [{ key: "X-Jev-Subject", value: subjectId }];
+}
+
 export function lambdaEdgeHandler(opts: Options): (event: CfEvent) => Promise<CfRequest | CfResponse> {
   let rt: Runtime | undefined;
   return async (event) => {
-    rt ??= createRuntime(opts);
     const cf = event.Records[0].cf.request;
-    const maxBytes = Math.max(...rt.rules.map((r) => r.max_body_bytes ?? 65536));
-    let verdict;
-    let response: Response | undefined;
-    let requestId = "";
     try {
-      ({ verdict, response, requestId } = await evaluate(toRequest(cf, maxBytes), rt));
+      rt ??= createRuntime(opts);
+      const maxBytes = Math.max(...rt.rules.map((r) => r.max_body_bytes ?? 65536));
+      const { verdict, response, requestId, subjectId } = await evaluate(toRequest(cf, maxBytes), rt);
+      if (response) {
+        const headers: Record<string, CfHeader[]> = {};
+        response.headers.forEach((v, k) => (headers[k] = [{ key: k, value: v }]));
+        const status = rt.config.policy.block_status ?? response.status;
+        return { status: String(status), statusDescription: STATUS_TEXT[status] ?? "Blocked", headers, body: await response.text() };
+      }
+      setJevHeaders(cf, verdictHeaders(verdict), requestId, subjectId);
+      return cf;
     } catch (e) {
+      // Same shape as every other host: pass, and every X-Jev-* header says so,
+      // so a client-supplied X-Jev-Verdict: safe cannot survive an adapter error.
       console.error("jev-edge: lambda@edge error, failing open: " + (e instanceof Error ? e.message : String(e)));
-      cf.headers["x-jev-verdict"] = [{ key: "X-Jev-Verdict", value: "error" }];
-      cf.headers["x-jev-source"] = [{ key: "X-Jev-Source", value: "adapter" }];
+      const v = newVerdict({ verdict: ERROR, source: SRC_ADAPTER, reason: "adapter error" });
+      let rid: string;
+      try {
+        rid = crypto.randomUUID();
+      } catch {
+        rid = String(Date.now());
+      }
+      setJevHeaders(cf, verdictHeaders(v), rid);
       return cf;
     }
-    if (response) {
-      const headers: Record<string, CfHeader[]> = {};
-      response.headers.forEach((v, k) => (headers[k] = [{ key: k, value: v }]));
-      return { status: String(response.status), statusDescription: "Forbidden", headers, body: await response.text() };
-    }
-    for (const h of HEADER_NAMES) delete cf.headers[h];
-    for (const [k, v] of Object.entries(verdictHeaders(verdict))) cf.headers[k.toLowerCase()] = [{ key: k, value: v }];
-    cf.headers["x-jev-request-id"] = [{ key: "X-Jev-Request-Id", value: requestId }];
-    return cf;
   };
 }

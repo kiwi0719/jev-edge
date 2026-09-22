@@ -21,10 +21,31 @@ local function split_path(path)
   return segs
 end
 
+-- A leaf that is not a string is a "content parts" value: the array form of
+-- `messages[*].content` every current chat API accepts
+-- (`[{type="text", text="..."}, {type="image_url", ...}]`), the Responses API's
+-- `input_text`, and Anthropic's `tool_result` whose `content` nests once more.
+-- Collect every string, every part's `text`, and recurse into `content`, to a
+-- bounded depth. Anything else (numbers, images) contributes nothing.
+local LEAF_DEPTH = 4
+local function collect(node, out, depth)
+  if type(node) == "string" then
+    out[#out + 1] = node
+    return
+  end
+  if type(node) ~= "table" or depth > LEAF_DEPTH then return end
+  if node[1] ~= nil then
+    for _, item in ipairs(node) do collect(item, out, depth + 1) end
+    return
+  end
+  if type(node.text) == "string" then out[#out + 1] = node.text end
+  if node.content ~= nil then collect(node.content, out, depth + 1) end
+end
+
 local function walk(node, segs, i, out)
   if node == nil then return end
   if i > #segs then
-    if type(node) == "string" then out[#out + 1] = node end
+    collect(node, out, 1)
     return
   end
   local seg = segs[i]
@@ -110,9 +131,26 @@ function _M.normalize(text, opts)
   return s
 end
 
---- Fingerprint = hash(normalize(text)). `hash` is injected by the adapter.
+--- Fingerprint = hash(normalize(text)) over the WHOLE normalized text.
+-- `opts.prefix_bytes` is deliberately ignored here: a fingerprint that only
+-- covers a prefix lets any text that shares the prefix reuse a cached or
+-- trusted verdict (0.3.0 hashed the first 2048 bytes; fixed in 0.3.1).
+-- Text that normalizes to nothing (digit runs, UUIDs) is hashed as typed, so
+-- it still gets a cache entry instead of a judge call per request.
+--
+-- `hash` is injected by the adapter and MUST be collision-resistant
+-- (sha256 hex or better). The fingerprint keys the verdict cache and the
+-- operator trust store, both of which turn a hit into a verdict without a
+-- judge call, so an attacker who can forge a hash forges a verdict. CRC32
+-- and djb2 are linear and let a few appended bytes hit any chosen value;
+-- `djb2` below exists for the golden vectors only.
 function _M.fingerprint(text, opts, hash)
-  local norm = _M.normalize(text, opts)
+  local o = { strip_digits = opts and opts.strip_digits, strip_uuid = opts and opts.strip_uuid,
+              prefix_bytes = math.huge }
+  local norm = _M.normalize(text, o)
+  if norm == "" then
+    norm = _M.normalize(text, { strip_digits = false, strip_uuid = false, prefix_bytes = math.huge })
+  end
   if norm == "" then return "" end
   return tostring(hash(norm))
 end

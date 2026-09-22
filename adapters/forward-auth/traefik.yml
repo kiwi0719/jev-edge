@@ -2,6 +2,16 @@
 # enable the file provider; this is the dynamic part.
 http:
   middlewares:
+    # never trust a client-supplied verdict: strip before forwardAuth runs
+    strip-jev:
+      headers:
+        customRequestHeaders:
+          X-Jev-Verdict: ""
+          X-Jev-Score: ""
+          X-Jev-Source: ""
+          X-Jev-Reason: ""
+          X-Jev-Request-Id: ""
+          X-Jev-Subject: ""
     jev-edge:
       forwardAuth:
         address: "http://jev-edge:8080/_jev/forward-auth"
@@ -26,7 +36,7 @@ http:
     app:
       rule: "PathPrefix(`/`)"
       entryPoints: [web]
-      middlewares: [jev-edge]
+      middlewares: [strip-jev, jev-edge]
       service: app
   services:
     app:

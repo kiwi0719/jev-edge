@@ -14,7 +14,9 @@
 //   memory          per isolate. The fallback when no binding is configured;
 //                   documented as "each isolate learns on its own".
 
-import type { Store } from "../core/breaker";
+import { Breaker, type Store, type BreakerLike, type BreakerConfig, type State } from "../core/breaker";
+import { Adaptive, tuning, type AdaptiveLike } from "./adaptive";
+import type { JevConfig } from "../core/defaults";
 
 export interface KVLike {
   get(key: string, type: "json"): Promise<unknown>;
@@ -57,9 +59,18 @@ export function memoryStore(clock: () => number = () => Date.now() / 1000): Stor
 }
 
 /**
- * A Durable Object exposing the store interface over fetch. One instance per
- * deployment (`idFromName("jev-edge")`) holds breaker and adaptive state for
- * every isolate. Export it from your Worker and bind it as JEV_STATE.
+ * A Durable Object holding breaker and adaptive state for every isolate. One
+ * instance per deployment (`idFromName("jev-edge")`). Export it from your
+ * Worker and bind it as JEV_STATE.
+ *
+ * Two kinds of endpoint:
+ *   /get, /set                  the plain Store interface (durableStore)
+ *   /breaker/<op>, /adaptive/<op>  the operation runs HERE, against this
+ *                               object's storage, with the same Breaker and
+ *                               Adaptive classes the in-process runtime uses.
+ *                               One fetch per operation, and atomic: a
+ *                               Durable Object delivers one request at a time
+ *                               while the handler only awaits its own storage.
  */
 export interface DOStateLike {
   storage: {
@@ -69,23 +80,62 @@ export interface DOStateLike {
   };
 }
 
+function storeOver(state: DOStateLike, clock: () => number): Store {
+  return {
+    get: async (k) => {
+      const e = (await state.storage.get(k)) as Entry | undefined;
+      if (!e || (e.exp && e.exp <= clock())) return undefined;
+      return e.v;
+    },
+    set: async (k, v, ttl) => {
+      if (v === null || v === undefined) await state.storage.delete(k);
+      else await state.storage.put(k, { v, exp: ttl && ttl > 0 ? clock() + ttl : 0 } satisfies Entry);
+    },
+  };
+}
+
+interface BreakerOp { op: "allow" | "state" | "trip" | "success" | "failure"; cfg?: BreakerConfig; now?: number }
+interface AdaptiveOp { op: "current" | "success" | "timeout"; cfg: JevConfig; ms?: number }
+
 export class JevState {
-  constructor(private state: DOStateLike) {}
+  private store: Store;
+  private clock = () => Date.now() / 1000;
+
+  constructor(state: DOStateLike) {
+    this.store = storeOver(state, this.clock);
+  }
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     if (request.method !== "POST") return new Response("method not allowed", { status: 405 });
-    const body = (await request.json()) as { key: string; value?: unknown; ttl?: number };
-    const now = Date.now() / 1000;
+    const body = (await request.json()) as { key?: string; value?: unknown; ttl?: number; op?: string; cfg?: unknown; now?: number; ms?: number };
     if (url.pathname === "/get") {
-      const e = (await this.state.storage.get(body.key)) as Entry | undefined;
-      if (!e || (e.exp && e.exp <= now)) return Response.json({ value: null });
-      return Response.json({ value: e.v });
+      const v = await this.store.get(String(body.key));
+      return Response.json({ value: v ?? null });
     }
     if (url.pathname === "/set") {
-      if (body.value === null || body.value === undefined) await this.state.storage.delete(body.key);
-      else await this.state.storage.put(body.key, { v: body.value, exp: body.ttl && body.ttl > 0 ? now + body.ttl : 0 } satisfies Entry);
+      await this.store.set(String(body.key), body.value ?? null, body.ttl ?? 0);
       return Response.json({ ok: true });
+    }
+    if (url.pathname === "/breaker") {
+      const b = new Breaker(this.store, this.clock, (body.cfg as BreakerConfig | undefined) ?? {});
+      switch (body.op) {
+        case "allow": return Response.json({ value: await b.allow() });
+        case "state": return Response.json({ value: await b.state() });
+        case "trip": await b.trip(typeof body.now === "number" ? body.now : undefined); return Response.json({ ok: true });
+        case "success": await b.success(); return Response.json({ ok: true });
+        case "failure": await b.failure(); return Response.json({ ok: true });
+        default: return new Response("bad breaker op", { status: 400 });
+      }
+    }
+    if (url.pathname === "/adaptive") {
+      const a = new Adaptive(this.store, (body.cfg as JevConfig | undefined) ?? { timeout_ms: 400 });
+      switch (body.op) {
+        case "current": return Response.json({ value: await a.current() });
+        case "success": await a.success(Number(body.ms) || 0); return Response.json({ ok: true });
+        case "timeout": await a.timeout(typeof body.ms === "number" ? body.ms : undefined); return Response.json({ ok: true });
+        default: return new Response("bad adaptive op", { status: 400 });
+      }
     }
     return new Response("not found", { status: 404 });
   }
@@ -95,22 +145,50 @@ export interface DOStubLike {
   fetch(input: string | Request, init?: RequestInit): Promise<Response>;
 }
 
-export function durableStore(stub: DOStubLike): Store {
-  const call = async (path: string, payload: unknown): Promise<unknown> => {
+function caller(stub: DOStubLike) {
+  return async (path: string, payload: unknown): Promise<{ value?: unknown; ok?: boolean }> => {
     const res = await stub.fetch("https://jev-state" + path, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
-    return (await res.json()) as unknown;
+    if (!res.ok) throw new Error(`jev-state ${path}: http ${res.status}`);
+    return (await res.json()) as { value?: unknown; ok?: boolean };
   };
+}
+
+/** The plain Store interface over a JevState stub: two hops per read-modify-write. */
+export function durableStore(stub: DOStubLike): Store {
+  const call = caller(stub);
   return {
-    get: async (k) => {
-      const r = (await call("/get", { key: k })) as { value: unknown };
-      return r.value ?? undefined;
-    },
+    get: async (k) => (await call("/get", { key: k })).value ?? undefined,
     set: async (k, v, ttl) => {
       await call("/set", { key: k, value: v ?? null, ttl });
     },
+  };
+}
+
+/** A breaker whose every operation is one fetch, executed inside the Durable Object. */
+export function durableBreaker(stub: DOStubLike, cfg: BreakerConfig = {}): BreakerLike {
+  const call = caller(stub);
+  const op = (o: BreakerOp["op"], extra: Record<string, unknown> = {}) => call("/breaker", { op: o, cfg, ...extra });
+  return {
+    state: async () => (await op("state")).value as State,
+    allow: async () => (await op("allow")).value === true,
+    trip: async (now?: number) => { await op("trip", now === undefined ? {} : { now }); },
+    success: async () => { await op("success"); },
+    failure: async () => { await op("failure"); },
+  };
+}
+
+/** Adaptive timeout whose observe() runs inside the Durable Object: one fetch, atomic. */
+export function durableAdaptive(stub: DOStubLike, cfg: JevConfig): AdaptiveLike {
+  const call = caller(stub);
+  const t = tuning(cfg);
+  const op = (o: AdaptiveOp["op"], extra: Record<string, unknown> = {}) => call("/adaptive", { op: o, cfg, ...extra });
+  return {
+    current: async () => (t.enabled ? Number((await op("current")).value) || t.floor : t.floor),
+    success: async (ms) => { if (t.enabled && ms > 0) await op("success", { ms }); },
+    timeout: async (firedMs) => { if (t.enabled) await op("timeout", firedMs === undefined ? {} : { ms: firedMs }); },
   };
 }

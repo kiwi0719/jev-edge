@@ -101,9 +101,14 @@ function _M.extract(scfg, view)
   if type(v) == "table" then v = v[1] end
   if type(v) ~= "string" then return nil end
   v = v:match("^%s*(.-)%s*$")
-  if v == "" then return nil end
+  if v == "" or #v > _M.MAX_VALUE_BYTES then return nil end
   return v
 end
+
+--- Longest raw subject value accepted. Hashing makes the length irrelevant
+--- for the store, but with `hashed = true` the value IS the key and the log
+--- field, so an unbounded header would be an unbounded dict key.
+_M.MAX_VALUE_BYTES = 512
 
 --- The id core and the store see: `<from>:<hash(salt .. value)>`. The raw
 -- value never leaves this function. With `hashed = true` the value is used as
@@ -113,7 +118,12 @@ end
 function _M.hash_id(scfg, value, hash)
   if value == nil then return nil end
   local from = scfg.from or "ip"
-  if scfg.hashed then return value end
+  if scfg.hashed then
+    -- Already `<from>:<hex>` from another jev-edge. Anything else is not an
+    -- id computed by us and does not get to name a trajectory.
+    if value:match("^[a-z]+:[0-9a-f]+$") then return value end
+    return nil
+  end
   if type(scfg.salt) ~= "string" or scfg.salt == "" then return nil end
   return from .. ":" .. tostring(hash(scfg.salt .. "\0" .. value))
 end

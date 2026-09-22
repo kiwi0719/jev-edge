@@ -13,11 +13,21 @@ export function byteLength(s: string): number {
   return enc.encode(s).length;
 }
 
-/** Truncate to at most n UTF-8 bytes (a split code point decodes as U+FFFD). */
+/**
+ * Truncate to at most n UTF-8 bytes on a code point boundary: the output
+ * never exceeds n bytes and never contains a U+FFFD from a split code point
+ * (the partial code point is dropped). Lua's `s:sub(1, n)` keeps the partial
+ * bytes; see the README parity notes for the (logged, sampled-text-only)
+ * difference. The fingerprint never truncates, so it is unaffected.
+ */
 export function truncateBytes(s: string, n: number): string {
   const b = enc.encode(s);
   if (b.length <= n) return s;
-  return dec.decode(b.subarray(0, n));
+  let end = n;
+  // step back over continuation bytes (10xxxxxx) to the start of the code
+  // point that straddles the cut, then drop it
+  while (end > 0 && (b[end] & 0xc0) === 0x80) end--;
+  return dec.decode(b.subarray(0, end));
 }
 
 /** Lua's string.lower under the C locale: ASCII letters only. */
@@ -48,10 +58,37 @@ function isObj(v: unknown): v is { [k: string]: JsonValue } | JsonValue[] {
   return typeof v === "object" && v !== null;
 }
 
+// A leaf that is not a string is a "content parts" value: the array form of
+// `messages[*].content` every current chat API accepts
+// (`[{type:"text", text:"..."}, {type:"image_url", ...}]`), the Responses API's
+// `input_text`, and Anthropic's `tool_result` whose `content` nests once more.
+// Collect every string, every part's `text`, and recurse into `content`, to a
+// bounded depth. Anything else (numbers, images) contributes nothing.
+// Mirrors collect() in core/normalize.lua, including Lua's "array if [1] is
+// set" test: an empty array is a table with no array part and yields nothing.
+const LEAF_DEPTH = 4;
+function collect(node: JsonValue | undefined, out: string[], depth: number): void {
+  if (typeof node === "string") {
+    out.push(node);
+    return;
+  }
+  if (!isObj(node) || depth > LEAF_DEPTH) return;
+  if (Array.isArray(node)) {
+    // Lua ipairs: stops at the first nil
+    for (const item of node) {
+      if (item === null || item === undefined) break;
+      collect(item, out, depth + 1);
+    }
+    return;
+  }
+  if (typeof node.text === "string") out.push(node.text);
+  if (node.content !== undefined && node.content !== null) collect(node.content, out, depth + 1);
+}
+
 function walk(node: JsonValue | undefined, segs: Seg[], i: number, out: string[]): void {
   if (node === undefined || node === null) return;
   if (i >= segs.length) {
-    if (typeof node === "string") out.push(node);
+    collect(node, out, 1);
     return;
   }
   const seg = segs[i];
@@ -160,12 +197,29 @@ export function normalize(text: string | null | undefined, opts?: NormalizeOpts 
   return s;
 }
 
+/**
+ * Fingerprint = hash(normalize(text)) over the WHOLE normalized text.
+ * `opts.prefix_bytes` is deliberately ignored here: a fingerprint that only
+ * covers a prefix lets any text that shares the prefix reuse a cached or
+ * trusted verdict (0.3.0 hashed the first 2048 bytes; fixed in 0.3.1).
+ * Text that normalizes to nothing (digit runs, UUIDs) is hashed as typed, so
+ * it still gets a cache entry instead of a judge call per request.
+ *
+ * `hash` is injected by the adapter and MUST be collision-resistant
+ * (sha256 hex or better). The fingerprint keys the verdict cache and the
+ * operator trust store, both of which turn a hit into a verdict without a
+ * judge call, so an attacker who can forge a hash forges a verdict. CRC32
+ * and djb2 are linear and let a few appended bytes hit any chosen value;
+ * `djb2` below exists for the golden vectors only.
+ */
 export function fingerprint(
   text: string | null | undefined,
   opts: NormalizeOpts | null | undefined,
   hash: (s: string) => string,
 ): string {
-  const norm = normalize(text, opts);
+  const o: NormalizeOpts = { strip_digits: opts?.strip_digits, strip_uuid: opts?.strip_uuid, prefix_bytes: Infinity };
+  let norm = normalize(text, o);
+  if (norm === "") norm = normalize(text, { strip_digits: false, strip_uuid: false, prefix_bytes: Infinity });
   if (norm === "") return "";
   return String(hash(norm));
 }

@@ -44,31 +44,115 @@ export interface RulesCtx {
 }
 
 /**
- * Lua pattern -> RegExp for the subset rule files use: ^ anchor, literals,
- * %-escaped punctuation and the %a %d %s %w %x classes. Anything else in a
- * watch path is unsupported on this adapter and throws at load time rather
- * than silently matching differently.
+ * Syntax check for a Lua pattern, ported from core/rules.lua pattern_error():
+ * walks the pattern the way lstrlib does and reports what it would raise on
+ * some subject. Returns null when the pattern is well formed. Used at rule
+ * resolve time so a malformed watch path fails at startup, not per request.
+ */
+export function patternError(p: string): string | null {
+  const n = p.length;
+  let i = 0;
+  while (i < n) {
+    const c = p[i];
+    if (c === "%") {
+      const d = p[i + 1];
+      if (d === undefined) return "malformed pattern (ends with '%')";
+      if (d === "b") {
+        if (i + 3 >= n) return "malformed pattern (missing arguments to '%b')";
+        i += 4;
+      } else if (d === "f") {
+        if (p[i + 2] !== "[") return "missing '[' after '%f' in pattern";
+        i += 2;
+      } else {
+        i += 2;
+      }
+    } else if (c === "[") {
+      let j = i + 1;
+      if (p[j] === "^") j++;
+      // the first ']' right after '[' or '[^' is literal
+      if (p[j] === "]") j++;
+      let closed = false;
+      while (j < n) {
+        const e = p[j];
+        if (e === "%") {
+          if (j + 1 >= n) return "malformed pattern (ends with '%')";
+          j += 2;
+        } else if (e === "]") {
+          closed = true;
+          break;
+        } else {
+          j++;
+        }
+      }
+      if (!closed) return "malformed pattern (missing ']')";
+      i = j + 1;
+    } else {
+      i++;
+    }
+  }
+  return null;
+}
+
+const LUA_CLASSES: Record<string, string> = {
+  a: "A-Za-z", d: "0-9", s: " \\t\\n\\v\\f\\r", w: "A-Za-z0-9", x: "0-9A-Fa-f", p: "!-/:-@\\[-`{-~",
+};
+
+/**
+ * Lua pattern -> RegExp for the subset rule files use: ^ $ anchors, literals,
+ * %-escaped punctuation, the %a %d %s %w %x %p classes and [...] sets (with
+ * those classes and ranges inside). Anything else in a watch path is
+ * unsupported on this adapter and throws at load time rather than silently
+ * matching differently. `-` is Lua's lazy `*?` outside a set and a plain
+ * range/literal inside one.
  */
 const luaPatternCache = new Map<string, RegExp>();
 export function luaPatternToRegExp(p: string): RegExp {
   const hit = luaPatternCache.get(p);
   if (hit) return hit;
+  const perr = patternError(p);
+  if (perr) throw new Error(`malformed Lua pattern ${p}: ${perr}`);
   let out = "";
-  for (let i = 0; i < p.length; i++) {
+  let i = 0;
+  const n = p.length;
+  const classFor = (k: string, inSet: boolean): string => {
+    const body = LUA_CLASSES[k];
+    if (body !== undefined) return inSet ? body : "[" + body + "]";
+    if (/[A-Za-z0-9]/.test(k)) throw new Error(`unsupported Lua class %${k} in ${p}`);
+    return "\\" + k; // escaped punctuation is a literal in both
+  };
+  while (i < n) {
     const c = p[i];
     if (c === "%") {
-      const n = p[++i];
-      if (n === undefined) throw new Error(`malformed Lua pattern: ${p}`);
-      const cls: Record<string, string> = { a: "[A-Za-z]", d: "[0-9]", s: "[ \\t\\n\\v\\f\\r]", w: "[A-Za-z0-9]", x: "[0-9A-Fa-f]", p: "[!-/:-@\\[-`{-~]" };
-      if (cls[n]) out += cls[n];
-      else if (/[A-Za-z0-9]/.test(n)) throw new Error(`unsupported Lua class %${n} in ${p}`);
-      else out += "\\" + n;
+      out += classFor(p[i + 1], false);
+      i += 2;
+    } else if (c === "[") {
+      // copy the set through to its closing ']', translating what is inside
+      let j = i + 1;
+      let set = "[";
+      if (p[j] === "^") { set += "^"; j++; }
+      if (p[j] === "]") { set += "\\]"; j++; }
+      while (p[j] !== "]") {
+        const e = p[j];
+        if (e === "%") {
+          set += classFor(p[j + 1], true);
+          j += 2;
+        } else {
+          if ("\\[".includes(e)) set += "\\" + e;
+          else set += e; // '-' stays a range, '^' inside stays literal for JS too
+          j++;
+        }
+      }
+      out += set + "]";
+      i = j + 1;
     } else if (c === "-") {
       out += "*?";
+      i++;
     } else if ("\\{}|".includes(c)) {
       out += "\\" + c; // literal in Lua, special in JS
+      i++;
     } else {
-      out += c; // ^ $ . * + ? [ ] ( ) mean the same in both for this subset
+      out += c; // ^ $ . * + ? ( ) mean the same in both for this subset
+      i++;
     }
   }
   const re = new RegExp(out);
@@ -76,7 +160,7 @@ export function luaPatternToRegExp(p: string): RegExp {
   return re;
 }
 
-function pathMatches(s: string, patterns: string[] | undefined): string | null {
+export function pathMatches(s: string, patterns: string[] | undefined): string | null {
   for (const p of patterns ?? []) {
     if (luaPatternToRegExp(p).test(s)) return p;
   }
@@ -84,6 +168,7 @@ function pathMatches(s: string, patterns: string[] | undefined): string | null {
 }
 
 let warned = false;
+const badPatterns = new Set<string>();
 function textMatches(s: string, patterns: string[] | undefined, ctx: RulesCtx | undefined): string | null {
   if (!patterns || patterns.length === 0) return null;
   const reFind = ctx?.re_find;
@@ -97,8 +182,15 @@ function textMatches(s: string, patterns: string[] | undefined, ctx: RulesCtx | 
   for (const p of patterns) {
     try {
       if (reFind(s, p)) return p;
-    } catch {
-      // a pattern the engine rejects is skipped, like pcall in Lua
+    } catch (e) {
+      // a pattern the engine rejects is skipped, like pcall in Lua, but an
+      // operator should hear about it once instead of losing the prefilter silently
+      if (!badPatterns.has(p)) {
+        badPatterns.add(p);
+        const msg = `jev-edge: always_suspect pattern ${JSON.stringify(p)} does not compile and is skipped: ${e instanceof Error ? e.message : String(e)}`;
+        if (ctx?.log) ctx.log("warn", msg);
+        else console.warn(msg);
+      }
     }
   }
   return null;
@@ -141,8 +233,11 @@ export async function evaluate(req: Req, rule: Rule, ctx?: RulesCtx): Promise<[R
   const ct = req.headers ? (req.headers["content-type"] ?? req.headers["Content-Type"] ?? "") : "";
   if (!ctAllowed(ct, rule.content_types)) return [PASS, "", "content-type not watched"];
 
-  // 4. body size (bytes, like Lua's #body)
-  const size = typeof req.body_size === "number" ? req.body_size : (typeof req.body === "string" ? byteLength(req.body) : 0);
+  // 4. body size: the larger of what the adapter declared and what it handed
+  //    over, so a wrong or missing Content-Length cannot shrink the body
+  //    (bytes, like Lua's #body).
+  const declared = Number(req.body_size);
+  const size = Math.max(Number.isFinite(declared) ? declared : 0, typeof req.body === "string" ? byteLength(req.body) : 0);
   if (size === 0 && (req.body === undefined || req.body === null)) return [PASS, "", "no body"];
   if (size < (rule.min_body_bytes ?? 8)) return [PASS, "", "body too small"];
   if (size > (rule.max_body_bytes ?? 65536)) return [PASS, "", "body too large"];

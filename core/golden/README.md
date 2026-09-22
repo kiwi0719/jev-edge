@@ -59,7 +59,7 @@ An implementation replays a case by constructing its IO from `input` exactly as 
 - cache TTL precision and eviction (a shared dict, KV and the Cache API expire differently)
 - breaker window statistics across workers or isolates; only "open skips L2, closed calls L2" is pinned
 - the adaptive timeout's numeric value; only that `jev.timeout_ms` is what the judge receives
-- the production hash (OpenResty uses `ngx.crc32_long`; a port may use any function, as long as its own adapters agree with each other); the vectors use djb2 so the *normalised text* is what is compared
+- the production hash (OpenResty and APISIX use SHA-256; a port may use any function that is collision-resistant, because the fingerprint keys the verdict cache and the trust store); the vectors use djb2 so the *normalised text* is what is compared
 - HTTP transport: provider request bodies, retries, header casing on the wire
 
 ## Regex portability

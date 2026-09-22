@@ -25,17 +25,50 @@ export interface ProviderRequestInfo {
   subjectId?: string;
 }
 
-async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+class TimeoutError extends Error {
+  constructor(ms: number) {
+    super(`timeout after ${ms} ms`);
+    this.name = "TimeoutError";
+  }
+}
+
+/**
+ * fetch + read the body under ONE deadline. `timeoutMs` covers the connect,
+ * the headers and the body (`read`), the way the Lua provider's socket
+ * timeout does: a judge that answers headers quickly and then stalls is a
+ * timeout, and counts as one for the breaker and the adaptive estimate.
+ * The body read is raced against the deadline as well, for runtimes whose
+ * body streams ignore the fetch signal.
+ */
+async function fetchWithin<T>(url: string, init: RequestInit, timeoutMs: number, read: (res: Response) => Promise<T>): Promise<T> {
   const ac = new AbortController();
-  const t = setTimeout(() => ac.abort(), timeoutMs);
+  let fired: (() => void) | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    fired = () => reject(new TimeoutError(timeoutMs));
+  });
+  const t = setTimeout(() => {
+    ac.abort();
+    fired?.();
+  }, timeoutMs);
+  deadline.catch(() => {}); // never unhandled
   try {
-    return await fetch(url, { ...init, signal: ac.signal });
+    const res = await Promise.race([fetch(url, { ...init, signal: ac.signal }), deadline]);
+    return await Promise.race([read(res), deadline]);
   } finally {
     clearTimeout(t);
   }
 }
 
+/** A non-OK status is reported as an error string without reading the body. */
+class HttpStatus extends Error {
+  constructor(public status: number) {
+    super("http " + status);
+    this.name = "HttpStatus";
+  }
+}
+
 function errorString(e: unknown, timeoutMs: number): string {
+  if (e instanceof TimeoutError) return e.message;
   if (e instanceof Error && e.name === "AbortError") return `timeout after ${timeoutMs} ms`;
   return e instanceof Error ? e.message : String(e);
 }
@@ -58,18 +91,21 @@ export const jev: Provider = {
     const body = JSON.stringify({ model: cfg.model ?? "jev-latest", state, questions });
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (cfg.api_key) headers.Authorization = "Bearer " + cfg.api_key;
-    let res: Response;
-    try {
-      res = await fetchWithTimeout(cfg.endpoint ?? "https://api.typesafe.ai/v1/systemone", { method: "POST", headers, body }, timeoutMs);
-    } catch (e) {
-      return [null, errorString(e, timeoutMs)];
-    }
-    if (res.status !== 200) return [null, "jev http " + res.status];
     let decoded: { answers?: Record<string, { noul?: unknown }> };
     try {
-      decoded = (await res.json()) as typeof decoded;
-    } catch {
-      return [null, "jev: malformed response"];
+      decoded = await fetchWithin(cfg.endpoint ?? "https://api.typesafe.ai/v1/systemone", { method: "POST", headers, body }, timeoutMs, async (res) => {
+        if (res.status !== 200) throw new HttpStatus(res.status);
+        try {
+          return (await res.json()) as typeof decoded;
+        } catch (e) {
+          if (e instanceof Error && e.name === "AbortError") throw e;
+          throw new Error("malformed response");
+        }
+      });
+    } catch (e) {
+      if (e instanceof HttpStatus) return [null, "jev http " + e.status];
+      if (e instanceof Error && e.message === "malformed response") return [null, "jev: malformed response"];
+      return [null, errorString(e, timeoutMs)];
     }
     if (!decoded || typeof decoded.answers !== "object" || decoded.answers === null) return [null, "jev: malformed response"];
     const answers: Answers = {};
@@ -119,19 +155,22 @@ export const openaiCompat: Provider = {
     });
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (cfg.api_key) headers.Authorization = "Bearer " + cfg.api_key;
-    let res: Response;
-    try {
-      res = await fetchWithTimeout(endpoint + "/chat/completions", { method: "POST", headers, body }, timeoutMs);
-    } catch (e) {
-      return [null, errorString(e, timeoutMs)];
-    }
-    if (res.status !== 200) return [null, "openai-compat http " + res.status];
     let content: string;
     try {
-      const d = (await res.json()) as { choices?: { message?: { content?: string } }[] };
-      content = d.choices?.[0]?.message?.content ?? "";
-    } catch {
-      return [null, "openai-compat: malformed response"];
+      content = await fetchWithin(endpoint + "/chat/completions", { method: "POST", headers, body }, timeoutMs, async (res) => {
+        if (res.status !== 200) throw new HttpStatus(res.status);
+        try {
+          const d = (await res.json()) as { choices?: { message?: { content?: string } }[] };
+          return d.choices?.[0]?.message?.content ?? "";
+        } catch (e) {
+          if (e instanceof Error && e.name === "AbortError") throw e;
+          throw new Error("malformed response");
+        }
+      });
+    } catch (e) {
+      if (e instanceof HttpStatus) return [null, "openai-compat http " + e.status];
+      if (e instanceof Error && e.message === "malformed response") return [null, "openai-compat: malformed response"];
+      return [null, errorString(e, timeoutMs)];
     }
     const m = /\{[\s\S]*\}/.exec(content);
     if (!m) return [null, "openai-compat: no JSON in reply"];
@@ -170,13 +209,18 @@ export const backend: Provider = {
     const headers: Record<string, string> = { "Content-Type": info?.headers.get("content-type") ?? "application/json" };
     if (info?.clientIp) headers["X-Forwarded-For"] = info.clientIp;
     if (info?.subjectId) headers["X-Jev-Subject"] = info.subjectId;
+    // The answer is in the headers; the body (a 403's JSON) is drained so the
+    // connection is reusable, still under the same deadline.
     let res: Response;
     try {
-      res = await fetchWithTimeout(base + "/_jev/authz" + path, {
+      res = await fetchWithin(base + "/_jev/authz" + path, {
         method: info?.method ?? prompt.context.method ?? "POST",
         headers,
         body: info?.body ?? prompt.text,
-      }, timeoutMs);
+      }, timeoutMs, async (r) => {
+        await r.text().catch(() => "");
+        return r;
+      });
     } catch (e) {
       return [null, errorString(e, timeoutMs)];
     }

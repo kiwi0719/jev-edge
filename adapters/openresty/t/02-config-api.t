@@ -124,3 +124,44 @@ Content-Type: application/json
 --- response_body_like eval
 [ ("verdict=(error|safe)") x 40,
   '(?s)(?=.*jev_l2_timeout_ms ([6-9]\d|[1-4]\d\d)\b)(?=.*jev_requests_total\{source="l2",verdict="safe"\} [1-9])' ]
+
+
+
+=== TEST 8: GET /_jev/config never shows the provider key, the feedback token or the subject salt
+--- http_config eval: $::HttpConfig
+--- user_files eval: ::conf('feedback = { enabled = true, token = "hunter2-feedback" }, subject = { enabled = true, from = "ip", salt = "pepper-salt" },')
+--- config
+location = /_jev/config { content_by_lua_block { require("resty.jev.edge").config_api() } }
+--- request eval
+["PUT /_jev/config\n{\"jev\":{\"api_key\":\"sk-live-secret\"}}",
+ "GET /_jev/config"]
+--- error_code eval
+[200, 200]
+--- response_body_like eval
+["ok", '(?s)^(?!.*sk-live-secret)(?!.*hunter2-feedback)(?!.*pepper-salt)(?=.*<redacted>)']
+
+
+
+=== TEST 9: PUT larger than client_body_buffer_size is read from the spooled file
+--- http_config eval: $::HttpConfig
+--- user_files eval: ::conf()
+--- config
+client_body_buffer_size 1k;
+location = /_jev/config { content_by_lua_block { require("resty.jev.edge").config_api() } }
+--- request eval
+"PUT /_jev/config\n{\"jev\":{\"deployment_context\":\"" . ("x" x 3000) . "\"},\"policy\":{\"mode\":\"enforce\"}}"
+--- response_body
+{"ok":true}
+
+
+
+=== TEST 10: a malformed watch_paths pattern is rejected instead of failing every request open
+--- http_config eval: $::HttpConfig
+--- user_files eval: ::conf()
+--- config
+location = /_jev/config { content_by_lua_block { require("resty.jev.edge").config_api() } }
+--- request
+PUT /_jev/config
+{"rules":[{"id":"t","watch_paths":["^/v1/["]}]}
+--- error_code: 422
+--- response_body_like: not a valid Lua pattern|malformed pattern

@@ -18,4 +18,5 @@ services:
       - ..:/work:ro
       - ./nginx.conf:/tmp/nx/conf/nginx.conf:ro
       - ./jev-edge.conf.lua:/tmp/nx/conf/jev-edge.conf.lua:ro
-    ports: ["8080:8080"]
+    # 8080 = traffic; 8090 = admin (/_jev/config, /_jev/health, ...), loopback only.
+    ports: ["8080:8080", "127.0.0.1:8090:8090"]

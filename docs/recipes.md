@@ -17,8 +17,9 @@ Answer:
 | status | headers | meaning |
 |---|---|---|
 | 200 | `X-Jev-Verdict`, `X-Jev-Score`, `X-Jev-Source`, `X-Jev-Reason`, `X-Jev-Request-Id` | allow; copy the headers to the upstream request |
-| 403 | same headers, JSON body | block; return the status and body to the client |
+| >= 400 with `X-Jev-Verdict` (`policy.block_status`, 403 by default) | same headers, JSON body | block; return the status and body to the client |
 | 200 with `X-Jev-Verdict: error` | | jev-edge could not judge (provider down, breaker open); allow |
+| anything else | no `X-Jev-Verdict` | not jev-edge (a 404, a 5xx from a proxy); allow, see below |
 
 Two properties every recipe must keep:
 
@@ -30,6 +31,16 @@ The nginx side is one location:
 ```nginx
 location /_jev/authz/ { content_by_lua_block { require("resty.jev.edge").authz() } }
 ```
+
+## Thin-adapter contract
+
+What every adapter that only relays `/_jev/authz` (Envoy, the gRPC shim, HAProxy's agent, the LiteLLM guardrail, the recipes below) must do with the answer:
+
+- **200** = a decision; the verdict is in the headers, copy them upstream.
+- **>= 400 with `X-Jev-Verdict`** = a block; return that status and body to the client.
+- **Anything else** (no `X-Jev-Verdict`, a 3xx, a timeout, a connection error) = not judged; fail open with `X-Jev-Verdict: error` and, if the adapter can, `X-Jev-Source: adapter`.
+- **Strip inbound `X-Jev-*`** (verdict, score, source, reason, request-id, subject) before the upstream sees the request, so a client cannot pre-fill a verdict. Overwrite, do not append.
+- **Keep the admin endpoints off the gateway path.** `/_jev/config`, `/_jev/samples`, `/_jev/feedback`, `/_jev/health` and `/_jev/metrics` sit next to `/_jev/authz`; serve them from a separate server block or port, and refuse to forward paths containing `..`, `%2e` or `//`.
 
 ## Istio
 

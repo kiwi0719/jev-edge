@@ -41,7 +41,7 @@ location = /_t/subject {
  "Content-Type: application/json\nX-Api-Key: secret-key-1\nX-Jev-Mock-Score: 0.9",
  ""]
 --- response_body_like eval
-["safe", "safe", "malicious", '^subj:header:[0-9a-f]{40} n=2 last=0\\.9 raw=false']
+["safe", "safe", "malicious", '^subj:header:[0-9a-f]{64} n=2 last=0\\.9 raw=false']
 --- no_error_log
 [error]
 

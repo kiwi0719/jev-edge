@@ -19,8 +19,12 @@ config.yaml::
           timeout: 2.0           # seconds; exceeded = fail open
           path: /v1/chat/completions   # what jev-edge's L1 sees as the path
 
-Fail-open: any error reaching jev-edge (connection refused, timeout, 5xx) lets
-the request through with ``metadata.jev_verdict == {"verdict": "error", ...}``.
+Contract: only an answer carrying ``X-Jev-Verdict`` is trusted. 200 with the
+header is a decision; any status >= 400 with the header is a block (whatever
+``policy.block_status`` is); anything else, and any error reaching jev-edge
+(connection refused, timeout, a 5xx from something that is not jev-edge),
+fails open: the request goes through with
+``metadata.jev_verdict == {"verdict": "error", ...}``.
 
 Put ``adapters/litellm`` on ``PYTHONPATH`` (or copy this file next to your
 config). Requires ``httpx``, which LiteLLM already depends on.
@@ -32,6 +36,7 @@ import json
 import logging
 import os
 from typing import Any, Optional, Union
+from urllib.parse import unquote_plus
 
 import httpx
 
@@ -144,10 +149,11 @@ class JevEdgeGuardrail(CustomGuardrail):
         data.setdefault("metadata", {})["jev_verdict"] = verdict
 
         if verdict.get("action") == "block" and self.enforce:
+            status = int(verdict.get("status") or 403)
             detail = {"error": "request rejected", "jev": verdict}
             if HTTPException is not None:
-                raise HTTPException(status_code=403, detail=detail)
-            raise JevEdgeBlocked(403, detail)
+                raise HTTPException(status_code=status, detail=detail)
+            raise JevEdgeBlocked(status, detail)
         return data
 
     async def judge(self, body: str, client_ip: Optional[str]) -> dict[str, Any]:
@@ -160,19 +166,21 @@ class JevEdgeGuardrail(CustomGuardrail):
             log.warning("jev-edge unreachable, failing open: %s", e)
             return {"verdict": "error", "score": "0.00", "source": "adapter", "reason": str(e), "action": "pass"}
 
+        if "x-jev-verdict" not in res.headers or res.status_code not in (200, *range(400, 600)):
+            log.warning("jev-edge answered %s%s, failing open", res.status_code,
+                        "" if "x-jev-verdict" in res.headers else " without X-Jev-Verdict")
+            return {"verdict": "error", "score": "0.00", "source": "adapter", "reason": f"http {res.status_code}", "action": "pass"}
+
         v = {k[6:].replace("-", "_"): res.headers.get(k, "") for k in HEADER_NAMES if res.headers.get(k) is not None}
-        v.setdefault("verdict", "error")
         v.setdefault("score", "0.00")
         v.setdefault("source", "l2")
         if "reason" in v:
-            v["reason"] = v["reason"].replace("+", " ")
-        if res.status_code == 403:
+            v["reason"] = unquote_plus(v["reason"])
+        if res.status_code >= 400:
             v["action"] = "block"
-        elif res.status_code == 200:
-            v["action"] = "pass"
+            v["status"] = res.status_code
         else:
-            log.warning("jev-edge answered %s, failing open", res.status_code)
-            v.update(verdict="error", action="pass", source="adapter", reason=f"http {res.status_code}")
+            v["action"] = "pass"
         return v
 
     async def aclose(self) -> None:

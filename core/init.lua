@@ -29,7 +29,7 @@ local trust     = require "jev.core.trust"
 local verdict   = require "jev.core.verdict"
 local subject   = require "jev.core.subject"
 
-local _M = { _VERSION = "0.3.0" }
+local _M = { _VERSION = "0.3.1" }
 
 local function log(ctx, level, msg)
   if ctx.log then ctx.log(level, msg) end
@@ -88,9 +88,12 @@ function _M.evaluate(req, ctx)
   if fp ~= "" and ctx.cache then
     local hit = ctx.cache:get("fp:" .. fp)
     if type(hit) == "table" and type(hit.score) == "number" then
-      local action, label, async = policy.decide(hit.score, cfg.policy)
+      local action, label = policy.decide(hit.score, cfg.policy)
+      -- Never async on a hit: the cached score already is the judge's
+      -- answer, and a re-judge per hit would turn the cache into an
+      -- amplifier (one suspicious prompt repeated N times = N L3 calls).
       return finish(ctx, verdict.new({
-        action = action, verdict = label, score = hit.score, async = async,
+        action = action, verdict = label, score = hit.score, async = false,
         source = verdict.SRC_CACHE, reason = hit.reason or reason, fingerprint = fp,
       }))
     end

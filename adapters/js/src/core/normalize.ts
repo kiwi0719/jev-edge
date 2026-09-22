@@ -145,6 +145,9 @@ export function extract(
   if (typeof body !== "string" || body === "") return ["", "none"];
   const ct = asciiLower(contentType ?? "");
   if (ct.includes("application/json") || ct.includes("+json")) {
+    // A UTF-8 BOM is not JSON, but Python's json.loads on bytes and Express's
+    // body-parser skip it: judge what the backend reads.
+    if (body.startsWith("\uFEFF")) body = body.slice(1);
     let decoded: JsonValue;
     try {
       decoded = jsonDecode(body);

@@ -61,6 +61,7 @@ async function run(spec: Spec): Promise<[core.Verdict, core.SubjectEntry[]]> {
 }
 
 const FP = core.normalize.fingerprint(LONG, { prefix_bytes: 2048 }, core.normalize.djb2);
+const FP_KEY = core.cacheKey(FP, loadRule("llm-endpoints"), core.defaults.merge(core.defaults.config, {}), core.normalize.djb2);
 
 describe("subject: history is accepted and ignored", () => {
   const cases: [string, Spec][] = [
@@ -69,7 +70,7 @@ describe("subject: history is accepted and ignored", () => {
     ["malicious", { answers: { injection: 0.95 }, req: req(ATTACK), config: { policy: { mode: "enforce" } } }],
     ["l2 error", { error: "timeout" }],
     ["l1 block", { cache: { "rep:203.0.113.7": { blocked_until: 2000 } } }],
-    ["cache hit", { cache: { ["fp:" + FP]: { score: 0.8, reason: "injection 0.80" } } }],
+    ["cache hit", { cache: { [FP_KEY]: { score: 0.8, reason: "injection 0.80" } } }],
   ];
 
   for (const [name, spec] of cases) {

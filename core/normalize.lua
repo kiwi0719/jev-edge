@@ -84,9 +84,12 @@ end
 -- @return text string, kind ("json"|"text"|"form"|"none")
 function _M.extract(body, content_type, fields, json_decode)
   if type(body) ~= "string" or body == "" then return "", "none" end
-  local ct = (content_type or ""):lower()
+  local ct = (type(content_type) == "string" and content_type or ""):lower()
   if ct:find("application/json", 1, true) or ct:find("+json", 1, true) then
     if not json_decode then return "", "none" end
+    -- A UTF-8 BOM is not JSON (cjson rejects it) but Python's json.loads on
+    -- bytes and Express's body-parser skip it: judge what the backend reads.
+    if body:sub(1, 3) == "\239\187\191" then body = body:sub(4) end
     local ok, decoded = pcall(json_decode, body)
     if not ok or type(decoded) ~= "table" then return "", "none" end
     return _M.extract_json(decoded, fields), "json"

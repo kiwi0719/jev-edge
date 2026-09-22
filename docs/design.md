@@ -123,7 +123,7 @@ Three key kinds in one shared dict:
 
 | Key | Built from | Default TTL | Purpose |
 |---|---|---|---|
-| `fp:<hash>` | normalized text | 300 s | exact-ish replays |
+| `fp:<scope>:<hash>` | normalized text, scoped to rule, templates, deployment context, provider, model (`core.cache_key`) | 300 s | exact-ish replays |
 | `rep:<ip>` | client IP | 600 s | per-IP verdict aggregate |
 | `rep:<ip>:<path>` | IP + path | 120 s | one endpoint being hammered |
 
@@ -195,7 +195,7 @@ Default is `monitor`.
 Triggered by an L2 timeout, a breaker skip, or a score in `[suspect, block)`. Runs in `ngx.timer.at(0, …)` with only the normalized text and fingerprint, never the raw body:
 
 1. Call Jev with a relaxed 5 s timeout.
-2. Write `fp:<hash>` so the next replay hits the cache.
+2. Write `fp:<scope>:<hash>` (the key L2 reads) so the next replay hits the cache.
 3. Update `rep:<ip>`; if `rep_block_after` is set (default 0 = off), mark the IP blocked after that many malicious verdicts so L1 rejects it directly.
 4. On malicious, fire `on_alert` (error log by default, webhook configurable).
 
@@ -279,7 +279,7 @@ The one adapter that does not run the Lua core. `adapters/js` is a TypeScript po
 
 The thin preset exists because the most common Cloudflare deployment already has a gateway behind it, and two sets of thresholds is the failure mode to avoid: it runs L1 and the cache at the edge and leaves the score, the deployment context and the key at the origin. The `backend` provider translates the origin's `X-Jev-*` answer back into an answer map, so the Worker's own policy still applies (`enforce` at the edge blocks on the origin's score).
 
-What differs from nginx by platform, not by design: KV's 60 s minimum TTL and eventual consistency, the Durable Object hop for breaker state, a different fingerprint hash (SHA-256 on nginx, `djb2` in the package; caches are never shared between the two, so only collision resistance matters, and the package's runtime should be given a real hash before its cache is exposed), no `/_jev/config` hot reload (config is code), no L3 yet. The adapter README keeps the full list.
+What differs from nginx by platform, not by design: KV's 60 s minimum TTL and eventual consistency, the Durable Object hop for breaker state, no `/_jev/config` hot reload (config is code), no L3 yet. The adapter README keeps the full list.
 
 ## Subject trajectories
 

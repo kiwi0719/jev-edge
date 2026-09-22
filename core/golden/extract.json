@@ -196,6 +196,24 @@
     },
     {
       "expect": {
+        "kind": "json",
+        "text": "after bom"
+      },
+      "input": {
+        "body": "﻿{\"prompt\":\"after bom\"}",
+        "content_type": "application/json",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "UTF-8 BOM before json is skipped"
+    },
+    {
+      "expect": {
         "kind": "none",
         "text": ""
       },

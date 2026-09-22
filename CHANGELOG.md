@@ -6,6 +6,49 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Security
+- **A repeated `Content-Type` header no longer skips judging.** OpenResty and
+  APISIX hand a repeated header to Lua as a list; L1 called `:lower()` on it,
+  raised, and the adapter failed open with `X-Jev-Verdict: error`. The values
+  are now joined (`rules.content_type`) and the content type is watched when
+  any of them is.
+- **The verdict cache is scoped to the prompt that produced the score.** The
+  key was `fp:<fingerprint>`, so a SAFE judged under a lenient tenant rule,
+  deployment context, provider or model (an APISIX route with
+  `provider = "mock"`) was replayed on a strict one. The key is now
+  `fp:<scope>:<fingerprint>` (`core.cache_key`), scope = rule id, templates,
+  deployment context, provider and model. L3 writes the same key. Trust stays
+  keyed by fingerprint alone. Cached verdicts from earlier versions are not
+  read again; the cache refills.
+- **A judge answer with no score is an error, not SAFE.** `{"answers":{}}` or
+  only non-numeric values reduced to score 0, counted as a breaker success
+  and was cached as SAFE for `fp_ttl`. It now takes the `on_error` path and
+  writes nothing (L2 and L3). `judge.reduce` returns the count of numeric
+  answers as a third value.
+- **A UTF-8 BOM before a JSON body no longer hides the text.** cjson rejects
+  it, extraction returned "no text" and L1 passed, while Python and Express
+  backends skip the BOM and read the prompt.
+- **The JS runtime fingerprints with SHA-256.** 0.3.1 said it did; it still
+  passed `djb2`, so a few appended letters could land an attack on a cached
+  SAFE fingerprint. `core.sha256Hex` (synchronous, same hex as
+  `resty.sha256`) is now the runtime's hash.
+- **Watch paths match the path the origin routes on.** `forward_auth` (from
+  `X-Forwarded-Uri` / `X-Original-URI`) and the JS runtime now percent-decode
+  the path and collapse duplicate slashes before the watch list, as nginx
+  does for `$uri`; `/v1/%63hat/completions` and `//v1/chat/completions` were
+  "path not watched" while the backend served `/v1/chat/completions`.
+- **Cloudflare Workers forward to the configured upstream only.** The
+  forwarding URL was `new URL(path, upstream)`, and a request path starting
+  with `//` made that a different host (an open proxy, unjudged).
+- **The LiteLLM guardrail keeps every text form core judges.** It kept only
+  `type == "text"` parts and string `input` items, so Responses API input,
+  `input_text` parts and Anthropic `tool_result` arrived empty or were
+  skipped without a call; a `prompt` next to `messages` was ignored.
+
+### Fixed
+- APISIX picks the rule for L3 and sampling by path, method and content type
+  (`rules.rule_for`), like the OpenResty adapter; it used path alone.
+
 ## [0.3.1] - 2026-09-22
 
 Patch release from a full audit of 0.3.0. Everything below is a fix; there is

@@ -24,7 +24,8 @@ export interface Rule {
 export interface Req {
   method?: string;
   path?: string;
-  headers?: Record<string, string | undefined>;
+  /** A repeated header may arrive as a list (Lua's ngx.req.get_headers does this). */
+  headers?: Record<string, string | string[] | undefined>;
   body?: string | null;
   body_size?: number;
   client_ip?: string;
@@ -196,6 +197,16 @@ function textMatches(s: string, patterns: string[] | undefined, ctx: RulesCtx | 
   return null;
 }
 
+/** Port of rules.content_type: the Content-Type as one string; a repeated
+ *  header's values are joined so it is watched when any of them is. */
+export function contentType(headers: Req["headers"]): string {
+  if (!headers || typeof headers !== "object") return "";
+  let ct: unknown = headers["content-type"];
+  if (ct === undefined || ct === null) ct = headers["Content-Type"];
+  if (Array.isArray(ct)) ct = ct.filter((v) => typeof v === "string").join(", ");
+  return typeof ct === "string" ? ct : "";
+}
+
 function ctAllowed(ct: string | undefined, allowed: string[] | undefined): boolean {
   if (!allowed || allowed.length === 0) return true;
   const c = (ct ?? "").toLowerCase();
@@ -230,7 +241,7 @@ export async function evaluate(req: Req, rule: Rule, ctx?: RulesCtx): Promise<[R
 
   // 3. method + content type
   if (rule.methods && !rule.methods[(req.method ?? "").toUpperCase()]) return [PASS, "", "method not watched"];
-  const ct = req.headers ? (req.headers["content-type"] ?? req.headers["Content-Type"] ?? "") : "";
+  const ct = contentType(req.headers);
   if (!ctAllowed(ct, rule.content_types)) return [PASS, "", "content-type not watched"];
 
   // 4. body size: the larger of what the adapter declared and what it handed
@@ -249,6 +260,17 @@ export async function evaluate(req: Req, rule: Rule, ctx?: RulesCtx): Promise<[R
   if (hit) return [SUSPECT, text, "pattern: " + hit];
   if (byteLength(text) >= (rule.min_text_chars ?? 20)) return [SUSPECT, text, "natural language"];
   return [PASS, "", "text too short"];
+}
+
+/** Port of rules.rule_for: the first rule whose path, method and content type all match. */
+export function ruleFor(req: Req, rules: Rule[] | undefined): Rule | undefined {
+  const ct = contentType(req.headers);
+  for (const r of rules ?? []) {
+    if (pathMatches(req.path ?? "", r.watch_paths)
+      && !(r.methods && !r.methods[(req.method ?? "").toUpperCase()])
+      && ctAllowed(ct, r.content_types)) return r;
+  }
+  return undefined;
 }
 
 export async function evaluateAll(

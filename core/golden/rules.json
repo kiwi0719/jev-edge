@@ -198,6 +198,81 @@
           "body_size": 108,
           "client_ip": "203.0.113.7",
           "headers": {
+            "content-type": [
+              "application/json",
+              "application/json"
+            ]
+          },
+          "method": "POST",
+          "path": "/v1/chat/completions"
+        },
+        "rule": "llm-endpoints"
+      },
+      "name": "repeated Content-Type header is watched"
+    },
+    {
+      "expect": {
+        "reason": "natural language",
+        "result": "suspect",
+        "text": "Please write a detailed summary of the attached quarterly report."
+      },
+      "input": {
+        "cache": {},
+        "clock": 1000,
+        "req": {
+          "body": "{\"messages\":[{\"role\":\"user\",\"content\":\"Please write a detailed summary of the attached quarterly report.\"}]}",
+          "body_size": 108,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": [
+              "image/png",
+              "application/json"
+            ]
+          },
+          "method": "POST",
+          "path": "/v1/chat/completions"
+        },
+        "rule": "llm-endpoints"
+      },
+      "name": "repeated Content-Type header, any watched value counts"
+    },
+    {
+      "expect": {
+        "reason": "natural language",
+        "result": "suspect",
+        "text": "Please write a detailed summary of the attached quarterly report."
+      },
+      "input": {
+        "cache": {},
+        "clock": 1000,
+        "req": {
+          "body": "﻿{\"messages\":[{\"role\":\"user\",\"content\":\"Please write a detailed summary of the attached quarterly report.\"}]}",
+          "body_size": 43,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/v1/chat/completions"
+        },
+        "rule": "llm-endpoints"
+      },
+      "name": "UTF-8 BOM before the JSON body"
+    },
+    {
+      "expect": {
+        "reason": "natural language",
+        "result": "suspect",
+        "text": "Please write a detailed summary of the attached quarterly report."
+      },
+      "input": {
+        "cache": {},
+        "clock": 1000,
+        "req": {
+          "body": "{\"messages\":[{\"role\":\"user\",\"content\":\"Please write a detailed summary of the attached quarterly report.\"}]}",
+          "body_size": 108,
+          "client_ip": "203.0.113.7",
+          "headers": {
             "content-type": "application/vnd.api+json"
           },
           "method": "POST",

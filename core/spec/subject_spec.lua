@@ -69,7 +69,9 @@ describe("subject: history is accepted and ignored", function()
                       config = { policy = { mode = "enforce" } } } },
     { "l2 error",   { error = "timeout" } },
     { "l1 block",   { cache = { ["rep:203.0.113.7"] = { blocked_until = 2000 } } } },
-    { "cache hit",  { cache = { ["fp:" .. normalize.fingerprint(LONG, { prefix_bytes = 2048 }, normalize.djb2)]
+    { "cache hit",  { cache = { [core.cache_key(normalize.fingerprint(LONG, { prefix_bytes = 2048 }, normalize.djb2),
+                                  require("jev.rules.llm-endpoints"), defaults.merge(defaults.config, nil),
+                                  normalize.djb2)]
                                 = { score = 0.8, reason = "injection 0.80" } } } },
   }
 

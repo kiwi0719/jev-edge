@@ -8,6 +8,7 @@ local core      = require "jev.core"
 local verdict   = require "jev.core.verdict"
 local judge_mod = require "jev.core.judge"
 local normalize = require "jev.core.normalize"
+local rules_mod = require "jev.core.rules"
 local breaker_m = require "jev.core.breaker"
 local config    = require "resty.jev.config"
 local cache_m   = require "resty.jev.cache"
@@ -150,40 +151,15 @@ local function set_headers(v)
   ngx.req.set_header("X-Jev-Request-Id", ngx.var.request_id or "")
 end
 
--- The rule core judged with: the first one whose path, method and content
--- type all match, which is the first one evaluate_all did not PASS on those
--- gates. Path alone is not enough: a tenant rule can match the path and
--- still hand the request to the general rule on method or content type.
-local function rule_for(req, rules)
-  local ct = (req.headers["content-type"] or ""):lower()
-  for _, r in ipairs(rules) do
-    local hit = false
-    for _, p in ipairs(r.watch_paths or {}) do
-      if (req.path or ""):find(p) then hit = true break end
-    end
-    if hit and r.methods and not r.methods[(req.method or ""):upper()] then hit = false end
-    if hit and r.content_types and #r.content_types > 0 then
-      local ok = false
-      for _, a in ipairs(r.content_types) do
-        if ct:find(a, 1, true) then ok = true break end
-      end
-      hit = ok
-    end
-    if hit then return r end
-  end
-  return nil
-end
-
 local function maybe_async(cfg, v, req, rules)
   if not v.async or not judge then return end
   -- L3 exists to get an answer L2 could not; while the breaker is open the
   -- provider is the reason, and hammering it from timers only keeps it open.
   if breaker and breaker:state() ~= breaker_m.CLOSED then return end
   -- rebuild the prompt from the request; core does not hand it back
-  local rule = rule_for(req, rules)
+  local rule = rules_mod.rule_for(req, rules)
   if not rule then return end
-  local ct = req.headers["content-type"] or ""
-  local text = normalize.extract(req.body, ct, rule.text_fields, cjson.decode)
+  local text = normalize.extract(req.body, rules_mod.content_type(req.headers), rule.text_fields, cjson.decode)
   if text == "" then return end
   -- Same prompt L2 built, deployment context included: L3's verdict replaces
   -- L2's in the cache, so it must not be judged with less context.
@@ -195,6 +171,7 @@ local function maybe_async(cfg, v, req, rules)
   local ok, err = async.schedule({
     cfg = cfg, cache = cache, state = state_store(), judge = judge, prompt = prompt,
     fingerprint = v.fingerprint, client_ip = req.client_ip,
+    cache_key = v.fingerprint ~= "" and core.cache_key(v.fingerprint, rule, cfg, sha256_hex) or nil,
   })
   if not ok and err ~= "disabled" then metrics.incr_async_dropped() end
 end
@@ -204,7 +181,7 @@ end
 local function maybe_sample(cfg, v, req, rules)
   if not sampling.should_sample(cfg, v, math.random) then return end
   local ok, err = pcall(function()
-    local s = sampling.build(cfg, v, req, rule_for(req, rules),
+    local s = sampling.build(cfg, v, req, rules_mod.rule_for(req, rules),
       { rid = ngx.var.request_id, ts = ngx.now(), json_decode = cjson.decode })
     sampling.store(cfg, cache, s)
     if cfg.sampling.log then ngx.log(ngx.INFO, "jev-edge sample: ", cjson.encode(s)) end
@@ -506,10 +483,12 @@ local function client_ip_from(h, cfg)
   return ip or ngx.var.remote_addr
 end
 
--- Path normalisation for headers that carry the original URI: collapse
--- duplicate slashes and resolve `.` / `..` the way nginx does for $uri, so a
--- watch pattern anchored at `^/v1/` sees the path the backend will serve.
+-- Path normalisation for headers that carry the original URI: decode %XX,
+-- collapse duplicate slashes and resolve `.` / `..` the way nginx does for
+-- $uri, so a watch pattern anchored at `^/v1/` sees the path the backend will
+-- serve (`/v1/%63hat/completions` is `/v1/chat/completions` to it).
 local function normalize_path(path)
+  path = path:gsub("%%(%x%x)", function(h) return string.char(tonumber(h, 16)) end)
   local out = {}
   for seg in path:gmatch("[^/]+") do
     if seg == ".." then

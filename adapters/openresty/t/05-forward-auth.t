@@ -109,3 +109,26 @@ Content-Type: application/json
 verdict=skipped score=0.00 source=l1 reason=-
 --- no_error_log
 [error]
+
+
+
+=== TEST 5: a percent-encoded original URI is decoded before the watch list
+--- http_config eval: $::HttpConfig
+--- user_files eval: ::conf()
+--- config
+location = /_jev/forward-auth { content_by_lua_block { require("resty.jev.edge").forward_auth() } }
+--- request
+POST /_jev/forward-auth
+{"messages":[{"role":"user","content":"Please summarise the attached quarterly report for me."}]}
+--- more_headers
+Content-Type: application/json
+X-Forwarded-Method: POST
+X-Forwarded-Uri: //v1/%63hat/completions
+X-Forwarded-For: 198.51.100.9
+X-Jev-Mock-Score: 0.2
+--- error_code: 200
+--- response_headers
+X-Jev-Verdict: safe
+X-Jev-Source: l2
+--- no_error_log
+[error]

@@ -123,7 +123,7 @@ return {
 
 | Key | 来源 | 默认 TTL | 用途 |
 |---|---|---|---|
-| `fp:<hash>` | 归一化文本 | 300 s | 近似重放 |
+| `fp:<scope>:<hash>` | 归一化文本，按规则、模板、部署上下文、provider、模型区分（`core.cache_key`） | 300 s | 近似重放 |
 | `rep:<ip>` | 客户端 IP | 600 s | 单 IP 判定聚合 |
 | `rep:<ip>:<path>` | IP + 路径 | 120 s | 同一端点被刷 |
 
@@ -195,7 +195,7 @@ policy = {
 由 L2 超时、熔断跳过、或分数落在 `[suspect, block)` 区间触发。在 `ngx.timer.at(0, …)` 里运行，只带归一化文本和指纹，从不带原始 body：
 
 1. 用放宽到 5 s 的超时调 Jev。
-2. 写 `fp:<hash>`，下一次重放直接命中缓存。
+2. 写 `fp:<scope>:<hash>`（与 L2 读的是同一个 key），下一次重放直接命中缓存。
 3. 更新 `rep:<ip>`；如果设置了 `rep_block_after`（默认 0 = 关闭），达到该次数的恶意判定后把 IP 标记为封禁，L1 直接拒绝。
 4. 判定恶意时触发 `on_alert`（默认写 error 日志，可配 webhook）。
 
@@ -279,7 +279,7 @@ HAProxy 的 SPOE 把请求连 body 交给 `adapters/haproxy/spoa`，一个调 `/
 
 薄预设的存在是因为最常见的 Cloudflare 部署后面本来就有网关，而两套阈值正是要避免的故障模式：它在边缘跑 L1 和缓存，把分数、部署上下文和 key 留在源站。`backend` provider 把源站的 `X-Jev-*` 答案翻译回答案表，所以 Worker 自己的 policy 仍然生效（边缘的 `enforce` 会按源站的分数拦截）。
 
-与 nginx 的差异来自平台而不是设计：KV 最小 60 秒 TTL 和最终一致性、熔断状态多一跳 Durable Object、指纹哈希不同（nginx 上是 SHA-256，包里是 `djb2`；两边永远不共享缓存，所以只有抗碰撞性重要）、没有 `/_jev/config` 热更新（配置即代码）、暂无 L3。完整清单在 adapter 的 README 里。
+与 nginx 的差异来自平台而不是设计：KV 最小 60 秒 TTL 和最终一致性、熔断状态多一跳 Durable Object、没有 `/_jev/config` 热更新（配置即代码）、暂无 L3。完整清单在 adapter 的 README 里。
 
 ## 主体轨迹
 

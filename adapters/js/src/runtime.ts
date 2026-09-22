@@ -106,6 +106,30 @@ function consumesSubjectHeader(cfg: core.Config): boolean {
 }
 
 /** Does any rule watch this path and method? Decides whether the body is worth reading at all. */
+/**
+ * The path the origin will route on, the way nginx builds $uri: %XX decoded,
+ * duplicate slashes collapsed, `.` / `..` resolved. Watch patterns anchored at
+ * `^/v1/` must not miss `/v1/%63hat/completions` or `//v1/chat/completions`.
+ */
+export function normalizePath(pathname: string): string {
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(pathname);
+  } catch {
+    // malformed escapes: decode the valid ASCII ones, leave the rest
+    decoded = pathname.replace(/%([0-7][0-9a-fA-F])/g, (_, h: string) => String.fromCharCode(parseInt(h, 16)));
+  }
+  const out: string[] = [];
+  for (const seg of decoded.split("/")) {
+    if (seg === "" || seg === ".") continue;
+    if (seg === "..") out.pop();
+    else out.push(seg);
+  }
+  let p = "/" + out.join("/");
+  if (decoded.endsWith("/") && p !== "/") p += "/";
+  return p;
+}
+
 function isCandidate(rt: Runtime, path: string, method: string): boolean {
   const m = method.toUpperCase();
   return rt.rules.some((r) => core.rules.pathMatches(path, r.watch_paths) && (!r.methods || r.methods[m]));
@@ -151,6 +175,7 @@ async function readBounded(request: Request, maxBytes: number): Promise<[string 
 
 async function readReq(request: Request, rt: Runtime): Promise<[core.Req, ProviderRequestInfo]> {
   const url = new URL(request.url);
+  const path = normalizePath(url.pathname);
   const headers: Record<string, string> = {};
   request.headers.forEach((v, k) => (headers[k] = v));
   // A client-supplied X-Jev-Subject is only meaningful when this deployment
@@ -167,20 +192,20 @@ async function readReq(request: Request, rt: Runtime): Promise<[core.Req, Provid
   let size = Number.isFinite(len) ? len : 0;
   // The body is only read for a request some rule would judge; everything
   // else passes at L1 on path or method without touching the stream.
-  if (request.body && isCandidate(rt, url.pathname, request.method) && !(Number.isFinite(len) && len > maxBytes)) {
+  if (request.body && isCandidate(rt, path, request.method) && !(Number.isFinite(len) && len > maxBytes)) {
     const [text, seen] = await readBounded(request, maxBytes);
     body = text;
     size = Math.max(size, seen);
   }
   const req: core.Req = {
     method: request.method,
-    path: url.pathname,
+    path,
     headers,
     body: body ?? undefined,
     body_size: body !== null ? core.normalize.byteLength(body) : size,
     client_ip: clientIp,
   };
-  return [req, { method: request.method, path: url.pathname, headers: request.headers, body, clientIp }];
+  return [req, { method: request.method, path, headers: request.headers, body, clientIp }];
 }
 
 /** Subject context for this request, or undefined: hashed id, one history read, a sink that writes without being awaited. */
@@ -273,7 +298,9 @@ async function evaluateInner(request: Request, rt: Runtime, requestId: string, r
     breaker: rt.breaker,
     subject,
     clock: () => Date.now() / 1000,
-    hash: core.normalize.djb2,
+    // sha256, not djb2: the fingerprint keys the verdict cache and the trust
+    // store, and a linear hash lets a few appended bytes hit a chosen value.
+    hash: core.sha256Hex,
     json_decode: (s) => JSON.parse(s),
     re_find: core.rules.reFind,
     judge: {

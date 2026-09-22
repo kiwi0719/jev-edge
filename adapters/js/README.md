@@ -158,7 +158,7 @@ Different, by platform:
 | Next.js on Vercel, Node, Hono | memory per process / isolate | memory | pass a `Store` to share |
 | Lambda@Edge | memory per execution environment | memory | no env vars; key from Secrets Manager |
 
-- **Fingerprint hash.** nginx uses `crc32_long`; this package uses the reference `djb2`. Caches are never shared between the two, so it does not matter. Since 0.3.1 the fingerprint covers the whole normalized text on both; `cache.fp_prefix_bytes` only bounds sampled text.
+- **Fingerprint hash.** SHA-256 hex over the whole normalized text, on both (`core.sha256Hex` here, `resty.sha256` on nginx), so the same text has the same fingerprint everywhere. `djb2` is only the golden vectors' reference hash. `cache.fp_prefix_bytes` only bounds sampled text.
 - **Byte truncation of sampled text.** Lua's `s:sub(1, n)` keeps the bytes of a code point split at `n`; this package drops the partial code point, so the sampled text is never longer than `n` bytes and never contains U+FFFD. The golden normalize vectors cut on ASCII and agree; only a logged sample that ends inside a multi-byte character differs, by at most three bytes.
 - **Adaptive timeout state.** One document (`adapt`) instead of the three `adapt:*` keys the OpenResty adapter keeps; the value is outside the parity contract either way.
 - **No `/_jev/config` hot reload.** Config is code; redeploy, or read it from your store in an options function.

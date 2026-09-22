@@ -60,12 +60,20 @@ export function thinWorker<E extends WorkerEnv = WorkerEnv>(
       }), env, cache);
       const upstream = (opts as { upstream?: string }).upstream ?? origin;
       return handle(request, rt, (req) => {
-        const u = new URL(req.url);
-        const target = new URL(u.pathname + u.search, upstream);
-        return fetch(new Request(target.toString(), req));
+        return fetch(new Request(upstreamUrl(req.url, upstream), req));
       }, ctx);
     },
   };
+}
+
+/**
+ * The upstream URL for a request: upstream's origin, the request's path and
+ * query. Never `new URL(path, upstream)`: a path starting with `//` is a
+ * scheme-relative reference there and would send the request to another host.
+ */
+export function upstreamUrl(requestUrl: string, upstream: string): string {
+  const u = new URL(requestUrl);
+  return new URL(upstream).origin + u.pathname + u.search;
 }
 
 /**
@@ -81,8 +89,7 @@ export function fullWorker<E extends WorkerEnv = WorkerEnv>(
     async fetch(request, env, ctx) {
       const rt = runtimeFor(opts, env, cache);
       return handle(request, rt, (req) => {
-        const u = new URL(req.url);
-        return fetch(new Request(new URL(u.pathname + u.search, opts.upstream).toString(), req));
+        return fetch(new Request(upstreamUrl(req.url, opts.upstream), req));
       }, ctx);
     },
   };

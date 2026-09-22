@@ -215,13 +215,9 @@ local function load_rules(specs)
   return out
 end
 
+-- The rule core judged with (path, method and content type all match).
 local function rule_for(rt, req)
-  for _, r in ipairs(rt.rules) do
-    for _, p in ipairs(r.watch_paths or {}) do
-      if (req.path or ""):find(p) then return r end
-    end
-  end
-  return nil
+  return rules_mod.rule_for(req, rt.rules)
 end
 
 -- Decision sampling into the shared dict ring; read it with
@@ -305,15 +301,9 @@ end
 
 local function maybe_async(rt, v, req)
   if not v.async then return end
-  local rule
-  for _, r in ipairs(rt.rules) do
-    for _, p in ipairs(r.watch_paths or {}) do
-      if (req.path or ""):find(p) then rule = r break end
-    end
-    if rule then break end
-  end
+  local rule = rule_for(rt, req)
   if not rule then return end
-  local text = normalize.extract(req.body, req.headers["content-type"] or "", rule.text_fields, cjson.decode)
+  local text = normalize.extract(req.body, rules_mod.content_type(req.headers), rule.text_fields, cjson.decode)
   if text == "" then return end
   local prompt = judge_mod.build(rule.templates, text, {
     path = req.path, method = req.method,
@@ -321,7 +311,8 @@ local function maybe_async(rt, v, req)
   })
   if not prompt then return end
   async.schedule({ cfg = rt.cfg, cache = cache, judge = rt.judge, prompt = prompt,
-    fingerprint = v.fingerprint, client_ip = req.client_ip })
+    fingerprint = v.fingerprint, client_ip = req.client_ip,
+    cache_key = v.fingerprint ~= "" and jev_core.cache_key(v.fingerprint, rule, rt.cfg, sha256_hex) or nil })
 end
 
 -- ---------------------------------------------------------------------------

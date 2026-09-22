@@ -40,6 +40,24 @@ local function text_matches(s, patterns, ctx)
   return nil
 end
 
+--- The request's Content-Type as one string. A repeated header arrives as a
+-- list (ngx.req.get_headers, APISIX); its values are joined so the content
+-- type is watched when any of them is, since the backend may read any one.
+function _M.content_type(headers)
+  if type(headers) ~= "table" then return "" end
+  local ct = headers["content-type"]
+  if ct == nil then ct = headers["Content-Type"] end
+  if type(ct) == "table" then
+    local parts = {}
+    for _, v in ipairs(ct) do
+      if type(v) == "string" then parts[#parts + 1] = v end
+    end
+    ct = table.concat(parts, ", ")
+  end
+  if type(ct) ~= "string" then return "" end
+  return ct
+end
+
 local function ct_allowed(ct, allowed)
   if not allowed or #allowed == 0 then return true end
   ct = (ct or ""):lower()
@@ -80,7 +98,7 @@ function _M.evaluate(req, rule, ctx)
   if rule.methods and not rule.methods[(req.method or ""):upper()] then
     return _M.PASS, "", "method not watched"
   end
-  local ct = req.headers and (req.headers["content-type"] or req.headers["Content-Type"]) or ""
+  local ct = _M.content_type(req.headers)
   if not ct_allowed(ct, rule.content_types) then
     return _M.PASS, "", "content-type not watched"
   end
@@ -207,6 +225,23 @@ function _M.resolve_all(specs, load)
     out[#out + 1] = rule
   end
   return out
+end
+
+--- The rule evaluate_all judged a request with: the first one whose path,
+-- method and content type all match. Adapters that rebuild the prompt off the
+-- request path (L3, sampling) use it; path alone is not enough, since a
+-- tenant rule can match the path and still hand the request to the general
+-- rule on method or content type.
+function _M.rule_for(req, rules)
+  local ct = _M.content_type(req.headers)
+  for _, r in ipairs(rules or {}) do
+    if path_matches(req.path or "", r.watch_paths)
+      and not (r.methods and not r.methods[(req.method or ""):upper()])
+      and ct_allowed(ct, r.content_types) then
+      return r
+    end
+  end
+  return nil
 end
 
 --- Evaluate a list of rules; first non-pass result wins.

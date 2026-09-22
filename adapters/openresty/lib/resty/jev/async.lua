@@ -33,12 +33,18 @@ local function handler(premature, job)
       ngx.log(ngx.WARN, "jev-edge: L3 judge failed: ", tostring(jerr))
       return
     end
-    local score, top = judge_mod.reduce(answers)
+    local score, top, n = judge_mod.reduce(answers)
+    if n == 0 then
+      -- no score in the answer: a provider fault, never a cached SAFE
+      ngx.log(ngx.WARN, "jev-edge: L3 answer has no scores")
+      return
+    end
     local _, label = policy.decide(score, cfg.policy)
     local why = top ~= "" and (top .. " " .. string.format("%.2f", score)) or "l3"
 
-    if job.fingerprint ~= "" then
-      cache:set("fp:" .. job.fingerprint, { score = score, reason = why }, cfg.cache.fp_ttl)
+    -- the same key core reads (core.cache_key): scoped to the rule and provider
+    if job.cache_key then
+      cache:set(job.cache_key, { score = score, reason = why }, cfg.cache.fp_ttl)
     end
 
     if job.client_ip and job.client_ip ~= "" then
@@ -68,7 +74,9 @@ local function handler(premature, job)
 end
 
 --- Schedule an L3 job. Never blocks; drops when over max_async.
--- @param job { cfg, cache, state, judge, prompt, fingerprint, client_ip, on_alert }
+-- @param job { cfg, cache, state, judge, prompt, fingerprint, cache_key, client_ip, on_alert }
+--   cache_key: core.cache_key() for the rule that judged the request; nil
+--   (text had no fingerprint) means reputation only, no verdict-cache write.
 --   cache: verdict / reputation dict; state: where the in-flight counter lives
 --   (defaults to cache).
 function _M.schedule(job)

@@ -395,7 +395,9 @@ function _M.resolve(spec, load)
   end
   local uok, uerr = defaults.validate_untrusted(out.untrusted, "rule " .. out.id .. ": untrusted")
   if not uok then return nil, uerr end
-  if not out.text_fields then out.text_fields = { "messages[*].content", "prompt", "input", "query", "text" } end
+  if not out.text_fields then
+    out.text_fields = { "messages[*].content", "prompt", "input", "input[*].output", "query", "text" }
+  end
   if not out.templates then out.templates = { "injection" } end
   return out
 end

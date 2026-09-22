@@ -13,7 +13,7 @@ export const llmEndpoints: Rule = {
   max_body_bytes: 1048576,
   max_judge_bytes: 32768,
   max_judge_chunks: 1,
-  text_fields: ["messages[*].content", "prompt", "input", "query", "text"],
+  text_fields: ["messages[*].content", "prompt", "input", "input[*].output", "query", "text"],
   min_text_chars: 20,
   always_suspect: [
     String.raw`\b(ignore|disregard|forget)\b.{0,20}\b(previous|prior|above|earlier|all)\b.{0,20}\b(instructions?|rules?|prompts?)\b`,
@@ -40,7 +40,7 @@ export const defaultRule: Rule = {
   id: "default",
   watch_paths: [],
   methods: { POST: true },
-  text_fields: ["prompt", "input", "text"],
+  text_fields: ["prompt", "input", "input[*].output", "text"],
   templates: ["injection"],
 };
 
@@ -74,7 +74,7 @@ export function resolve(spec: RuleSpec): Rule {
   });
   const [uok, uerr] = validateUntrusted(out.untrusted, `rule ${out.id}: untrusted`);
   if (!uok) throw new Error(uerr);
-  out.text_fields ??= ["messages[*].content", "prompt", "input", "query", "text"];
+  out.text_fields ??= ["messages[*].content", "prompt", "input", "input[*].output", "query", "text"];
   out.templates ??= ["injection"];
   return out;
 }

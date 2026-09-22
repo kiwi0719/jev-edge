@@ -26,7 +26,8 @@ return {
   -- cheapest; raise it (4 covers 128 KiB) to judge long text in full, and
   -- policy.unjudgeable then decides what still does not fit. See README.
   max_judge_chunks = 1,
-  text_fields = { "messages[*].content", "prompt", "input", "query", "text" },
+  -- input[*].output: a Responses API function_call_output (a tool result)
+  text_fields = { "messages[*].content", "prompt", "input", "input[*].output", "query", "text" },
   min_text_chars = 20,
   always_suspect = {
     [[\b(ignore|disregard|forget)\b.{0,20}\b(previous|prior|above|earlier|all)\b]]

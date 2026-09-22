@@ -760,6 +760,8 @@ eval_case("untrusted: an Anthropic tool_result block", {
   req = raw_req(U_ANTHROPIC), config = U_ON_ENF, judge = U_SCORES })
 eval_case("untrusted: a Responses function_call_output item", {
   req = raw_req(U_RESPONSES), config = U_ON_ENF, judge = U_SCORES })
+eval_case("untrusted off: a Responses function_call_output is judged with the whole text", {
+  req = raw_req(U_RESPONSES), config = { policy = { mode = "enforce" } }, judge = U_SCORES })
 eval_case("untrusted: tool_results = false leaves tool messages to the whole text", {
   req = raw_req(U_TOOL), judge = U_SCORES,
   config = { untrusted = { enabled = true, tool_results = false }, policy = { mode = "enforce" } } })

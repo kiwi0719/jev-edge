@@ -34,6 +34,12 @@ All notable changes to this project are recorded here. The format follows
   `MODEL=` (`--provider` / `--model`) picks one, since their scores are not
   comparable.
 
+### Fixed
+- **CodeQL `js/incomplete-url-substring-sanitization`** in
+  `adapters/js/test/worker.test.ts`: the fetch stub matched the judge by URL
+  prefix, which `api.typesafe.ai.example` also passes; it compares the parsed
+  host now. Test-only, no runtime change.
+
 ## [0.5.0] - 2026-09-23
 
 Subject reputation, a Kong plugin, a Deno preset and the npm package, an

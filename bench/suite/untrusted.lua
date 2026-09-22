@@ -74,12 +74,14 @@ local function retrieved(body)
 end
 
 local todo = {}
-for line in io.lines("/work/bench/datasets/suite-v1.jsonl") do
+local suite = os.getenv("SUITE") or "suite-v1"   -- bench/datasets/<SUITE>.jsonl
+local tag = suite == "suite-v1" and "suite" or suite
+for line in io.lines("/work/bench/datasets/" .. suite .. ".jsonl") do
   local r = cjson.decode(line)
   if r and r.shape == "indirect" then todo[#todo + 1] = r end
 end
 
-local out_path = "/work/bench/datasets/live-suite-untrusted-" .. cfg.model .. ".jsonl"
+local out_path = "/work/bench/datasets/live-" .. tag .. "-untrusted-" .. cfg.model .. ".jsonl"
 local done = {}
 do
   local f = io.open(out_path, "r")

@@ -1,4 +1,4 @@
-.PHONY: test lint check invariants luajit-check golden golden-check calibrate labels context-lint test-js test-openresty bench bench-offline bench-judge bench-judge-live bench-chart dist opm-build rock-lint rock-pack rock-upload install live-check live-full live-openai soak shim e2e-envoy e2e-forward-auth e2e-apisix e2e-kong e2e-haproxy test-litellm suite-fetch suite-build suite-live suite-report
+.PHONY: test lint check invariants luajit-check golden golden-check calibrate labels context-lint test-js test-openresty bench bench-offline bench-judge bench-judge-live bench-chart dist opm-build rock-lint rock-pack rock-upload install live-check live-full live-openai soak shim e2e-envoy e2e-forward-auth e2e-apisix e2e-kong e2e-haproxy test-litellm suite-fetch suite-build suite-live suite-report suite-tooldocs-build suite-untrusted suite-untrusted-report
 
 test:
 	busted
@@ -119,6 +119,21 @@ suite-live:
 
 suite-report:
 	lua bench/suite/report.lua > bench/suite/report.md
+
+# Experiment (bench/suite/README.md#experiment-judging-retrieved-content-on-its-own):
+# the retrieved part of each indirect record judged on its own. Costs ~900 calls
+# for suite v1 and ~1.6k for the non-email tool results (whole text + segment).
+suite-tooldocs-build:
+	python3 bench/suite/build_tooldocs.py --raw bench/suite/raw
+
+suite-untrusted:
+	docker run --rm --env-file .env -v "$(CURDIR)":/work jev-edge-test sh -c \
+	  'for s in "SUITE=suite-v1 untrusted" "SUITE=suite-v1-tooldocs live" "SUITE=suite-v1-tooldocs untrusted"; do \
+	     set -- $$s; env $$1 resty --http-conf "lua_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt; lua_ssl_verify_depth 5;" \
+	       -I /work/adapters/openresty/lib -I /work /work/bench/suite/$$2.lua || exit 1; done'
+
+suite-untrusted-report:
+	lua bench/suite/untrusted_report.lua > bench/suite/untrusted-report.md
 
 # openai-compat provider against an Ollama container on the jev-net network:
 #   docker network create jev-net; docker run -d --rm --name ollama --network jev-net ollama/ollama

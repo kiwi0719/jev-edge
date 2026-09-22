@@ -206,7 +206,9 @@ def raw_socket(t: Target):
     s = socket.create_connection((t.host, t.port), timeout=t.timeout)
     if t.https:
         import ssl
-        s = ssl.create_default_context().wrap_socket(s, server_hostname=t.host)
+        ctx = ssl.create_default_context()
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        s = ctx.wrap_socket(s, server_hostname=t.host)
     return s
 
 

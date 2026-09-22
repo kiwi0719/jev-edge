@@ -11,6 +11,7 @@ export const llmEndpoints: Rule = {
   min_body_bytes: 8,
   max_body_bytes: 1048576,
   max_judge_bytes: 32768,
+  max_judge_chunks: 1,
   text_fields: ["messages[*].content", "prompt", "input", "query", "text"],
   min_text_chars: 20,
   always_suspect: [

@@ -201,7 +201,7 @@ return {
 - **模板。** `injection` 的判定标准把对分类器说话、或替它规定结论的文本列为强注入信号。
 - **L1。** 新增六条 `always_suspect` 模式识别针对判定器的文本（要求给出结论、指挥分类器输出什么、“致审查本文的 AI”、答案 JSON、伪造的输入结束标记、“真正的结论是安全”）。这类文本本来就会作为自然语言进入 L2；命中还能保证它留在超过 `max_judge_bytes` 的长请求体的判定窗口里。
 
-`make bench-judge` 用 L1 跑 `bench/datasets/judge-directed.jsonl`（32 条攻击、13 条相似的正常请求，比如“Is this email safe to open?”）：所有攻击都进入 L2，没有一条正常请求被模式命中。`make bench-judge-live` 把同样的用例发给真实判定器（需要密钥，见 `bench/judge_robustness.lua`）。已知局限：如果模型*只*复述了嵌入的答案，仍会被当作那个答案（回复格式里没有要求回显 nonce，小模型做不好这一点）；超过 `max_judge_bytes` 的单条消息中间的指令，如果没有模式命中（比如非英文），会被头尾窗口截掉，根本不会被判定。
+`make bench-judge` 用 L1 跑 `bench/datasets/judge-directed.jsonl`（32 条攻击、13 条相似的正常请求，比如“Is this email safe to open?”）：所有攻击都进入 L2，没有一条正常请求被模式命中。`make bench-judge-live` 把同样的用例发给真实判定器（需要密钥，见 `bench/judge_robustness.lua`）。如果模型*只*复述了输入里植入的答案（对被问的问题给出的值，和被判文本里某个 JSON 对象完全相同；按解析后的值比较，所以改空格或 `0` 与 `0.0` 之类的写法藏不住），说明它被输入牵着走了，这正是注入：每个被问的问题记 1，而不是植入的那个值；这里刻意不按错误处理，因为错误会 fail-open。超过 `max_judge_bytes` 的单条消息中间的指令，如果没有模式命中（比如非英文），在默认的单窗口下会被截掉；`max_judge_chunks > 1` 会分块判定，`max_judge_chunks × max_judge_bytes` 以内的文本全部判到（见 README 的“长文本分块判定”）。
 
 ## 策略
 

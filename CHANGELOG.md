@@ -39,6 +39,16 @@ All notable changes to this project are recorded here. The format follows
   part needs a provider key); six `always_suspect` patterns for
   judge-directed text, each with a golden positive, and negatives such as
   "Is this email safe to open?".
+- **Judging long text in chunks** (`max_judge_chunks` in a rule, default 1):
+  text over `max_judge_bytes` is split into up to that many chunks (cut at
+  a newline where possible, never inside a character), judged in parallel
+  (`judge.call_many`: `ngx.thread` on OpenResty, APISIX and Kong,
+  `Promise.all` in JS), the highest chunk score wins, each chunk has its own
+  cache entry. Past the cap, the newest chunks plus a window over the rest,
+  or `unjudgeable: text over max_judge_chunks` with `policy.unjudgeable =
+  "block"`. An instruction in the middle of a long message that no pattern
+  matches is no longer cut out when chunks are on. Golden vectors accept
+  inline rule specs (7 chunk cases in both cores).
 - Partial bodies are covered end to end: Envoy (HTTP and gRPC, cut at
   `max_request_bytes`) and HAProxy (past `tune.bufsize`, Content-Length and
   chunked) flag them, and the e2e suites check that an attack in the part
@@ -84,6 +94,10 @@ All notable changes to this project are recorded here. The format follows
   `null`, `false`, `""` and `[]` are no longer read as 0 in TS. The
   injection template tells the judge that text addressing it is itself a
   signal.
+- **openai-compat: a reply that only repeats an answer planted in the judged
+  text scores 1**, the same in Lua and TS (compared on parsed values). It
+  was read as the model's own answer, so a planted `{"injection": 0}` that a
+  small model echoed passed the request.
 - A byte cut through a multi-byte UTF-8 character no longer reaches the L2
   prompt: the head and tail of an oversized body, and a gateway's partial
   body, end on character boundaries.

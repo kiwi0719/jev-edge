@@ -228,7 +228,7 @@ rule("rule-parity", function(r)
   local lua = read("rules/llm-endpoints.lua") or ""
   local ts = read("adapters/js/src/rules/index.ts") or ""
   local tsrule = ts:match("export const llmEndpoints: Rule = (%b{})") or ""
-  for _, k in ipairs({ "max_body_bytes", "max_judge_bytes", "min_body_bytes", "min_text_chars" }) do
+  for _, k in ipairs({ "max_body_bytes", "max_judge_bytes", "max_judge_chunks", "min_body_bytes", "min_text_chars" }) do
     local a = lua:match("\n%s*" .. k .. "%s*=%s*(%d+)")
     local b = tsrule:match(k .. ":%s*(%d+)")
     if a ~= b then fail(r, k .. ": Lua " .. tostring(a) .. " vs TS " .. tostring(b)) end

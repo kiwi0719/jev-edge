@@ -100,7 +100,13 @@ describe("golden: evaluate", function()
       local cache = store_from(inp.cache)
       local writes, calls, seen = {}, 0, nil
       local rules = {}
-      for _, id in ipairs(inp.rules) do rules[#rules + 1] = require("jev.rules." .. id) end
+      for _, spec in ipairs(inp.rules) do
+        if type(spec) == "table" then
+          rules[#rules + 1] = assert(rules_mod.resolve(spec, function(id) return require("jev.rules." .. id) end))
+        else
+          rules[#rules + 1] = require("jev.rules." .. spec)
+        end
+      end
       local breaker
       if inp.breaker then
         local bstore = H.store()

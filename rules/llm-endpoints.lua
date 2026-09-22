@@ -21,6 +21,11 @@ return {
   -- Text over this many bytes is cut to a window before the fingerprint and
   -- L2: the always_suspect hit, then the newest messages.
   max_judge_bytes = 32768,
+  -- Text over max_judge_bytes in up to this many chunks, one judge call each
+  -- (in parallel). 1 = one window (hit + newest messages + head/tail), the
+  -- cheapest; raise it (4 covers 128 KiB) to judge long text in full, and
+  -- policy.unjudgeable then decides what still does not fit. See README.
+  max_judge_chunks = 1,
   text_fields = { "messages[*].content", "prompt", "input", "query", "text" },
   min_text_chars = 20,
   always_suspect = {

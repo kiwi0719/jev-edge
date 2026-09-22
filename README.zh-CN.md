@@ -232,6 +232,8 @@ L1 按后端读 body 的方式读受监控的请求：格式由 body 决定，�
 
 **`max_judge_bytes` 是 32 KiB**：做指纹并送往 L2 的文本。更长的文本被切成一个窗口：`always_suspect` 的命中处（整段文本都会被扫描）前后各 1 KiB，然后按消息从新到旧；放不下的那条保留开头和结尾。聊天 API 每一轮都会重发历史，之前的轮次在它们是最新一轮时已经判定过。调大它会让每个长请求都多花 token；`jev_window_total` 统计它被触发的次数。
 
+**长文本分块判定。** 单窗口成本低，但一条长消息中间的指令，如果没有命中任何 `always_suspect` 规则（比如非英文），可能落在窗口之外。规则里的 `max_judge_chunks`（默认 1）会把超过 `max_judge_bytes` 的文本切成最多这么多块，每块一次 judge 调用，并行进行（OpenResty、APISIX 和 Kong 用 `ngx.thread`，JS 运行时用 `Promise.all`），请求的分数取各块的最高分，reason 以 `(N chunks)` 结尾。每块有自己的缓存条目，所以长对话里没变的历史不会每轮重复计费。超过 `max_judge_chunks × max_judge_bytes` 的文本按“最新的几块 + 其余部分的窗口”判定（`(window)`）；如果 `policy.unjudgeable = "block"` 且处于 enforce 模式，则按 `unjudgeable: text over max_judge_chunks` 拦截。`rules = { { id = "long", extends = "llm-endpoints", max_judge_chunks = 4 } }` 可以完整判定 128 KiB 以内的文本，每个长请求最多四次调用；`jev_window_total` 能看出长文本出现得多频繁。L3 和薄 Worker 的 `backend` provider 仍然每个请求只调用一次。
+
 **Content-Type 只是提示。** 除媒体类型（`skip_content_types`：`image/`、`audio/`、`video/`、`font/`、PDF、zip、gzip）外，所有类型都会读：能解析成 JSON 的 body 就是 JSON，不管头怎么写（Ollama 和 FastAPI 就是这么读的）；form 和 `multipart/form-data` 的字段会读（文本文件部分也读）；其他文本整体取用。列了 `content_types` 的规则保持旧的白名单行为。
 
 **Content-Encoding** `gzip`、`deflate` 和 `br` 会被解码（Express 的 body-parser 会解压它们），上限为 `max_body_bytes`，小的压缩 body 无法在内存里膨胀。OpenResty 和 APISIX 通过 FFI 使用 zlib（已链接进 nginx）和 libbrotlidec：要支持 `br`，安装 `brotli-libs`（Alpine）或 `libbrotli1`（Debian）。JS 运行时用 `DecompressionStream`，`br` 在有 `node:zlib` 的地方用它。

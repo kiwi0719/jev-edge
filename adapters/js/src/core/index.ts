@@ -14,8 +14,12 @@ import type { JsonValue } from "./normalize.js";
 
 export const VERSION = "0.4.0";
 
+export type JudgeResult = [judge.Answers, null] | [null, string];
+
 export interface Judge {
-  call(prompt: judge.Prompt, timeoutMs: number): Promise<[judge.Answers, null] | [null, string]> | [judge.Answers, null] | [null, string];
+  call(prompt: judge.Prompt, timeoutMs: number): Promise<JudgeResult> | JudgeResult;
+  /** Optional: several prompts at once (in parallel), for text judged in chunks. */
+  call_many?(prompts: judge.Prompt[], timeoutMs: number): Promise<JudgeResult[]>;
 }
 
 export interface Ctx {
@@ -72,11 +76,98 @@ export function cacheKey(fp: string, rule: Rule | undefined, cfg: Config, hash: 
   return "fp:" + String(hash(scope)).slice(0, 16) + ":" + fp;
 }
 
+// Port of judge_chunks in core/init.lua: each chunk its own cache entry, the
+// misses judged together, the highest chunk score wins; a failed chunk makes
+// the request an error unless another chunk already blocks.
+async function judgeChunks(
+  req: Req, ctx: Ctx, rule: Rule, chunks: string[], capped: boolean, fp: string, ckey: string | undefined, reason: string,
+): Promise<verdict.Verdict> {
+  const cfg = ctx.config;
+  const scores: (number | undefined)[] = [];
+  const tops: string[] = [];
+  const pending: { i: number; prompt: judge.Prompt; ck?: string }[] = [];
+  const context = {
+    path: req.path ?? "", method: req.method ?? "",
+    deployment: rule.deployment_context ?? cfg.jev.deployment_context ?? "",
+  };
+  for (let i = 0; i < chunks.length; i++) {
+    const cfp = normalize.fingerprint(chunks[i], { prefix_bytes: cfg.cache.fp_prefix_bytes }, ctx.hash);
+    const ck = cfp !== "" ? cacheKey(cfp, rule, cfg, ctx.hash) : undefined;
+    const hit = ck && ctx.cache ? ((await ctx.cache.get(ck)) as { score?: unknown; reason?: string } | undefined) : undefined;
+    if (hit && typeof hit === "object" && typeof hit.score === "number") {
+      scores[i] = hit.score;
+      tops[i] = /^(\S+)/.exec(String(hit.reason ?? ""))?.[1] ?? "";
+    } else {
+      const [prompt, perr] = judge.build(rule.templates, chunks[i], context);
+      if (!prompt) {
+        log(ctx, "error", "jev-edge: " + perr);
+        const [action, label, async] = policy.onError();
+        return finish(ctx, verdict.newVerdict({ action, verdict: label, async, source: verdict.SRC_L2, reason: perr, fingerprint: fp }));
+      }
+      pending.push({ i, prompt, ck });
+    }
+  }
+
+  const t0 = nowMs(ctx);
+  let results: JudgeResult[];
+  if (pending.length > 1 && ctx.judge.call_many) {
+    results = await ctx.judge.call_many(pending.map((p) => p.prompt), cfg.jev.timeout_ms);
+  } else {
+    results = [];
+    for (const p of pending) results.push(await ctx.judge.call(p.prompt, cfg.jev.timeout_ms));
+  }
+  const elapsed = nowMs(ctx) - t0;
+
+  let err: string | undefined;
+  for (let k = 0; k < pending.length; k++) {
+    const p = pending[k];
+    const [a, e] = results[k] ?? [null, "error"];
+    let s = 0, t = "", n = 0;
+    if (a) [s, t, n] = judge.reduce(a);
+    if (!a || n === 0) {
+      err ??= String(e ?? (a ? "no scores in answer" : "error"));
+    } else {
+      scores[p.i] = s;
+      tops[p.i] = t;
+      if (p.ck && ctx.cache) await ctx.cache.set(p.ck, { score: s, reason: `${t} ${verdict.format2(s)}` }, cfg.cache.fp_ttl);
+    }
+  }
+  if (ctx.breaker && pending.length > 0) {
+    if (err) await ctx.breaker.failure();
+    else await ctx.breaker.success();
+  }
+
+  let best: number | undefined;
+  let top = "";
+  for (let i = 0; i < chunks.length; i++) {
+    const s = scores[i];
+    if (s !== undefined && (best === undefined || s > best)) {
+      best = s;
+      top = tops[i];
+    }
+  }
+  if (err && !(best !== undefined && best >= (cfg.policy.block_threshold ?? 0.7))) {
+    log(ctx, "warn", "jev-edge: L2 failed on a chunk: " + err);
+    const [action, label, async] = policy.onError();
+    return finish(ctx, verdict.newVerdict({
+      action, verdict: label, async, source: verdict.SRC_L2, reason: err, fingerprint: fp, l2_ms: elapsed,
+    }));
+  }
+  const score = best ?? 0;
+  const [action, label, async] = policy.decide(score, cfg.policy);
+  let why = top !== "" ? `${top} ${verdict.format2(score)}` : reason;
+  if (top !== "") why += capped ? " (window)" : ` (${chunks.length} chunks)`;
+  if (ckey && ctx.cache) await ctx.cache.set(ckey, { score, reason: why }, cfg.cache.fp_ttl);
+  return finish(ctx, verdict.newVerdict({
+    action, verdict: label, score, async, source: verdict.SRC_L2, reason: why, fingerprint: fp, l2_ms: elapsed,
+  }));
+}
+
 export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
   const cfg = ctx.config;
 
   // L1 --------------------------------------------------------------------
-  const [r, text, reason, rule, windowed] = await rulesMod.evaluateAll(req, ctx.rules, ctx);
+  const [r, text, reason, rule, windowed, chunks, capped] = await rulesMod.evaluateAll(req, ctx.rules, ctx);
 
   if (r === rulesMod.PASS) {
     return verdict.newVerdict({ verdict: verdict.SKIPPED, source: verdict.SRC_L1, reason });
@@ -138,6 +229,16 @@ export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
   }
 
   // L2 --------------------------------------------------------------------
+  if (chunks && chunks.length > 1) {
+    // max_judge_chunks > 1: what still did not fit is unjudgeable
+    if (capped && cfg.policy.unjudgeable === "block" && cfg.policy.mode === "enforce") {
+      return finish(ctx, verdict.newVerdict({
+        action: verdict.ACTION_BLOCK, verdict: verdict.SKIPPED, source: verdict.SRC_L1,
+        reason: "unjudgeable: text over max_judge_chunks", fingerprint: fp,
+      }));
+    }
+    return judgeChunks(req, ctx, rule!, chunks, capped === true, fp, ckey, reason);
+  }
   const [prompt, perr] = judge.build(rule!.templates, text, {
     path: req.path ?? "",
     method: req.method ?? "",

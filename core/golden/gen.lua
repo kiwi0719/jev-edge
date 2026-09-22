@@ -424,7 +424,12 @@ local function eval_case(name, spec)
 
   local rule_list = {}
   for _, id in ipairs(spec.rules or { "llm-endpoints" }) do
-    rule_list[#rule_list + 1] = require("jev.rules." .. id)
+    -- an id, or an inline spec resolved the way a config's `rules` list is
+    if type(id) == "table" then
+      rule_list[#rule_list + 1] = assert(rules_mod.resolve(id, function(x) return require("jev.rules." .. x) end))
+    else
+      rule_list[#rule_list + 1] = require("jev.rules." .. id)
+    end
   end
 
   -- spec.breaker: "open" | "closed" | nil (no breaker injected). "open" is a
@@ -667,6 +672,40 @@ eval_case("subject reputation: a malicious cache hit counts", { req = req(ATTACK
 eval_case("subject reputation: unwatched path is not blocked", { req = req(LONG, { path = "/healthz" }),
   config = REP_ENF, subject = { id = "u-1", store = { ["srep:u-1:until"] = 1300 } },
   judge = { answers = { injection = 0.1 } } })
+
+-- judging in chunks (rule.max_judge_chunks) --------------------------------
+-- an inline rule with a 64-byte window keeps these vectors small
+local CHUNKED = { id = "chunked", extends = "llm-endpoints", max_judge_bytes = 64, max_judge_chunks = 3 }
+local chunked_rule = assert(rules_mod.resolve(CHUNKED, function(x) return require("jev.rules." .. x) end))
+local FITS = string.rep("Please summarise the quarterly report. ", 4)     -- 3 chunks
+local OVER = string.rep("Please summarise the quarterly report. ", 8)     -- 5 chunks: capped
+local function chunk_key(text, i)
+  local pieces = normalize.chunks(text, 64)
+  local cfp = normalize.fingerprint(pieces[i], { prefix_bytes = 2048 }, normalize.djb2)
+  return core.cache_key(cfp, chunked_rule, defaults.merge(defaults.config, {}), normalize.djb2)
+end
+eval_case("chunks: text that fits max_judge_chunks is judged in full, one call per chunk", {
+  req = req(FITS), rules = { CHUNKED }, judge = { answers = { injection = 0.3 } } })
+eval_case("chunks: the highest chunk score is the request's", {
+  req = req(FITS), rules = { CHUNKED }, config = { policy = { mode = "enforce" } },
+  cache = { [chunk_key(FITS, 2)] = { score = 0.95, reason = "injection 0.95" } },
+  judge = { answers = { injection = 0.1 } } })
+eval_case("chunks: a cached chunk is not judged again", {
+  req = req(FITS), rules = { CHUNKED },
+  cache = { [chunk_key(FITS, 1)] = { score = 0.1, reason = "injection 0.10" } },
+  judge = { answers = { injection = 0.2 } } })
+eval_case("chunks: over max_judge_chunks, the newest chunks whole and a window over the rest", {
+  req = req(OVER), rules = { CHUNKED }, judge = { answers = { injection = 0.2 } } })
+eval_case("chunks: over max_judge_chunks with policy.unjudgeable = block is blocked in enforce", {
+  req = req(OVER), rules = { CHUNKED }, config = { policy = { mode = "enforce", unjudgeable = "block" } },
+  judge = { answers = { injection = 0.2 } } })
+eval_case("chunks: a judge error on a chunk is an error", {
+  req = req(FITS), rules = { CHUNKED }, config = { policy = { mode = "enforce" } },
+  judge = { error = "timeout" } })
+eval_case("chunks: a judge error does not undo a chunk that already blocks", {
+  req = req(FITS), rules = { CHUNKED }, config = { policy = { mode = "enforce" } },
+  cache = { [chunk_key(FITS, 3)] = { score = 0.95, reason = "injection 0.95" } },
+  judge = { error = "timeout" } })
 
 eval_case("whitespace-only text is cached like any other", { req = req(string.rep(" \t", 15)),
   judge = { answers = { injection = 0.1 } } })

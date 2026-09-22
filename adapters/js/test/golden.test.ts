@@ -5,7 +5,7 @@ import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import * as core from "../src/core";
-import { load as loadRule } from "../src/rules";
+import { load as loadRule, resolve as resolveRule } from "../src/rules";
 import { Breaker, memoryStore, OPEN, CLOSED } from "../src/core/breaker";
 
 const GOLDEN = resolve(__dirname, "../../../core/golden");
@@ -111,7 +111,8 @@ describe("golden: evaluate", () => {
             },
           }
           : undefined,
-        rules: inp.rules.map(loadRule),
+        // an id, or an inline spec resolved the way a config's `rules` list is
+        rules: inp.rules.map((r: string | object) => (typeof r === "string" ? loadRule(r) : resolveRule(r as never))),
         breaker,
         cache: {
           get: (k) => cache.get(k),

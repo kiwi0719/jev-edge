@@ -329,6 +329,45 @@ export function tail(s: string, n: number): string {
 export const HIT_CONTEXT = 1024;
 
 /**
+ * Port of normalize.chunks: consecutive pieces of at most `budget` UTF-8
+ * bytes covering all of `text`; a cut prefers the last newline in the second
+ * half of a piece (dropped) and never splits a code point. Returns the pieces
+ * and each one's 1-based byte offset, as in Lua.
+ */
+export function chunks(text: string, budget: number): [string[], number[]] {
+  const b = enc.encode(text);
+  const n = b.length;
+  const half = Math.floor(budget / 2);
+  const pieces: string[] = [];
+  const starts: number[] = [];
+  let i = 1;
+  while (i <= n) {
+    if (n - i + 1 <= budget) {
+      pieces.push(dec.decode(b.subarray(i - 1)));
+      starts.push(i);
+      break;
+    }
+    let e = i + budget - 1;
+    let next: number | undefined;
+    for (let j = e; j >= i + half + 1; j--) {
+      if (b[j - 1] === 10) {
+        e = j - 1;
+        next = j + 1;
+        break;
+      }
+    }
+    if (next === undefined) {
+      while (e > i && isCont(b, e)) e--;
+      next = e + 1;
+    }
+    pieces.push(dec.decode(b.subarray(i - 1, e)));
+    starts.push(i);
+    i = next;
+  }
+  return [pieces, starts];
+}
+
+/**
  * @param from,to 1-based inclusive byte span of an always_suspect hit, or undefined
  * @returns the text to judge, and true when it was cut
  */

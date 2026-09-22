@@ -287,6 +287,34 @@ end
 
 _M.HIT_CONTEXT = 1024
 
+--- Split `text` into consecutive pieces of at most `budget` bytes covering
+-- all of it, for judging in chunks (rule.max_judge_chunks). A cut prefers the
+-- last newline in the second half of a piece (the newline itself is dropped,
+-- it joined two values) and never splits a UTF-8 sequence.
+-- @return pieces, and the byte offset in `text` where each piece starts
+function _M.chunks(text, budget)
+  local pieces, starts = {}, {}
+  local i, n = 1, #text
+  local half = math.floor(budget / 2)
+  while i <= n do
+    if n - i + 1 <= budget then
+      pieces[#pieces + 1], starts[#starts + 1] = text:sub(i), i
+      break
+    end
+    local e, nexti = i + budget - 1, nil
+    for j = e, i + half + 1, -1 do
+      if text:byte(j) == 10 then e, nexti = j - 1, j + 1 break end
+    end
+    if not nexti then
+      while e > i and cont(text, e + 1) do e = e - 1 end
+      nexti = e + 1
+    end
+    pieces[#pieces + 1], starts[#starts + 1] = text:sub(i, e), i
+    i = nexti
+  end
+  return pieces, starts
+end
+
 --- @param text   the joined values
 -- @param values the values, in order (newest last)
 -- @param budget max bytes

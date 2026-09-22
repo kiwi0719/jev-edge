@@ -118,6 +118,31 @@ function _M.new(cfg, inflight, metrics)
     return answers, err
   end
 
+  --- Several prompts at once, one light thread each (text judged in chunks,
+  -- core's judge_chunks): the wall time is the slowest call, not the sum.
+  -- Each call takes its own in-flight slot. Returns { { answers, err }, ... }
+  -- in prompt order.
+  function self.call_many(prompts, requested_timeout)
+    local results = {}
+    if not (ngx and ngx.thread) or #prompts < 2 then
+      for i, p in ipairs(prompts) do results[i] = { self.call(p, requested_timeout) } end
+      return results
+    end
+    local threads = {}
+    for i, p in ipairs(prompts) do
+      local th, serr = ngx.thread.spawn(self.call, p, requested_timeout)
+      threads[i] = th or false
+      if not th then results[i] = { nil, "thread: " .. tostring(serr) } end
+    end
+    for i, th in ipairs(threads) do
+      if th then
+        local ok, answers, err = ngx.thread.wait(th)
+        results[i] = ok and { answers, err } or { nil, "judge error: " .. tostring(answers) }
+      end
+    end
+    return results
+  end
+
   return self
 end
 

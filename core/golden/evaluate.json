@@ -3994,6 +3994,596 @@
     {
       "expect": {
         "cache_writes": {
+          "fp:daf36bf6:21a522f3": {
+            "ttl": 300,
+            "value": {
+              "reason": "injection 0.30",
+              "score": 0.3
+            }
+          },
+          "fp:daf36bf6:9dcbf2ed": {
+            "ttl": 300,
+            "value": {
+              "reason": "injection 0.30",
+              "score": 0.3
+            }
+          },
+          "fp:daf36bf6:cebeeaff": {
+            "ttl": 300,
+            "value": {
+              "reason": "injection 0.30",
+              "score": 0.3
+            }
+          },
+          "fp:daf36bf6:dd757a15": {
+            "ttl": 300,
+            "value": {
+              "reason": "injection 0.30 (3 chunks)",
+              "score": 0.3
+            }
+          }
+        },
+        "headers": {
+          "X-Jev-Reason": "injection+0.30+%283+chunks%29",
+          "X-Jev-Score": "0.30",
+          "X-Jev-Source": "l2",
+          "X-Jev-Verdict": "safe"
+        },
+        "judge_calls": 3,
+        "prompt": {
+          "context": {
+            "deployment": "",
+            "method": "POST",
+            "path": "/v1/chat/completions"
+          },
+          "questions": [
+            "injection"
+          ],
+          "text": "arise the quarterly report. "
+        },
+        "subject_record": null,
+        "subject_store_writes": null,
+        "verdict": {
+          "action": "pass",
+          "async": false,
+          "fingerprint": "dd757a15",
+          "l2_ms": 0,
+          "reason": "injection 0.30 (3 chunks)",
+          "score": 0.3,
+          "source": "l2",
+          "verdict": "safe"
+        }
+      },
+      "input": {
+        "breaker": null,
+        "cache": {},
+        "clock": 1000,
+        "config": {},
+        "judge": {
+          "answers": {
+            "injection": 0.3
+          }
+        },
+        "req": {
+          "body": "{\"messages\":[{\"role\":\"user\",\"content\":\"Please summarise the quarterly report. Please summarise the quarterly report. Please summarise the quarterly report. Please summarise the quarterly report. \"}]}",
+          "body_size": 199,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/v1/chat/completions"
+        },
+        "rules": [
+          {
+            "extends": "llm-endpoints",
+            "id": "chunked",
+            "max_judge_bytes": 64,
+            "max_judge_chunks": 3
+          }
+        ],
+        "subject": null
+      },
+      "name": "chunks: text that fits max_judge_chunks is judged in full, one call per chunk"
+    },
+    {
+      "expect": {
+        "cache_writes": {
+          "fp:daf36bf6:21a522f3": {
+            "ttl": 300,
+            "value": {
+              "reason": "injection 0.10",
+              "score": 0.1
+            }
+          },
+          "fp:daf36bf6:9dcbf2ed": {
+            "ttl": 300,
+            "value": {
+              "reason": "injection 0.10",
+              "score": 0.1
+            }
+          },
+          "fp:daf36bf6:dd757a15": {
+            "ttl": 300,
+            "value": {
+              "reason": "injection 0.95 (3 chunks)",
+              "score": 0.95
+            }
+          }
+        },
+        "headers": {
+          "X-Jev-Reason": "injection+0.95+%283+chunks%29",
+          "X-Jev-Score": "0.95",
+          "X-Jev-Source": "l2",
+          "X-Jev-Verdict": "malicious"
+        },
+        "judge_calls": 2,
+        "prompt": {
+          "context": {
+            "deployment": "",
+            "method": "POST",
+            "path": "/v1/chat/completions"
+          },
+          "questions": [
+            "injection"
+          ],
+          "text": "arise the quarterly report. "
+        },
+        "subject_record": null,
+        "subject_store_writes": null,
+        "verdict": {
+          "action": "block",
+          "async": false,
+          "fingerprint": "dd757a15",
+          "l2_ms": 0,
+          "reason": "injection 0.95 (3 chunks)",
+          "score": 0.95,
+          "source": "l2",
+          "verdict": "malicious"
+        }
+      },
+      "input": {
+        "breaker": null,
+        "cache": {
+          "fp:daf36bf6:cebeeaff": {
+            "reason": "injection 0.95",
+            "score": 0.95
+          }
+        },
+        "clock": 1000,
+        "config": {
+          "policy": {
+            "mode": "enforce"
+          }
+        },
+        "judge": {
+          "answers": {
+            "injection": 0.1
+          }
+        },
+        "req": {
+          "body": "{\"messages\":[{\"role\":\"user\",\"content\":\"Please summarise the quarterly report. Please summarise the quarterly report. Please summarise the quarterly report. Please summarise the quarterly report. \"}]}",
+          "body_size": 199,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/v1/chat/completions"
+        },
+        "rules": [
+          {
+            "extends": "llm-endpoints",
+            "id": "chunked",
+            "max_judge_bytes": 64,
+            "max_judge_chunks": 3
+          }
+        ],
+        "subject": null
+      },
+      "name": "chunks: the highest chunk score is the request's"
+    },
+    {
+      "expect": {
+        "cache_writes": {
+          "fp:daf36bf6:9dcbf2ed": {
+            "ttl": 300,
+            "value": {
+              "reason": "injection 0.20",
+              "score": 0.2
+            }
+          },
+          "fp:daf36bf6:cebeeaff": {
+            "ttl": 300,
+            "value": {
+              "reason": "injection 0.20",
+              "score": 0.2
+            }
+          },
+          "fp:daf36bf6:dd757a15": {
+            "ttl": 300,
+            "value": {
+              "reason": "injection 0.20 (3 chunks)",
+              "score": 0.2
+            }
+          }
+        },
+        "headers": {
+          "X-Jev-Reason": "injection+0.20+%283+chunks%29",
+          "X-Jev-Score": "0.20",
+          "X-Jev-Source": "l2",
+          "X-Jev-Verdict": "safe"
+        },
+        "judge_calls": 2,
+        "prompt": {
+          "context": {
+            "deployment": "",
+            "method": "POST",
+            "path": "/v1/chat/completions"
+          },
+          "questions": [
+            "injection"
+          ],
+          "text": "arise the quarterly report. "
+        },
+        "subject_record": null,
+        "subject_store_writes": null,
+        "verdict": {
+          "action": "pass",
+          "async": false,
+          "fingerprint": "dd757a15",
+          "l2_ms": 0,
+          "reason": "injection 0.20 (3 chunks)",
+          "score": 0.2,
+          "source": "l2",
+          "verdict": "safe"
+        }
+      },
+      "input": {
+        "breaker": null,
+        "cache": {
+          "fp:daf36bf6:21a522f3": {
+            "reason": "injection 0.10",
+            "score": 0.1
+          }
+        },
+        "clock": 1000,
+        "config": {},
+        "judge": {
+          "answers": {
+            "injection": 0.2
+          }
+        },
+        "req": {
+          "body": "{\"messages\":[{\"role\":\"user\",\"content\":\"Please summarise the quarterly report. Please summarise the quarterly report. Please summarise the quarterly report. Please summarise the quarterly report. \"}]}",
+          "body_size": 199,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/v1/chat/completions"
+        },
+        "rules": [
+          {
+            "extends": "llm-endpoints",
+            "id": "chunked",
+            "max_judge_bytes": 64,
+            "max_judge_chunks": 3
+          }
+        ],
+        "subject": null
+      },
+      "name": "chunks: a cached chunk is not judged again"
+    },
+    {
+      "expect": {
+        "cache_writes": {
+          "fp:daf36bf6:09e9dbcb": {
+            "ttl": 300,
+            "value": {
+              "reason": "injection 0.20",
+              "score": 0.2
+            }
+          },
+          "fp:daf36bf6:9183260c": {
+            "ttl": 300,
+            "value": {
+              "reason": "injection 0.20",
+              "score": 0.2
+            }
+          },
+          "fp:daf36bf6:9632dccd": {
+            "ttl": 300,
+            "value": {
+              "reason": "injection 0.20",
+              "score": 0.2
+            }
+          },
+          "fp:daf36bf6:daaceffa": {
+            "ttl": 300,
+            "value": {
+              "reason": "injection 0.20 (window)",
+              "score": 0.2
+            }
+          }
+        },
+        "headers": {
+          "X-Jev-Reason": "injection+0.20+%28window%29",
+          "X-Jev-Score": "0.20",
+          "X-Jev-Source": "l2",
+          "X-Jev-Verdict": "safe"
+        },
+        "judge_calls": 3,
+        "prompt": {
+          "context": {
+            "deployment": "",
+            "method": "POST",
+            "path": "/v1/chat/completions"
+          },
+          "questions": [
+            "injection"
+          ],
+          "text": "uarterly report. Please summarise the quarterly report. "
+        },
+        "subject_record": null,
+        "subject_store_writes": null,
+        "verdict": {
+          "action": "pass",
+          "async": false,
+          "fingerprint": "daaceffa",
+          "l2_ms": 0,
+          "reason": "injection 0.20 (window)",
+          "score": 0.2,
+          "source": "l2",
+          "verdict": "safe"
+        }
+      },
+      "input": {
+        "breaker": null,
+        "cache": {},
+        "clock": 1000,
+        "config": {},
+        "judge": {
+          "answers": {
+            "injection": 0.2
+          }
+        },
+        "req": {
+          "body": "{\"messages\":[{\"role\":\"user\",\"content\":\"Please summarise the quarterly report. Please summarise the quarterly report. Please summarise the quarterly report. Please summarise the quarterly report. Please summarise the quarterly report. Please summarise the quarterly report. Please summarise the quarterly report. Please summarise the quarterly report. \"}]}",
+          "body_size": 355,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/v1/chat/completions"
+        },
+        "rules": [
+          {
+            "extends": "llm-endpoints",
+            "id": "chunked",
+            "max_judge_bytes": 64,
+            "max_judge_chunks": 3
+          }
+        ],
+        "subject": null
+      },
+      "name": "chunks: over max_judge_chunks, the newest chunks whole and a window over the rest"
+    },
+    {
+      "expect": {
+        "cache_writes": {},
+        "headers": {
+          "X-Jev-Reason": "unjudgeable%3A+text+over+max_judge_chunks",
+          "X-Jev-Score": "0.00",
+          "X-Jev-Source": "l1",
+          "X-Jev-Verdict": "skipped"
+        },
+        "judge_calls": 0,
+        "prompt": null,
+        "subject_record": null,
+        "subject_store_writes": null,
+        "verdict": {
+          "action": "block",
+          "async": false,
+          "fingerprint": "daaceffa",
+          "l2_ms": 0,
+          "reason": "unjudgeable: text over max_judge_chunks",
+          "score": 0,
+          "source": "l1",
+          "verdict": "skipped"
+        }
+      },
+      "input": {
+        "breaker": null,
+        "cache": {},
+        "clock": 1000,
+        "config": {
+          "policy": {
+            "mode": "enforce",
+            "unjudgeable": "block"
+          }
+        },
+        "judge": {
+          "answers": {
+            "injection": 0.2
+          }
+        },
+        "req": {
+          "body": "{\"messages\":[{\"role\":\"user\",\"content\":\"Please summarise the quarterly report. Please summarise the quarterly report. Please summarise the quarterly report. Please summarise the quarterly report. Please summarise the quarterly report. Please summarise the quarterly report. Please summarise the quarterly report. Please summarise the quarterly report. \"}]}",
+          "body_size": 355,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/v1/chat/completions"
+        },
+        "rules": [
+          {
+            "extends": "llm-endpoints",
+            "id": "chunked",
+            "max_judge_bytes": 64,
+            "max_judge_chunks": 3
+          }
+        ],
+        "subject": null
+      },
+      "name": "chunks: over max_judge_chunks with policy.unjudgeable = block is blocked in enforce"
+    },
+    {
+      "expect": {
+        "cache_writes": {},
+        "headers": {
+          "X-Jev-Reason": "timeout",
+          "X-Jev-Score": "0.00",
+          "X-Jev-Source": "l2",
+          "X-Jev-Verdict": "error"
+        },
+        "judge_calls": 3,
+        "prompt": {
+          "context": {
+            "deployment": "",
+            "method": "POST",
+            "path": "/v1/chat/completions"
+          },
+          "questions": [
+            "injection"
+          ],
+          "text": "arise the quarterly report. "
+        },
+        "subject_record": null,
+        "subject_store_writes": null,
+        "verdict": {
+          "action": "pass",
+          "async": true,
+          "fingerprint": "dd757a15",
+          "l2_ms": 0,
+          "reason": "timeout",
+          "score": 0,
+          "source": "l2",
+          "verdict": "error"
+        }
+      },
+      "input": {
+        "breaker": null,
+        "cache": {},
+        "clock": 1000,
+        "config": {
+          "policy": {
+            "mode": "enforce"
+          }
+        },
+        "judge": {
+          "error": "timeout"
+        },
+        "req": {
+          "body": "{\"messages\":[{\"role\":\"user\",\"content\":\"Please summarise the quarterly report. Please summarise the quarterly report. Please summarise the quarterly report. Please summarise the quarterly report. \"}]}",
+          "body_size": 199,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/v1/chat/completions"
+        },
+        "rules": [
+          {
+            "extends": "llm-endpoints",
+            "id": "chunked",
+            "max_judge_bytes": 64,
+            "max_judge_chunks": 3
+          }
+        ],
+        "subject": null
+      },
+      "name": "chunks: a judge error on a chunk is an error"
+    },
+    {
+      "expect": {
+        "cache_writes": {
+          "fp:daf36bf6:dd757a15": {
+            "ttl": 300,
+            "value": {
+              "reason": "injection 0.95 (3 chunks)",
+              "score": 0.95
+            }
+          }
+        },
+        "headers": {
+          "X-Jev-Reason": "injection+0.95+%283+chunks%29",
+          "X-Jev-Score": "0.95",
+          "X-Jev-Source": "l2",
+          "X-Jev-Verdict": "malicious"
+        },
+        "judge_calls": 2,
+        "prompt": {
+          "context": {
+            "deployment": "",
+            "method": "POST",
+            "path": "/v1/chat/completions"
+          },
+          "questions": [
+            "injection"
+          ],
+          "text": "terly report. Please summarise the quarterly report. Please summ"
+        },
+        "subject_record": null,
+        "subject_store_writes": null,
+        "verdict": {
+          "action": "block",
+          "async": false,
+          "fingerprint": "dd757a15",
+          "l2_ms": 0,
+          "reason": "injection 0.95 (3 chunks)",
+          "score": 0.95,
+          "source": "l2",
+          "verdict": "malicious"
+        }
+      },
+      "input": {
+        "breaker": null,
+        "cache": {
+          "fp:daf36bf6:9dcbf2ed": {
+            "reason": "injection 0.95",
+            "score": 0.95
+          }
+        },
+        "clock": 1000,
+        "config": {
+          "policy": {
+            "mode": "enforce"
+          }
+        },
+        "judge": {
+          "error": "timeout"
+        },
+        "req": {
+          "body": "{\"messages\":[{\"role\":\"user\",\"content\":\"Please summarise the quarterly report. Please summarise the quarterly report. Please summarise the quarterly report. Please summarise the quarterly report. \"}]}",
+          "body_size": 199,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/v1/chat/completions"
+        },
+        "rules": [
+          {
+            "extends": "llm-endpoints",
+            "id": "chunked",
+            "max_judge_bytes": 64,
+            "max_judge_chunks": 3
+          }
+        ],
+        "subject": null
+      },
+      "name": "chunks: a judge error does not undo a chunk that already blocks"
+    },
+    {
+      "expect": {
+        "cache_writes": {
           "fp:e912b53a:0002b5c5": {
             "ttl": 300,
             "value": {

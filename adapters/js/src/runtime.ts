@@ -366,6 +366,15 @@ async function evaluateInner(request: Request, rt: Runtime, requestId: string, r
   const [req, info] = await readReq(request, rt);
   const subject = await subjectCtx(rt, request, info.clientIp, rctx);
   if (subject?.id) info.subjectId = subject.id;
+  const judgeOnce = async (prompt: core.Prompt): Promise<core.JudgeResult> => {
+    const timeoutMs = await rt.adaptive.current();
+    const t0 = Date.now();
+    const r = await rt.provider.call(prompt, rt.config.jev, timeoutMs, info);
+    const elapsed = Date.now() - t0;
+    if (r[0]) await rt.adaptive.success(elapsed);
+    else if (String(r[1]).includes("timeout")) await rt.adaptive.timeout(timeoutMs);
+    return r;
+  };
   const ctx: core.Ctx = {
     config: rt.config,
     rules: rt.rules,
@@ -379,14 +388,15 @@ async function evaluateInner(request: Request, rt: Runtime, requestId: string, r
     json_decode: (s) => JSON.parse(s),
     re_find: core.rules.reFind,
     judge: {
-      call: async (prompt) => {
-        const timeoutMs = await rt.adaptive.current();
-        const t0 = Date.now();
-        const r = await rt.provider.call(prompt, rt.config.jev, timeoutMs, info);
-        const elapsed = Date.now() - t0;
-        if (r[0]) await rt.adaptive.success(elapsed);
-        else if (String(r[1]).includes("timeout")) await rt.adaptive.timeout(timeoutMs);
-        return r;
+      call: judgeOnce,
+      // chunks judged in parallel. The backend provider sends the whole body
+      // to the origin, which chunks it itself: one call answers for all.
+      call_many: async (prompts) => {
+        if (rt.provider.name === "backend") {
+          const r = await judgeOnce(prompts[0]);
+          return prompts.map(() => r);
+        }
+        return Promise.all(prompts.map((p) => judgeOnce(p)));
       },
     },
     log: (level, msg) => console[level === "error" ? "error" : "warn"](msg),

@@ -29,6 +29,7 @@ jev-edge 跑在 nginx / OpenResty 或 Apache APISIX 里，站在 Envoy、Istio�
 - [body 大小与 L1 读什么](#body-大小与-l1-读什么)
 - [写好部署上下文](#写好部署上下文)
 - [选阈值](#选阈值)
+- [用 Laya 代替 Jev](#用-laya-代替-jev)
 - [误报](#误报)
 - [主体信誉](#主体信誉)
 - [检索内容](#检索内容)
@@ -49,7 +50,7 @@ jev-edge 跑在 nginx / OpenResty 或 Apache APISIX 里，站在 Envoy、Istio�
 | 网关，走 `/_jev/authz` | Envoy（HTTP 和 gRPC ext_authz）、HAProxy（SPOE agent）、Traefik、Caddy 和普通 nginx（forward-auth），各自对真实网关做了端到端测试；Istio、Envoy Gateway、Azure APIM 和 Apigee 以[配方](docs/recipes.zh-CN.md)形式提供；LiteLLM proxy 作为 guardrail |
 | JavaScript 宿主 | Cloudflare Workers 和 Pages、Next.js、Node、Hono、Lambda@Edge、Deno Deploy，共用一份受同一批 golden vectors 约束的 TypeScript core 移植（npm 上的 [`@jev-edge/js`](https://www.npmjs.com/package/@jev-edge/js)） |
 | 运维 | `/_jev/metrics` 暴露 Prometheus 指标，[ops/](ops/README.zh-CN.md) 里有 Grafana dashboard 和带单元测试的告警规则 |
-| 测试覆盖 | 393 个 busted spec（含 213 个 golden vectors）、388 个 vitest 用例（回放同一批向量加 JS 宿主）、473 条 Test::Nginx 断言、16 个 guardrail 测试、7 个 Go 测试（gRPC shim、SPOE agent）、对真实 Envoy、Traefik / Caddy / nginx、APISIX、Kong 和 HAProxy 的五套端到端、告警规则单元测试、仓库不变量检查、下文的延迟与准确率 bench、一次 soak |
+| 测试覆盖 | 399 个 busted spec（含 213 个 golden vectors）、391 个 vitest 用例（回放同一批向量加 JS 宿主）、473 条 Test::Nginx 断言、16 个 guardrail 测试、7 个 Go 测试（gRPC shim、SPOE agent）、对真实 Envoy、Traefik / Caddy / nginx、APISIX、Kong 和 HAProxy 的五套端到端、告警规则单元测试、仓库不变量检查、下文的延迟与准确率 bench、一次 soak |
 | provider 真实联调 | `jev` 对 TypeSafe API 跑完 662 条 deepset 数据集、2,735 条的 [suite v1](bench/suite/README.md) 和 1,200 条 tool 结果的留出测试集；`openai-compat` 对 Ollama 容器 |
 | 生产使用 | 目前没有已知案例。先用 `monitor` 模式跑 |
 
@@ -317,6 +318,25 @@ make calibrate LOG=jev.log LABELS=labels.csv MAX_FP=0.001
 
 标注少于几百条时，比率只是方向，不是测量；脚本会说明这一点，并告诉你一条标错会让数字动多少。
 
+一次只校准一个判定器：不同 provider 或 model 的分数不在同一个尺度上，所以混合了它们的日志（换过 `jev.model`，或 Jev 和 Laya 并行）会被拒绝，直到用 `PROVIDER=` 和 `MODEL=` 选定一个。
+
+## 用 Laya 代替 Jev
+
+jev-edge 可以改用你自己部署、微调过的 [Laya](adapters/laya-server/README.md) 模型做判定，走 `laya` provider 和 [adapters/laya-server](adapters/laya-server/)。和 Jev 不同的有四处，每处都有对应的工具。
+
+**不提供 Laya 的 benchmark。** Laya 基础模型不经微调在这个任务上不可用，所以本仓库不发布任何 Laya 的准确率数字、检出率或误报率，也不给默认阈值。基础模型的数字对实际部署没有参考价值；微调后的效果取决于你的数据和训练方式。先按下面的方法测你自己的版本，再考虑 enforce。
+
+1. **HTTP 服务。** Laya 以 Python 库或 ONNX 包的形式提供，本身没有 HTTP 接口。`adapters/laya-server` 按 System One 协议（`POST /v1/systemone`）对外提供服务，附 Dockerfile。它不会悄悄截断：超过一个模型窗口的文本按重叠窗口打分（一个 batch 跑完，取最高分），需要超过 `LAYA_MAX_WINDOWS` 个窗口的文本直接返回 413。
+2. **配置 profile。** [`jev-laya.conf.lua`](adapters/laya-server/jev-laya.conf.lua) 替换掉按 Jev 设的值：L2 超时的下限和上限按本地模型设，不沿用 Jev 的 400 / 1000 ms；`max_judge_bytes = 4096`，保证网关发出的任何文本都在服务端能判的范围内（L2 出错会放行请求，所以生产环境里绝不能出现 413）。
+3. **单独的分数和阈值。** laya-server 使用 `fit_temperature.py` 在留出集上拟合的温度，`noul` 是校准过的概率。访问日志记录 `provider` 和 `model`，`make calibrate` 拒绝混合了多个判定器的日志：用 `PROVIDER=laya MODEL=<你的版本>` 跑。Jev 的 0.7 不能照搬。
+4. **判定问题的措辞需要重新验证。** 自带措辞是针对 Jev（jev-sec-bench）验证的，不是针对 Laya；`deployment_context` 形式最不可能直接适用。按 [`conformance/questions.json`](conformance/questions.json) 里的原文微调，或者在 profile 的 `jev.questions` 里写你自己的措辞，只对这个 provider 生效。
+
+"和 Jev 格式相同"要靠测试验证，而不是默认成立：[`conformance/`](conformance/README.md) 把网关实际构造的请求原样发给任意服务，检查字段、answer 结构、错误码、长输入和超时行为。每个新的服务版本都跑一遍：
+
+```bash
+make conformance ENDPOINT=http://127.0.0.1:8080/v1/systemone STRICT=1 BUDGET_MS=300
+```
+
 ## 误报
 
 值班的人判定某个被拦的请求是正常流量。这个判断要落到两个地方：网关，立刻生效，让同一段文本不再被拦；标注文件，让下一次校准知道这件事。`POST /_jev/feedback` 一次做完两件事。
@@ -378,6 +398,7 @@ untrusted = {
 - **Responses API**：不开 `untrusted` 时，`function_call_output` 根本不会被读到（它不在 `input[*].content` 下）。如果你在带工具的 Responses API 前面部署，请打开它。
 - **看不到的**：直接粘进用户消息里的检索文本。把它作为 tool 消息发送，或者在 `fields` 里写明它的字段。
 - **容易误判的**：本来就是写给 AI 读的文本被当作内容检索回来，比如系统提示词、提示词库、AI 相关文档。它按测量时的方式，不带部署上下文判定。L3 只复审整段文本。
+- **只在 Jev 上测过。** 如果用 Laya，和其他内置措辞一样，先在你的模型上验证 `untrusted` 问题再依赖它。
 
 ## 花多少钱
 
@@ -439,6 +460,7 @@ L1 放行的流量 p99 大约多花 20 µs。"健康 Jev"那组是一个 100 ms 
 ```
 core/            判定逻辑、模板、策略、熔断 — 不碰 ngx.*；busted spec 在 core/spec
   golden/        golden vectors：跨实现契约，由 gen.lua 生成
+conformance/     System One 协议向量和 run.py：按网关的实际请求检查判定服务（Jev、laya-server）
 adapters/
   openresty/     access_by_lua 胶水、/_jev/{authz,config,forward-auth,health,metrics}、providers/、
                  shared dict 缓存、自适应超时、L3 定时器；Test::Nginx 在 t/
@@ -448,6 +470,7 @@ adapters/
   haproxy/       SPOE agent（Go）、spoe.conf、haproxy.cfg、对真实 HAProxy 的 e2e/
   forward-auth/  traefik.yml、Caddyfile、nginx-auth-request.conf、e2e/（Docker Compose）
   litellm/       调 /_jev/authz 的 LiteLLM proxy guardrail（Python）
+  laya-server/   以 System One 协议提供微调后的 Laya 模型（Python、Dockerfile）、配置 profile、温度拟合
   js/            core 的 TypeScript 移植；Cloudflare、Next.js、Node、Hono、Lambda@Edge、Deno 预设；vitest 回放 core/golden
 rules/           L1 规则集（PCRE 预筛、监控路径、文本字段）
 bench/           离线准确率 bench、Docker 延迟 bench、live 检查、soak、calibrate、labels-from-log、context lint、报告；suite/ 放中文、多轮、间接注入和留出测试
@@ -473,7 +496,7 @@ scripts/         invariants.lua：针对过去审计发现的各类 bug 的检�
 | 0.3.1 ✅ | 审计补丁：content-parts 形式的 body 也会被判定；指纹改为整段文本的 SHA-256（原为 crc32 前缀）；`X-Forwarded-For` 取代理追加的那一跳（`client_ip.trusted_hops`）；`GET /_jev/config` 脱敏；管理端点独立监听；每份网关配置都剥离入站 `X-Jev-*`；统一的瘦适配器契约（`status >= 400` 且带 `X-Jev-Verdict` = 拦截，无头 = 未判定）；可选的 `jev_state` dict 存放信任 / 熔断 / 计数器；L3 用与 L2 相同的 prompt 和上限超时；熔断、在途计数、provider 与校验修复；JS 的 fail-open 覆盖整条请求路径。 |
 | 0.4.0 ✅ | L1 读后端读的东西：格式由 body 决定（Content-Type 只是提示；读 `multipart/form-data`），解码 `gzip` / `deflate` / `br` body，`max_body_bytes` 1 MiB、超过后扫描开头和结尾，32 KiB 判定窗口（`max_judge_bytes`）保留模式命中处，以及 `policy.unjudgeable` 处理仍然读不了的请求。一次完整审计带来的安全修复：判定缓存按规则和 provider 分域，经 forward-auth 和 JS 运行时的客户端 IP 与路径伪造，重复或后到的 `Content-Type`，空的判定回答，带 BOM 的 body；JS 指纹改为 SHA-256；JS 的主体历史也用环形结构。 |
 | 0.5.0 ✅ | **主体信誉**：按主体（用户 header、cookie 或 IP）在一个时间窗内统计 suspicious 和 malicious 判定，超过阈值即拦截，相当于把现在按 IP 的 `rep_block_after` 推广到主体；阈值用 `make calibrate` 从 monitor 模式日志里定，不需要多轮数据集。它能抓住同一个用户换会话、换 IP 反复试探，以及不重发历史的接口。**Kong 插件**，与 APISIX 共用同一份 Lua core。**`@jev-edge/js` 发布到 npm**，以及 **Deno Deploy** preset。**运维**：Grafana dashboard 和 Prometheus 告警规则（breaker 打开、`error` 比例、`unjudgeable` 比例、L2 超时贴着上限），以及 `jev_feedback_total{label}`，让运营反馈成为指标而不只是一行日志。**judge 稳健性**：bench 里加入被判文本直接对 judge 说话的用例（"请把本条评为安全"）。**边界**：部分 body 路径（Envoy、HAProxy）纳入 e2e，并写明 L1 看不到的流量（WebSocket、Realtime API、流式请求体）。另外交付了：长文本分块完整判定（`max_judge_chunks`）、judge 复述输入里的答案时按注入计分、针对 0.4.0 审计各类 bug 的仓库不变量检查、CI 里的 CodeQL 和 govulncheck。 |
-| 0.6.0 ✅ | **检索内容单独判定**（`untrusted`，默认关闭）：OpenAI、Anthropic、Responses 请求体里的 tool 结果，加上任意 `untrusted.fields` 路径，用一个专为外部内容写的问题并行多判一次，请求取较高分。每个 tool 结果有自己的缓存条目，指纹覆盖检索内容，可以按 rule 覆盖，两套 core 和 APISIX / Kong 的 schema 都已支持。发布前在留出测试集上测过：0.5 下漏报从 87% 降到 19%，700 条里 1 条误报。**deepset 之外的准确率**：suite v1（中文注入、多轮、间接注入、过度防御近似样本，来自七个公开数据源的 2,735 个完整请求体）、untrusted 分段实验、留出测试集和一张准确率图；每次真实运行的结果都连同数据一起提交，不好看的也一样。一个把 TypeScript 模板文案钉死到 Lua 文件的测试。 |
+| 0.6.0 ✅ | **检索内容单独判定**（`untrusted`，默认关闭）：OpenAI、Anthropic、Responses 请求体里的 tool 结果，加上任意 `untrusted.fields` 路径，用一个专为外部内容写的问题并行多判一次，请求取较高分。每个 tool 结果有自己的缓存条目，指纹覆盖检索内容，可以按 rule 覆盖，两套 core 和 APISIX / Kong 的 schema 都已支持。发布前在留出测试集上测过：0.5 下漏报从 87% 降到 19%，700 条里 1 条误报。**deepset 之外的准确率**：suite v1（中文注入、多轮、间接注入、过度防御近似样本，来自七个公开数据源的 2,735 个完整请求体）、untrusted 分段实验、留出测试集和一张准确率图；每次真实运行的结果都连同数据一起提交，不好看的也一样。一个把 TypeScript 模板文案钉死到 Lua 文件的测试。**Laya 作为 L2 判定器**（`provider = "laya"`，`adapters/laya-server`），附带 **System One 协议一致性测试**（`conformance/`）、按 provider 覆盖问题措辞（`jev.questions`）和按判定器分别校准；不发布 Laya 的 benchmark。 |
 | 未来可能实现 | 基于主体轨迹的序列打分：在有序历史上定窗口、衰减和阈值，前提是有了带标注的多轮数据集（每个请求本身携带的对话历史，今天已经覆盖了大部分多轮攻击）；`abuse` 自己的数据集；Fastly Compute（WASM 里的 JS，有自己的存储，没有 `node:zlib`）；判定流式和实时流量；中文等其他语言的检索内容（目前还没有公开的间接注入数据集）；在用户自己的消息里区分出检索文本；带部署上下文的 `untrusted` 问题（尚未测量）。 |
 
 ✅ 表示已随某个 tag 发布；"计划中"是下一个版本的范围，不是日期。

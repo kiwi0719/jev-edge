@@ -8,11 +8,38 @@ All notable changes to this project are recorded here. The format follows
 
 ## [0.6.0] - 2026-09-23
 
-Retrieved content judged on its own, and accuracy measured beyond deepset.
-Nothing changes for an existing deployment unless it opts in
-(`untrusted.enabled`); every existing golden vector is unchanged.
+Retrieved content judged on its own, accuracy measured beyond deepset, and
+Laya as an L2 judge with a System One conformance suite. Nothing changes for
+an existing deployment unless it opts in (`untrusted.enabled`,
+`provider = "laya"`); every existing golden vector is unchanged.
 
 ### Added
+- **Laya as an L2 judge.** `provider = "laya"` (Lua and JS) sends the jev
+  System One request to a server you run; its scores stay apart from jev's in
+  the cache, the log and calibration. `adapters/laya-server/` serves a
+  fine-tuned Laya model over that protocol (Python, Dockerfile; ONNX, your
+  own Python scorer, or a mock backend): long text is judged in overlapping
+  windows in one batch and refused with 413 past `LAYA_MAX_WINDOWS`, never
+  silently cut; `fit_temperature.py` fits the temperature that makes `noul` a
+  calibrated probability; `jev-laya.conf.lua` is the gateway profile (L2
+  timeout 100 / 300 ms instead of 400 / 1000, `max_judge_bytes = 4096`,
+  monitor mode). The base Laya model is not usable for this task without
+  fine-tuning, so no Laya benchmark and no default thresholds ship.
+- **Protocol conformance suite.** `conformance/`: System One vectors built
+  by the real provider from the real templates (`make conformance-vectors`,
+  `conformance-check` in `make check`) and `run.py`, which checks any judge
+  server for the answer set, `noul` range, determinism, error codes, long
+  input, keepalive, aborted and stalled clients and p99 latency
+  (`make conformance ENDPOINT=... [STRICT=1] [MOCK=1]`). `make test-laya`
+  runs it against laya-server, including a server that truncates, which must
+  fail.
+- **Per-provider question wording.** `jev.questions.<template>` replaces
+  `instructions`, `criteria`, `instructions_ctx` or `criteria_ctx` for the
+  `jev` / `laya` request only, for wording validated on another judge.
+- **Calibration per judge.** The access log records `provider` and `model`;
+  `make calibrate` refuses a log that mixes judges until `PROVIDER=` /
+  `MODEL=` (`--provider` / `--model`) picks one, since their scores are not
+  comparable.
 - **Retrieved content judged on its own** (`untrusted`, off by default, hot
   reloadable, overridable per rule). L1 cuts retrieved content out of a body
   parsed whole: OpenAI `role: "tool"` / `"function"` messages, Anthropic
@@ -65,6 +92,12 @@ Nothing changes for an existing deployment unless it opts in
   slow-provider scenario waits up to `timeout_max_ms` (p99 478 ms against a
   500 ms mock). The 0.5.0 code gives the same 475 ms; the old chart no longer
   matched the code it described.
+
+### Fixed
+- **CodeQL `js/incomplete-url-substring-sanitization`** in
+  `adapters/js/test/worker.test.ts`: the fetch stub matched the judge by URL
+  prefix, which `api.typesafe.ai.example` also passes; it compares the parsed
+  host now. Test-only, no runtime change.
 
 ### Known gap
 - Without `untrusted`, Responses API `function_call_output` items are not

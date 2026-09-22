@@ -3,6 +3,13 @@ import type { Policy } from "./policy.js";
 import type { BreakerConfig } from "./breaker.js";
 import type { FeedbackConfig } from "./trust.js";
 
+export interface QuestionWording {
+  instructions?: string;
+  instructions_ctx?: string;
+  criteria?: { true?: string; false?: string };
+  criteria_ctx?: { true?: string; false?: string };
+}
+
 export interface JevConfig {
   provider?: string;
   endpoint?: string;
@@ -16,6 +23,8 @@ export interface JevConfig {
   timeout_alpha?: number;
   timeout_warmup?: number;
   max_inflight?: number;
+  /** Per-provider question wording: fields here replace the bundled template's for jev / laya requests. */
+  questions?: Record<string, QuestionWording>;
   [k: string]: unknown;
 }
 
@@ -159,6 +168,21 @@ export function validate(c: Config): [true, null] | [null, string] {
   if (sm.rate !== undefined && (typeof sm.rate !== "number" || sm.rate < 0 || sm.rate > 1)) return [null, "sampling.rate must be in [0,1]"];
   if (sm.max_samples !== undefined && (typeof sm.max_samples !== "number" || sm.max_samples < 1)) return [null, "sampling.max_samples must be >= 1"];
   if (sm.min_verdict !== undefined && !["safe", "suspicious", "malicious"].includes(sm.min_verdict)) return [null, "sampling.min_verdict must be safe|suspicious|malicious"];
+  // per-provider question wording (providers/index.ts): { [template]: { instructions, ... } }
+  const qs = c.jev.questions;
+  if (qs !== undefined) {
+    if (typeof qs !== "object" || qs === null || Array.isArray(qs)) return [null, "jev.questions must be a table"];
+    for (const [name, q] of Object.entries(qs as Record<string, unknown>)) {
+      if (typeof q !== "object" || q === null || Array.isArray(q)) return [null, "jev.questions must map template names to tables"];
+      const o = q as Record<string, unknown>;
+      for (const k of ["instructions", "instructions_ctx"]) {
+        if (o[k] !== undefined && (typeof o[k] !== "string" || o[k] === "")) return [null, `jev.questions.${name}.${k} must be a non-empty string`];
+      }
+      for (const k of ["criteria", "criteria_ctx"]) {
+        if (o[k] !== undefined && (typeof o[k] !== "object" || o[k] === null)) return [null, `jev.questions.${name}.${k} must be a table`];
+      }
+    }
+  }
   const max = c.jev.timeout_max_ms;
   if (max !== undefined && (typeof max !== "number" || max < c.jev.timeout_ms)) return [null, "jev.timeout_max_ms must be >= timeout_ms"];
   const [uok, uerr] = validateUntrusted(c.untrusted, "untrusted");

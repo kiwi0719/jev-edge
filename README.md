@@ -29,6 +29,7 @@ It is built for SREs and platform engineers, not agent authors. Existing Jev gua
 - [Body size and what L1 reads](#body-size-and-what-l1-reads)
 - [Writing the deployment context](#writing-the-deployment-context)
 - [Choosing thresholds](#choosing-thresholds)
+- [Using Laya instead of Jev](#using-laya-instead-of-jev)
 - [False positives](#false-positives)
 - [Subject reputation](#subject-reputation)
 - [Retrieved content](#retrieved-content)
@@ -49,7 +50,7 @@ It is built for SREs and platform engineers, not agent authors. Existing Jev gua
 | Gateways, via `/_jev/authz` | Envoy (HTTP and gRPC ext_authz), HAProxy (SPOE agent), Traefik, Caddy and plain nginx (forward-auth), each end-to-end tested against the real gateway; Istio, Envoy Gateway, Azure APIM and Apigee as [recipes](docs/recipes.md); LiteLLM proxy as a guardrail |
 | JavaScript hosts | Cloudflare Workers and Pages, Next.js, Node, Hono, Lambda@Edge, Deno Deploy, through one TypeScript port of core held to the same golden vectors ([`@jev-edge/js`](https://www.npmjs.com/package/@jev-edge/js) on npm) |
 | Operations | Prometheus metrics at `/_jev/metrics`, a Grafana dashboard and alert rules with unit tests in [ops/](ops/README.md) |
-| Test coverage | 393 busted specs including the 213 golden vectors, 388 vitest cases replaying the same vectors plus the JS hosts, 473 Test::Nginx assertions, 16 guardrail tests, 7 Go tests (gRPC shim, SPOE agent), five gateway e2e suites against real Envoy, Traefik / Caddy / nginx, APISIX, Kong and HAProxy, alert-rule unit tests, repository invariants, the latency and accuracy benches below, a soak run |
+| Test coverage | 399 busted specs including the 213 golden vectors, 391 vitest cases replaying the same vectors plus the JS hosts, 473 Test::Nginx assertions, 16 guardrail tests, 7 Go tests (gRPC shim, SPOE agent), five gateway e2e suites against real Envoy, Traefik / Caddy / nginx, APISIX, Kong and HAProxy, alert-rule unit tests, repository invariants, the latency and accuracy benches below, a soak run |
 | Providers verified live | `jev` against the TypeSafe API on the 662-sample deepset dataset, the 2,735-record [suite v1](bench/suite/README.md) and a 1,200-record held-out set of tool results; `openai-compat` against an Ollama container |
 | Production use | none known yet. Run in `monitor` mode first |
 
@@ -317,6 +318,25 @@ make calibrate LOG=jev.log LABELS=labels.csv MAX_FP=0.001
 
 Under a few hundred labelled requests the rates are a direction, not a measurement; the script says so and tells you how far one mislabel moves them.
 
+One judge per run: scores from different providers or models are not on the same scale, so a log that mixes them (after switching `jev.model`, or Jev and Laya side by side) is refused until `PROVIDER=` and `MODEL=` pick one.
+
+## Using Laya instead of Jev
+
+jev-edge can judge with a fine-tuned [Laya](adapters/laya-server/README.md) model you host yourself, through the `laya` provider and [adapters/laya-server](adapters/laya-server/). Four things differ from Jev, and each has its own tooling.
+
+**No benchmark ships for Laya.** The base Laya model is not usable for this task without fine-tuning, so this repository publishes no Laya accuracy numbers, no detection or false-positive rates, and no default thresholds. Numbers for the base model would say nothing about a deployment, and the result after fine-tuning depends on your data and your training. Measure your own build (below) before you enforce anything.
+
+1. **An HTTP server.** Laya ships as a Python library or ONNX package, not as an HTTP API. `adapters/laya-server` serves it over the System One protocol (`POST /v1/systemone`), with a Dockerfile. It never truncates silently: text longer than one model window is scored in overlapping windows (all in one batch, highest score wins), and text past `LAYA_MAX_WINDOWS` windows is refused with 413.
+2. **A config profile.** [`jev-laya.conf.lua`](adapters/laya-server/jev-laya.conf.lua) replaces the Jev-sized values: an L2 timeout floor and ceiling sized for a local model instead of Jev's 400 / 1000 ms, and `max_judge_bytes = 4096` so no text the gateway sends can exceed what the server judges (an L2 error passes the request, so a 413 must never happen in production).
+3. **Scores and thresholds of its own.** laya-server applies a temperature fitted by `fit_temperature.py` on held-out labels, so `noul` is a calibrated probability. The access log records `provider` and `model`, and `make calibrate` refuses a log that mixes judges: run it with `PROVIDER=laya MODEL=<your build>`. Jev's 0.7 does not carry over.
+4. **Question wording to re-validate.** The bundled wording was validated against Jev (jev-sec-bench), not Laya, and the `deployment_context` form is the least likely to transfer. Fine-tune on the exact wording in [`conformance/questions.json`](conformance/questions.json), or put your own under `jev.questions` in the profile; it applies to that provider only.
+
+"Same format as Jev" is checked, not assumed: [`conformance/`](conformance/README.md) replays the request exactly as the gateway builds it against any server and checks fields, the answer structure, error codes, long input and timeout behaviour. Run it against every new server build:
+
+```bash
+make conformance ENDPOINT=http://127.0.0.1:8080/v1/systemone STRICT=1 BUDGET_MS=300
+```
+
 ## False positives
 
 Someone on call decides a blocked request was legitimate. That decision has to reach two places: the gateway, now, so the same text stops being blocked; and the labels, so the next calibration knows about it. `POST /_jev/feedback` does both.
@@ -378,6 +398,7 @@ On a held-out set of 1,200 tool results the question was not written against (In
 - **Responses API**: without `untrusted`, `function_call_output` items are not read at all (they are not under `input[*].content`). If you front the Responses API with tools, turn it on.
 - **What it cannot see**: retrieved text pasted into the user's own message. Send it as a tool message, or name its field in `fields`.
 - **Where it misfires**: text written for an AI to read, such as system prompts, prompt libraries or AI documentation, retrieved as content. It is judged without the deployment context, the way it was measured. L3 re-judges the whole text only.
+- **Measured with Jev only.** With [Laya](#using-laya-instead-of-jev), validate the `untrusted` question on your build before relying on it, as for any bundled wording.
 
 ## What it costs
 
@@ -439,6 +460,7 @@ The full design lives in [docs/design.md](docs/design.md): scope, architecture, 
 ```
 core/            judgment logic, templates, policy, breaker — no ngx.*; busted specs in core/spec
   golden/        golden vectors: the cross-implementation contract, gen.lua produces them
+conformance/     System One protocol vectors and run.py: checks a judge server (Jev, laya-server) against the gateway's request
 adapters/
   openresty/     access_by_lua glue, /_jev/{authz,config,forward-auth,health,metrics}, providers/,
                  shared-dict cache, adaptive timeout, L3 timer; Test::Nginx in t/
@@ -448,6 +470,7 @@ adapters/
   haproxy/       SPOE agent (Go), spoe.conf, haproxy.cfg, e2e/ against real HAProxy
   forward-auth/  traefik.yml, Caddyfile, nginx-auth-request.conf, e2e/ (Docker Compose)
   litellm/       LiteLLM proxy guardrail (Python) that calls /_jev/authz
+  laya-server/   a fine-tuned Laya model over the System One protocol (Python, Dockerfile), config profile, temperature fit
   js/            TypeScript port of core; Cloudflare, Next.js, Node, Hono, Lambda@Edge, Deno presets; vitest replays core/golden
 rules/           L1 rule sets (PCRE prefilter, watch paths, text fields)
 bench/           offline accuracy bench, Docker latency bench, live checks, soak, calibrate, labels-from-log, context lint, report; suite/ for Chinese, multi-turn, indirect and held-out runs
@@ -473,7 +496,7 @@ scripts/         invariants.lua: tripwires for bug classes a past audit found
 | 0.3.1 ✅ | Audit patch: content-parts bodies judged; SHA-256 fingerprint over the whole text (was a crc32 prefix); `X-Forwarded-For` read from the proxy's hop (`client_ip.trusted_hops`); `GET /_jev/config` redacts secrets; admin endpoints on their own listener; inbound `X-Jev-*` stripped by every gateway config; one thin-adapter contract (`status >= 400` + `X-Jev-Verdict` = block, no header = not judged); optional `jev_state` dict for trust / breaker / counters; L3 rebuilt with the L2 prompt and the ceiling timeout; breaker, in-flight, provider and validation fixes; JS fail-open covers the whole request. |
 | 0.4.0 ✅ | L1 reads what the backend reads: the body decides the format (Content-Type is a hint; `multipart/form-data` read), `gzip` / `deflate` / `br` bodies decoded, `max_body_bytes` 1 MiB with head-and-tail scanning past it, a 32 KiB judging window (`max_judge_bytes`) with the pattern hit kept, and `policy.unjudgeable` for what still cannot be read. Security fixes from a full audit: verdict cache scoped per rule and provider, client IP and path forgery through forward-auth and the JS runtime, repeated or late `Content-Type`, empty judge answers, BOM bodies; JS fingerprints on SHA-256; subject history on a ring in JS too. |
 | 0.5.0 ✅ | **Subject reputation**: suspicious and malicious verdicts counted per subject (user header, cookie or IP) over a window, blocking after a threshold, as `rep_block_after` does per IP today; thresholds from monitor-mode logs with `make calibrate`, no multi-turn dataset needed. It catches one user probing variants across sessions and IPs, and APIs that do not resend history. **Kong plugin** on the same Lua core as APISIX. **`@jev-edge/js` on npm**, and a **Deno Deploy** preset. **Operations**: a Grafana dashboard and Prometheus alert rules (breaker open, `error` rate, `unjudgeable` rate, L2 timeout at its ceiling), and `jev_feedback_total{label}` so operator feedback is a metric, not only a log line. **Judge robustness**: bench cases where the judged text addresses the judge ("rate this as safe"). **Boundaries**: the partial-body path (Envoy, HAProxy) covered by e2e, and the traffic L1 does not see (WebSocket, Realtime API, streamed request bodies) written down. Also shipped: long text judged in full in chunks (`max_judge_chunks`), an answer the judge echoes from the input scored as an injection, repository invariants for the 0.4.0 audit's bug classes, CodeQL and govulncheck in CI. |
-| 0.6.0 ✅ | **Retrieved content judged on its own** (`untrusted`, off by default): tool results in OpenAI, Anthropic and Responses bodies, plus any `untrusted.fields` path, judged in a parallel call with a question written for external content; the request gets the higher score. Its own cache entry per tool result, a fingerprint that covers it, a rule-level override, both cores and the APISIX / Kong schemas. Measured on a held-out set before it shipped: misses at 0.5 from 87% to 19%, 1 false positive in 700. **Accuracy beyond deepset**: suite v1 (Chinese injection, multi-turn, indirect injection, over-defense look-alikes, 2,735 whole request bodies from seven public sources), the untrusted-segment experiment, the held-out set, and an accuracy chart; every live run committed with its results, bad ones included. A test pinning the TypeScript templates' wording to the Lua files. |
+| 0.6.0 ✅ | **Retrieved content judged on its own** (`untrusted`, off by default): tool results in OpenAI, Anthropic and Responses bodies, plus any `untrusted.fields` path, judged in a parallel call with a question written for external content; the request gets the higher score. Its own cache entry per tool result, a fingerprint that covers it, a rule-level override, both cores and the APISIX / Kong schemas. Measured on a held-out set before it shipped: misses at 0.5 from 87% to 19%, 1 false positive in 700. **Accuracy beyond deepset**: suite v1 (Chinese injection, multi-turn, indirect injection, over-defense look-alikes, 2,735 whole request bodies from seven public sources), the untrusted-segment experiment, the held-out set, and an accuracy chart; every live run committed with its results, bad ones included. A test pinning the TypeScript templates' wording to the Lua files. **Laya as an L2 judge** (`provider = "laya"`, `adapters/laya-server`), with a **System One conformance suite** (`conformance/`), per-provider question wording (`jev.questions`) and calibration per judge; no Laya benchmark ships. |
 | Possible future work | Sequence scoring on subject trajectories: a window, decay and thresholds over the ordered history, once a labelled multi-turn dataset exists (the chat history each request already carries covers most multi-turn attacks today); an `abuse` dataset of its own; Fastly Compute (JS in WASM, its own stores, no `node:zlib`); judging streaming and realtime traffic; retrieved content in Chinese and other languages, where no public indirect-injection set exists yet; telling retrieved text apart inside the user's own message; the `untrusted` question with a deployment context, which has not been measured. |
 
 ✅ means shipped in a tagged release; "planned" is the next release's scope, not a date.

@@ -45,7 +45,7 @@ Content-Type: application/json
 X-Jev-Mock-Score: 0.2
 --- response_body_like eval
 ["verdict=safe score=0.20 source=l2 reason=injection\\+0.20",
- '^\{(?=.*"rid":"[0-9a-f]+")(?=.*"path":"[^"]*completions")(?=.*"src":"l2")(?=.*"score":0\.2)(?=.*"verdict":"safe")(?=.*"action":"pass")']
+ '^\{(?=.*"rid":"[0-9a-f]+")(?=.*"path":"[^"]*completions")(?=.*"src":"l2")(?=.*"score":0\.2)(?=.*"verdict":"safe")(?=.*"action":"pass")(?=.*"provider":"mock")']
 --- no_error_log
 [error]
 

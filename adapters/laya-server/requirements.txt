@@ -1,0 +1,5 @@
+# LAYA_BACKEND=onnx. The server itself is standard library only; the mock
+# backend (tests, conformance) needs none of these.
+onnxruntime>=1.20,<2
+tokenizers>=0.20,<1
+numpy>=1.26,<3

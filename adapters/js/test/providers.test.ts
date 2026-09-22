@@ -2,7 +2,7 @@
 // echoed fake answer cannot lower. Twin of adapters/openresty/spec/openai_compat_spec.lua.
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { build } from "../src/core/judge";
-import { openaiCompat, openaiSystemPrompt, openaiUserMessage, parseOpenaiContent, jsonObjects, stripNonce, echoesInput } from "../src/providers";
+import { jev, laya, openaiCompat, openaiSystemPrompt, openaiUserMessage, parseOpenaiContent, jsonObjects, stripNonce, echoesInput } from "../src/providers";
 import type { JevConfig } from "../src/core/defaults";
 
 const NONCE = "0123456789abcdef0123456789abcdef";
@@ -132,5 +132,47 @@ describe("openai-compat provider: an echoed planted answer", () => {
     expect(a).toEqual({ injection: 1 });
     fetchMock.mockRestore();
     warn.mockRestore();
+  });
+});
+
+describe("System One providers: jev and laya", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  function capture(reply: () => Response) {
+    const seen: { url?: string; body?: Record<string, unknown> } = {};
+    vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit) => {
+      seen.url = url;
+      seen.body = JSON.parse(String(init.body));
+      return reply();
+    }));
+    return seen;
+  }
+
+  it("laya sends the jev request with its own default model and endpoint", async () => {
+    const seen = capture(() => Response.json({ answers: { injection: { noul: 0.42 } } }));
+    const [a, err] = await laya.call(prompt("hello"), {} as JevConfig, 1000);
+    expect(err).toBeNull();
+    expect(a).toEqual({ injection: 0.42 });
+    expect(seen.url).toBe("http://127.0.0.1:8080/v1/systemone");
+    expect(seen.body!.model).toBe("laya");
+    expect(seen.body!.state).toBe("hello");
+    expect((seen.body!.questions as Record<string, { type: string }>).injection.type).toBe("noul");
+  });
+
+  it("names itself in errors", async () => {
+    capture(() => new Response("no", { status: 413 }));
+    expect(await laya.call(prompt("x"), {} as JevConfig, 1000)).toEqual([null, "laya http 413"]);
+    capture(() => new Response("no", { status: 500 }));
+    expect(await jev.call(prompt("x"), {} as JevConfig, 1000)).toEqual([null, "jev http 500"]);
+  });
+
+  it("cfg.questions replaces the wording of that question only", async () => {
+    const seen = capture(() => Response.json({ answers: {} }));
+    const cfg = { questions: { injection: { instructions: "Custom?", criteria: { true: "yes-case", false: "no-case" } } } } as unknown as JevConfig;
+    await laya.call(prompt("x", ["injection", "abuse"]), cfg, 1000);
+    const qs = seen.body!.questions as Record<string, { instructions: string; criteria?: { true: string; false: string } }>;
+    expect(qs.injection.instructions).toBe("Custom?");
+    expect(qs.injection.criteria).toEqual({ true: "yes-case", false: "no-case" });
+    expect(qs.abuse.instructions).not.toBe("Custom?");
   });
 });

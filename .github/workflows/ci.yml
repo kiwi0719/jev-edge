@@ -67,6 +67,7 @@ jobs:
       - uses: leafo/gh-actions-luarocks@35d062def313a7699a0d513e996bcf4352f05389 # v6.1.0
       - run: luarocks install busted && luarocks install dkjson && luarocks install lrexlib-pcre2
       - run: make golden-check
+      - run: make conformance-check
       - run: busted
       - if: matrix.lua == 'luajit-openresty'
         run: make luajit-check LUAJIT=lua
@@ -169,13 +170,34 @@ jobs:
       - run: ruff check --select F,B,E --ignore E501 --target-version py39 .
       - run: python3 -m pytest -q
 
+  # laya-server unit tests and the protocol conformance suite against its
+  # mock backend, plus the image the README tells people to build.
+  laya-server:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: pip install ruff
+      - run: ruff check --select F,B,E --ignore E501 --target-version py39 adapters/laya-server conformance
+      - run: make test-laya
+      - run: docker build -q -t laya-server adapters/laya-server
+      - name: conformance against the image
+        run: |
+          docker run -d --rm --name laya -p 8080:8080 -e LAYA_BACKEND=mock -e LAYA_ACCESS_LOG=0 laya-server
+          for i in $(seq 1 30); do curl -fs http://127.0.0.1:8080/healthz >/dev/null && break; sleep 1; done
+          make conformance ENDPOINT=http://127.0.0.1:8080/v1/systemone STRICT=1 MOCK=1
+          docker stop laya
+
   # The one check the main ruleset requires: green only when every job above
   # succeeded. Adding, removing or renaming a job or matrix entry needs no
   # ruleset change, only an edit to `needs` here (scripts/invariants.lua
   # checks that it lists every job).
   ci-ok:
     if: always()
-    needs: [lint, core-tests, openresty-tests, e2e, js, go, litellm]
+    needs: [lint, core-tests, openresty-tests, e2e, js, go, litellm, laya-server]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

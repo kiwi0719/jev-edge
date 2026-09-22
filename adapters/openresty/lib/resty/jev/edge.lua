@@ -240,6 +240,9 @@ local function evaluate_current(cfg, rules, over)
   if breaker then metrics.set_breaker_state(breaker:state()) end
   if judge and judge.adaptive then metrics.set_l2_timeout(judge.adaptive:current(), judge.adaptive.ceil) end
   ngx.ctx.jev = v
+  -- which judge scored it: scores from different providers or models are not
+  -- comparable, and `make calibrate` keeps them apart by these two fields
+  ngx.ctx.jev_judge = { provider = cfg.jev.provider, model = cfg.jev.model }
   maybe_async(cfg, v, req, rules)
   maybe_sample(cfg, v, req, rules)
   return v
@@ -285,10 +288,12 @@ end
 function _M.log()
   local v = ngx.ctx.jev
   if not v then return end
+  local jj = ngx.ctx.jev_judge or {}
   emit({
     ts = ngx.now(), rid = ngx.var.request_id, path = ngx.var.uri, ip = ngx.var.remote_addr,
     src = v.source, score = v.score, verdict = v.verdict, action = v.action,
     l2_ms = v.l2_ms, fp = v.fingerprint, reason = v.reason, subject = ngx.ctx.jev_subject,
+    provider = jj.provider, model = jj.model,
   })
 end
 

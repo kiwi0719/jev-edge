@@ -287,6 +287,26 @@ function _M.validate(c)
   if fb.enabled == true and (fb.token == nil or fb.token == "") then
     return nil, "feedback.enabled needs feedback.token set"
   end
+  -- per-provider question wording (providers/jev.lua): { [template] = { instructions = ..., ... } }
+  local qs = c.jev.questions
+  if qs ~= nil then
+    if type(qs) ~= "table" then return nil, "jev.questions must be a table" end
+    for name, q in pairs(qs) do
+      if type(name) ~= "string" or type(q) ~= "table" then
+        return nil, "jev.questions must map template names to tables"
+      end
+      for _, k in ipairs({ "instructions", "instructions_ctx" }) do
+        if q[k] ~= nil and (type(q[k]) ~= "string" or q[k] == "") then
+          return nil, "jev.questions." .. name .. "." .. k .. " must be a non-empty string"
+        end
+      end
+      for _, k in ipairs({ "criteria", "criteria_ctx" }) do
+        if q[k] ~= nil and type(q[k]) ~= "table" then
+          return nil, "jev.questions." .. name .. "." .. k .. " must be a table"
+        end
+      end
+    end
+  end
   local max_ms = c.jev.timeout_max_ms
   if max_ms ~= nil and (type(max_ms) ~= "number" or max_ms < c.jev.timeout_ms) then
     return nil, "jev.timeout_max_ms must be >= timeout_ms"

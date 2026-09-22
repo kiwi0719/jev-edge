@@ -46,6 +46,7 @@ build = {
       ["resty.jev.metrics"]  = "adapters/openresty/lib/resty/jev/metrics.lua",
 
       ["resty.jev.providers.jev"]            = "adapters/openresty/lib/resty/jev/providers/jev.lua",
+      ["resty.jev.providers.laya"]           = "adapters/openresty/lib/resty/jev/providers/laya.lua",
       ["resty.jev.providers.mock"]           = "adapters/openresty/lib/resty/jev/providers/mock.lua",
       ["resty.jev.providers.openai_compat"]  = "adapters/openresty/lib/resty/jev/providers/openai_compat.lua",
 

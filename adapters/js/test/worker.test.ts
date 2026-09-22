@@ -259,7 +259,7 @@ describe("fullWorker and pagesMiddleware", () => {
     let seenAuth = "";
     vi.stubGlobal("fetch", vi.fn(async (input: string | Request, init?: RequestInit) => {
       const req = input instanceof Request ? input : new Request(input, init);
-      if (req.url.startsWith("https://api.typesafe.ai")) {
+      if (new URL(req.url).host === "api.typesafe.ai") {
         seenAuth = req.headers.get("authorization") ?? "";
         return Response.json({ answers: { injection: { noul: 0.05 } } });
       }

@@ -9,6 +9,14 @@ updates:
     directory: /adapters/js
     schedule: { interval: weekly }
     groups: { js: { patterns: ["*"] } }
+    ignore:
+      # major versions of the dev toolchain (TypeScript, vitest, vite,
+      # workers-types) change APIs and get their own reviewed PR
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+      # the types follow the oldest Node we support (engines: node >= 20)
+      - dependency-name: "@types/node"
+        versions: [">=21"]
   - package-ecosystem: gomod
     directories: [/adapters/envoy/grpc-shim, /adapters/haproxy/spoa]
     schedule: { interval: weekly }

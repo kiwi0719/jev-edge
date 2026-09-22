@@ -6,6 +6,7 @@
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![opm](https://img.shields.io/badge/opm-lua--resty--jev--edge-orange.svg)](https://opm.openresty.org/package/kiwi0719/lua-resty-jev-edge/)
 [![LuaRocks](https://img.shields.io/badge/luarocks-lua--resty--jev--edge-blue.svg)](https://luarocks.org/modules/kiwi719/lua-resty-jev-edge)
+[![npm](https://img.shields.io/npm/v/@jev-edge/js.svg)](https://www.npmjs.com/package/@jev-edge/js)
 [![OpenResty](https://img.shields.io/badge/OpenResty-1.21%2B-brightgreen.svg)](https://openresty.org)
 [![Release](https://img.shields.io/github/v/tag/kiwi0719/jev-edge?label=release)](https://github.com/kiwi0719/jev-edge/tags)
 

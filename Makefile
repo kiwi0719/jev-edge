@@ -139,8 +139,17 @@ dist:
 	@echo "assembled $(DIST)"
 
 # opm build/upload run from the assembled tree (opm needs lib/ next to dist.ini).
+# `opm build` only works inside a full OpenResty install (it looks for
+# <prefix>/site); a Homebrew opm alone cannot. Without one, build in the
+# official image instead: same command, same output under dist/.
 opm-build: dist
-	cd $(DIST) && opm build
+	@if [ -d "$$(dirname $$(dirname $$(command -v opm 2>/dev/null || echo /x/x)))/site" ]; then \
+	  cd $(DIST) && opm build; \
+	else \
+	  echo "no local OpenResty install; running opm build in openresty/openresty:alpine-fat"; \
+	  test -f "$$HOME/.opmrc" || printf 'github_account=%s\n' "$$(sed -n 's/^author = //p' dist.ini)" > "$$HOME/.opmrc"; \
+	  docker run --rm -v "$$(PWD)/$(DIST)":/pkg -v "$$HOME/.opmrc":/root/.opmrc:ro -w /pkg openresty/openresty:alpine-fat opm build; \
+	fi
 
 install: dist
 	mkdir -p $(LUA_LIB_DIR)/jev $(LUA_LIB_DIR)/resty

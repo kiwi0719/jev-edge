@@ -29,7 +29,7 @@ local trust     = require "jev.core.trust"
 local verdict   = require "jev.core.verdict"
 local subject   = require "jev.core.subject"
 
-local _M = { _VERSION = "0.3.1" }
+local _M = { _VERSION = "0.4.0" }
 
 local function log(ctx, level, msg)
   if ctx.log then ctx.log(level, msg) end
@@ -74,10 +74,19 @@ function _M.evaluate(req, ctx)
   local cfg = ctx.config
 
   -- L1 ------------------------------------------------------------------
-  local r, text, reason, rule = rules_mod.evaluate_all(req, ctx.rules, ctx)
+  local r, text, reason, rule, windowed = rules_mod.evaluate_all(req, ctx.rules, ctx)
 
   if r == rules_mod.PASS then
     return verdict.new({ verdict = verdict.SKIPPED, source = verdict.SRC_L1, reason = reason })
+  end
+  if r == rules_mod.UNJUDGEABLE then
+    -- A watched request nobody read. Not judged, so `skipped`; blocked only
+    -- when the operator chose that and the gateway enforces.
+    local block = cfg.policy.mode == "enforce" and cfg.policy.unjudgeable == "block"
+    return finish(ctx, verdict.new({
+      action = block and verdict.ACTION_BLOCK or verdict.ACTION_PASS,
+      verdict = verdict.SKIPPED, source = verdict.SRC_L1, reason = reason,
+    }))
   end
   if r == rules_mod.BLOCK then
     local action = (cfg.policy.mode == "enforce") and verdict.ACTION_BLOCK or verdict.ACTION_PASS
@@ -170,6 +179,8 @@ function _M.evaluate(req, ctx)
   if ctx.breaker then ctx.breaker:success() end
   local action, label, async = policy.decide(score, cfg.policy)
   local why = top ~= "" and (top .. " " .. string.format("%.2f", score)) or reason
+  -- the score is for the window, not the whole text; say so
+  if windowed and top ~= "" then why = why .. " (window)" end
 
   if ckey and ctx.cache then
     ctx.cache:set(ckey, { score = score, reason = why }, cfg.cache.fp_ttl)

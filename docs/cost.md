@@ -17,7 +17,7 @@ Measured on the live runs (`make live-full`, deepset/prompt-injections, `jev-lat
 | `injection` | no | 513 | 39 |
 | `injection` | yes | 610 | 39 |
 
-Add the `abuse` template and the per-call count rises slightly; the questions share one request. Longer user messages cost more: these figures are for the dataset's short prompts, and `rules.max_body_bytes` (64 KB) is the upper bound per call.
+Add the `abuse` template and the per-call count rises slightly; the questions share one request. Longer user messages cost more: these figures are for the dataset's short prompts, and `rules.max_judge_bytes` (32 KiB of text) is the upper bound per call. Longer text is cut to that window before L2 (`jev_window_total` counts how often), so a large body puts at most 32 KiB of text into the prompt.
 
 ## Worked table
 

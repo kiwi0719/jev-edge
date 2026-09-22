@@ -31,12 +31,12 @@ local jev_core  = require("jev.core")
 local defaults  = require("jev.core.defaults")
 local verdict   = require("jev.core.verdict")
 local judge_mod = require("jev.core.judge")
-local normalize = require("jev.core.normalize")
 local breaker_m = require("jev.core.breaker")
 local cache_m   = require("resty.jev.cache")
 local http      = require("resty.jev.http")
 local async     = require("resty.jev.async")
 local rules_mod = require("jev.core.rules")
+local body_m    = require("resty.jev.body")
 local sampling  = require("jev.core.sampling")
 local subject_m = require("jev.core.subject")
 local cjson     = require("cjson.safe")
@@ -280,32 +280,20 @@ local function build_req(rt, ctx)
     body      = nil,
     body_size = tonumber(headers["content-length"]) or 0,
   }
+  -- whole up to max_body_bytes, head and tail past it, decoded (resty.jev.body)
   local max = 0
   for _, r in ipairs(rt.rules) do
     for _, p in ipairs(r.watch_paths or {}) do
-      if req.path:find(p) then max = math.max(max, r.max_body_bytes or 65536) break end
+      if req.path:find(p) then max = math.max(max, r.max_body_bytes or rules_mod.MAX_BODY_BYTES) break end
     end
   end
-  if max > 0 and req.body_size <= max then
-    -- get_body(max) returns nil past the cap instead of slurping a chunked body
-    local body, berr = core.request.get_body(max + 1, ctx)
-    if berr then
-      core.log.warn("jev-edge: body read: ", berr)
-      -- APISIX says "request size N is greater than the maximum size M" when a
-      -- chunked body (no Content-Length) overflows; report it as too large,
-      -- not as "no body", so L1 gives the right reason
-      if tostring(berr):find("greater than", 1, true) then req.body_size = max + 1 end
-    end
-    if body then
-      req.body_size = #body
-      req.body = (#body > max) and nil or body
-    end
-  end
+  if max > 0 then body_m.fill(req, max) end
   return req
 end
 
+-- the byte span of the match, which places the hit in the judging window
 local function re_find(subject, pattern)
-  return ngx.re.find(subject, pattern, "ijo") ~= nil
+  return ngx.re.find(subject, pattern, "ijo")
 end
 
 local function maybe_async(rt, v, req)
@@ -315,7 +303,8 @@ local function maybe_async(rt, v, req)
   if rt.breaker:state() ~= breaker_m.CLOSED then return end
   local rule = rule_for(rt, req)
   if not rule then return end
-  local text = normalize.extract(req.body, rules_mod.content_type(req.headers), rule.text_fields, cjson.decode)
+  -- the same text L2 judged: the window, not the whole body
+  local text = rules_mod.judged_text(req, rule, { json_decode = cjson.decode, re_find = re_find })
   if text == "" then return end
   local prompt = judge_mod.build(rule.templates, text, {
     path = req.path, method = req.method,

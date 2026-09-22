@@ -206,7 +206,12 @@ export const backend: Provider = {
     const base = (cfg.endpoint ?? "").replace(/\/+$/, "");
     if (!base) return [null, "backend: jev.endpoint (origin jev-edge URL) not set"];
     const path = info?.path ?? prompt.context.path ?? "/";
-    const headers: Record<string, string> = { "Content-Type": info?.headers.get("content-type") ?? "application/json" };
+    // The decoded body when the Worker read it whole (so no Content-Encoding);
+    // otherwise the judged window, sent as what it is: plain text.
+    const whole = info?.body !== null && info?.body !== undefined;
+    const headers: Record<string, string> = {
+      "Content-Type": whole ? info.headers.get("content-type") ?? "application/json" : "text/plain; charset=utf-8",
+    };
     if (info?.clientIp) headers["X-Forwarded-For"] = info.clientIp;
     if (info?.subjectId) headers["X-Jev-Subject"] = info.subjectId;
     // The answer is in the headers; the body (a 403's JSON) is drained so the

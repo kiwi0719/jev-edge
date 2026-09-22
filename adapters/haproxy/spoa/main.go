@@ -58,6 +58,13 @@ func str(v interface{}) string {
 	}
 }
 
+// partialBody reports whether HAProxy's declared body size (req.body_size)
+// exceeds the bytes it passed in req.body.
+func partialBody(declared string, got int) bool {
+	n, err := strconv.Atoi(strings.TrimSpace(declared))
+	return err == nil && n > got
+}
+
 func failOpen(reason string) map[string]string {
 	return map[string]string{"verdict": "error", "score": "0.00", "source": "adapter", "reason": reason, "action": "pass", "rid": "", "status": "0"}
 }
@@ -82,6 +89,8 @@ var skipHeader = map[string]bool{
 	// never trust a client-supplied verdict
 	"x-jev-verdict": true, "x-jev-score": true, "x-jev-source": true, "x-jev-reason": true,
 	"x-jev-request-id": true, "x-jev-subject": true,
+	// set below from HAProxy's own body size, never taken from the client
+	"x-jev-body-partial": true,
 }
 
 // copyHeaders adds each "Name: value" line of a raw header block to dst,
@@ -152,6 +161,12 @@ func handler(req *request.Request) {
 	}
 	if ip != "" {
 		hreq.Header.Set("X-Forwarded-For", ip)
+	}
+	// HAProxy hands over at most tune.bufsize of the body: when the declared
+	// size is larger, jev-edge must scan what it got as the head of a larger
+	// body, not parse it as a whole (truncated JSON would read as "no text").
+	if partialBody(get("size"), len(body)) {
+		hreq.Header.Set("X-Jev-Body-Partial", "1")
 	}
 	res, err := client.Do(hreq)
 	if err != nil {

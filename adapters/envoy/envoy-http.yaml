@@ -50,14 +50,15 @@ static_resources:
                       allowed_headers:
                         patterns:
                           - exact: content-type
+                          - exact: content-encoding
                           - exact: content-length
                           - exact: x-forwarded-for
                           - exact: x-envoy-external-address
                           - exact: x-request-id
                           - exact: x-jev-mock-score     # e2e only; drop in production
                       with_request_body:
-                        max_request_bytes: 65536       # matches rules.max_body_bytes
-                        allow_partial_message: true    # larger bodies: jev-edge sees a truncated body and passes it at L1
+                        max_request_bytes: 1048576     # matches rules.max_body_bytes (1 MiB)
+                        allow_partial_message: true    # larger bodies arrive cut, with x-envoy-auth-partial-body: true; jev-edge scans them as a head
                       http_service:
                         server_uri:
                           uri: http://jev-edge:8080

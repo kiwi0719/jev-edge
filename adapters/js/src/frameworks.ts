@@ -115,21 +115,23 @@ function reencode(body: object, contentType: string): string {
  * this route. Returns [null, 0] when there is no body to read: no stream, or
  * a stream something else already consumed.
  */
-async function readNodeBody(req: NodeRequestLike): Promise<[string | null, number]> {
+async function readNodeBody(req: NodeRequestLike): Promise<[string | Buffer | null, number, boolean]> {
   // `complete` is not "consumed": node sets it once the whole body has
   // arrived, often before anyone reads it. Only an ended stream is gone.
   const streamGone = typeof req.on !== "function" || req.readableEnded === true || req.readable === false;
   const parsed = req._body === true || streamGone;
+  // The third value: true when a parser produced the body, which it has
+  // already decoded (body-parser inflates gzip / deflate / br).
   if (req.body !== undefined && req.body !== null && parsed) {
-    if (typeof req.body === "string") return [req.body, Buffer.byteLength(req.body)];
-    if (Buffer.isBuffer(req.body)) return [req.body.toString("utf8"), req.body.length];
+    if (typeof req.body === "string") return [req.body, Buffer.byteLength(req.body), true];
+    if (Buffer.isBuffer(req.body)) return [req.body.toString("utf8"), req.body.length, true];
     if (typeof req.body === "object") {
       const ct = req.headers["content-type"];
       const s = reencode(req.body, Array.isArray(ct) ? ct.join(", ") : ct ?? "");
-      return [s, Buffer.byteLength(s)];
+      return [s, Buffer.byteLength(s), true];
     }
   }
-  if (streamGone) return [null, 0];
+  if (streamGone) return [null, 0, false];
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let size = 0;
@@ -137,7 +139,8 @@ async function readNodeBody(req: NodeRequestLike): Promise<[string | null, numbe
       size += c.length;
       chunks.push(c);
     });
-    req.on("end", () => resolve([Buffer.concat(chunks).toString("utf8"), size]));
+    // raw bytes: a compressed body is decoded by the runtime, not mangled into a string here
+    req.on("end", () => resolve([Buffer.concat(chunks), size, false]));
     req.on("error", reject);
   });
 }
@@ -157,7 +160,6 @@ export function nodeMiddleware(opts: Options) {
   return async (req: NodeRequestLike & { jev?: Verdict }, res: NodeResponseLike, next: (err?: unknown) => void): Promise<void> => {
     try {
       const r = rt();
-      const max = Math.max(...r.rules.map((x) => x.max_body_bytes ?? 65536));
       const host = (req.headers.host as string) ?? "localhost";
       const url = new URL(req.url ?? "/", "http://" + host);
       const headers = new Headers();
@@ -172,14 +174,17 @@ export function nodeMiddleware(opts: Options) {
         headers.set("x-forwarded-for", xff ? xff + ", " + req.socket.remoteAddress : req.socket.remoteAddress);
       }
       const method = req.method ?? "GET";
-      const [body, size] = method === "GET" || method === "HEAD" ? [null, 0] : await readNodeBody(req);
-      if (body !== null && (req.body === undefined || (req._body !== true && isEmptyObject(req.body)))) req.body = body;
-      // Over the limit the body stays on req.body for the app but is not
-      // handed to the evaluation: Content-Length alone lets L1 pass it as
-      // "body too large", the same fail-open as the other hosts.
-      const tooLarge = body !== null && size > max;
-      if (tooLarge) headers.set("content-length", String(size));
-      const request = new Request(url.toString(), { method, headers, body: tooLarge ? undefined : body ?? undefined });
+      const [body, , fromParser] = method === "GET" || method === "HEAD" ? [null, 0, false] : await readNodeBody(req);
+      if (body !== null && (req.body === undefined || (req._body !== true && isEmptyObject(req.body)))) {
+        req.body = Buffer.isBuffer(body) ? body.toString("utf8") : body;
+      }
+      // a parser already decoded it: the runtime must not try again
+      if (fromParser) headers.delete("content-encoding");
+      // The whole body goes to the runtime, which reads it as it reads any
+      // stream: parsed whole up to max_body_bytes, head and tail past it.
+      const request = new Request(url.toString(), {
+        method, headers, body: body === null ? undefined : (Buffer.isBuffer(body) ? new Uint8Array(body) : body) as BodyInit,
+      });
       if (r.opts.health !== false && url.pathname === "/_jev/health" && method === "GET") {
         const h = healthResponse(r);
         res.statusCode = 200;

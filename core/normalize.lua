@@ -69,43 +69,259 @@ end
 --- Extract candidate text from a decoded JSON value using the given field paths.
 -- @param decoded table (decoded JSON)
 -- @param fields  list of path strings
--- @return string (joined with "\n"), may be ""
+-- @return string (joined with "\n"), may be ""; and the list of strings found
 function _M.extract_json(decoded, fields)
   local out = {}
   for _, f in ipairs(fields or {}) do
     walk(decoded, split_path(f), 1, out)
   end
-  return table.concat(out, "\n")
+  return table.concat(out, "\n"), out
 end
 
---- Extract text from a raw body given its content type.
+-- ---------------------------------------------------------------------------
+-- Format detection. The Content-Type a client sends is a hint, not a fact:
+-- Ollama decodes JSON whatever the header says, and FastAPI parses a body
+-- without one as JSON. So the body decides: JSON when it parses as JSON,
+-- form or multipart when declared (or form-shaped with no header), text when
+-- it reads as text, and "binary" otherwise, which L1 reports as unjudgeable
+-- instead of letting it through as "no text".
+-- ---------------------------------------------------------------------------
+
+local BOM = "\239\187\191"
+
+--- True when `s` reads as text: no NUL, and control bytes other than tab,
+-- newline and carriage return under 1% of the bytes.
+function _M.is_text(s)
+  if s:find("%z") then return false end
+  local _, ctl = s:gsub("[\1-\8\11\12\14-\31\127]", "")
+  return ctl * 100 <= #s
+end
+
+local function form_values(body, out)
+  for _, v in body:gmatch("([^&=]+)=([^&]*)") do
+    v = v:gsub("+", " "):gsub("%%(%x%x)", function(h) return string.char(tonumber(h, 16)) end)
+    out[#out + 1] = v
+  end
+end
+
+-- multipart/form-data: every field without a filename, and file parts whose
+-- own Content-Type is text or JSON (a prompt uploaded as prompt.txt). Binary
+-- files contribute nothing. At most MAX_PARTS parts are read.
+local MAX_PARTS = 100
+local function multipart_values(body, content_type, out)
+  local boundary = content_type:match('[Bb][Oo][Uu][Nn][Dd][Aa][Rr][Yy]="([^"]+)"')
+    or content_type:match("[Bb][Oo][Uu][Nn][Dd][Aa][Rr][Yy]=([^;%s,]+)")
+  if not boundary then return end
+  local delim = "--" .. boundary
+  local pos = body:find(delim, 1, true)
+  local parts = 0
+  while pos and parts < MAX_PARTS do
+    local after = pos + #delim
+    if body:sub(after, after + 1) == "--" then break end   -- closing delimiter
+    local next_pos = body:find(delim, after, true)
+    local part = body:sub(after, (next_pos or #body + 1) - 1)
+    part = part:gsub("^\r?\n", ""):gsub("\r?\n$", "")
+    local hs, he = part:find("\r?\n\r?\n")
+    if hs then
+      local head, value = part:sub(1, hs - 1):lower(), part:sub(he + 1)
+      local has_file = head:find("filename%*?=") ~= nil
+      local pct = head:match("content%-type:%s*([^\r\n;]+)") or ""
+      if (not has_file or pct:find("^text/") or pct:find("json", 1, true)) and _M.is_text(value) then
+        out[#out + 1] = value
+      end
+    end
+    parts = parts + 1
+    pos = next_pos
+  end
+end
+
+--- Extract text from a raw body.
 -- @param body         string
 -- @param content_type string (may be nil)
 -- @param fields       list of JSON paths
 -- @param json_decode  function(string) -> table|nil
--- @return text string, kind ("json"|"text"|"form"|"none")
+-- @return text string (the values joined with "\n"),
+--         kind ("json"|"form"|"multipart"|"text"|"binary"|"none"),
+--         list of the values found (newest last), for window()
 function _M.extract(body, content_type, fields, json_decode)
-  if type(body) ~= "string" or body == "" then return "", "none" end
-  local ct = (type(content_type) == "string" and content_type or ""):lower()
-  if ct:find("application/json", 1, true) or ct:find("+json", 1, true) then
-    if not json_decode then return "", "none" end
-    -- A UTF-8 BOM is not JSON (cjson rejects it) but Python's json.loads on
-    -- bytes and Express's body-parser skip it: judge what the backend reads.
-    if body:sub(1, 3) == "\239\187\191" then body = body:sub(4) end
+  if type(body) ~= "string" or body == "" then return "", "none", {} end
+  local raw_ct = type(content_type) == "string" and content_type or ""
+  local ct = raw_ct:lower()
+  -- A UTF-8 BOM is not JSON (cjson rejects it) but Python's json.loads on
+  -- bytes and Express's body-parser skip it: judge what the backend reads.
+  if body:sub(1, 3) == BOM then body = body:sub(4) end
+  local declared_json = ct:find("json", 1, true) ~= nil
+  local first = body:match("^%s*(.)")
+  if first == "{" or first == "[" or declared_json then
+    if not json_decode then return "", "none", {} end
     local ok, decoded = pcall(json_decode, body)
-    if not ok or type(decoded) ~= "table" then return "", "none" end
-    return _M.extract_json(decoded, fields), "json"
-  elseif ct:find("application/x%-www%-form%-urlencoded") then
-    local parts = {}
-    for _, v in body:gmatch("([^&=]+)=([^&]*)") do
-      v = v:gsub("+", " "):gsub("%%(%x%x)", function(h) return string.char(tonumber(h, 16)) end)
-      parts[#parts + 1] = v
+    if ok and type(decoded) == "table" then
+      local text, out = _M.extract_json(decoded, fields)
+      return text, "json", out
     end
-    return table.concat(parts, "\n"), "form"
-  elseif ct:find("text/", 1, true) or ct == "" then
-    return body, "text"
+    -- declared JSON that is not: the backend rejects it too
+    if declared_json then return "", "none", {} end
   end
-  return "", "none"
+  local out = {}
+  if ct:find("application/x-www-form-urlencoded", 1, true)
+     or (ct == "" and body:find("^[%w%.%-_~%%%+%[%]]+=[^%s]*$")) then
+    form_values(body, out)
+    return table.concat(out, "\n"), "form", out
+  end
+  if ct:find("multipart/form-data", 1, true) then
+    multipart_values(body, raw_ct, out)
+    return table.concat(out, "\n"), "multipart", out
+  end
+  if _M.is_text(body) then return body, "text", { body } end
+  return "", "binary", {}
+end
+
+-- ---------------------------------------------------------------------------
+-- Partial bodies. Past max_body_bytes the body is not parsed; the adapter
+-- hands over the bytes it has (the head, and the tail where it can seek) and
+-- this tolerant scanner pulls the JSON string values of the text-field keys
+-- out of them, truncated JSON included.
+-- ---------------------------------------------------------------------------
+
+local function utf8_char(cp)
+  if cp < 0x80 then return string.char(cp) end
+  if cp < 0x800 then return string.char(0xC0 + math.floor(cp / 0x40), 0x80 + cp % 0x40) end
+  if cp < 0x10000 then
+    return string.char(0xE0 + math.floor(cp / 0x1000), 0x80 + math.floor(cp / 0x40) % 0x40, 0x80 + cp % 0x40)
+  end
+  return string.char(0xF0 + math.floor(cp / 0x40000), 0x80 + math.floor(cp / 0x1000) % 0x40,
+    0x80 + math.floor(cp / 0x40) % 0x40, 0x80 + cp % 0x40)
+end
+
+local ESC = { ['"'] = '"', ["\\"] = "\\", ["/"] = "/", b = "\b", f = "\f", n = "\n", r = "\r", t = "\t" }
+
+-- Decode one JSON string body starting at `i` (just after the opening quote);
+-- returns the value and the index after the closing quote (or #s + 1).
+local function read_string(s, i)
+  local buf, n = {}, #s
+  while i <= n do
+    local j = s:find('["\\]', i)
+    if not j then buf[#buf + 1] = s:sub(i); return table.concat(buf), n + 1 end
+    buf[#buf + 1] = s:sub(i, j - 1)
+    if s:sub(j, j) == '"' then return table.concat(buf), j + 1 end
+    local e = s:sub(j + 1, j + 1)
+    if e == "u" then
+      local hex = s:match("^%x%x%x%x", j + 2)
+      if not hex then return table.concat(buf), n + 1 end
+      local cp = tonumber(hex, 16)
+      i = j + 6
+      if cp >= 0xD800 and cp <= 0xDBFF then
+        local lo = s:match("^\\u(%x%x%x%x)", i)
+        local lcp = lo and tonumber(lo, 16)
+        if lcp and lcp >= 0xDC00 and lcp <= 0xDFFF then
+          cp = 0x10000 + (cp - 0xD800) * 0x400 + (lcp - 0xDC00)
+          i = i + 6
+        end
+      end
+      buf[#buf + 1] = utf8_char(cp)
+    elseif e == "" then
+      return table.concat(buf), n + 1
+    else
+      buf[#buf + 1] = ESC[e] or e
+      i = j + 2
+    end
+  end
+  return table.concat(buf), n + 1
+end
+
+--- The last key of each text-field path: "messages[*].content" -> "content".
+function _M.field_keys(fields)
+  local keys = {}
+  for _, f in ipairs(fields or {}) do
+    local last = f:match("([^%.%[%]%*]+)[%[%]%*]*$")
+    if last then keys[last] = true end
+  end
+  -- content parts carry their text under "text"
+  if keys.content then keys.text = true end
+  return keys
+end
+
+--- Collect the string values of `keys` from possibly truncated JSON.
+function _M.scan_strings(s, keys, out)
+  local i = 1
+  while true do
+    local a, b, key = s:find('"([%w_%-]+)"%s*:%s*"', i)
+    if not a then break end
+    local value, nexti = read_string(s, b + 1)
+    if keys[key] and value ~= "" then out[#out + 1] = value end
+    i = nexti
+  end
+  return out
+end
+
+-- ---------------------------------------------------------------------------
+-- Judging window. Text over the budget is cut down before it is fingerprinted
+-- and sent to L2: the always_suspect hit (if any) with 1 KiB on each side,
+-- then values newest first, the one that does not fit kept as head + tail.
+-- Chat APIs resend the whole history every turn; the turns before the newest
+-- were judged when they were the newest. Cuts never split a UTF-8 sequence.
+-- ---------------------------------------------------------------------------
+
+local function cont(s, i)
+  local c = s:byte(i)
+  return c ~= nil and c >= 0x80 and c < 0xC0
+end
+
+--- `s` cut to at most `n` bytes at a character boundary, from the front.
+function _M.head(s, n)
+  if n <= 0 then return "" end
+  if #s <= n then return s end
+  local e = n
+  while e > 0 and cont(s, e + 1) do e = e - 1 end
+  return s:sub(1, e)
+end
+
+--- `s` cut to at most `n` bytes at a character boundary, from the back.
+function _M.tail(s, n)
+  if n <= 0 then return "" end
+  if #s <= n then return s end
+  local b = #s - n + 1
+  while b <= #s and cont(s, b) do b = b + 1 end
+  return s:sub(b)
+end
+
+_M.HIT_CONTEXT = 1024
+
+--- @param text   the joined values
+-- @param values the values, in order (newest last)
+-- @param budget max bytes
+-- @param from,to byte span of an always_suspect hit in `text`, or nil
+-- @return the text to judge, true when it was cut
+function _M.window(text, values, budget, from, to)
+  if #text <= budget then return text, false end
+  local out, rem = {}, budget
+  if from and to then
+    -- the hit and up to HIT_CONTEXT bytes each side, in at most half the budget
+    local half = math.floor(budget / 2)
+    local ctxb = math.max(0, math.min(_M.HIT_CONTEXT, math.floor((half - (to - from + 1)) / 2)))
+    local a = math.max(1, from - ctxb)
+    while a > 1 and cont(text, a) do a = a - 1 end
+    local piece = _M.head(text:sub(a), math.min(math.min(to + ctxb, #text) - a + 1, half))
+    out[1] = piece
+    rem = rem - #piece - 1
+  end
+  local chosen = {}
+  for i = #values, 1, -1 do
+    if rem <= 0 then break end
+    local v = values[i]
+    if #v + 1 <= rem then
+      chosen[i] = v
+      rem = rem - #v - 1
+    else
+      local h = _M.head(v, math.floor((rem - 1) / 2))
+      chosen[i] = h .. "\n" .. _M.tail(v, rem - 1 - #h - 1)
+      rem = 0
+    end
+  end
+  for i = 1, #values do
+    if chosen[i] then out[#out + 1] = chosen[i] end
+  end
+  return table.concat(out, "\n"), true
 end
 
 -- ---------------------------------------------------------------------------

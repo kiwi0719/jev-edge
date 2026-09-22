@@ -7,9 +7,10 @@ export const llmEndpoints: Rule = {
   id: "llm-endpoints",
   watch_paths: ["^/v1/chat", "^/v1/completions", "^/api/chat", "^/api/completions"],
   methods: { POST: true, PUT: true, PATCH: true },
-  content_types: ["application/json", "+json", "text/plain", "application/x-www-form-urlencoded"],
+  skip_content_types: ["image/", "audio/", "video/", "font/", "application/pdf", "application/zip", "application/gzip"],
   min_body_bytes: 8,
-  max_body_bytes: 65536,
+  max_body_bytes: 1048576,
+  max_judge_bytes: 32768,
   text_fields: ["messages[*].content", "prompt", "input", "query", "text"],
   min_text_chars: 20,
   always_suspect: [
@@ -30,7 +31,6 @@ export const defaultRule: Rule = {
   id: "default",
   watch_paths: [],
   methods: { POST: true },
-  content_types: ["application/json"],
   text_fields: ["prompt", "input", "text"],
   templates: ["injection"],
 };

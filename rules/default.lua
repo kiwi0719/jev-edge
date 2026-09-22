@@ -4,7 +4,6 @@ return {
   id = "default",
   watch_paths = {},
   methods = { POST = true },
-  content_types = { "application/json" },
   text_fields = { "prompt", "input", "text" },
   templates = { "injection" },
 }

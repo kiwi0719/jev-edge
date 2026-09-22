@@ -32,6 +32,7 @@ http:
         # forward only what jev-edge needs
         authRequestHeaders:
           - Content-Type
+          - Content-Encoding           # without it a gzip body reads as "no text"
           - Content-Length
           - X-Forwarded-For
           - X-Jev-Mock-Score           # e2e only; drop in production

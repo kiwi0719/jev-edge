@@ -17,7 +17,7 @@ client ──► HAProxy ──SPOE──► jev-spoa ──HTTP──► jev-ed
 | file | role |
 |---|---|
 | [spoa/](spoa/) | the agent (`go build`, or the Dockerfile) |
-| [spoe.conf](spoe.conf) | the SPOE engine: one message, `check-request`, with method, path, client IP, content type, headers and body |
+| [spoe.conf](spoe.conf) | the SPOE engine: one message, `check-request`, with method, path, client IP, content type, headers, body and the body's declared size |
 | [haproxy.cfg](haproxy.cfg) | reference frontend: `option http-buffer-request`, the SPOE filter, the `deny` rules and the `set-header` lines |
 | [e2e/](e2e/) | Docker Compose against real HAProxy 3.1; `make e2e-haproxy` |
 
@@ -56,7 +56,7 @@ client ──► HAProxy ──SPOE──► jev-spoa ──HTTP──► jev-ed
 
 ## Limits that come from SPOE
 
-- **Body size.** SPOE carries the body inside a frame. The default `tune.bufsize` (16 KB) caps what the agent sees; the reference config raises it to 128 KB to cover jev-edge's `rules.max_body_bytes` (64 KB). A body larger than the frame arrives truncated; jev-edge judges the truncated text, which is the one place this adapter is weaker than Envoy's `ext_authz`.
+- **Body size.** SPOE carries the body inside a frame, so `tune.bufsize` (16 KB by default, 128 KB in the reference config) caps what the agent sees, per connection. The `size` argument passes HAProxy's `req.body_size`; when it is larger than the body the agent received, the agent sends `X-Jev-Body-Partial: 1` (a client copy is dropped) and jev-edge scans the body as the head of a larger one for the text fields, instead of parsing truncated JSON as a whole. The reason then ends in `(window)`; a head with no text is `unjudgeable: body too large`. There is no tail, which is the one place this adapter is weaker than Envoy's `ext_authz`. Raising `tune.bufsize` toward `rules.max_body_bytes` (1 MiB) costs that much memory per connection; see [Body size and what L1 reads](../../README.md#body-size-and-what-l1-reads).
 - **`option http-buffer-request`** is required so the body is available when the message fires. It makes HAProxy wait for the full body before forwarding, which for chat requests is the normal case anyway.
 - **`timeout processing`** in `spoe.conf` (2 s) is the hard stop; with `option continue-on-error` an agent timeout leaves the variables unset and the request continues without `X-Jev-*`. Keep the chain ordered: jev-edge `timeout_max_ms` < agent `-timeout` (1.5 s) < `timeout processing` (2 s), so each layer's fail-open answer arrives before the next one gives up. Your upstream should treat a missing `X-Jev-Verdict` as "not judged".
 - The agent forwards the original request headers (from `req.hdrs`), so anything jev-edge's rules look at is there. `Host`, `Content-Length`, `Transfer-Encoding`, `Connection`, `Expect`, `Accept-Encoding`, `TE`, `Upgrade`, `Keep-Alive` and inbound `X-Jev-*` are dropped; the first four are recomputed by the client.

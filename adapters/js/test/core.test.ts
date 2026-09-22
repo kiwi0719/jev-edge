@@ -72,8 +72,11 @@ describe("rules.resolve", () => {
     expect(() => resolve({ watch_paths: [] })).toThrow(/needs an id/);
   });
 
-  it("llm-endpoints watches vendor +json", () => {
-    expect(load("llm-endpoints").content_types).toContain("+json");
+  it("llm-endpoints reads every content type but media types", () => {
+    const r = load("llm-endpoints");
+    expect(r.content_types).toBeUndefined();
+    expect(r.skip_content_types).toContain("image/");
+    expect(r.max_body_bytes).toBe(1048576);
   });
 });
 
@@ -83,8 +86,11 @@ describe("rules.evaluate body size", () => {
     const req = { method: "POST", path: "/v1/chat/completions", headers: { "content-type": "application/json" }, body, body_size: 0, client_ip: "1.2.3.4" };
     const [r] = await rulesEvaluate(req, load("llm-endpoints"), { re_find: core.rules.reFind });
     expect(r).toBe("suspect");
-    const [r2, , reason] = await rulesEvaluate({ ...req, body_size: 70000 }, load("llm-endpoints"), { re_find: core.rules.reFind });
-    expect([r2, reason]).toEqual(["pass", "body too large"]);
+    // past max_body_bytes the body is scanned, not passed
+    const [r2, , reason] = await rulesEvaluate({ ...req, body_size: 2_000_000 }, load("llm-endpoints"), { re_find: core.rules.reFind });
+    expect([r2, reason]).toEqual(["suspect", "natural language (window)"]);
+    const [r3, , reason3] = await rulesEvaluate({ ...req, body: undefined, body_size: 2_000_000 }, load("llm-endpoints"), { re_find: core.rules.reFind });
+    expect([r3, reason3]).toEqual(["unjudgeable", "unjudgeable: body too large"]);
   });
 
   it("warns once about an always_suspect pattern that does not compile", async () => {

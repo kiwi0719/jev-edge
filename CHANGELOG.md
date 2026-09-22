@@ -6,6 +6,58 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-23
+
+L1 now reads a watched request the way the backend will, and reports the
+requests it still cannot read instead of passing them as "no text". Plus the
+fixes from a full audit of 0.3.1. Four changes alter what an existing
+deployment sees; read **Changed** before upgrading.
+
+### Changed
+- **`max_body_bytes` is 1 MiB (was 64 KB)**, nginx's default
+  `client_max_body_size`. Bodies up to it are parsed whole. Past it the body is
+  no longer passed as "body too large": its first `max_body_bytes` and last
+  64 KiB are scanned for the text fields' string values (truncated JSON
+  included) and judged, with ` (window)` at the end of the reason. Where to
+  raise it (rule, nginx, Envoy, HAProxy, Traefik, APISIX, JS) is in README
+  "Body size and what L1 reads"; every limit on the path has to agree.
+- **Content-Type is a hint, not a gate.** `llm-endpoints` lists
+  `skip_content_types` (media: `image/`, `audio/`, `video/`, `font/`, PDF,
+  zip, gzip) instead of an allow list, and the body decides the format: JSON
+  when it parses as JSON whatever the header (Ollama and FastAPI read it that
+  way; `text/json`, none, `application/octet-stream` were "not watched"),
+  forms and `multipart/form-data` fields (text file parts too), other text
+  whole. A rule that lists `content_types` keeps the allow list.
+- **Text over `max_judge_bytes` (new, 32 KiB) is judged on a window**: the
+  `always_suspect` hit (all of the text is scanned for it) with 1 KiB either
+  side, then values newest first. The fingerprint and L2 see the window; so
+  does L3 (`rules.judged_text`). `ctx.re_find` should return the match's byte
+  span (`from, to`, as `ngx.re.find` does) so the hit lands in the window.
+- **Verdict-cache keys** are `fp:<scope>:<fingerprint>` (see Security); the
+  cache refills after the upgrade. Subject history in the JS runtime moves to
+  ring keys, so earlier KV history is not read again.
+
+### Added
+- **`Content-Encoding` gzip, deflate and br are decoded** before L1
+  (`resty.jev.decode` through FFI to zlib and libbrotlidec; `DecompressionStream`
+  and `node:zlib` in JS), capped at `max_body_bytes` so a small compressed body
+  cannot expand into memory. Express's body-parser inflates request bodies by
+  default, so a compressed prompt used to reach the app unjudged. `br` needs
+  `brotli-libs` (Alpine) or `libbrotli1` (Debian) on OpenResty images.
+- **`policy.unjudgeable = "pass" | "block"`** (default `pass`) for a watched
+  request L1 cannot read: an encoding it cannot decode, a binary body, or an
+  oversized body with no text in its head or tail. It is passed as
+  `X-Jev-Verdict: skipped` with `X-Jev-Reason: unjudgeable: <why>`, or
+  rejected in enforce mode with `block`. Metrics: `jev_unjudged_total{reason}`,
+  `jev_window_total`.
+- Gateways that hand over part of a body say so, and jev-edge scans it as a
+  head: Envoy's `x-envoy-auth-partial-body` (example configs now allow 1 MiB
+  and forward `content-encoding`), and the HAProxy SPOA agent's
+  `X-Jev-Body-Partial` from HAProxy's declared body size (new `size` arg in
+  `spoe.conf`).
+- `nextMiddleware(request, event)` forwards Next's event, so `waitUntil` keeps
+  the subject write alive.
+
 ### Security
 - **A repeated `Content-Type` header no longer skips judging.** OpenResty and
   APISIX hand a repeated header to Lua as a list; L1 called `:lower()` on it,
@@ -70,7 +122,15 @@ All notable changes to this project are recorded here. The format follows
   of the stream; and a stream that had fully arrived but was not yet read
   (`req.complete`) was taken for consumed, so the request was not judged.
 
+- **LiteLLM guardrail: the whole `X-Forwarded-For` chain wins over
+  `requester_ip_address`**, which LiteLLM may itself take from the
+  client-written first entry (`use_x_forwarded_for`).
+
 ### Fixed
+- JS subject history is a ring (one atomic counter, one key per entry), as
+  on OpenResty: concurrent requests no longer lose entries. Atomic on the
+  memory store and the Durable Object; best effort on KV. Stores without
+  `incr` keep the list layout.
 - APISIX picks the rule for L3 and sampling by path, method and content type
   (`rules.rule_for`), like the OpenResty adapter; it used path alone.
 - APISIX keeps breaker, adaptive timeout and in-flight counters per provider,

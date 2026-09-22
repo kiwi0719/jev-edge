@@ -9,10 +9,10 @@ import * as trust from "./trust";
 import * as subject from "./subject";
 import type { Config } from "./defaults";
 import type { BreakerLike } from "./breaker";
-import type { Req, Rule, CacheLike } from "./rules";
+import type { Req, Rule, CacheLike, RulesCtx } from "./rules";
 import type { JsonValue } from "./normalize";
 
-export const VERSION = "0.3.1";
+export const VERSION = "0.4.0";
 
 export interface Judge {
   call(prompt: judge.Prompt, timeoutMs: number): Promise<[judge.Answers, null] | [null, string]> | [judge.Answers, null] | [null, string];
@@ -34,7 +34,7 @@ export interface Ctx {
   clock?: () => number;
   hash: (s: string) => string;
   json_decode?: (s: string) => JsonValue;
-  re_find?: (subject: string, pattern: string) => boolean;
+  re_find?: RulesCtx["re_find"];
   log?: (level: string, msg: string) => void;
 }
 
@@ -75,10 +75,19 @@ export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
   const cfg = ctx.config;
 
   // L1 --------------------------------------------------------------------
-  const [r, text, reason, rule] = await rulesMod.evaluateAll(req, ctx.rules, ctx);
+  const [r, text, reason, rule, windowed] = await rulesMod.evaluateAll(req, ctx.rules, ctx);
 
   if (r === rulesMod.PASS) {
     return verdict.newVerdict({ verdict: verdict.SKIPPED, source: verdict.SRC_L1, reason });
+  }
+  if (r === rulesMod.UNJUDGEABLE) {
+    // A watched request nobody read: `skipped`, blocked only when the operator
+    // chose that and the gateway enforces.
+    const block = cfg.policy.mode === "enforce" && cfg.policy.unjudgeable === "block";
+    return finish(ctx, verdict.newVerdict({
+      action: block ? verdict.ACTION_BLOCK : verdict.ACTION_PASS,
+      verdict: verdict.SKIPPED, source: verdict.SRC_L1, reason,
+    }));
   }
   if (r === rulesMod.BLOCK) {
     const action = cfg.policy.mode === "enforce" ? verdict.ACTION_BLOCK : verdict.ACTION_PASS;
@@ -167,7 +176,8 @@ export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
   }
   if (ctx.breaker) await ctx.breaker.success();
   const [action, label, async] = policy.decide(score, cfg.policy);
-  const why = top !== "" ? `${top} ${verdict.format2(score)}` : reason;
+  // the score is for the window, not the whole text; say so
+  const why = top !== "" ? `${top} ${verdict.format2(score)}${windowed ? " (window)" : ""}` : reason;
 
   if (ckey && ctx.cache) {
     await ctx.cache.set(ckey, { score, reason: why }, cfg.cache.fp_ttl);

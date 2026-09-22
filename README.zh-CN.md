@@ -25,6 +25,7 @@ jev-edge 跑在 nginx / OpenResty 或 Apache APISIX 里，站在 Envoy、Istio�
 - [30 秒试一下](#30-秒试一下)
 - [工作原理](#工作原理)
 - [安装](#安装)
+- [body 大小与 L1 读什么](#body-大小与-l1-读什么)
 - [写好部署上下文](#写好部署上下文)
 - [选阈值](#选阈值)
 - [误报](#误报)
@@ -209,6 +210,31 @@ curl -X PUT localhost:8090/_jev/config -d '{"policy":{"mode":"enforce"}}'
 - **LiteLLM proxy**：每次调用前先问 jev-edge 的 guardrail：[adapters/litellm](adapters/litellm/README.md)。
 - **Cloudflare Workers 和 Pages、Next.js、Node、Hono、Lambda@Edge**：一个 npm 包，core 的 TypeScript 移植，[adapters/js](adapters/js/README.md)。薄 Worker 把判定留在你已有的网关，其余在宿主里跑完整 core。
 
+## body 大小与 L1 读什么
+
+L1 按后端读 body 的方式读受监控的请求：格式由 body 决定，压缩的 body 会被解码，大到无法整体解析的 body 仍会被扫描。完全读不了的请求会如实报告，绝不会被当作"没有文本"悄悄放行。
+
+**`max_body_bytes` 是 1 MiB**（0.4.0 之前是 64 KB），即 nginx 默认的 `client_max_body_size`。不超过它的 body 整体解析。超过的只扫描前 `max_body_bytes` 字节和最后 64 KiB，从中取文本字段（`content`、`prompt`、`input`……）的值；此时判定理由以 `(window)` 结尾。1 MiB 覆盖粘贴了文档的长上下文聊天；视觉或 RAG 流量内联 base64 文件，几 MB 的请求很正常，这时调大它。下面各处必须一致，否则最小的那个上限说了算：
+
+| 位置 | 设置 | 说明 |
+|---|---|---|
+| `jev-edge.conf.lua` | `rules = { { id = "big", extends = "llm-endpoints", max_body_bytes = 4 * 1048576 } }` | L1 用的规则；多租户时每个租户规则各设一次 |
+| nginx / OpenResty | `client_max_body_size 4m;` | 超过它 nginx 在 jev-edge 运行前就回 413 |
+| nginx / OpenResty | `client_body_buffer_size` | 超过它的 body 落到临时文件；jev-edge 从文件里读开头和结尾，不把整个文件载入内存 |
+| Envoy | `with_request_body.max_request_bytes` | 超过它 Envoy 发送截断的 body 并带 `x-envoy-auth-partial-body: true`，jev-edge 把它当开头扫描（`allow_partial_message: true`） |
+| HAProxy | `tune.bufsize` | 每连接内存；超过它 SPOE agent 把 body 标为部分，按开头扫描 |
+| Traefik | 不设 `maxBodySize` | 超过它 Traefik 自己回 401 拒绝；改用 `buffering` 中间件限制大小 |
+| APISIX | 插件 `rules`，以及 `config.yaml` 里的 `nginx_config.http.client_max_body_size` | 同 nginx |
+| `@jev-edge/js` | `rules: [{ id: "big", extends: "llm-endpoints", max_body_bytes: 4 * 1048576 }]` | 超过它运行时继续读到上限的 4 倍以取结尾；Workers 的请求大小受套餐限制 |
+
+**`max_judge_bytes` 是 32 KiB**：做指纹并送往 L2 的文本。更长的文本被切成一个窗口：`always_suspect` 的命中处（整段文本都会被扫描）前后各 1 KiB，然后按消息从新到旧；放不下的那条保留开头和结尾。聊天 API 每一轮都会重发历史，之前的轮次在它们是最新一轮时已经判定过。调大它会让每个长请求都多花 token；`jev_window_total` 统计它被触发的次数。
+
+**Content-Type 只是提示。** 除媒体类型（`skip_content_types`：`image/`、`audio/`、`video/`、`font/`、PDF、zip、gzip）外，所有类型都会读：能解析成 JSON 的 body 就是 JSON，不管头怎么写（Ollama 和 FastAPI 就是这么读的）；form 和 `multipart/form-data` 的字段会读（文本文件部分也读）；其他文本整体取用。列了 `content_types` 的规则保持旧的白名单行为。
+
+**Content-Encoding** `gzip`、`deflate` 和 `br` 会被解码（Express 的 body-parser 会解压它们），上限为 `max_body_bytes`，小的压缩 body 无法在内存里膨胀。OpenResty 和 APISIX 通过 FFI 使用 zlib（已链接进 nginx）和 libbrotlidec：要支持 `br`，安装 `brotli-libs`（Alpine）或 `libbrotli1`（Debian）。JS 运行时用 `DecompressionStream`，`br` 在有 `node:zlib` 的地方用它。
+
+**无法判定（unjudgeable）。** 解不开的编码、二进制 body、或超过上限且开头和结尾都没有文本的 body，会以 `X-Jev-Verdict: skipped` 放行，带 `X-Jev-Reason: unjudgeable: <原因>`，并计入 `jev_unjudged_total{reason}`。设 `policy.unjudgeable = "block"` 可在 enforce 模式下拒绝它们：正常的 SDK 不会发这些请求，所以在 monitor 模式下这个指标安静之后，这是更严格的选择。
+
 ## 写好部署上下文
 
 `jev.deployment_context` 是一段话，告诉 Jev 你的助手是*干什么的*。有了它，Jev 回答的问题从"这段文本像不像攻击"变成"这条消息是不是对*这个*服务的误用"。同样的 662 条文本、同样的模型，AUC 从 0.983 提到 0.996，阈值 0.5 下的漏报率从 37% 降到 5%。配置里没有别的东西能接近这个效果。
@@ -382,6 +408,7 @@ docs/            design、cost、recipes（Istio、Envoy Gateway、APIM、Apigee
 | 0.2.0 ✅ | OpenResty 之外的网关，同一套引擎：Envoy HTTP ext_authz（`/_jev/authz`）和 gRPC ext_authz（`grpc-shim`）；`/_jev/forward-auth` 服务 Traefik ForwardAuth（转发 body，完整判定）、Caddy `forward_auth` 和 nginx `auth_request`（只有头：路径、方法、信誉）。对每个真实网关的 Docker Compose 端到端。`demo/`。许可证改为 Apache 2.0。 |
 | 0.3.0 ✅ | golden vectors 作为带版本的 core 契约（`core/golden/`，两个 core 在 CI 里回放）；`make calibrate`、`make context-lint`、`make labels`；多租户规则，每个租户自己的 `deployment_context`；决策采样（`/_jev/samples`）；误报反馈回路（`/_jev/feedback`，带过期的指纹信任）；主体轨迹契约（只记录，尚不打分），主体 id 取自 IP、header 或 cookie，加盐哈希后才存储，放在自己的有界 dict 里；APISIX 插件；HAProxy SPOE agent；LiteLLM guardrail；Istio、Envoy Gateway、APIM、Apigee 配方；`@jev-edge/js`：通过向量的 TypeScript core，以及 Cloudflare（薄 / 完整 Worker、Pages）、Next.js、Node、Hono、Lambda@Edge 预设。 |
 | 0.3.1 ✅ | 审计补丁：content-parts 形式的 body 也会被判定；指纹改为整段文本的 SHA-256（原为 crc32 前缀）；`X-Forwarded-For` 取代理追加的那一跳（`client_ip.trusted_hops`）；`GET /_jev/config` 脱敏；管理端点独立监听；每份网关配置都剥离入站 `X-Jev-*`；统一的瘦适配器契约（`status >= 400` 且带 `X-Jev-Verdict` = 拦截，无头 = 未判定）；可选的 `jev_state` dict 存放信任 / 熔断 / 计数器；L3 用与 L2 相同的 prompt 和上限超时；熔断、在途计数、provider 与校验修复；JS 的 fail-open 覆盖整条请求路径。 |
+| 0.4.0 ✅ | L1 读后端读的东西：格式由 body 决定（Content-Type 只是提示；读 `multipart/form-data`），解码 `gzip` / `deflate` / `br` body，`max_body_bytes` 1 MiB、超过后扫描开头和结尾，32 KiB 判定窗口（`max_judge_bytes`）保留模式命中处，以及 `policy.unjudgeable` 处理仍然读不了的请求。一次完整审计带来的安全修复：判定缓存按规则和 provider 分域，经 forward-auth 和 JS 运行时的客户端 IP 与路径伪造，重复或后到的 `Content-Type`，空的判定回答，带 BOM 的 body；JS 指纹改为 SHA-256；JS 的主体历史也用环形结构。 |
 | 未来可能实现 | 基于主体轨迹打分：窗口、衰减和阈值从记录下来的轨迹和一个多轮数据集里定（和 `abuse` 模板共用，`abuse` 同时得到自己的数据集）；等向量经历过一次真实的 core 变更后再做 Fastly Compute 和 Deno Deploy；面向指标和反馈日志的 Grafana dashboard |
 
 ✅ 表示已随某个 tag 发布。

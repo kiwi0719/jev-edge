@@ -7,6 +7,8 @@ export interface Policy {
   suspect_threshold?: number;
   block_status?: number;
   block_body?: string;
+  /** What happens to a watched request L1 cannot read (see core/defaults.lua). */
+  unjudgeable?: "pass" | "block" | string;
 }
 
 export const DEFAULTS: Required<Policy> = {
@@ -15,6 +17,7 @@ export const DEFAULTS: Required<Policy> = {
   suspect_threshold: 0.5,
   block_status: 403,
   block_body: '{"error":"request rejected"}',
+  unjudgeable: "pass",
 };
 
 export type Decision = [Action, Label, boolean];

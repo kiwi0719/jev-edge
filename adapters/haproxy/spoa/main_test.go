@@ -26,3 +26,15 @@ func TestSafePath(t *testing.T) {
 		}
 	}
 }
+
+func TestPartialBody(t *testing.T) {
+	for _, c := range []struct {
+		declared string
+		got      int
+		want     bool
+	}{{"200000", 131000, true}, {"100", 100, false}, {"", 50, false}, {"x", 50, false}} {
+		if partialBody(c.declared, c.got) != c.want {
+			t.Errorf("partialBody(%q, %d) != %v", c.declared, c.got, c.want)
+		}
+	}
+}

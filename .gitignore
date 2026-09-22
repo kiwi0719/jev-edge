@@ -40,3 +40,6 @@ __pycache__/
 bench/datasets/labels*.csv
 *.rock
 jev-edge/
+
+# agent worktrees
+.claude/worktrees/

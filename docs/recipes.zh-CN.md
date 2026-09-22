@@ -9,7 +9,7 @@ jev-edge 把整套判定暴露成 OpenResty adapter 上的一个 HTTP 端点 `/_
 发给 jev-edge 的请求：
 
 - `POST /_jev/authz/<原始路径>`（任何方法；L1 检查的是原始方法）
-- 原始 `Content-Type` 和 body
+- 原始 `Content-Type`、`Content-Encoding` 和 body（压缩的 body 会被解码；缺了这个头就读不了）
 - 客户端地址放在 `X-Forwarded-For`（取第一个值）
 
 答复：
@@ -24,7 +24,7 @@ jev-edge 把整套判定暴露成 OpenResty adapter 上的一个 HTTP 端点 `/_
 每条配方都必须保住的两个性质：
 
 - **Fail-open。** jev-edge 不可达或慢了，放行并标 `X-Jev-Verdict: error`。下面每个网关都有这个开关，每段配置里都设了。
-- **body 大小。** jev-edge 最多读 `rules.max_body_bytes`（64 KB）。给网关同样的上限，大 body 就不会卡住子请求；无论如何 L1 都会以 `body too large` 放行它。
+- **body 大小。** jev-edge 对不超过 `rules.max_body_bytes`（1 MiB）的 body 整体解析；超过的只扫描前 `max_body_bytes` 字节和最后 64 KiB 里的文本字段。给网关同样的上限。只转发大 body 一部分的网关必须标明：基于 Envoy 的（Istio、Envoy Gateway）在 `allowPartialMessage` 下发送 `x-envoy-auth-partial-body: true`，jev-edge 把这样的 body 当作开头扫描。没有标记的截断 body 会被当作完整 body 解析，截断的 JSON 抽不出文本。详见 README 的 [body 大小与 L1 读什么](../README.zh-CN.md#body-大小与-l1-读什么)。
 
 nginx 这边只有一个 location：
 
@@ -57,9 +57,9 @@ meshConfig:
         pathPrefix: /_jev/authz
         timeout: 2s
         failOpen: true
-        includeRequestHeadersInCheck: ["content-type", "content-length", "x-forwarded-for"]
+        includeRequestHeadersInCheck: ["content-type", "content-encoding", "content-length", "x-forwarded-for"]
         includeRequestBodyInCheck:
-          maxRequestBytes: 65536
+          maxRequestBytes: 1048576
           allowPartialMessage: true
         headersToUpstreamOnAllow: ["x-jev-*"]
         headersToDownstreamOnDeny: ["content-type", "x-jev-*"]
@@ -84,7 +84,7 @@ spec:
             paths: ["/v1/*", "/api/chat*"]
 ```
 
-只有设了 `includeRequestBodyInCheck` Istio 才会发 body；不设的话 jev-edge 回 `skipped`，理由是 `no body`。`allowPartialMessage: true` 让超过上限的 body 被截断送达，而不是让检查失败。
+只有设了 `includeRequestBodyInCheck` Istio 才会发 body；不设的话 jev-edge 回 `skipped`，理由是 `no body`。`allowPartialMessage: true` 让超过上限的 body 被截断送达并带上 `x-envoy-auth-partial-body: true`，而不是让检查失败；jev-edge 把它当作更大 body 的开头扫描。
 
 ## Envoy Gateway（Gateway API）
 
@@ -100,9 +100,9 @@ spec:
       name: llm-api
   extAuth:
     failOpen: true
-    headersToExtAuth: ["content-type", "content-length", "x-forwarded-for"]
+    headersToExtAuth: ["content-type", "content-encoding", "content-length", "x-forwarded-for"]
     bodyToExtAuth:
-      maxRequestBytes: 65536
+      maxRequestBytes: 1048576
     http:
       backendRefs:
         - name: jev-edge
@@ -111,7 +111,7 @@ spec:
       headersToBackend: ["x-jev-verdict", "x-jev-score", "x-jev-source", "x-jev-reason", "x-jev-request-id"]
 ```
 
-`path` 会作为路径前缀传给 Envoy，这正是 jev-edge 期望的（它剥掉 `/_jev/authz` 再判定剩余部分）。第一个请求就验证一下：聊天端点上出现 `X-Jev-Reason: path+not+watched`，说明你这个版本的 Envoy Gateway 是替换路径而不是加前缀；那就去掉 `path`，改用 `EnvoyPatchPolicy` 设前缀。注意 `bodyToExtAuth.maxRequestBytes` 对更大的 body 返回 413 而不是跳过检查；同一路由上如果接受更大的上传，把它设成真实上限而不是 64 KB。
+`path` 会作为路径前缀传给 Envoy，这正是 jev-edge 期望的（它剥掉 `/_jev/authz` 再判定剩余部分）。第一个请求就验证一下：聊天端点上出现 `X-Jev-Reason: path+not+watched`，说明你这个版本的 Envoy Gateway 是替换路径而不是加前缀；那就去掉 `path`，改用 `EnvoyPatchPolicy` 设前缀。注意 `bodyToExtAuth.maxRequestBytes` 对更大的 body 返回 413 而不是跳过检查；同一路由上如果接受更大的上传，把它设成真实上限而不是 1 MiB。完整送达 jev-edge 但超过 `rules.max_body_bytes` 的 body 按开头和结尾判定。
 
 ## Azure API Management
 

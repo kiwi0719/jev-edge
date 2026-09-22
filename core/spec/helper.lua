@@ -63,7 +63,7 @@ do
       re = rex.new(pattern, CASELESS)
       compiled[pattern] = re
     end
-    return re:find(subject) ~= nil
+    return re:find(subject)   -- from, to (1-based, inclusive) or nil
   end
 end
 

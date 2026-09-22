@@ -9,7 +9,7 @@ jev-edge exposes its whole evaluation as one HTTP endpoint, `/_jev/authz`, on th
 Request to jev-edge:
 
 - `POST /_jev/authz/<original path>` (any method; the original method is what L1 checks)
-- the original `Content-Type` and body
+- the original `Content-Type`, `Content-Encoding` and body (a compressed body is decoded; without the header it cannot be read)
 - the client address in `X-Forwarded-For` (first value is used)
 
 Answer:
@@ -24,7 +24,7 @@ Answer:
 Two properties every recipe must keep:
 
 - **Fail-open.** If jev-edge is unreachable or slow, allow the request and mark it `X-Jev-Verdict: error`. Every gateway below has a switch for this; it is set in every snippet.
-- **Body size.** jev-edge reads at most `rules.max_body_bytes` (64 KB). Give the gateway the same cap so a large body does not stall the subrequest; L1 passes it as `body too large` either way.
+- **Body size.** jev-edge parses a body up to `rules.max_body_bytes` (1 MiB) whole; past it, it scans the first `max_body_bytes` and the last 64 KiB for the text fields. Give the gateway the same cap. A gateway that forwards only part of a larger body must say so: Envoy-based ones (Istio, Envoy Gateway) send `x-envoy-auth-partial-body: true` with `allowPartialMessage`, and jev-edge scans that body as a head. A cut body with no flag is parsed as if whole, and truncated JSON yields no text. Details in the README, [Body size and what L1 reads](../README.md#body-size-and-what-l1-reads).
 
 The nginx side is one location:
 
@@ -57,9 +57,9 @@ meshConfig:
         pathPrefix: /_jev/authz
         timeout: 2s
         failOpen: true
-        includeRequestHeadersInCheck: ["content-type", "content-length", "x-forwarded-for"]
+        includeRequestHeadersInCheck: ["content-type", "content-encoding", "content-length", "x-forwarded-for"]
         includeRequestBodyInCheck:
-          maxRequestBytes: 65536
+          maxRequestBytes: 1048576
           allowPartialMessage: true
         headersToUpstreamOnAllow: ["x-jev-*"]
         headersToDownstreamOnDeny: ["content-type", "x-jev-*"]
@@ -84,7 +84,7 @@ spec:
             paths: ["/v1/*", "/api/chat*"]
 ```
 
-Istio sends the body only when `includeRequestBodyInCheck` is set; without it jev-edge answers `skipped` with reason `no body`. `allowPartialMessage: true` is what makes a body over the cap arrive truncated instead of failing the check.
+Istio sends the body only when `includeRequestBodyInCheck` is set; without it jev-edge answers `skipped` with reason `no body`. `allowPartialMessage: true` is what makes a body over the cap arrive truncated, flagged `x-envoy-auth-partial-body: true`, instead of failing the check; jev-edge scans it as the head of a larger body.
 
 ## Envoy Gateway (Gateway API)
 
@@ -100,9 +100,9 @@ spec:
       name: llm-api
   extAuth:
     failOpen: true
-    headersToExtAuth: ["content-type", "content-length", "x-forwarded-for"]
+    headersToExtAuth: ["content-type", "content-encoding", "content-length", "x-forwarded-for"]
     bodyToExtAuth:
-      maxRequestBytes: 65536
+      maxRequestBytes: 1048576
     http:
       backendRefs:
         - name: jev-edge
@@ -111,7 +111,7 @@ spec:
       headersToBackend: ["x-jev-verdict", "x-jev-score", "x-jev-source", "x-jev-reason", "x-jev-request-id"]
 ```
 
-`path` is forwarded to Envoy as a path prefix, which is what jev-edge expects (it strips `/_jev/authz` and evaluates the rest). Verify on the first request: an `X-Jev-Reason: path+not+watched` on a chat endpoint means your Envoy Gateway version replaced the path instead of prefixing it; pin `path` off and set the prefix through an `EnvoyPatchPolicy` in that case. Note `bodyToExtAuth.maxRequestBytes` returns 413 for larger bodies rather than skipping the check; set it to your real upper bound, not to 64 KB, if you accept larger uploads on the same route.
+`path` is forwarded to Envoy as a path prefix, which is what jev-edge expects (it strips `/_jev/authz` and evaluates the rest). Verify on the first request: an `X-Jev-Reason: path+not+watched` on a chat endpoint means your Envoy Gateway version replaced the path instead of prefixing it; pin `path` off and set the prefix through an `EnvoyPatchPolicy` in that case. Note `bodyToExtAuth.maxRequestBytes` returns 413 for larger bodies rather than skipping the check; set it to your real upper bound, not to 1 MiB, if you accept larger uploads on the same route. A body that reaches jev-edge whole but exceeds `rules.max_body_bytes` is judged on its head and tail.
 
 ## Azure API Management
 

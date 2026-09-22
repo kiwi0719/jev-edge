@@ -260,7 +260,7 @@
       "name": "on_skipped"
     }
   ],
-  "core_version": "0.3.1",
+  "core_version": "0.4.0",
   "format_version": 1,
   "generated_by": "core/golden/gen.lua",
   "suite": "policy"

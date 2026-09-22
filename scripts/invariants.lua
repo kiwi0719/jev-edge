@@ -105,6 +105,7 @@ end)
 rule("get-headers-limit", function(r)
   local files = tracked("adapters/openresty/lib", "%.lua$")
   files[#files + 1] = "adapters/apisix/apisix/plugins/jev-edge.lua"
+  files[#files + 1] = "adapters/kong/kong/plugins/jev-edge/handler.lua"
   for _, f in ipairs(files) do
     local s = code(f)
     local n = 0
@@ -125,6 +126,7 @@ rule("cache-key", function(r)
   for _, f in ipairs(tracked("core", "^core/[^/]+%.lua$")) do files[#files + 1] = f end
   for _, f in ipairs(tracked("adapters/js/src", "%.ts$")) do files[#files + 1] = f end
   files[#files + 1] = "adapters/apisix/apisix/plugins/jev-edge.lua"
+  files[#files + 1] = "adapters/kong/kong/plugins/jev-edge/handler.lua"
   for _, f in ipairs(files) do
     if not allowed[f] then
       local s = read(f) or ""
@@ -143,7 +145,8 @@ rule("fingerprint-hash", function(r)
       fail(r, f .. ": djb2 outside the golden reference")
     end
   end
-  for _, f in ipairs({ "adapters/openresty/lib/resty/jev/edge.lua", "adapters/apisix/apisix/plugins/jev-edge.lua" }) do
+  for _, f in ipairs({ "adapters/openresty/lib/resty/jev/edge.lua", "adapters/apisix/apisix/plugins/jev-edge.lua",
+                       "adapters/kong/kong/plugins/jev-edge/handler.lua" }) do
     local s = code(f)
     if s:find("djb2") or s:find("crc32") then fail(r, f .. ": weak fingerprint hash") end
     if not s:find("hash%s*=%s*sha256_hex") then fail(r, f .. ": ctx.hash is not sha256_hex") end

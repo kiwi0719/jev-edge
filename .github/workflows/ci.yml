@@ -8,12 +8,9 @@ on:
       - "docs/**"
       - "LICENSE"
       - ".github/ISSUE_TEMPLATE/**"
+  # every pull request runs, docs-only ones included: the main ruleset
+  # requires `ci-ok`, and a check that never reports blocks the merge
   pull_request:
-    paths-ignore:
-      - "**.md"
-      - "docs/**"
-      - "LICENSE"
-      - ".github/ISSUE_TEMPLATE/**"
   workflow_dispatch:
   # Weekly: the e2e jobs pull upstream Envoy, HAProxy, APISIX, Traefik, Caddy
   # and nginx images, which move without a commit here.
@@ -171,3 +168,20 @@ jobs:
       # pyflakes and bugbear: real bugs, not style
       - run: ruff check --select F,B,E --ignore E501 --target-version py39 .
       - run: python3 -m pytest -q
+
+  # The one check the main ruleset requires: green only when every job above
+  # succeeded. Adding, removing or renaming a job or matrix entry needs no
+  # ruleset change, only an edit to `needs` here (scripts/invariants.lua
+  # checks that it lists every job).
+  ci-ok:
+    if: always()
+    needs: [lint, core-tests, openresty-tests, e2e, js, go, litellm]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: every job succeeded
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          echo "$NEEDS" | jq -e 'all(.[]; .result == "success")' > /dev/null

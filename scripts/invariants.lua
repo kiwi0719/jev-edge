@@ -299,6 +299,24 @@ rule("template-parity", function(r)
   end
 end)
 
+-- 12. The ruleset's one required check covers every CI job: `ci-ok` needs
+--     all of them (a job left out could fail and still let a PR merge)
+rule("ci-ok", function(r)
+  local ci = read(".github/workflows/ci.yml") or ""
+  local jobs_block = ci:match("\njobs:\n(.*)$") or ""
+  local jobs = {}
+  for name in jobs_block:gmatch("\n  ([%w_%-]+):") do jobs[#jobs + 1] = name end
+  local first = jobs_block:match("^  ([%w_%-]+):")
+  if first then table.insert(jobs, 1, first) end
+  local needs = ci:match("\n  ci%-ok:.-\n    needs:%s*%[([^%]]*)%]")
+  if not needs then return fail(r, "ci.yml has no ci-ok job with a needs list") end
+  local listed = {}
+  for n in needs:gmatch("[%w_%-]+") do listed[n] = true end
+  for _, j in ipairs(jobs) do
+    if j ~= "ci-ok" and not listed[j] then fail(r, "ci-ok does not need job " .. j) end
+  end
+end)
+
 -- ---------------------------------------------------------------------------
 if #failures > 0 then
   io.stderr:write(("invariants: %d problem(s) across %d rules\n"):format(#failures, checked))

@@ -33,33 +33,35 @@ function _M.new(cfg, inflight, metrics)
 
   local function now_ms() return ngx.now() * 1000 end
 
-  -- core passes cfg.jev.timeout_ms; the adaptive estimate overrides it.
-  function self.call(prompt, _requested_timeout)
-    local timeout_ms = adaptive:current()
+  local key = "inflight:l2"
+  local function release()
+    if not inflight then return end
+    local n = inflight:incr(key, -1, 0)
+    -- evicted or reset counter: clamp instead of letting the cap grow
+    if n and n < 0 then inflight:set(key, 0, 0) end
+  end
 
-    -- Concurrency cap applies to every provider, mock included, so the limit
-    -- is exercised by the soak test.
-    local key = "inflight:l2"
-    local max = tonumber(cfg.max_inflight) or 64
-    if inflight then
-      local n = inflight:incr(key, 1, 0)
-      if n and n > max then
-        inflight:incr(key, -1, 0)
-        return nil, "max_inflight exceeded"
-      end
-    end
+  -- core passes cfg.jev.timeout_ms and the adaptive estimate (floor..ceiling)
+  -- overrides it. A caller asking for MORE than the estimate (L3 with the
+  -- ceiling, /_jev/health) gets what it asked for, and such a call does not
+  -- feed the adaptive estimate: it is not an L2 sample.
+  local function do_call(prompt, requested)
+    local est = adaptive:current()
+    local req_ms = tonumber(requested)
+    local timeout_ms = (req_ms and req_ms > est) and req_ms or est
+    local is_l2 = timeout_ms == est
 
     if provider.local_only then
       local t0 = now_ms()
       local answers, err = provider.call(prompt, cfg, timeout_ms)
-      if inflight then inflight:incr(key, -1, 0) end
       ngx.update_time()
-      if answers then adaptive:success(now_ms() - t0)
-      elseif tostring(err):find("timeout", 1, true) then adaptive:timeout(timeout_ms) end
+      if is_l2 then
+        if answers then adaptive:success(now_ms() - t0)
+        elseif tostring(err):find("timeout", 1, true) then adaptive:timeout(timeout_ms) end
+      end
       return answers, err
     end
     if not http_ok then
-      if inflight then inflight:incr(key, -1, 0) end
       return nil, "lua-resty-http not installed"
     end
 
@@ -82,19 +84,38 @@ function _M.new(cfg, inflight, metrics)
       keepalive_timeout = 60000,
       keepalive_pool = 16,
     })
-    if inflight then inflight:incr(key, -1, 0) end
     ngx.update_time()
     local elapsed = now_ms() - t0
 
     if not res then
-      if tostring(err):find("timeout", 1, true) then adaptive:timeout(timeout_ms) end
+      if is_l2 and tostring(err):find("timeout", 1, true) then adaptive:timeout(timeout_ms) end
       return nil, tostring(err)
     end
-    local answers, perr2, usage = provider.parse_response(res.status, res.body, cfg)
+    -- req.ctx: per-call state the provider needs to read its own answer
+    -- (openai-compat's question set); never stored on the shared cfg table.
+    local answers, perr2, usage = provider.parse_response(res.status, res.body, cfg, req.ctx)
     if metrics and usage then metrics("usage", usage) end
     if not answers then return nil, perr2 end
-    adaptive:success(elapsed)
+    if is_l2 then adaptive:success(elapsed) end
     return answers
+  end
+
+  function self.call(prompt, requested_timeout)
+    -- Concurrency cap applies to every provider, mock included, so the limit
+    -- is exercised by the soak test. The slot is released on every exit,
+    -- including a Lua error or a client abort killing the thread mid-call.
+    local max = tonumber(cfg.max_inflight) or 64
+    if inflight then
+      local n = inflight:incr(key, 1, 0)
+      if n and n > max then
+        release()
+        return nil, "max_inflight exceeded"
+      end
+    end
+    local ok, answers, err = pcall(do_call, prompt, requested_timeout)
+    release()
+    if not ok then return nil, "judge error: " .. tostring(answers) end
+    return answers, err
   end
 
   return self

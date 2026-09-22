@@ -1,6 +1,6 @@
 {
   "name": "@jev-edge/js",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "jev-edge for JavaScript runtimes: Cloudflare Workers and Pages, Next.js, Node, Hono, Lambda@Edge. Same core contract as the OpenResty adapter.",
   "license": "Apache-2.0",
   "type": "module",
@@ -42,11 +42,11 @@
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20250906.0",
-    "@types/node": "^26.6.2",
+    "@types/node": "^20.19.0",
     "typescript": "^5.6.0",
     "vitest": "^2.1.0"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   }
 }

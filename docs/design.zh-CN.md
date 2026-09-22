@@ -20,7 +20,7 @@
 - 替代传统 WAF。SQLi、路径穿越、扫描器交给 CRS / ModSecurity，它们更快也更擅长。
 - 响应侧过滤。
 - 训练或托管模型。判定完全来自 provider。
-- 在 Cloudflare 上跑 L3 旁路；Worker 会设置 `verdict.async`，但目前没有消费者。Envoy 自 0.2.0 起支持，Cloudflare 自 0.3.0 起。
+- 在 Cloudflare 上跑 L3 旁路；Worker 会设置 `verdict.async`，但目前没有消费者。
 
 ## 架构
 
@@ -127,7 +127,7 @@ return {
 | `rep:<ip>` | 客户端 IP | 600 s | 单 IP 判定聚合 |
 | `rep:<ip>:<path>` | IP + 路径 | 120 s | 同一端点被刷 |
 
-归一化决定命中率：NFKC + 小写、折叠空白、去掉 UUID 和四位以上数字串、截到 `fp_prefix_bytes`（2048），再哈希（OpenResty 里用 `ngx.crc32_long`）。bench 给出不同归一化强度下命中率与漏过率的对比。
+归一化决定命中率：NFKC + 小写、折叠空白、去掉 UUID 和四位以上数字串、再对整段归一化文本做 SHA-256（0.3.0 只哈希前 2048 字节且用 `crc32_long`，两者都让攻击者能复用别的文本的缓存或信任判定，0.3.1 一并改掉）。`fp_prefix_bytes` 现在只限制采样和日志里的文本长度。bench 给出不同归一化强度下命中率与漏过率的对比。
 
 ## L2：同步判定
 
@@ -279,13 +279,13 @@ HAProxy 的 SPOE 把请求连 body 交给 `adapters/haproxy/spoa`，一个调 `/
 
 薄预设的存在是因为最常见的 Cloudflare 部署后面本来就有网关，而两套阈值正是要避免的故障模式：它在边缘跑 L1 和缓存，把分数、部署上下文和 key 留在源站。`backend` provider 把源站的 `X-Jev-*` 答案翻译回答案表，所以 Worker 自己的 policy 仍然生效（边缘的 `enforce` 会按源站的分数拦截）。
 
-与 nginx 的差异来自平台而不是设计：KV 最小 60 秒 TTL 和最终一致性、熔断状态多一跳 Durable Object、指纹用 `djb2` 而不是 `crc32_long`（两边永远不共享缓存，所以无所谓）、没有 `/_jev/config` 热更新（配置即代码）、暂无 L3。完整清单在 adapter 的 README 里。
+与 nginx 的差异来自平台而不是设计：KV 最小 60 秒 TTL 和最终一致性、熔断状态多一跳 Durable Object、指纹哈希不同（nginx 上是 SHA-256，包里是 `djb2`；两边永远不共享缓存，所以只有抗碰撞性重要）、没有 `/_jev/config` 热更新（配置即代码）、暂无 L3。完整清单在 adapter 的 README 里。
 
 ## 主体轨迹
 
 单条请求可以看起来无害，却是一次分六条消息组装的攻击的第六步。要抓住它需要按主体随时间打分。`core/subject.lua`（移植为 `adapters/js/src/core/subject.ts`）是其中不需要流量就能做的那一半：契约。`evaluate` 接受可选的 `ctx.subject = { id, history, record }`；在每个做出判定的出口（缓存命中、熔断跳过、L2、信任、L1 拦截；L1 放行不算，那是热路径）把一条扁平记录（`at, subject, verdict, score, source, reason, fingerprint`）交给 `record` 然后直接返回，不等待。`history` 在请求路径上读取但**本版本忽略**；golden vectors 断言带主体和非空历史的请求和不带的判定逐字段相同。窗口、衰减和阈值一个都没定，因为没有东西可以校准；基于记录下来的轨迹打分属于未来可能实现的工作，没有排期。现在钉死两条约束，让 adapter 和向量只写一次：主体 id 由 adapter 提取，core 不知道是哪种；写入是 sink，永不等待。
 
-提取和存储随契约一起发布。`subject = { enabled, from = "ip" | "header" | "cookie", name, salt, hashed, history_ttl, max_entries }` 在每个 adapter 上相同。header 或 cookie 的原始值是凭证（API key、session id），**永远不存、不记日志、不采样**：adapter 对 `salt .. value` 做哈希（OpenResty 和 APISIX 用 SHA-1，JavaScript 宿主用 SHA-256），下游只见 `<from>:<hex>`。salt 是每个部署一个的秘密，日志或 dict 泄露不等于凭证泄露；没有 salt 的配置会被拒绝。`hashed = true` 把值当作完整 id 接受，薄 Worker 就是这样通过 `X-Jev-Subject` 把哈希后的 id 交给源站。轨迹放在**自己的 dict** 里（OpenResty 和 APISIX 的 `jev_subject`，JavaScript 宿主的 `subjectStore`），每个主体一个 key，保留最新 `max_entries` 条、`history_ttl` 秒：一个有一百万个 session 的爬虫可以把它填满，填满时被淘汰的只有轨迹，判定缓存和信任不受影响。历史读取是请求路径上的一次查找；写入在零延迟定时器里（JavaScript 宿主上是不等待的 promise）。哈希后的 id 也出现在每行 `$jev_log` 的 `subject` 字段里，轨迹打分要靠它校准。
+提取和存储随契约一起发布。`subject = { enabled, from = "ip" | "header" | "cookie", name, salt, hashed, history_ttl, max_entries }` 在每个 adapter 上相同。header 或 cookie 的原始值是凭证（API key、session id），**永远不存、不记日志、不采样**：adapter 对 `salt .. value` 做哈希（0.3.1 起所有 adapter 都用 SHA-256），下游只见 `<from>:<hex>`。salt 是每个部署一个的秘密，日志或 dict 泄露不等于凭证泄露；没有 salt 的配置会被拒绝。`hashed = true` 把值当作完整 id 接受，薄 Worker 就是这样通过 `X-Jev-Subject` 把哈希后的 id 交给源站。轨迹放在**自己的 dict** 里（OpenResty 和 APISIX 的 `jev_subject`，JavaScript 宿主的 `subjectStore`），每个主体一个 key，保留最新 `max_entries` 条、`history_ttl` 秒：一个有一百万个 session 的爬虫可以把它填满，填满时被淘汰的只有轨迹，判定缓存和信任不受影响。OpenResty 和 APISIX 上轨迹是一个环：每个主体一个原子计数器、每条记录一个 dict key，写入是两次原子操作、内联完成（没有定时器，也没有会被两个 worker 互相覆盖的读改写），读取是 `max_entries` 次查找。JavaScript 宿主仍是每个主体一个列表，由不等待的 promise 写入。哈希后的 id 也出现在每行 `$jev_log` 的 `subject` 字段里，轨迹打分要靠它校准。
 
 ## 误报反馈
 

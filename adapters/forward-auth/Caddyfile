@@ -3,10 +3,21 @@
 # for reputation enforcement on top of another judging path, or move judgment
 # into the OpenResty adapter behind Caddy.
 :80 {
-    forward_auth jev-edge:8080 {
-        uri /_jev/forward-auth
-        copy_headers X-Jev-Verdict X-Jev-Score X-Jev-Source X-Jev-Reason X-Jev-Request-Id
-        # Caddy sets X-Forwarded-Method and X-Forwarded-Uri itself.
+    # `route` keeps the written order: Caddy's default directive order runs
+    # forward_auth BEFORE request_header, which would strip the real verdict.
+    route {
+        # never trust a client-supplied verdict: strip before forward_auth runs
+        request_header -X-Jev-Verdict
+        request_header -X-Jev-Score
+        request_header -X-Jev-Source
+        request_header -X-Jev-Reason
+        request_header -X-Jev-Request-Id
+        request_header -X-Jev-Subject
+        forward_auth jev-edge:8080 {
+            uri /_jev/forward-auth
+            copy_headers X-Jev-Verdict X-Jev-Score X-Jev-Source X-Jev-Reason X-Jev-Request-Id
+            # Caddy sets X-Forwarded-Method and X-Forwarded-Uri itself.
+        }
+        reverse_proxy app:8081
     }
-    reverse_proxy app:8081
 }

@@ -101,9 +101,14 @@ function _M.extract(scfg, view)
   if type(v) == "table" then v = v[1] end
   if type(v) ~= "string" then return nil end
   v = v:match("^%s*(.-)%s*$")
-  if v == "" then return nil end
+  if v == "" or #v > _M.MAX_VALUE_BYTES then return nil end
   return v
 end
+
+--- Longest raw subject value accepted. Hashing makes the length irrelevant
+--- for the store, but with `hashed = true` the value IS the key and the log
+--- field, so an unbounded header would be an unbounded dict key.
+_M.MAX_VALUE_BYTES = 512
 
 --- The id core and the store see: `<from>:<hash(salt .. value)>`. The raw
 -- value never leaves this function. With `hashed = true` the value is used as
@@ -113,7 +118,12 @@ end
 function _M.hash_id(scfg, value, hash)
   if value == nil then return nil end
   local from = scfg.from or "ip"
-  if scfg.hashed then return value end
+  if scfg.hashed then
+    -- Already `<from>:<hex>` from another jev-edge. Anything else is not an
+    -- id computed by us and does not get to name a trajectory.
+    if value:match("^[a-z]+:[0-9a-f]+$") then return value end
+    return nil
+  end
   if type(scfg.salt) ~= "string" or scfg.salt == "" then return nil end
   return from .. ":" .. tostring(hash(scfg.salt .. "\0" .. value))
 end
@@ -131,6 +141,43 @@ function _M.append(history, e, max_entries)
 end
 
 function _M.key(id) return _M.KEY_PREFIX .. tostring(id) end
+
+-- ---------------------------------------------------------------------------
+-- Ring layout for stores without compare-and-swap (nginx shared dicts).
+-- `load`/`save` above keep one list per subject; appending to it is a
+-- read-modify-write, and two workers doing it at once lose an entry. The ring
+-- keeps one counter per subject (`incr`, atomic) and one key per entry,
+-- `subj:<id>:<n % max>`, so a write is two atomic dict operations and needs
+-- neither a lock nor a timer. Reading is `max` gets, newest last.
+-- store: { get, set, incr = fn(self, key, by, ttl) -> new value|nil }
+-- ---------------------------------------------------------------------------
+
+function _M.ring_append(store, id, e, max_entries, ttl)
+  if not store or not id or type(store.incr) ~= "function" then return false end
+  local max = tonumber(max_entries) or 20
+  local t = tonumber(ttl) or 3600
+  local key = _M.key(id)
+  local n = store:incr(key .. ":n", 1, t)
+  if not n then return false end
+  return store:set(key .. ":" .. ((n - 1) % max), e, t)
+end
+
+function _M.ring_load(store, id, max_entries)
+  if not store or not id then return nil end
+  local max = tonumber(max_entries) or 20
+  local key = _M.key(id)
+  local n = tonumber(store:get(key .. ":n")) or 0
+  if n == 0 then return nil end
+  local out = {}
+  local first = math.max(1, n - max + 1)
+  for i = first, n do
+    local e = store:get(key .. ":" .. ((i - 1) % max))
+    -- an evicted or expired slot is a hole, not an error; skip it
+    if type(e) == "table" then out[#out + 1] = e end
+  end
+  if #out == 0 then return nil end
+  return out
+end
 
 --- Read a subject's history from a store. nil when absent, always valid.
 function _M.load(store, id)

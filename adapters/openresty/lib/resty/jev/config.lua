@@ -23,14 +23,16 @@ local rules_mod = require "jev.core.rules"
 -- rules entries are rule set ids or inline tables (with optional `extends`),
 -- see core/rules.lua resolve(). A bad entry is logged and skipped so one
 -- tenant's typo does not take the gateway down.
+local function load_rule_set(id)
+  local ok, r = pcall(require, "jev.rules." .. id)
+  if ok then return r end
+  return nil, tostring(r)
+end
+
 local function load_rules(specs)
   local out = {}
   for i, spec in ipairs(specs or {}) do
-    local rule, err = rules_mod.resolve(spec, function(id)
-      local ok, r = pcall(require, "jev.rules." .. id)
-      if ok then return r end
-      return nil, tostring(r)
-    end)
+    local rule, err = rules_mod.resolve(spec, load_rule_set)
     if rule then
       out[#out + 1] = rule
     else
@@ -149,6 +151,10 @@ function _M.set_override(tbl)
   local merged = defaults.merge(defaults.merge(defaults.config, state.file_cfg), tbl or {})
   local ok, err = defaults.validate(merged)
   if not ok then return nil, err end
+  -- An override is refused, not logged-and-skipped, when a rule in it is
+  -- broken: the caller is right there to read the error.
+  local _, rerr = rules_mod.resolve_all(merged.rules, load_rule_set)
+  if rerr then return nil, rerr end
   if tbl == nil then
     dict:delete("override")
   else

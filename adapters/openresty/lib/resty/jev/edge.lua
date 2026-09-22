@@ -19,14 +19,39 @@ local subject_m = require "jev.core.subject"
 local trust     = require "jev.core.trust"
 local cjson     = require "cjson.safe"
 
-local _M = { _VERSION = "0.3.0" }
+local _M = { _VERSION = "0.3.1" }
 
 local CACHE_DICT = "jev_cache"
+-- Safety-critical state (trust grants, breaker, in-flight counters, adaptive
+-- timeout) lives in its own small dict when `lua_shared_dict jev_state` is
+-- declared, so a flood of distinct prompts filling jev_cache cannot evict it.
+-- Without that dict everything shares jev_cache, as in 0.3.0.
+local STATE_DICT = "jev_state"
 local SUBJECT_DICT = "jev_subject"
 local subject_store
+local ADMIN_BODY_MAX = 1024 * 1024
 local HEADER_NAMES = { "X-Jev-Verdict", "X-Jev-Score", "X-Jev-Source", "X-Jev-Reason", "X-Jev-Request-Id" }
 
-local cache, breaker, judge, judge_cfg
+local cache, state, breaker, judge, judge_cfg
+
+local sha256_m = require "resty.sha256"
+local to_hex = require("resty.string").to_hex
+local function sha256_hex(s)
+  local h = sha256_m:new()
+  h:update(s)
+  return to_hex(h:final())
+end
+
+local function state_store()
+  if state then return state end
+  if ngx.shared[STATE_DICT] then
+    state = cache_m.new(STATE_DICT)
+  else
+    if not cache then cache = cache_m.new(CACHE_DICT) end
+    state = cache
+  end
+  return state
+end
 
 -- ---------------------------------------------------------------------------
 
@@ -36,6 +61,7 @@ end
 
 function _M.init_worker()
   cache = cache_m.new(CACHE_DICT)
+  state_store()
   local interval = 2
   local ok, err = ngx.timer.every(interval, function(premature)
     if premature then return end
@@ -50,14 +76,15 @@ end
 local function ensure_runtime(cfg)
   if not cache then cache = cache_m.new(CACHE_DICT) end
   if cfg ~= judge_cfg then
-    local j, err = http.new(cfg.jev, cache, metrics.usage)
+    local st = state_store()
+    local j, err = http.new(cfg.jev, st, metrics.usage)
     if not j then
       ngx.log(ngx.ERR, "jev-edge: ", err)
-      judge = { call = function() return nil, err end }
+      judge = { call = function() return nil, err end, adaptive = nil }
     else
       judge = j
     end
-    breaker = breaker_m.new(cache, ngx.now, cfg.breaker)
+    breaker = breaker_m.new(st, ngx.now, cfg.breaker)
     judge_cfg = cfg
   end
 end
@@ -123,36 +150,53 @@ local function set_headers(v)
   ngx.req.set_header("X-Jev-Request-Id", ngx.var.request_id or "")
 end
 
+-- The rule core judged with: the first one whose path, method and content
+-- type all match, which is the first one evaluate_all did not PASS on those
+-- gates. Path alone is not enough: a tenant rule can match the path and
+-- still hand the request to the general rule on method or content type.
+local function rule_for(req, rules)
+  local ct = (req.headers["content-type"] or ""):lower()
+  for _, r in ipairs(rules) do
+    local hit = false
+    for _, p in ipairs(r.watch_paths or {}) do
+      if (req.path or ""):find(p) then hit = true break end
+    end
+    if hit and r.methods and not r.methods[(req.method or ""):upper()] then hit = false end
+    if hit and r.content_types and #r.content_types > 0 then
+      local ok = false
+      for _, a in ipairs(r.content_types) do
+        if ct:find(a, 1, true) then ok = true break end
+      end
+      hit = ok
+    end
+    if hit then return r end
+  end
+  return nil
+end
+
 local function maybe_async(cfg, v, req, rules)
   if not v.async or not judge then return end
+  -- L3 exists to get an answer L2 could not; while the breaker is open the
+  -- provider is the reason, and hammering it from timers only keeps it open.
+  if breaker and breaker:state() ~= breaker_m.CLOSED then return end
   -- rebuild the prompt from the request; core does not hand it back
-  local rule
-  for _, r in ipairs(rules) do
-    for _, p in ipairs(r.watch_paths or {}) do
-      if (req.path or ""):find(p) then rule = r break end
-    end
-    if rule then break end
-  end
+  local rule = rule_for(req, rules)
   if not rule then return end
   local ct = req.headers["content-type"] or ""
   local text = normalize.extract(req.body, ct, rule.text_fields, cjson.decode)
   if text == "" then return end
-  local prompt = judge_mod.build(rule.templates, text, { path = req.path, method = req.method })
+  -- Same prompt L2 built, deployment context included: L3's verdict replaces
+  -- L2's in the cache, so it must not be judged with less context.
+  local prompt = judge_mod.build(rule.templates, text, {
+    path = req.path, method = req.method,
+    deployment = rule.deployment_context or cfg.jev.deployment_context or "",
+  })
   if not prompt then return end
   local ok, err = async.schedule({
-    cfg = cfg, cache = cache, judge = judge, prompt = prompt,
+    cfg = cfg, cache = cache, state = state_store(), judge = judge, prompt = prompt,
     fingerprint = v.fingerprint, client_ip = req.client_ip,
   })
   if not ok and err ~= "disabled" then metrics.incr_async_dropped() end
-end
-
-local function rule_for(req, rules)
-  for _, r in ipairs(rules) do
-    for _, p in ipairs(r.watch_paths or {}) do
-      if (req.path or ""):find(p) then return r end
-    end
-  end
-  return nil
 end
 
 -- Decision sampling: a share of judged requests, normalized text only, kept
@@ -168,13 +212,9 @@ local function maybe_sample(cfg, v, req, rules)
   if not ok then ngx.log(ngx.WARN, "jev-edge: sampling failed: ", err) end
 end
 
-local function sha1_hex(s)
-  return (ngx.sha1_bin(s):gsub(".", function(c) return string.format("%02x", c:byte()) end))
-end
-
 -- Per-subject trajectory: id extracted per cfg.subject, hashed with the salt
--- before anything stores or logs it; history read once here; the write goes
--- through a 0-delay timer so the request never waits on it.
+-- before anything stores or logs it; history read once here; the write is a
+-- ring append (see core/subject.lua) and does not yield.
 local function subject_ctx(cfg, req)
   local scfg = cfg.subject
   if not scfg or not scfg.enabled then return nil end
@@ -183,20 +223,17 @@ local function subject_ctx(cfg, req)
     header = function(n) return req.headers[n] end,
     cookie = function(n) return ngx.var["cookie_" .. tostring(n)] end,
   })
-  local id = subject_m.hash_id(scfg, raw, sha1_hex)
+  local id = subject_m.hash_id(scfg, raw, sha256_hex)
   if not id then return nil end
   subject_store = subject_store or cache_m.new(SUBJECT_DICT)
   local store = subject_store
   return {
     id = id,
-    history = subject_m.load(store, id),
+    history = subject_m.ring_load(store, id, scfg.max_entries),
+    -- Two atomic dict operations, inline: cheaper than the timer it
+    -- replaces and safe across workers (no read-modify-write).
     record = function(e)
-      local ok, err = ngx.timer.at(0, function(premature)
-        if premature then return end
-        local h = subject_m.append(subject_m.load(store, id), e, scfg.max_entries)
-        subject_m.save(store, id, h, scfg.history_ttl)
-      end)
-      if not ok then ngx.log(ngx.WARN, "jev-edge: subject write skipped: ", err) end
+      subject_m.ring_append(store, id, e, scfg.max_entries, scfg.history_ttl)
     end,
   }
 end
@@ -208,8 +245,10 @@ local function evaluate_current(cfg, rules, over)
   local subj = subject_ctx(cfg, req)
   ngx.ctx.jev_subject = subj and subj.id or nil
   local v = core.evaluate(req, {
-    config = cfg, rules = rules, cache = cache, trust = cache, judge = judge, breaker = breaker, subject = subj,
-    clock = ngx.now, hash = function(s) return string.format("%08x", ngx.crc32_long(s)) end,
+    config = cfg, rules = rules, cache = cache, trust = state_store(), judge = judge, breaker = breaker, subject = subj,
+    -- sha256, not crc32: the fingerprint keys the verdict cache and the trust
+    -- store, and a linear hash lets a few appended bytes hit a chosen value.
+    clock = ngx.now, hash = sha256_hex,
     json_decode = cjson.decode, re_find = re_find,
     log = function(level, msg) ngx.log(level == "error" and ngx.ERR or ngx.WARN, msg) end,
   })
@@ -267,6 +306,39 @@ function _M.log()
     src = v.source, score = v.score, verdict = v.verdict, action = v.action,
     l2_ms = v.l2_ms, fp = v.fingerprint, reason = v.reason, subject = ngx.ctx.jev_subject,
   })
+end
+
+-- Body of an admin request (config PUT, feedback POST): in memory when it fits
+-- client_body_buffer_size, otherwise nginx has already spooled it to disk and
+-- get_body_data() is nil. Read the file too, up to ADMIN_BODY_MAX.
+local function read_admin_body()
+  ngx.req.read_body()
+  local body = ngx.req.get_body_data()
+  if body then return body end
+  local file = ngx.req.get_body_file()
+  if not file then return nil end
+  local f = io.open(file, "rb")
+  if not f then return nil end
+  body = f:read(ADMIN_BODY_MAX + 1)
+  f:close()
+  if body and #body > ADMIN_BODY_MAX then return nil, "body too large" end
+  return body
+end
+
+-- What GET /_jev/config shows. The effective config carries the provider
+-- key (read from the environment), the feedback token and the subject salt;
+-- none of them belongs in an HTTP response, allow-listed or not.
+local SECRET_PATHS = { { "jev", "api_key" }, { "feedback", "token" }, { "subject", "salt" } }
+local function redacted(tbl)
+  if type(tbl) ~= "table" then return tbl end
+  local out = {}
+  for k, v in pairs(tbl) do out[k] = type(v) == "table" and redacted(v) or v end
+  for _, p in ipairs(SECRET_PATHS) do
+    local sect = out[p[1]]
+    if type(sect) == "table" and sect[p[2]] ~= nil then sect[p[2]] = "<redacted>" end
+  end
+  out._questions = nil
+  return out
 end
 
 -- Constant-time string compare, so a wrong token cannot be found byte by byte.
@@ -333,8 +405,7 @@ function _M.feedback()
     return
   end
 
-  ngx.req.read_body()
-  local body = ngx.req.get_body_data()
+  local body = read_admin_body()
   local tbl = body and cjson.decode(body)
   if type(tbl) ~= "table" or type(tbl.fp) ~= "string" or tbl.fp == "" then
     ngx.status = 400
@@ -345,11 +416,11 @@ function _M.feedback()
   local label = tostring(tbl.label or "benign"):lower()
   local by  = tbl.by and tostring(tbl.by):sub(1, 64) or nil
   local rid = tbl.rid and tostring(tbl.rid):sub(1, 64) or nil
-  if not cache then cache = cache_m.new(CACHE_DICT) end
+  local store = state_store()
   local now = ngx.now()
 
   if ATTACK[label] then
-    trust.revoke(cache, tbl.fp)
+    trust.revoke(store, tbl.fp)
     emit({ ts = now, src = "feedback", fp = tbl.fp, label = "attack", by = by, rid = rid,
            action = "revoke", reason = "operator label" })
     ngx.say(cjson.encode({ ok = true, fp = tbl.fp, label = "attack", trusted = false }))
@@ -361,7 +432,7 @@ function _M.feedback()
     return
   end
 
-  local rec, err = trust.grant(cache, tbl.fp, now, fcfg, { by = by, rid = rid })
+  local rec, err = trust.grant(store, tbl.fp, now, fcfg, { by = by, rid = rid })
   if not rec then
     emit({ ts = now, src = "feedback", fp = tbl.fp, label = "benign", by = by, rid = rid,
            action = "refused", reason = err })
@@ -381,11 +452,16 @@ function _M.config_api()
   local method = ngx.req.get_method()
   ngx.header["Content-Type"] = "application/json"
   if method == "GET" then
-    ngx.say(cjson.encode({ effective = config.current(), override = config.get_override() or cjson.null }))
+    ngx.say(cjson.encode({ effective = redacted(config.current()),
+                           override = redacted(config.get_override()) or cjson.null }))
     return
   elseif method == "PUT" then
-    ngx.req.read_body()
-    local body = ngx.req.get_body_data()
+    local body, berr = read_admin_body()
+    if berr then
+      ngx.status = 413
+      ngx.say(cjson.encode({ error = berr }))
+      return
+    end
     local tbl = body and cjson.decode(body)
     if type(tbl) ~= "table" then
       ngx.status = 400
@@ -407,6 +483,44 @@ function _M.config_api()
   end
   ngx.status = 405
   ngx.say('{"error":"method not allowed"}')
+end
+
+-- The client address as seen by the proxy in front of us. Proxies append to
+-- X-Forwarded-For, so the client's own (forgeable) value is leftmost and the
+-- address the trusted hop saw is rightmost: element `trusted_hops` from the
+-- right (1 = last). Envoy's x-envoy-external-address is already that value.
+local function client_ip_from(h, cfg)
+  local function first(v) if type(v) == "table" then return v[1] end return v end
+  local ext = first(h["x-envoy-external-address"])
+  if type(ext) == "string" and ext ~= "" then return (ext:match("^%s*(%S+)")) end
+  local xff = first(h["x-forwarded-for"])
+  if type(xff) ~= "string" or xff == "" then
+    local real = first(h["x-real-ip"])
+    if type(real) == "string" and real ~= "" then return (real:match("^%s*(%S+)")) end
+    return ngx.var.remote_addr
+  end
+  local hops = {}
+  for ip in xff:gmatch("[^,%s]+") do hops[#hops + 1] = ip end
+  local n = tonumber(cfg.client_ip and cfg.client_ip.trusted_hops) or 1
+  local ip = hops[#hops - n + 1]
+  return ip or ngx.var.remote_addr
+end
+
+-- Path normalisation for headers that carry the original URI: collapse
+-- duplicate slashes and resolve `.` / `..` the way nginx does for $uri, so a
+-- watch pattern anchored at `^/v1/` sees the path the backend will serve.
+local function normalize_path(path)
+  local out = {}
+  for seg in path:gmatch("[^/]+") do
+    if seg == ".." then
+      out[#out] = nil
+    elseif seg ~= "." then
+      out[#out + 1] = seg
+    end
+  end
+  local p = "/" .. table.concat(out, "/")
+  if path:sub(-1) == "/" and p ~= "/" then p = p .. "/" end
+  return p
 end
 
 local function respond_authz(cfg, rules, over, who)
@@ -449,10 +563,7 @@ function _M.authz(prefix)
   if uri:sub(1, #prefix) == prefix then path = uri:sub(#prefix + 1) end
   if path == "" then path = "/" end
   -- Envoy sets x-envoy-external-address / x-forwarded-for; nginx sees Envoy's IP.
-  local h = ngx.req.get_headers()
-  local xff = h["x-envoy-external-address"] or h["x-forwarded-for"]
-  if type(xff) == "table" then xff = xff[1] end
-  local client_ip = xff and xff:match("^%s*([^,%s]+)") or ngx.var.remote_addr
+  local client_ip = client_ip_from(ngx.req.get_headers(), cfg)
 
   return respond_authz(cfg, rules, { path = path, client_ip = client_ip }, "authz")
 end
@@ -473,10 +584,8 @@ function _M.forward_auth()
   -- nginx auth_request subrequests inherit the main request, so $request_uri
   -- is the original URI even when no X-Original-URI header was set.
   local uri = first(h["x-forwarded-uri"] or h["x-original-uri"] or h["x-original-url"]) or ngx.var.request_uri or "/"
-  local path = uri:match("^[^?]*") or "/"
-  if path == "" then path = "/" end
-  local xff = first(h["x-forwarded-for"] or h["x-real-ip"])
-  local client_ip = xff and xff:match("^%s*([^,%s]+)") or ngx.var.remote_addr
+  local path = normalize_path(uri:match("^[^?]*") or "/")
+  local client_ip = client_ip_from(h, cfg)
   return respond_authz(cfg, rules, { method = method:upper(), path = path, client_ip = client_ip }, "forward_auth")
 end
 
@@ -498,12 +607,16 @@ function _M.health()
   local answers, jerr = judge.call(prompt, cfg.jev.timeout_max_ms or cfg.jev.timeout_ms)
   ngx.update_time()
   local ms = math.floor((ngx.now() - t0) * 1000)
-  local n, mean = judge.adaptive:stats()
+  local n, mean, effective = 0, 0, cfg.jev.timeout_ms
+  if judge.adaptive then
+    n, mean = judge.adaptive:stats()
+    effective = judge.adaptive:current()
+  end
   local body = {
     ok = answers ~= nil,
     provider = cfg.jev.provider, endpoint = cfg.jev.endpoint or cjson.null, model = cfg.jev.model or cjson.null,
     latency_ms = ms, error = jerr or cjson.null, score = answers and answers.injection or cjson.null,
-    timeout = { effective_ms = judge.adaptive:current(), floor_ms = cfg.jev.timeout_ms,
+    timeout = { effective_ms = effective, floor_ms = cfg.jev.timeout_ms,
                 max_ms = cfg.jev.timeout_max_ms or cjson.null, samples = n, mean_ms = math.floor(mean) },
     breaker_state = breaker and breaker:state() or cjson.null,
     mode = cfg.policy.mode,

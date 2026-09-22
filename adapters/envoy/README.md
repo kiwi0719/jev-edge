@@ -34,11 +34,13 @@ Both keep every property of the nginx deployment: L1 rules, cache, breaker, adap
    failure_mode_allow: true
    ```
 
-   `timeout` must exceed `jev.timeout_max_ms` plus network, otherwise Envoy gives up before jev-edge's own fail-open can answer. `failure_mode_allow: true` is the Envoy-level fail-open for when OpenResty itself is unreachable.
+   `timeout` must exceed `jev.timeout_max_ms` plus network, otherwise Envoy gives up before jev-edge's own fail-open can answer. `failure_mode_allow: true` is the Envoy-level fail-open for when OpenResty itself is unreachable. Note that `failure_mode_allow` cannot add headers: a request that passed this way reaches your upstream with **no** `X-Jev-Verdict` at all (`failure_mode_allow_header_add` only adds `x-envoy-auth-failure-mode-allowed`). Treat a missing `X-Jev-Verdict` as "not judged", the same as `error`.
+
+   Both reference configs also set `normalize_path` and `merge_slashes` on the connection manager and strip inbound `x-jev-*` (verdict, score, reason, source, request-id, subject) with `request_headers_to_remove` on the virtual host, so a client can neither forge a verdict nor steer the ext_authz path at `/_jev/config` through `..` or `//`.
 
 ## gRPC ext_authz
 
-`grpc-shim/` is a ~150-line Go service implementing `envoy.service.auth.v3.Authorization/Check`. It forwards each check to `/_jev/authz` and maps the answer to `OkHttpResponse` (with the `X-Jev-*` headers to add upstream) or `DeniedHttpResponse` (status and body from jev-edge). If it cannot reach the adapter it returns OK with `X-Jev-Verdict: error`, `X-Jev-Source: shim`.
+`grpc-shim/` is a ~150-line Go service implementing `envoy.service.auth.v3.Authorization/Check`. It forwards each check to `/_jev/authz` and maps the answer to `OkHttpResponse` (with the `X-Jev-*` headers to add upstream) or `DeniedHttpResponse` (status and body from jev-edge). Only an answer carrying `X-Jev-Verdict` is trusted: 200 is a decision, any status >= 400 with the header is a block (whatever `policy.block_status` is), and everything else (a 404 or 5xx from something that is not jev-edge, a timeout, a connection error) fails open with `X-Jev-Verdict: error`, `X-Jev-Source: shim`. On every path the shim overwrites all five `X-Jev-*` headers or removes the ones jev-edge did not set, so a forged inbound value cannot survive even without the route-level strip. Paths containing `..`, `%2e` or `//` are not forwarded (they fail open and are logged): the adapter's admin endpoints sit next to the authz prefix.
 
 ```bash
 cd adapters/envoy/grpc-shim && go build -o jev-shim . && ./jev-shim -listen :9001 -upstream http://127.0.0.1:8080/_jev/authz

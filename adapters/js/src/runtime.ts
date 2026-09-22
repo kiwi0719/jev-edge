@@ -2,15 +2,20 @@
 // verdict -> headers or 403. Hosts (cloudflare.ts, frameworks.ts, aws.ts) only
 // adapt their request shape and pick the stores. evaluate() itself is the
 // core held to the golden vectors in core/golden/.
+//
+// Fail-open contract, same as edge.lua access(): everything between "we have a
+// Request" and "we have a verdict" runs under one try/catch; a throw anywhere
+// (body read, subject store, judge, onVerdict, block response) passes the
+// request with X-Jev-Verdict: error and X-Jev-Source: adapter, and is logged.
 
 import * as core from "./core";
 import { resolve as resolveRule, type RuleSpec } from "./rules";
 import { shouldSample, buildSample, type Sample } from "./sampling";
 import * as subjectMod from "./core/subject";
 import { load as loadProvider, type Provider, type ProviderRequestInfo } from "./providers";
-import { kvStore, memoryStore, durableStore, type KVLike, type DOStubLike } from "./cf/stores";
-import { Adaptive } from "./cf/adaptive";
-import type { Store } from "./core/breaker";
+import { kvStore, memoryStore, durableStore, durableBreaker, durableAdaptive, type KVLike, type DOStubLike } from "./cf/stores";
+import { Adaptive, type AdaptiveLike } from "./cf/adaptive";
+import type { Store, BreakerLike } from "./core/breaker";
 
 type DeepPartial<T> = { [K in keyof T]?: T[K] extends object ? DeepPartial<T[K]> : T[K] };
 
@@ -23,7 +28,8 @@ export interface Options {
   provider?: Provider;
   /** KV namespace for the fingerprint / reputation cache. Memory (per isolate) if absent. */
   cache?: KVLike | Store;
-  /** Durable Object stub (or any Store) for breaker + adaptive timeout. Memory (per isolate) if absent. */
+  /** Durable Object stub (JevState) or any Store for breaker + adaptive timeout. Memory (per isolate) if absent.
+   *  With a stub the breaker and adaptive read-modify-write run inside the Durable Object, one fetch per operation. */
   state?: DOStubLike | Store;
   /** Store for per-subject trajectories (KV or memory). Memory (per isolate) if absent. Only used with config.subject.enabled. */
   subjectStore?: KVLike | Store;
@@ -35,6 +41,8 @@ export interface Options {
   onSample?: (s: Sample, req: Request) => void;
   /** Serve GET /_jev/health from the Worker (default true). */
   health?: boolean;
+  /** Set by the Cloudflare presets. Only then is `cf-ray` trusted as the request id; elsewhere it is a client header like any other. */
+  platform?: "cloudflare";
 }
 
 export interface Runtime {
@@ -44,9 +52,14 @@ export interface Runtime {
   cache: Store;
   state: Store;
   subjectStore: Store;
-  breaker: core.breaker.Breaker;
-  adaptive: Adaptive;
+  breaker: BreakerLike;
+  adaptive: AdaptiveLike;
   opts: Options;
+}
+
+/** Per-request host facilities. `waitUntil` (Workers, Pages) keeps the subject write alive after the response is sent. */
+export interface RequestCtx {
+  waitUntil?: (p: Promise<unknown>) => void;
 }
 
 function isKV(x: unknown): x is KVLike {
@@ -64,40 +77,114 @@ export function createRuntime(opts: Options): Runtime {
   const provider = opts.provider ?? loadProvider(config.jev.provider ?? "jev");
   const clock = () => Date.now() / 1000;
   const cache: Store = isKV(opts.cache) ? kvStore(opts.cache) : (opts.cache as Store | undefined) ?? memoryStore(clock);
-  const state: Store = isStub(opts.state) ? durableStore(opts.state) : (opts.state as Store | undefined) ?? memoryStore(clock);
   const subjectStore: Store = isKV(opts.subjectStore) ? kvStore(opts.subjectStore, "jev:") : (opts.subjectStore as Store | undefined) ?? memoryStore(clock);
-  const breaker = new core.breaker.Breaker(state, clock, config.breaker);
-  const adaptive = new Adaptive(state, config.jev);
+  let state: Store;
+  let breaker: BreakerLike;
+  let adaptive: AdaptiveLike;
+  if (isStub(opts.state)) {
+    // One hop per operation: the Durable Object runs the same Breaker and
+    // Adaptive classes against its own storage, so the read-modify-write is
+    // atomic there instead of three or four round trips from here.
+    state = durableStore(opts.state);
+    breaker = durableBreaker(opts.state, config.breaker);
+    adaptive = durableAdaptive(opts.state, config.jev);
+  } else {
+    state = (opts.state as Store | undefined) ?? memoryStore(clock);
+    breaker = new core.breaker.Breaker(state, clock, config.breaker);
+    adaptive = new Adaptive(state, config.jev);
+  }
   return { config, rules, provider, cache, state, subjectStore, breaker, adaptive, opts };
 }
 
 const HEADER_NAMES = ["X-Jev-Verdict", "X-Jev-Score", "X-Jev-Source", "X-Jev-Reason", "X-Jev-Request-Id"];
+const SUBJECT_HEADER = "x-jev-subject";
+
+/** Is the inbound X-Jev-Subject header the one this deployment consumes (hashed id from another jev-edge)? */
+function consumesSubjectHeader(cfg: core.Config): boolean {
+  const s = cfg.subject;
+  return !!(s?.enabled && s.from === "header" && typeof s.name === "string" && s.name.toLowerCase() === SUBJECT_HEADER);
+}
+
+/** Does any rule watch this path and method? Decides whether the body is worth reading at all. */
+function isCandidate(rt: Runtime, path: string, method: string): boolean {
+  const m = method.toUpperCase();
+  return rt.rules.some((r) => core.rules.pathMatches(path, r.watch_paths) && (!r.methods || r.methods[m]));
+}
+
+/**
+ * Read at most `maxBytes` of a body from a clone of the request. Returns the
+ * text, or null when the body is larger than that: the clone's stream is
+ * cancelled at maxBytes + 1 so a missing or lying Content-Length cannot make
+ * the edge buffer an unbounded body. The original request is untouched.
+ */
+async function readBounded(request: Request, maxBytes: number): Promise<[string | null, number]> {
+  const body = request.clone().body;
+  if (!body) return ["", 0];
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > maxBytes) {
+        // Not awaited: the clone is one branch of a tee, and a tee branch's
+        // cancel() only settles once the other branch (the request the app
+        // will read) is cancelled as well.
+        reader.cancel().catch(() => {});
+        return [null, size];
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const all = new Uint8Array(size);
+  let off = 0;
+  for (const c of chunks) {
+    all.set(c, off);
+    off += c.byteLength;
+  }
+  return [new TextDecoder("utf-8", { fatal: false }).decode(all), size];
+}
 
 async function readReq(request: Request, rt: Runtime): Promise<[core.Req, ProviderRequestInfo]> {
   const url = new URL(request.url);
   const headers: Record<string, string> = {};
   request.headers.forEach((v, k) => (headers[k] = v));
+  // A client-supplied X-Jev-Subject is only meaningful when this deployment
+  // is configured to consume it (from = "header", name = "x-jev-subject",
+  // usually with hashed = true behind a thin Worker). Otherwise it is noise
+  // that must not reach core, the provider or the upstream.
+  if (!consumesSubjectHeader(rt.config)) delete headers[SUBJECT_HEADER];
   const ipHeader = rt.opts.clientIpHeader ?? "cf-connecting-ip";
   const clientIp = request.headers.get(ipHeader) ?? (request.headers.get("x-forwarded-for") ?? "").split(",")[0].trim();
-  let body: string | null = null;
   const maxBytes = Math.max(...rt.rules.map((r) => r.max_body_bytes ?? 65536));
-  const len = Number(request.headers.get("content-length"));
-  if (request.body && !(Number.isFinite(len) && len > maxBytes)) {
-    body = await request.clone().text();
+  const lenHeader = request.headers.get("content-length");
+  const len = lenHeader === null ? NaN : Number(lenHeader);
+  let body: string | null = null;
+  let size = Number.isFinite(len) ? len : 0;
+  // The body is only read for a request some rule would judge; everything
+  // else passes at L1 on path or method without touching the stream.
+  if (request.body && isCandidate(rt, url.pathname, request.method) && !(Number.isFinite(len) && len > maxBytes)) {
+    const [text, seen] = await readBounded(request, maxBytes);
+    body = text;
+    size = Math.max(size, seen);
   }
   const req: core.Req = {
     method: request.method,
     path: url.pathname,
     headers,
     body: body ?? undefined,
-    body_size: body !== null ? core.normalize.byteLength(body) : Number.isFinite(len) ? len : 0,
+    body_size: body !== null ? core.normalize.byteLength(body) : size,
     client_ip: clientIp,
   };
   return [req, { method: request.method, path: url.pathname, headers: request.headers, body, clientIp }];
 }
 
 /** Subject context for this request, or undefined: hashed id, one history read, a sink that writes without being awaited. */
-async function subjectCtx(rt: Runtime, request: Request, clientIp: string): Promise<subjectMod.SubjectCtx | undefined> {
+async function subjectCtx(rt: Runtime, request: Request, clientIp: string, rctx?: RequestCtx): Promise<subjectMod.SubjectCtx | undefined> {
   const scfg = rt.config.subject;
   if (!scfg?.enabled) return undefined;
   const raw = subjectMod.extract(scfg, {
@@ -113,19 +200,71 @@ async function subjectCtx(rt: Runtime, request: Request, clientIp: string): Prom
     id,
     history: await store.get(k),
     record: (e) => {
-      void (async () => {
+      const p = (async () => {
         const h = subjectMod.append(await store.get(k), e, scfg.max_entries);
         await store.set(k, h, scfg.history_ttl ?? 3600);
       })().catch(() => {});
+      // On Workers the isolate may be torn down right after the response;
+      // waitUntil keeps the write alive. Elsewhere it is plain fire-and-forget.
+      if (rctx?.waitUntil) {
+        try {
+          rctx.waitUntil(p);
+        } catch {
+          /* a host that refuses the promise still gets the fire-and-forget write */
+        }
+      }
     },
   };
 }
 
-/** Evaluate one request. Returns the verdict and, when it must be returned as-is, a Response. */
-export async function evaluate(request: Request, rt: Runtime): Promise<{ verdict: core.Verdict; response?: Response; requestId: string }> {
-  const requestId = request.headers.get("cf-ray") ?? crypto.randomUUID();
+function requestIdFor(request: Request, rt: Runtime): string {
+  // cf-ray is set by Cloudflare on its own edge and is a plain client header
+  // anywhere else, so only a Cloudflare preset (or a request that carries the
+  // platform's `cf` object) gets to use it.
+  const onCf = rt.opts.platform === "cloudflare" || "cf" in request;
+  const ray = onCf ? request.headers.get("cf-ray") : null;
+  return ray && ray !== "" ? ray : crypto.randomUUID();
+}
+
+export interface Evaluation {
+  verdict: core.Verdict;
+  /** Present when the verdict must be returned as-is (a block). */
+  response?: Response;
+  requestId: string;
+  /** Hashed subject id when config.subject produced one; forwarded upstream as X-Jev-Subject. */
+  subjectId?: string;
+}
+
+function errorVerdict(): core.Verdict {
+  return core.verdict.newVerdict({ verdict: core.verdict.ERROR, source: core.verdict.SRC_ADAPTER, reason: "adapter error" });
+}
+
+function describe(e: unknown): string {
+  return e instanceof Error ? (e.stack ?? e.message) : String(e);
+}
+
+/**
+ * Evaluate one request. Never throws: any failure in the pipeline yields a
+ * pass with verdict "error" and source "adapter" (see the header comment).
+ */
+export async function evaluate(request: Request, rt: Runtime, rctx?: RequestCtx): Promise<Evaluation> {
+  let requestId: string;
+  try {
+    requestId = requestIdFor(request, rt);
+  } catch {
+    requestId = String(Date.now());
+  }
+  try {
+    return await evaluateInner(request, rt, requestId, rctx);
+  } catch (e) {
+    console.error("jev-edge: adapter error, failing open: " + describe(e));
+    return { verdict: errorVerdict(), requestId };
+  }
+}
+
+async function evaluateInner(request: Request, rt: Runtime, requestId: string, rctx?: RequestCtx): Promise<Evaluation> {
   const [req, info] = await readReq(request, rt);
-  const subject = await subjectCtx(rt, request, info.clientIp);
+  const subject = await subjectCtx(rt, request, info.clientIp, rctx);
   if (subject?.id) info.subjectId = subject.id;
   const ctx: core.Ctx = {
     config: rt.config,
@@ -154,41 +293,52 @@ export async function evaluate(request: Request, rt: Runtime): Promise<{ verdict
   try {
     verdict = await core.evaluate(req, ctx);
   } catch (e) {
-    console.error("jev-edge: evaluate error, failing open: " + (e instanceof Error ? e.message : String(e)));
-    verdict = core.verdict.newVerdict({ verdict: core.verdict.ERROR, source: core.verdict.SRC_L2, reason: "adapter error" });
+    console.error("jev-edge: evaluate error, failing open: " + describe(e));
+    verdict = errorVerdict();
   }
-  if (rt.opts.onVerdict) rt.opts.onVerdict(verdict, request);
+  if (rt.opts.onVerdict) {
+    try {
+      rt.opts.onVerdict(verdict, request);
+    } catch (e) {
+      console.warn("jev-edge: onVerdict failed: " + describe(e));
+    }
+  }
   if (rt.opts.onSample && shouldSample(rt.config, verdict)) {
     try {
       rt.opts.onSample(buildSample(rt.config, verdict, req, rt.rules, requestId), request);
     } catch (e) {
-      console.warn("jev-edge: onSample failed: " + (e instanceof Error ? e.message : String(e)));
+      console.warn("jev-edge: onSample failed: " + describe(e));
     }
   }
+  const out: Evaluation = { verdict, requestId, subjectId: subject?.id };
   if (verdict.action === core.verdict.ACTION_BLOCK) {
-    return {
-      verdict, requestId,
-      response: new Response(rt.config.policy.block_body ?? '{"error":"request rejected"}', {
-        status: rt.config.policy.block_status ?? 403,
-        headers: { "Content-Type": "application/json", ...core.verdict.headers(verdict), "X-Jev-Request-Id": requestId },
-      }),
-    };
+    out.response = new Response(rt.config.policy.block_body ?? '{"error":"request rejected"}', {
+      status: rt.config.policy.block_status ?? 403,
+      headers: { "Content-Type": "application/json", ...core.verdict.headers(verdict), "X-Jev-Request-Id": requestId },
+    });
   }
-  return { verdict, requestId };
+  return out;
 }
 
-/** The request to forward upstream: original plus X-Jev-* headers (client-supplied ones stripped). */
-export function withVerdictHeaders(request: Request, verdict: core.Verdict, requestId: string): Request {
+/**
+ * The request to forward upstream: original plus X-Jev-* headers. Every
+ * client-supplied X-Jev-* header is dropped, including X-Jev-Subject; when
+ * this runtime computed a subject id it is forwarded as X-Jev-Subject so an
+ * origin jev-edge configured with `hashed = true` sees the same trajectory.
+ */
+export function withVerdictHeaders(request: Request, verdict: core.Verdict, requestId: string, subjectId?: string): Request {
   const headers = new Headers(request.headers);
   for (const h of HEADER_NAMES) headers.delete(h);
+  headers.delete(SUBJECT_HEADER);
   for (const [k, v] of Object.entries(core.verdict.headers(verdict))) headers.set(k, v);
   headers.set("X-Jev-Request-Id", requestId);
+  if (subjectId) headers.set("X-Jev-Subject", subjectId);
   return new Request(request, { headers });
 }
 
 export function healthResponse(rt: Runtime): Response {
   return Response.json({
-    ok: true, adapter: "cloudflare", core: core.VERSION,
+    ok: true, adapter: rt.opts.platform ?? "js", core: core.VERSION,
     provider: rt.provider.name, model: rt.config.jev.model ?? null, mode: rt.config.policy.mode,
     endpoint: rt.config.jev.endpoint ?? null,
   });
@@ -197,13 +347,30 @@ export function healthResponse(rt: Runtime): Response {
 /**
  * Generic handler: evaluate, then either return the block or call `next` with
  * the request carrying X-Jev-* headers. Works for any framework that gives
- * you a Request and a way to continue.
+ * you a Request and a way to continue. A throw anywhere before `next` fails
+ * open: `next` is still called, with X-Jev-Verdict: error / X-Jev-Source: adapter.
  */
-export async function handle(request: Request, rt: Runtime, next: (req: Request) => Promise<Response>): Promise<Response> {
-  const url = new URL(request.url);
-  if (rt.opts.health !== false && url.pathname === "/_jev/health" && request.method === "GET") return healthResponse(rt);
-  const { verdict, response, requestId } = await evaluate(request, rt);
-  if (response) return response;
-  return next(withVerdictHeaders(request, verdict, requestId));
+export async function handle(request: Request, rt: Runtime, next: (req: Request) => Promise<Response>, rctx?: RequestCtx): Promise<Response> {
+  let forwarded: Request;
+  try {
+    const url = new URL(request.url);
+    if (rt.opts.health !== false && url.pathname === "/_jev/health" && request.method === "GET") return healthResponse(rt);
+    const { verdict, response, requestId, subjectId } = await evaluate(request, rt, rctx);
+    if (response) return response;
+    forwarded = withVerdictHeaders(request, verdict, requestId, subjectId);
+  } catch (e) {
+    console.error("jev-edge: handle error, failing open: " + describe(e));
+    let rid = "";
+    try {
+      rid = crypto.randomUUID();
+    } catch {
+      rid = String(Date.now());
+    }
+    try {
+      forwarded = withVerdictHeaders(request, errorVerdict(), rid);
+    } catch {
+      forwarded = request;
+    }
+  }
+  return next(forwarded);
 }
-

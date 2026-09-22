@@ -26,6 +26,21 @@ describe("defaults.validate", function()
     assert.is_nil(ok)
   end)
 
+  it("rejects configs that make a gate degenerate", function()
+    for _, over in ipairs({
+      { policy = { block_threshold = 5, suspect_threshold = 2 } },
+      { policy = { block_status = 42 } },
+      { breaker = { window_s = 0 } },
+      { breaker = { min_samples = 0 } },
+      { breaker = { fail_ratio = 0 } },
+      { sampling = { max_samples = 0 } },
+      { cache = { fp_ttl = 0 } },
+      { async = { max_async = -1 } },
+    }) do
+      assert.is_nil((D.validate(D.merge(D.config, over))))
+    end
+  end)
+
   it("rejects zero timeout", function()
     local ok = D.validate(D.merge(D.config, { jev = { timeout_ms = 0 } }))
     assert.is_nil(ok)

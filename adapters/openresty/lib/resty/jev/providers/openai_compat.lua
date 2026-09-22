@@ -30,9 +30,11 @@ local function system_prompt(questions)
 end
 
 function _M.build_request(prompt, cfg)
+  -- The question ids this call asked for, handed back through req.ctx so
+  -- parse_response can filter the model's reply. Never stored on cfg: that
+  -- table is shared by every concurrent request.
   local wanted = {}
   for name in pairs(prompt.questions) do wanted[name] = true end
-  cfg._questions = wanted
   local endpoint = (cfg.endpoint or "http://127.0.0.1:11434/v1"):gsub("/+$", "")
   local body = cjson.encode({
     model = cfg.model or "gpt-4o-mini",
@@ -52,10 +54,11 @@ function _M.build_request(prompt, cfg)
       ["Authorization"] = cfg.api_key and ("Bearer " .. cfg.api_key) or nil,
     },
     body = body,
+    ctx  = { questions = wanted },
   }
 end
 
-function _M.parse_response(status, body, cfg)
+function _M.parse_response(status, body, _cfg, ctx)
   if status ~= 200 then
     return nil, "openai-compat http " .. tostring(status)
   end
@@ -74,7 +77,7 @@ function _M.parse_response(status, body, cfg)
   -- Tolerate small models: numeric strings, and a lone "probability"/"score"
   -- key when exactly one question was asked.
   local out, n = {}, 0
-  local wanted = cfg and cfg._questions
+  local wanted = ctx and ctx.questions
   for k, v in pairs(answers) do
     local num = tonumber(v)
     if num and (not wanted or wanted[k]) then out[k] = num; n = n + 1 end

@@ -6,6 +6,105 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-09-22
+
+Patch release from a full audit of 0.3.0. Everything below is a fix; there is
+no new feature and no config key was removed. Two entries change observable
+values: fingerprints and subject ids are different strings than in 0.3.0
+(caches simply refill), and `X-Forwarded-For` is read from the other end.
+
+### Security
+- **Content-parts bodies are judged.** `messages[*].content` in the array
+  form every current chat API accepts (`[{type="text", text=...}, ...]`,
+  Responses API `input_text`, Anthropic `tool_result` with nested `content`)
+  used to extract no text, so the request passed L1 as "no text" in every
+  mode. `normalize.extract` now collects strings, each part's `text` and
+  nested `content`, on every adapter (golden vectors added).
+- **Fingerprint is SHA-256 over the whole normalized text.** 0.3.0 hashed a
+  2048-byte prefix with `crc32_long` (djb2 in the JS runtime). Either let a
+  chosen text reuse another text's cached or operator-trusted verdict: any
+  suffix behind a shared prefix, or a few appended bytes to hit a chosen
+  32-bit value. `fp_prefix_bytes` now only bounds sampled and logged text.
+- **Client IP behind a proxy is the appended hop, not the first element.**
+  `authz` and `forward_auth` took the leftmost `X-Forwarded-For` value, which
+  the client writes, so reputation blocks could be aimed at any address and
+  evaded by rotating the header. They now take element `client_ip.trusted_hops`
+  from the right (default 1, the value the proxy in front appended);
+  `x-envoy-external-address` is used when Envoy sends it.
+- **`GET /_jev/config` redacts `jev.api_key`, `feedback.token` and
+  `subject.salt`**, in both the effective config and the override.
+- **Admin endpoints on their own listener** in the example config, the demo
+  (`127.0.0.1:8090`) and the recipes: a gateway that reaches `/_jev/authz` on
+  the traffic port could reach `/_jev/config` through `..` path tricks.
+  The Envoy configs turn on `normalize_path` / `merge_slashes`, HAProxy and
+  the gRPC shim / SPOE agent refuse `..`, `%2e` and `//` (fail-open).
+- **Inbound `X-Jev-*` headers are stripped** by the Envoy, Caddy, Traefik and
+  nginx auth_request reference configs too, so a forged `X-Jev-Verdict: safe`
+  cannot reach the upstream on the fail-open path. `X-Jev-Subject` is
+  stripped as well unless it is the configured subject header.
+- **Subject values with `hashed = true` must look like an id we computed**
+  (`<from>:<hex>`), and raw subject values over 512 bytes are dropped.
+- Subject ids use SHA-256 on every adapter (OpenResty and APISIX used SHA-1).
+
+### Fixed
+- Core: the breaker re-tripped on the first success after a probe closed it,
+  because the window that tripped it was still counted; the window is reset
+  on close. A suspicious cache hit no longer sets `async`, so a repeated
+  suspicious prompt is one L3 call, not one per hit. `body_size` is the
+  larger of the declared size and the body handed over. `rules.resolve` on a
+  string spec returns a copy with defaults applied instead of the shared
+  module table, and rejects malformed `watch_paths` patterns (a bad pattern
+  used to raise on every request and fail everything open). `encode_reason`
+  truncates after encoding, never inside a `%XX` escape, so the header is
+  really <= 200 bytes. `defaults.validate` rejects thresholds outside
+  [0,1], non-HTTP `block_status`, zero breaker windows, zero
+  `sampling.max_samples` and other values that made a gate degenerate.
+  Text that normalizes to nothing (digit runs, UUIDs) is fingerprinted as
+  typed instead of being judged on every request.
+- OpenResty: L3 builds the same prompt L2 did (deployment context, the rule
+  that actually matched on path, method and content type), gets the ceiling
+  timeout instead of the adaptive estimate that just failed, is not started
+  while the breaker is open, and its timeouts no longer feed the adaptive
+  estimate. In-flight counters (`inflight:l2`, `inflight:l3`) are released on
+  every exit including premature timers at reload and Lua errors, and never
+  go negative after an eviction. `openai-compat` no longer stores its
+  question set on the shared config table (concurrent requests with
+  different templates got each other's filter). `PUT /_jev/config` and
+  `POST /_jev/feedback` read bodies nginx spooled to disk. A broken rule in an
+  override is a 422, not a log line. `/_jev/health` with a misconfigured
+  provider is a 503 JSON body, not a traceback. `X-Forwarded-Uri` is
+  normalised (`//`, `.`, `..`) before matching `watch_paths`. `resty.jev.cache`
+  warns once when a dict starts evicting. The `+json` content types the
+  extractor already decoded are now watched by `llm-endpoints`.
+- Subject trajectories on OpenResty and APISIX are stored as a ring (one
+  atomic counter plus one key per entry) instead of one list per subject:
+  the old append was a read-modify-write in a per-request timer, so two
+  workers recording the same subject lost entries and a burst could exhaust
+  `lua_max_pending_timers`. Existing `subj:` list keys are simply ignored.
+- New optional `lua_shared_dict jev_state`: trust grants, breaker state,
+  in-flight counters and the adaptive estimate move there when it is
+  declared, so a flood of new prompts filling `jev_cache` cannot evict them.
+  Without it everything stays in `jev_cache` as before.
+- JavaScript: fail-open now covers the whole request path (body read,
+  subject store, `onVerdict`, block response), not only the core call; the
+  provider timeout covers the response body, not just the headers; Lua
+  pattern conversion no longer corrupts `-` inside `[...]`; byte truncation
+  stops at a UTF-8 boundary; bodies without `Content-Length` are bounded;
+  `nodeMiddleware` no longer hands the app a placeholder body; `cf-ray` is
+  only trusted on Cloudflare; Hono and Lambda@Edge presets strip inbound
+  `X-Jev-*` and honour `block_status`; `engines` is `node >= 20` and `@types/node` follows the Node 20 line.
+- Envoy gRPC shim: a response without `X-Jev-Verdict` (404, 5xx, a sidecar
+  error) is fail-open, as documented, instead of a deny; fail-open overwrites
+  forged headers. HAProxy SPOE agent and LiteLLM guardrail: block is
+  `status >= 400` with `X-Jev-Verdict`, so a non-403 `block_status` blocks
+  instead of failing open; the agent timeout is below HAProxy's `timeout
+  processing` so the fail-open answer can arrive; `Expect` and hop-by-hop
+  headers are not forwarded. LiteLLM percent-decodes the reason. APISIX
+  reports chunked bodies over the cap as "body too large", not "no body".
+- Docs: thin-adapter contract written down once in `docs/recipes.md`; stale
+  test counts, the misplaced version note in `docs/design.md`, and the
+  Makefile comment; `.gitignore` covers default `go build` outputs.
+
 ## [0.3.0] - 2026-09-22
 
 ### Added

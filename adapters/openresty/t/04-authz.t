@@ -66,7 +66,7 @@ X-Jev-Source: l1
 
 
 
-=== TEST 4: client ip comes from Envoy's external-address header (reputation lookup)
+=== TEST 4: client ip is the hop the proxy appended to X-Forwarded-For, never the first element
 --- http_config eval: $::HttpConfig
 --- user_files eval: ::conf('policy = { mode = "enforce", block_threshold = 0.7, suspect_threshold = 0.5 },')
 --- config
@@ -80,11 +80,15 @@ location = /poison {
 }
 --- request eval
 ["GET /poison",
+ "POST /_jev/authz/v1/chat/completions\n{\"messages\":[{\"role\":\"user\",\"content\":\"a perfectly ordinary question about invoices\"}]}",
  "POST /_jev/authz/v1/chat/completions\n{\"messages\":[{\"role\":\"user\",\"content\":\"a perfectly ordinary question about invoices\"}]}"]
---- more_headers
-Content-Type: application/json
-X-Forwarded-For: 203.0.113.77, 10.0.0.1
+--- more_headers eval
+["",
+ "Content-Type: application/json\nX-Forwarded-For: 10.0.0.1, 203.0.113.77",
+ "Content-Type: application/json\nX-Forwarded-For: 203.0.113.77, 10.0.0.1"]
 --- error_code eval
-[200, 403]
+[200, 403, 200]
 --- response_body_like eval
-["ok", "request rejected"]
+["ok", "request rejected", "^\$"]
+--- response_headers eval
+[ "", "X-Jev-Verdict: malicious", "X-Jev-Verdict: safe" ]

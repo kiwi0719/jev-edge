@@ -68,7 +68,7 @@ Your upstream receives `X-Jev-Verdict`, `X-Jev-Score`, `X-Jev-Source`, `X-Jev-Re
 | `subject` | same keys; needs `nginx_config.http.lua_shared_dict.jev_subject` |
 | `/_jev/samples` | `sampling` config is honoured and samples land in `jev_cache`; read them with `sampling.log = true` through a logger plugin, or expose `resty.jev.edge.samples()` from a plain OpenResty location on the same box |
 
-One runtime (provider client, breaker, adaptive timeout) is built per distinct plugin conf and kept until the conf object changes, so routes with different `deployment_context` do not share a breaker but do share the fingerprint cache. Fingerprints include the text only, so a cached verdict for identical text is reused across routes; set `cache.fp_ttl` low on a route where that is wrong.
+One runtime (provider client, breaker, adaptive timeout) is built per distinct plugin conf and kept until the conf object changes, so routes with different `deployment_context` do not share a breaker but do share the fingerprint cache. The runtime is keyed on the conf *table* APISIX hands the plugin, so a conf merged per consumer (`consumer` plugin config on top of the route's) is its own table and gets its own breaker and adaptive timeout; the same applies after every route update. Fingerprints include the text only, so a cached verdict for identical text is reused across routes; set `cache.fp_ttl` low on a route where that is wrong.
 
 ## Alongside `ai-prompt-guard`
 

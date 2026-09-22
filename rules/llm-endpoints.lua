@@ -7,7 +7,7 @@ return {
   id = "llm-endpoints",
   watch_paths = { "^/v1/chat", "^/v1/completions", "^/api/chat", "^/api/completions" },
   methods = { POST = true, PUT = true, PATCH = true },
-  content_types = { "application/json", "text/plain", "application/x-www-form-urlencoded" },
+  content_types = { "application/json", "+json", "text/plain", "application/x-www-form-urlencoded" },
   min_body_bytes = 8,
   max_body_bytes = 65536,
   text_fields = { "messages[*].content", "prompt", "input", "query", "text" },

@@ -10,12 +10,25 @@ local _M = {}
 
 local INFLIGHT_KEY = "inflight:l3"
 
+local function done(job)
+  local st = job.state or job.cache
+  local n = st:incr(INFLIGHT_KEY, -1)
+  -- The key can be evicted or reset (reload, dict flush); never let the
+  -- counter go negative or the cap silently grows by that much.
+  if n and n < 0 then st:set(INFLIGHT_KEY, 0, 0) end
+end
+
 local function handler(premature, job)
-  if premature then return end
+  -- A timer that never ran still holds a slot: the shared dict outlives the
+  -- worker (HUP reload), so the slot must be given back or it is lost forever.
+  if premature then return done(job) end
   local cache = job.cache
   local cfg = job.cfg
   local ok, err = pcall(function()
-    local answers, jerr = job.judge.call(job.prompt, cfg.async.timeout_ms or 5000)
+    -- L3 is the retry L2 could not afford: give it the ceiling, not the
+    -- adaptive estimate that just failed.
+    local timeout = cfg.async.timeout_ms or math.max(cfg.jev.timeout_max_ms or 0, 5000)
+    local answers, jerr = job.judge.call(job.prompt, timeout)
     if not answers then
       ngx.log(ngx.WARN, "jev-edge: L3 judge failed: ", tostring(jerr))
       return
@@ -51,22 +64,25 @@ local function handler(premature, job)
     end
   end)
   if not ok then ngx.log(ngx.ERR, "jev-edge: L3 error: ", err) end
-  cache:incr(INFLIGHT_KEY, -1)
+  done(job)
 end
 
 --- Schedule an L3 job. Never blocks; drops when over max_async.
--- @param job { cfg, cache, judge, prompt, fingerprint, client_ip, on_alert }
+-- @param job { cfg, cache, state, judge, prompt, fingerprint, client_ip, on_alert }
+--   cache: verdict / reputation dict; state: where the in-flight counter lives
+--   (defaults to cache).
 function _M.schedule(job)
   local cfg = job.cfg
   if not cfg.async or cfg.async.enabled == false then return false, "disabled" end
-  local n = job.cache:incr(INFLIGHT_KEY, 1)
+  local st = job.state or job.cache
+  local n = st:incr(INFLIGHT_KEY, 1)
   if n and n > (cfg.async.max_async or 32) then
-    job.cache:incr(INFLIGHT_KEY, -1)
+    done(job)
     return false, "max_async exceeded"
   end
   local ok, err = ngx.timer.at(0, handler, job)
   if not ok then
-    job.cache:incr(INFLIGHT_KEY, -1)
+    done(job)
     ngx.log(ngx.WARN, "jev-edge: timer.at failed: ", err)
     return false, err
   end

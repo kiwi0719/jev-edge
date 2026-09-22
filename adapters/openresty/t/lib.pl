@@ -6,6 +6,7 @@ my $pwd = cwd();
 our $HttpConfig = qq{
     lua_package_path "$pwd/lib/?.lua;$pwd/../../?.lua;;";
     lua_shared_dict jev_cache   8m;
+    lua_shared_dict jev_state   1m;
     lua_shared_dict jev_config  1m;
     lua_shared_dict jev_metrics 1m;
     lua_shared_dict jev_subject 1m;

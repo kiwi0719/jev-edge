@@ -8,11 +8,11 @@ import * as verdict from "./verdict";
 import * as trust from "./trust";
 import * as subject from "./subject";
 import type { Config } from "./defaults";
-import type { Breaker } from "./breaker";
+import type { BreakerLike } from "./breaker";
 import type { Req, Rule, CacheLike } from "./rules";
 import type { JsonValue } from "./normalize";
 
-export const VERSION = "0.3.0";
+export const VERSION = "0.3.1";
 
 export interface Judge {
   call(prompt: judge.Prompt, timeoutMs: number): Promise<[judge.Answers, null] | [null, string]> | [judge.Answers, null] | [null, string];
@@ -26,7 +26,7 @@ export interface Ctx {
    *  somewhere shared or durable without moving the hot verdict cache too. */
   trust?: trust.TrustStore;
   judge: Judge;
-  breaker?: Breaker;
+  breaker?: BreakerLike;
   /** Per-subject trajectory (see ./subject). Absent, or absent id, means the
    *  behaviour this core had before it existed. `history` is IGNORED in this
    *  version; `record` is a sink that is never awaited. */
@@ -83,7 +83,8 @@ export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
       return finish(ctx, verdict.newVerdict({
         action: verdict.ACTION_PASS, verdict: verdict.SAFE, score: 0,
         source: verdict.SRC_TRUST, fingerprint: fp,
-        reason: rec.by ? "fingerprint trusted by " + rec.by : "fingerprint trusted",
+        // Lua: `rec.by and (...)`; "" is truthy there, so an empty `by` still reads "trusted by "
+        reason: rec.by !== undefined && rec.by !== null ? "fingerprint trusted by " + rec.by : "fingerprint trusted",
       }));
     }
   }
@@ -92,9 +93,12 @@ export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
   if (fp !== "" && ctx.cache) {
     const hit = (await ctx.cache.get("fp:" + fp)) as { score?: unknown; reason?: string } | undefined;
     if (hit && typeof hit === "object" && typeof hit.score === "number") {
-      const [action, label, async] = policy.decide(hit.score, cfg.policy);
+      const [action, label] = policy.decide(hit.score, cfg.policy);
+      // Never async on a hit: the cached score already is the judge's
+      // answer, and a re-judge per hit would turn the cache into an
+      // amplifier (one suspicious prompt repeated N times = N L3 calls).
       return finish(ctx, verdict.newVerdict({
-        action, verdict: label, score: hit.score, async,
+        action, verdict: label, score: hit.score, async: false,
         source: verdict.SRC_CACHE, reason: hit.reason ?? reason, fingerprint: fp,
       }));
     }

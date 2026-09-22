@@ -40,6 +40,8 @@ local rules_mod = require("jev.core.rules")
 local sampling  = require("jev.core.sampling")
 local subject_m = require("jev.core.subject")
 local cjson     = require("cjson.safe")
+local sha256    = require("resty.sha256")
+local to_hex    = require("resty.string").to_hex
 
 local DICT = "jev_cache"
 local SUBJECT_DICT = "jev_subject"
@@ -165,9 +167,16 @@ local runtimes = setmetatable({}, { __mode = "k" })
 local cache
 local subject_store
 
-local function sha1_hex(s)
-  return (ngx.sha1_bin(s):gsub(".", function(c) return string.format("%02x", c:byte()) end))
+-- SHA-256 for fingerprints and subject ids, the same as the OpenResty adapter
+-- and the JavaScript hosts: a collision-resistant fingerprint (it keys the
+-- verdict cache and the trust store) and one trajectory per user whichever
+-- adapter saw them.
+local function sha256_hex(s)
+  local h = sha256:new()
+  h:update(s)
+  return to_hex(h:final())
 end
+local sha256_hex_subject = sha256_hex
 
 local function subject_ctx(rt, req, ctx)
   local scfg = rt.cfg.subject
@@ -177,19 +186,17 @@ local function subject_ctx(rt, req, ctx)
     header = function(n) return req.headers[n] end,
     cookie = function(n) return ctx.var["cookie_" .. tostring(n)] end,
   })
-  local id = subject_m.hash_id(scfg, raw, sha1_hex)
+  local id = subject_m.hash_id(scfg, raw, sha256_hex_subject)
   if not id then return nil end
   subject_store = subject_store or cache_m.new(SUBJECT_DICT)
   local store = subject_store
   return {
     id = id,
-    history = subject_m.load(store, id),
+    history = subject_m.ring_load(store, id, scfg.max_entries),
+    -- Two atomic dict operations, inline: cheaper than the timer it
+    -- replaces and safe across workers (no read-modify-write).
     record = function(e)
-      ngx.timer.at(0, function(premature)
-        if premature then return end
-        local h = subject_m.append(subject_m.load(store, id), e, scfg.max_entries)
-        subject_m.save(store, id, h, scfg.history_ttl)
-      end)
+      subject_m.ring_append(store, id, e, scfg.max_entries, scfg.history_ttl)
     end,
   }
 end
@@ -277,7 +284,13 @@ local function build_req(rt, ctx)
   if max > 0 and req.body_size <= max then
     -- get_body(max) returns nil past the cap instead of slurping a chunked body
     local body, berr = core.request.get_body(max + 1, ctx)
-    if berr then core.log.warn("jev-edge: body read: ", berr) end
+    if berr then
+      core.log.warn("jev-edge: body read: ", berr)
+      -- APISIX says "request size N is greater than the maximum size M" when a
+      -- chunked body (no Content-Length) overflows; report it as too large,
+      -- not as "no body", so L1 gives the right reason
+      if tostring(berr):find("greater than", 1, true) then req.body_size = max + 1 end
+    end
     if body then
       req.body_size = #body
       req.body = (#body > max) and nil or body
@@ -327,7 +340,7 @@ function _M.access(conf, ctx)
     v = jev_core.evaluate(req, {
       config = rt.cfg, rules = rt.rules, cache = cache, trust = cache, judge = rt.judge, breaker = rt.breaker,
       subject = subj,
-      clock = ngx.now, hash = function(s) return string.format("%08x", ngx.crc32_long(s)) end,
+      clock = ngx.now, hash = sha256_hex,
       json_decode = cjson.decode, re_find = re_find,
       log = function(level, msg) if level == "error" then core.log.error(msg) else core.log.warn(msg) end end,
     })

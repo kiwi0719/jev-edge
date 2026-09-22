@@ -6,8 +6,15 @@
 // here: it is a protocol converter so gRPC-configured Envoy meshes can use the
 // same Lua code path as everyone else.
 //
-// Fail-open: any error talking to the adapter yields OK with
-// X-Jev-Verdict: error, matching the adapter's own behaviour.
+// Contract: only an answer that carries X-Jev-Verdict is trusted. 200 with the
+// header is a decision (OK, headers copied upstream); status >= 400 with the
+// header is a block (PermissionDenied with that status, body and headers);
+// anything else, including a 404 / 5xx from something that is not jev-edge,
+// or any error talking to the adapter, fails open: OK with X-Jev-Verdict:
+// error and X-Jev-Source: shim, matching the adapter's own behaviour. Every
+// X-Jev-* header is overwritten on the way upstream so a forged inbound
+// value never survives. Paths containing "..", "%2e" or "//" are not
+// forwarded at all (they could reach the adapter's admin endpoints).
 package main
 
 import (
@@ -50,7 +57,14 @@ func (s *server) Check(ctx context.Context, req *authv3.CheckRequest) (*authv3.C
 	if method == "" {
 		method = http.MethodGet
 	}
-	url := s.upstream + httpReq.GetPath()
+	path := httpReq.GetPath()
+	if i := strings.IndexByte(path, '?'); i >= 0 {
+		path = path[:i]
+	}
+	if !safePath(path) {
+		return failOpen("refusing path " + path), nil
+	}
+	url := s.upstream + path
 
 	var body io.Reader
 	if raw := httpReq.GetRawBody(); len(raw) > 0 {
@@ -89,13 +103,19 @@ func (s *server) Check(ctx context.Context, req *authv3.CheckRequest) (*authv3.C
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 
-	headers := make([]*corev3.HeaderValueOption, 0, len(jevHeaders))
+	if resp.Header.Get("X-Jev-Verdict") == "" {
+		return failOpen(fmt.Sprintf("adapter answered %d without X-Jev-Verdict", resp.StatusCode)), nil
+	}
+
+	// Overwrite every X-Jev-* header the adapter set and remove the ones it
+	// did not, so nothing the client sent survives.
+	headers := make([]*corev3.HeaderValueOption, 0, len(jevHeaders)+1)
+	var remove []string
 	for _, h := range jevHeaders {
 		if v := resp.Header.Get(h); v != "" {
-			headers = append(headers, &corev3.HeaderValueOption{
-				Header:       &corev3.HeaderValue{Key: h, Value: v},
-				AppendAction: corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
-			})
+			headers = append(headers, overwrite(h, v))
+		} else {
+			remove = append(remove, h)
 		}
 	}
 
@@ -103,16 +123,16 @@ func (s *server) Check(ctx context.Context, req *authv3.CheckRequest) (*authv3.C
 		return &authv3.CheckResponse{
 			Status: &rpcstatus.Status{Code: int32(codes.OK)},
 			HttpResponse: &authv3.CheckResponse_OkResponse{
-				OkResponse: &authv3.OkHttpResponse{Headers: headers},
+				OkResponse: &authv3.OkHttpResponse{Headers: headers, HeadersToRemove: remove},
 			},
 		}, nil
 	}
+	if resp.StatusCode < 400 {
+		return failOpen(fmt.Sprintf("adapter answered %d", resp.StatusCode)), nil
+	}
 
-	ct := resp.Header.Get("Content-Type")
-	if ct != "" {
-		headers = append(headers, &corev3.HeaderValueOption{
-			Header: &corev3.HeaderValue{Key: "Content-Type", Value: ct},
-		})
+	if ct := resp.Header.Get("Content-Type"); ct != "" {
+		headers = append(headers, overwrite("Content-Type", ct))
 	}
 	return &authv3.CheckResponse{
 		Status: &rpcstatus.Status{Code: int32(codes.PermissionDenied)},
@@ -126,15 +146,40 @@ func (s *server) Check(ctx context.Context, req *authv3.CheckRequest) (*authv3.C
 	}, nil
 }
 
+// safePath rejects anything that could escape /_jev/authz/ once the adapter
+// (or a proxy in between) normalises it: dot segments, encoded dots, and
+// doubled slashes. The adapter's admin endpoints live next to the authz
+// prefix, so these must never be forwarded.
+func safePath(p string) bool {
+	if p == "" {
+		return true
+	}
+	if p[0] != '/' {
+		return false
+	}
+	lower := strings.ToLower(p)
+	return !strings.Contains(p, "..") && !strings.Contains(lower, "%2e") && !strings.Contains(p, "//")
+}
+
+func overwrite(key, value string) *corev3.HeaderValueOption {
+	return &corev3.HeaderValueOption{
+		Header:       &corev3.HeaderValue{Key: key, Value: value},
+		AppendAction: corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
+	}
+}
+
 func failOpen(reason string) *authv3.CheckResponse {
 	log.Printf("jev-edge shim: failing open: %s", reason)
 	return &authv3.CheckResponse{
 		Status: &rpcstatus.Status{Code: int32(codes.OK)},
 		HttpResponse: &authv3.CheckResponse_OkResponse{
-			OkResponse: &authv3.OkHttpResponse{Headers: []*corev3.HeaderValueOption{
-				{Header: &corev3.HeaderValue{Key: "X-Jev-Verdict", Value: "error"}},
-				{Header: &corev3.HeaderValue{Key: "X-Jev-Source", Value: "shim"}},
-			}},
+			OkResponse: &authv3.OkHttpResponse{
+				Headers: []*corev3.HeaderValueOption{
+					overwrite("X-Jev-Verdict", "error"),
+					overwrite("X-Jev-Source", "shim"),
+				},
+				HeadersToRemove: []string{"X-Jev-Score", "X-Jev-Reason", "X-Jev-Request-Id"},
+			},
 		},
 	}
 }

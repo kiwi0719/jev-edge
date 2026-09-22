@@ -3,7 +3,7 @@
 import * as normalize from "./core/normalize";
 import { MALICIOUS, SRC_L1, type Verdict } from "./core/verdict";
 import type { Config } from "./core/defaults";
-import type { Req, Rule } from "./core/rules";
+import { pathMatches, type Req, type Rule } from "./core/rules";
 
 const RANK: Record<string, number> = { skipped: -1, error: 0, safe: 1, suspicious: 2, malicious: 3 };
 
@@ -26,7 +26,7 @@ export function shouldSample(cfg: Config, v: Verdict, rand: () => number = Math.
 }
 
 export function buildSample(cfg: Config, v: Verdict, req: Req, rules: Rule[], rid: string, ts = Date.now() / 1000): Sample {
-  const rule = rules.find((r) => (r.watch_paths ?? []).some((p) => new RegExp(p).test(req.path ?? "")));
+  const rule = rules.find((r) => pathMatches(req.path ?? "", r.watch_paths) !== null); // watch_paths are Lua patterns
   let text = "";
   if (rule && typeof req.body === "string") {
     const ct = req.headers?.["content-type"] ?? req.headers?.["Content-Type"] ?? "";

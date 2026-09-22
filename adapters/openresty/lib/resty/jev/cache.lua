@@ -37,9 +37,14 @@ function _M.set(self, key, value, ttl)
     raw = cjson.encode(value)
     if not raw then return false end
   end
-  local ok, err = self.dict:set(key, raw, tonumber(ttl) or 0)
+  local ok, err, forcible = self.dict:set(key, raw, tonumber(ttl) or 0)
   if not ok then
     ngx.log(ngx.WARN, "jev-edge: shared dict ", self.name, " set failed: ", err)
+  elseif forcible and not self.warned_full then
+    -- LRU eviction has started: valid entries are being dropped to make room.
+    -- Said once per worker; the fix is a bigger dict or a separate jev_state.
+    self.warned_full = true
+    ngx.log(ngx.WARN, "jev-edge: shared dict ", self.name, " is full, evicting entries; raise its size")
   end
   return ok
 end

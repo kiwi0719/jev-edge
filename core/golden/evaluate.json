@@ -815,6 +815,61 @@
       "expect": {
         "cache_writes": {},
         "headers": {
+          "X-Jev-Reason": "injection+0.55",
+          "X-Jev-Score": "0.55",
+          "X-Jev-Source": "cache",
+          "X-Jev-Verdict": "suspicious"
+        },
+        "judge_calls": 0,
+        "prompt": null,
+        "subject_record": null,
+        "verdict": {
+          "action": "pass",
+          "async": false,
+          "fingerprint": "cf223bdc",
+          "l2_ms": 0,
+          "reason": "injection 0.55",
+          "score": 0.55,
+          "source": "cache",
+          "verdict": "suspicious"
+        }
+      },
+      "input": {
+        "breaker": null,
+        "cache": {
+          "fp:cf223bdc": {
+            "reason": "injection 0.55",
+            "score": 0.55
+          }
+        },
+        "clock": 1000,
+        "config": {},
+        "judge": {
+          "answers": {
+            "injection": 0.1
+          }
+        },
+        "req": {
+          "body": "{\"messages\":[{\"role\":\"user\",\"content\":\"Please write a detailed summary of the attached quarterly report.\"}]}",
+          "body_size": 108,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/v1/chat/completions"
+        },
+        "rules": [
+          "llm-endpoints"
+        ],
+        "subject": null
+      },
+      "name": "suspicious cache hit is not async"
+    },
+    {
+      "expect": {
+        "cache_writes": {},
+        "headers": {
           "X-Jev-Reason": "injection+0.80",
           "X-Jev-Score": "0.80",
           "X-Jev-Source": "cache",
@@ -2672,7 +2727,7 @@
     {
       "expect": {
         "cache_writes": {
-          "fp:8a59ce8f": {
+          "fp:cf223bdc": {
             "ttl": 60,
             "value": {
               "reason": "injection 0.10",
@@ -2702,7 +2757,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
-          "fingerprint": "8a59ce8f",
+          "fingerprint": "cf223bdc",
           "l2_ms": 0,
           "reason": "injection 0.10",
           "score": 0.1,
@@ -2743,7 +2798,7 @@
       "name": "custom cache ttl and prefix"
     }
   ],
-  "core_version": "0.3.0",
+  "core_version": "0.3.1",
   "format_version": 1,
   "generated_by": "core/golden/gen.lua",
   "suite": "evaluate"

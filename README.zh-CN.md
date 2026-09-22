@@ -39,11 +39,11 @@ jev-edge 跑在 nginx / OpenResty 或 Apache APISIX 里，站在 Envoy、Istio�
 
 | | |
 |---|---|
-| 版本 | `v0.3.0` |
+| 版本 | `v0.3.1` |
 | 网关，原生 | OpenResty；Apache APISIX（插件，同一套引擎） |
 | 网关，走 `/_jev/authz` | Envoy（HTTP 和 gRPC ext_authz）、HAProxy（SPOE agent）、Traefik、Caddy 和普通 nginx（forward-auth），各自对真实网关做了端到端测试；Istio、Envoy Gateway、Azure APIM 和 Apigee 以[配方](docs/recipes.zh-CN.md)形式提供；LiteLLM proxy 作为 guardrail |
 | JavaScript 宿主 | Cloudflare Workers 和 Pages、Next.js、Node、Hono、Lambda@Edge，共用一份受同一批 golden vectors 约束的 TypeScript core 移植（在 `main` 上，未发版） |
-| 测试覆盖 | 242 个 busted spec（含 116 个 golden vectors）、175 个 vitest 用例（回放同一批向量加 JS 宿主）、233 条 Test::Nginx 断言、8 个 guardrail 测试、对真实 Envoy、Traefik / Caddy / nginx、APISIX 和 HAProxy 的四套端到端、两套 bench、一次 soak |
+| 测试覆盖 | 265 个 busted spec（含 142 个 golden vectors）、223 个 vitest 用例（回放同一批向量加 JS 宿主）、316 条 Test::Nginx 断言、12 个 guardrail 测试、4 个 gRPC shim 测试、对真实 Envoy、Traefik / Caddy / nginx、APISIX 和 HAProxy 的四套端到端、两套 bench、一次 soak |
 | provider 真实联调 | `jev` 对 TypeSafe API 跑完 662 条全量数据集；`openai-compat` 对 Ollama 容器 |
 | 生产使用 | 目前没有已知案例。先用 `monitor` 模式跑 |
 
@@ -86,7 +86,7 @@ HTTP/1.1 403 Forbidden
 {"error":"request rejected"}
 ```
 
-compose 日志里每个被判定的请求一行 JSON。`curl localhost:8080/_jev/health` 报告 provider 和超时状态，`curl -X PUT localhost:8080/_jev/config -d '{"policy":{"mode":"monitor"}}'` 不用 reload 就切到 monitor 模式。想用真模型判定，在 `docker compose up` 之前 `export TYPESAFE_API_KEY=...`，同一份配置会切到 `jev` provider。demo 跑的全部内容就是 [demo/](demo/) 下的四个小文件。
+compose 日志里每个被判定的请求一行 JSON。`curl localhost:8090/_jev/health` 报告 provider 和超时状态，`curl -X PUT localhost:8090/_jev/config -d '{"policy":{"mode":"monitor"}}'` 不用 reload 就切到 monitor 模式。想用真模型判定，在 `docker compose up` 之前 `export TYPESAFE_API_KEY=...`，同一份配置会切到 `jev` provider。demo 跑的全部内容就是 [demo/](demo/) 下的四个小文件。
 
 ## 工作原理
 
@@ -135,6 +135,7 @@ git clone https://github.com/kiwi0719/jev-edge && cd jev-edge && sudo make insta
 
 ```nginx
 lua_shared_dict jev_cache  64m;
+lua_shared_dict jev_state   4m;   # trust, breaker, in-flight counters: never evicted by the verdict cache
 lua_shared_dict jev_config  1m;
 lua_shared_dict jev_metrics 4m;
 env TYPESAFE_API_KEY;
@@ -163,7 +164,7 @@ return {
 5. reload nginx，在机器上检查 provider。这会发一次真实调用，报告延迟、生效的超时和熔断状态：
 
 ```bash
-curl -s localhost:8080/_jev/health
+curl -s localhost:8090/_jev/health
 ```
 
 6. 发一个请求：
@@ -186,7 +187,7 @@ make calibrate LOG=/var/log/nginx/jev.log LABELS=labels.csv MAX_FP=0.001
 8. 一次调用切到 `enforce`，不 reload：
 
 ```bash
-curl -X PUT localhost:8080/_jev/config -d '{"policy":{"mode":"enforce"}}'
+curl -X PUT localhost:8090/_jev/config -d '{"policy":{"mode":"enforce"}}'
 ```
 
 回滚就是同一个调用带 `"monitor"`，或者 `DELETE /_jev/config` 丢掉所有运行时覆盖。
@@ -279,7 +280,7 @@ make calibrate LOG=jev.log LABELS=labels.csv MAX_FP=0.001
 值班的人判定某个被拦的请求是正常流量。这个判断要落到两个地方：网关，立刻生效，让同一段文本不再被拦；标注文件，让下一次校准知道这件事。`POST /_jev/feedback` 一次做完两件事。
 
 ```bash
-curl -s localhost:8080/_jev/feedback -H 'X-Jev-Token: '"$JEV_FEEDBACK_TOKEN" \
+curl -s localhost:8090/_jev/feedback -H 'X-Jev-Token: '"$JEV_FEEDBACK_TOKEN" \
      -d '{"fp":"17e77570","label":"benign","by":"alice","rid":"ab12..."}'
 ```
 
@@ -336,7 +337,7 @@ L1 放行的流量 p99 多花 24 µs。"健康 Jev"那组是一个 100 ms 应答
 
 完整设计在 [docs/design.zh-CN.md](docs/design.zh-CN.md)：范围、架构、三层各自的细节、缓存、策略、判定头、热更新、降级矩阵、三个 adapter、可观测性、验收表和七条已定决策。要改 L1 规则、阈值或 fail-open 行为，先读[已定决策](docs/design.zh-CN.md#已定决策)。
 
-**跨实现一致性。** core 只有一份行为契约，就是 [core/golden/](core/golden/README.md) 里的 golden vectors：116 个用例，覆盖归一化、文本提取、每一种 L1 判定、策略边界、判定头，以及所有 IO 都被脚本化的完整流水线。两个 core 都回放它们，Lua 的在 busted 下，TypeScript 的在 vitest 下，任一漂移 CI 都失败。同一个请求在 nginx 上和在 Worker 上得到的是同一个判定。向量保证什么、把什么留给平台（缓存 TTL 精度、跨 worker 的熔断统计、自适应超时的具体值），那份 README 和 [JavaScript adapter](adapters/js/README.md#what-is-the-same-as-nginx-and-what-is-not) 自己的清单里都写清楚了。
+**跨实现一致性。** core 只有一份行为契约，就是 [core/golden/](core/golden/README.md) 里的 golden vectors：142 个用例，覆盖归一化、文本提取、每一种 L1 判定、策略边界、判定头，以及所有 IO 都被脚本化的完整流水线。两个 core 都回放它们，Lua 的在 busted 下，TypeScript 的在 vitest 下，任一漂移 CI 都失败。同一个请求在 nginx 上和在 Worker 上得到的是同一个判定。向量保证什么、把什么留给平台（缓存 TTL 精度、跨 worker 的熔断统计、自适应超时的具体值），那份 README 和 [JavaScript adapter](adapters/js/README.md#what-is-the-same-as-nginx-and-what-is-not) 自己的清单里都写清楚了。
 
 ## 仓库结构
 
@@ -371,6 +372,7 @@ docs/            design、cost、recipes（Istio、Envoy Gateway、APIM、Apigee
 | 0.1.1 ✅ | provider 真实联调、带上限的自适应超时、`/_jev/health`、`deployment_context`、soak 和全量 live bench |
 | 0.2.0 ✅ | OpenResty 之外的网关，同一套引擎：Envoy HTTP ext_authz（`/_jev/authz`）和 gRPC ext_authz（`grpc-shim`）；`/_jev/forward-auth` 服务 Traefik ForwardAuth（转发 body，完整判定）、Caddy `forward_auth` 和 nginx `auth_request`（只有头：路径、方法、信誉）。对每个真实网关的 Docker Compose 端到端。`demo/`。许可证改为 Apache 2.0。 |
 | 0.3.0 ✅ | golden vectors 作为带版本的 core 契约（`core/golden/`，两个 core 在 CI 里回放）；`make calibrate`、`make context-lint`、`make labels`；多租户规则，每个租户自己的 `deployment_context`；决策采样（`/_jev/samples`）；误报反馈回路（`/_jev/feedback`，带过期的指纹信任）；主体轨迹契约（只记录，尚不打分），主体 id 取自 IP、header 或 cookie，加盐哈希后才存储，放在自己的有界 dict 里；APISIX 插件；HAProxy SPOE agent；LiteLLM guardrail；Istio、Envoy Gateway、APIM、Apigee 配方；`@jev-edge/js`：通过向量的 TypeScript core，以及 Cloudflare（薄 / 完整 Worker、Pages）、Next.js、Node、Hono、Lambda@Edge 预设。 |
+| 0.3.1 ✅ | 审计补丁：content-parts 形式的 body 也会被判定；指纹改为整段文本的 SHA-256（原为 crc32 前缀）；`X-Forwarded-For` 取代理追加的那一跳（`client_ip.trusted_hops`）；`GET /_jev/config` 脱敏；管理端点独立监听；每份网关配置都剥离入站 `X-Jev-*`；统一的瘦适配器契约（`status >= 400` 且带 `X-Jev-Verdict` = 拦截，无头 = 未判定）；可选的 `jev_state` dict 存放信任 / 熔断 / 计数器；L3 用与 L2 相同的 prompt 和上限超时；熔断、在途计数、provider 与校验修复；JS 的 fail-open 覆盖整条请求路径。 |
 | 未来可能实现 | 基于主体轨迹打分：窗口、衰减和阈值从记录下来的轨迹和一个多轮数据集里定（和 `abuse` 模板共用，`abuse` 同时得到自己的数据集）；等向量经历过一次真实的 core 变更后再做 Fastly Compute 和 Deno Deploy；面向指标和反馈日志的 Grafana dashboard |
 
 ✅ 表示已随某个 tag 发布。

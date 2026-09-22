@@ -26,8 +26,11 @@ bench/datasets/private/
 bench/out*/
 dist/
 
-# go
+# go (default `go build` outputs and the names the READMEs use)
 adapters/envoy/grpc-shim/jev-shim
+adapters/envoy/grpc-shim/grpc-shim
+adapters/haproxy/spoa/spoa
+adapters/haproxy/spoa/jev-spoa
 
 # python
 __pycache__/

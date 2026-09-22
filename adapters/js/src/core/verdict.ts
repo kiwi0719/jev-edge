@@ -1,9 +1,10 @@
 // Port of core/verdict.lua. Flat structure: every field always present.
-import { utf8Bytes, truncateBytes } from "./normalize";
+import { utf8Bytes } from "./normalize";
 
 export type Action = "pass" | "block";
 export type Label = "safe" | "suspicious" | "malicious" | "error" | "skipped";
-export type Source = "l1" | "cache" | "trust" | "l2" | "breaker";
+/** "adapter" is what the host sets when its own pipeline threw and the request failed open (edge.lua access()). */
+export type Source = "l1" | "cache" | "trust" | "l2" | "breaker" | "adapter";
 
 export const ACTION_PASS: Action = "pass";
 export const ACTION_BLOCK: Action = "block";
@@ -17,6 +18,7 @@ export const SRC_CACHE: Source = "cache";
 export const SRC_TRUST: Source = "trust";
 export const SRC_L2: Source = "l2";
 export const SRC_BREAKER: Source = "breaker";
+export const SRC_ADAPTER: Source = "adapter";
 
 export interface Verdict {
   action: Action;
@@ -85,9 +87,12 @@ export function format2(n: number): string {
   return neg ? "-" + s : s;
 }
 
+/** Longest encoded reason placed in a header, in bytes. */
+export const REASON_MAX = 200;
+
+/** URL-encode and truncate a reason for header transport (<= REASON_MAX bytes of encoded output, never cut inside a %XX escape). */
 export function encodeReason(s: unknown): string {
-  let str = String(s ?? "");
-  if (utf8Bytes(str).length > 200) str = truncateBytes(str, 200);
+  const str = String(s ?? "");
   // Lua: gsub("[^%w%-%._~ ]", %%XX) over bytes, then spaces to +
   let out = "";
   for (const b of utf8Bytes(str)) {
@@ -95,6 +100,8 @@ export function encodeReason(s: unknown): string {
     if (/[A-Za-z0-9\-._~ ]/.test(c) && b < 128) out += c === " " ? "+" : c;
     else out += "%" + b.toString(16).toUpperCase().padStart(2, "0");
   }
+  // every char of `out` is one ASCII byte, so length is bytes
+  if (out.length > REASON_MAX) out = out.slice(0, REASON_MAX).replace(/%[0-9A-Fa-f]?$/, "");
   return out;
 }
 

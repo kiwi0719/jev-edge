@@ -200,6 +200,30 @@
     {
       "expect": {
         "headers": {
+          "X-Jev-Reason": "%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F",
+          "X-Jev-Score": "0.00",
+          "X-Jev-Source": "l1",
+          "X-Jev-Verdict": "skipped"
+        },
+        "verdict": {
+          "action": "pass",
+          "async": false,
+          "fingerprint": "",
+          "l2_ms": 0,
+          "reason": "//////////////////////////////////////////////////////////////////////ab",
+          "score": 0,
+          "source": "l1",
+          "verdict": "skipped"
+        }
+      },
+      "input": {
+        "reason": "//////////////////////////////////////////////////////////////////////ab"
+      },
+      "name": "reason truncated after encoding, never inside an escape"
+    },
+    {
+      "expect": {
+        "headers": {
           "X-Jev-Reason": "%C3%BCber",
           "X-Jev-Score": "0.00",
           "X-Jev-Source": "l1",
@@ -270,7 +294,7 @@
       "name": "score header rounds half"
     }
   ],
-  "core_version": "0.3.0",
+  "core_version": "0.3.1",
   "format_version": 1,
   "generated_by": "core/golden/gen.lua",
   "suite": "verdict"

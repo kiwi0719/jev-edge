@@ -85,8 +85,9 @@ function _M.evaluate(req, rule, ctx)
     return _M.PASS, "", "content-type not watched"
   end
 
-  -- 4. body size
-  local size = tonumber(req.body_size) or (req.body and #req.body) or 0
+  -- 4. body size: the larger of what the adapter declared and what it handed
+  --    over, so a wrong or missing Content-Length cannot shrink the body.
+  local size = math.max(tonumber(req.body_size) or 0, req.body and #req.body or 0)
   if size == 0 and req.body == nil then
     return _M.PASS, "", "no body"
   end
@@ -112,6 +113,53 @@ function _M.evaluate(req, rule, ctx)
   return _M.PASS, "", "text too short"
 end
 
+--- Syntax check for a Lua pattern. The runtime only parses a pattern as far
+-- as the subject takes it, so `pcall(string.find, "", p)` proves nothing;
+-- this walks the pattern the way lstrlib does and reports what it would
+-- raise on some subject. Returns nil when the pattern is well formed.
+function _M.pattern_error(p)
+  local i, n = 1, #p
+  while i <= n do
+    local c = p:sub(i, i)
+    if c == "%" then
+      local d = p:sub(i + 1, i + 1)
+      if d == "" then return "malformed pattern (ends with '%')" end
+      if d == "b" then
+        if i + 3 > n then return "malformed pattern (missing arguments to '%b')" end
+        i = i + 4
+      elseif d == "f" then
+        if p:sub(i + 2, i + 2) ~= "[" then return "missing '[' after '%f' in pattern" end
+        i = i + 2
+      else
+        i = i + 2
+      end
+    elseif c == "[" then
+      local j = i + 1
+      if p:sub(j, j) == "^" then j = j + 1 end
+      -- the first ']' right after '[' or '[^' is literal
+      if p:sub(j, j) == "]" then j = j + 1 end
+      local closed = false
+      while j <= n do
+        local e = p:sub(j, j)
+        if e == "%" then
+          if j + 1 > n then return "malformed pattern (ends with '%')" end
+          j = j + 2
+        elseif e == "]" then
+          closed = true
+          break
+        else
+          j = j + 1
+        end
+      end
+      if not closed then return "malformed pattern (missing ']')" end
+      i = j + 1
+    else
+      i = i + 1
+    end
+  end
+  return nil
+end
+
 --- Resolve a rule spec into a rule table.
 -- A spec is a rule set id (string, loaded through `load`), or a table. A
 -- table with `extends = "<id>"` starts from that rule set and overrides the
@@ -123,11 +171,10 @@ end
 -- @param load fn(id) -> rule|nil, err
 -- @return rule|nil, err
 function _M.resolve(spec, load)
-  if type(spec) == "string" then
-    local rule, err = load(spec)
-    if type(rule) ~= "table" then return nil, err or ("rule set " .. spec .. " not found") end
-    return rule
-  end
+  -- A string is the same as `{ extends = "<id>" }`: the loaded module is
+  -- copied, never handed back, so callers cannot mutate the shared table,
+  -- and the same defaults apply to both forms.
+  if type(spec) == "string" then spec = { extends = spec } end
   if type(spec) ~= "table" then return nil, "rule spec must be a string or a table" end
   local base = {}
   if spec.extends then
@@ -140,6 +187,12 @@ function _M.resolve(spec, load)
   for k, v in pairs(spec) do if k ~= "extends" then out[k] = v end end
   if not out.id then return nil, "rule needs an id" end
   if type(out.watch_paths) ~= "table" then return nil, "rule " .. out.id .. " needs watch_paths" end
+  -- watch_paths are Lua patterns; a malformed one raises on every request.
+  for i, p in ipairs(out.watch_paths) do
+    if type(p) ~= "string" then return nil, "rule " .. out.id .. ": watch_paths[" .. i .. "] must be a string" end
+    local perr = _M.pattern_error(p)
+    if perr then return nil, "rule " .. out.id .. ": watch_paths[" .. i .. "] " .. perr end
+  end
   if not out.text_fields then out.text_fields = { "messages[*].content", "prompt", "input", "query", "text" } end
   if not out.templates then out.templates = { "injection" } end
   return out

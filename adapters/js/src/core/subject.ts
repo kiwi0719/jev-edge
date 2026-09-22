@@ -20,6 +20,10 @@ import type { Verdict } from "./verdict";
 
 export const FORMAT = 1;
 export const KEY_PREFIX = "subj:";
+/** Longest raw subject value accepted. Hashing makes the length irrelevant
+ *  for the store, but with `hashed: true` the value IS the key and the log
+ *  field, so an unbounded header would be an unbounded store key. */
+export const MAX_VALUE_BYTES = 512;
 
 export interface SubjectConfig {
   enabled?: boolean;
@@ -46,14 +50,19 @@ export function extract(scfg: SubjectConfig | undefined, view: RequestView): str
   else if (from === "header") v = view.header?.(scfg.name ?? "");
   else if (from === "cookie") v = view.cookie?.(scfg.name ?? "");
   if (typeof v !== "string") return null;
-  v = v.trim();
-  return v === "" ? null : v;
+  v = v.replace(/^[ \t\n\v\f\r]+|[ \t\n\v\f\r]+$/g, ""); // Lua %s, not Unicode trim
+  if (v === "" || new TextEncoder().encode(v).length > MAX_VALUE_BYTES) return null;
+  return v;
 }
 
 /** `<from>:<hash(salt \0 value)>`; the raw value never leaves this function. `hashed` means the value already is the complete id. */
 export async function hashId(scfg: SubjectConfig, value: string | null, hash: (s: string) => Promise<string> | string): Promise<string | null> {
   if (value === null || value === undefined) return null;
-  if (scfg.hashed) return value;
+  if (scfg.hashed) {
+    // Already `<from>:<hex>` from another jev-edge. Anything else is not an
+    // id computed by us and does not get to name a trajectory.
+    return /^[a-z]+:[0-9a-f]+$/.test(value) ? value : null;
+  }
   if (typeof scfg.salt !== "string" || scfg.salt === "") return null;
   return (scfg.from ?? "ip") + ":" + String(await hash(scfg.salt + "\0" + value));
 }

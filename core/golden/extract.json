@@ -71,7 +71,7 @@
     {
       "expect": {
         "kind": "json",
-        "text": ""
+        "text": "a\nb"
       },
       "input": {
         "body": "{\"prompt\":42,\"messages\":[{\"content\":[\"a\",\"b\"]}]}",
@@ -84,7 +84,61 @@
           "text"
         ]
       },
-      "name": "non-string leaves are ignored"
+      "name": "numbers are ignored, string arrays are joined"
+    },
+    {
+      "expect": {
+        "kind": "json",
+        "text": "part one\npart two"
+      },
+      "input": {
+        "body": "{\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"part one\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"x\"}},{\"type\":\"text\",\"text\":\"part two\"}]}]}",
+        "content_type": "application/json",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "openai content parts"
+    },
+    {
+      "expect": {
+        "kind": "json",
+        "text": "nested"
+      },
+      "input": {
+        "body": "{\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"content\":[{\"type\":\"text\",\"text\":\"nested\"}]}]}]}",
+        "content_type": "application/json",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "anthropic tool_result nests content once more"
+    },
+    {
+      "expect": {
+        "kind": "json",
+        "text": "resp"
+      },
+      "input": {
+        "body": "{\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"resp\"}]}]}",
+        "content_type": "application/json",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "responses api input_text parts"
     },
     {
       "expect": {
@@ -231,7 +285,7 @@
       "name": "unknown content type yields nothing"
     }
   ],
-  "core_version": "0.3.0",
+  "core_version": "0.3.1",
   "format_version": 1,
   "generated_by": "core/golden/gen.lua",
   "suite": "extract"

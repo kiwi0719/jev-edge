@@ -14,6 +14,15 @@ _M.config = {
     max_inflight = 64,
   },
   rules  = { "llm-endpoints" },
+  client_ip = {
+    -- How adapters that sit behind another proxy (authz, forward-auth) find
+    -- the client address in X-Forwarded-For. Proxies APPEND to the header,
+    -- so the client's own value is on the left and the one your proxy added
+    -- is on the right: `trusted_hops = 1` takes the last element, 2 the one
+    -- before it (a load balancer in front of the gateway), and so on. Never
+    -- the first element: that is whatever the client typed.
+    trusted_hops = 1,
+  },
   policy = {
     mode              = "monitor",
     block_threshold   = 0.7,
@@ -24,7 +33,8 @@ _M.config = {
   cache = {
     fp_ttl          = 300,
     rep_ttl         = 600,
-    fp_prefix_bytes = 2048,
+    fp_prefix_bytes = 2048,   -- since 0.3.1: only bounds sampled/logged text; the
+                              -- fingerprint always covers the whole normalized text
   },
   async = {
     enabled         = true,
@@ -114,12 +124,50 @@ function _M.validate(c)
   if p.suspect_threshold > p.block_threshold then
     return nil, "policy.suspect_threshold must be <= block_threshold"
   end
+  if p.block_threshold > 1 or p.suspect_threshold < 0 then
+    return nil, "policy thresholds must be in [0,1]"
+  end
+  if p.block_status ~= nil and (type(p.block_status) ~= "number"
+     or p.block_status < 200 or p.block_status > 599 or p.block_status % 1 ~= 0) then
+    return nil, "policy.block_status must be an HTTP status code"
+  end
+  local ca = c.cache or {}
+  if ca.fp_ttl ~= nil and (type(ca.fp_ttl) ~= "number" or ca.fp_ttl <= 0) then
+    return nil, "cache.fp_ttl must be > 0"
+  end
+  if ca.rep_ttl ~= nil and (type(ca.rep_ttl) ~= "number" or ca.rep_ttl <= 0) then
+    return nil, "cache.rep_ttl must be > 0"
+  end
+  local br = c.breaker or {}
+  for _, k in ipairs({ "window_s", "open_s" }) do
+    if br[k] ~= nil and (type(br[k]) ~= "number" or br[k] <= 0) then
+      return nil, "breaker." .. k .. " must be > 0"
+    end
+  end
+  if br.min_samples ~= nil and (type(br.min_samples) ~= "number" or br.min_samples < 1) then
+    return nil, "breaker.min_samples must be >= 1"
+  end
+  if br.fail_ratio ~= nil and (type(br.fail_ratio) ~= "number" or br.fail_ratio <= 0 or br.fail_ratio > 1) then
+    return nil, "breaker.fail_ratio must be in (0,1]"
+  end
+  local ci = c.client_ip or {}
+  local hops = ci.trusted_hops
+  if hops ~= nil and (type(hops) ~= "number" or hops < 1 or hops % 1 ~= 0) then
+    return nil, "client_ip.trusted_hops must be an integer >= 1"
+  end
+  local as = c.async or {}
+  if as.max_async ~= nil and (type(as.max_async) ~= "number" or as.max_async < 0) then
+    return nil, "async.max_async must be >= 0"
+  end
   if type(c.jev.timeout_ms) ~= "number" or c.jev.timeout_ms <= 0 then
     return nil, "jev.timeout_ms must be > 0"
   end
   local sm = c.sampling or {}
   if sm.rate ~= nil and (type(sm.rate) ~= "number" or sm.rate < 0 or sm.rate > 1) then
     return nil, "sampling.rate must be in [0,1]"
+  end
+  if sm.max_samples ~= nil and (type(sm.max_samples) ~= "number" or sm.max_samples < 1) then
+    return nil, "sampling.max_samples must be >= 1"
   end
   local mv = sm.min_verdict
   if mv ~= nil and mv ~= "safe" and mv ~= "suspicious" and mv ~= "malicious" then

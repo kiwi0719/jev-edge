@@ -3,9 +3,9 @@
 // only the request shape and the stores differ (memory per process unless you
 // pass a Store).
 import { createRuntime, evaluate, withVerdictHeaders, healthResponse, type Options, type Runtime } from "./runtime";
-import type { Verdict } from "./core/verdict";
+import { headers as verdictHeaders, newVerdict, ERROR, SRC_ADAPTER, type Verdict } from "./core/verdict";
 
-const HEADERS = ["x-jev-verdict", "x-jev-score", "x-jev-source", "x-jev-reason", "x-jev-request-id"];
+const HEADERS = ["x-jev-verdict", "x-jev-score", "x-jev-source", "x-jev-reason", "x-jev-request-id", "x-jev-subject"];
 
 function runtimeOnce(opts: Options): () => Runtime {
   let rt: Runtime | undefined;
@@ -40,9 +40,9 @@ export function nextMiddleware(opts: Options, NextResponse: NextResponseLike) {
     const r = rt();
     const url = new URL(request.url);
     if (r.opts.health !== false && url.pathname === "/_jev/health" && request.method === "GET") return healthResponse(r);
-    const { verdict, response, requestId } = await evaluate(request, r);
+    const { verdict, response, requestId, subjectId } = await evaluate(request, r); // never throws: fails open
     if (response) return response;
-    const forwarded = withVerdictHeaders(request, verdict, requestId);
+    const forwarded = withVerdictHeaders(request, verdict, requestId, subjectId);
     return NextResponse.next({ request: { headers: forwarded.headers } });
   };
 }
@@ -59,6 +59,12 @@ export interface NodeRequestLike {
   /** set by express.json() / body-parser; used instead of the stream when present */
   body?: unknown;
   on(event: "data" | "end" | "error", cb: (arg?: any) => void): unknown;
+  /** node:http IncomingMessage flags: when the stream is already finished (a
+   *  previous middleware consumed it) there is nothing to read and waiting
+   *  for "end" would hang forever. */
+  readableEnded?: boolean;
+  complete?: boolean;
+  readable?: boolean;
 }
 
 export interface NodeResponseLike {
@@ -67,21 +73,35 @@ export interface NodeResponseLike {
   end(body?: string): unknown;
 }
 
-async function readNodeBody(req: NodeRequestLike, max: number): Promise<string | null> {
+/**
+ * The request body as text plus its size in bytes. From `req.body` when a
+ * parser ran first; otherwise the stream is read to completion and buffered
+ * whole, because the app behind this middleware still needs it. A body over
+ * `max` is still buffered and handed on as `req.body` unchanged; only the
+ * evaluation drops it (L1 passes it as "body too large"). Cap the size before
+ * this middleware (a proxy limit, or a body parser with `limit`) if unbounded
+ * uploads can reach this route. Returns [null, 0] when there is no body to
+ * read: no stream, or a stream something else already consumed.
+ */
+async function readNodeBody(req: NodeRequestLike): Promise<[string | null, number]> {
   if (req.body !== undefined) {
-    if (typeof req.body === "string") return req.body;
-    if (Buffer.isBuffer(req.body)) return req.body.toString("utf8");
-    if (typeof req.body === "object" && req.body !== null) return JSON.stringify(req.body);
+    if (typeof req.body === "string") return [req.body, Buffer.byteLength(req.body)];
+    if (Buffer.isBuffer(req.body)) return [req.body.toString("utf8"), req.body.length];
+    if (typeof req.body === "object" && req.body !== null) {
+      const s = JSON.stringify(req.body);
+      return [s, Buffer.byteLength(s)];
+    }
   }
-  if (!("on" in req)) return null;
+  if (typeof req.on !== "function") return [null, 0];
+  if (req.readableEnded === true || req.complete === true || req.readable === false) return [null, 0];
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let size = 0;
     req.on("data", (c: Buffer) => {
       size += c.length;
-      if (size <= max + 1) chunks.push(c);
+      chunks.push(c);
     });
-    req.on("end", () => resolve(size > max ? "x".repeat(max + 1) : Buffer.concat(chunks).toString("utf8")));
+    req.on("end", () => resolve([Buffer.concat(chunks).toString("utf8"), size]));
     req.on("error", reject);
   });
 }
@@ -91,8 +111,10 @@ async function readNodeBody(req: NodeRequestLike, max: number): Promise<string |
  *
  * Mount before the routes that carry natural language. If you use
  * express.json() first, the parsed body is re-serialised for evaluation; if
- * not, the stream is read here and re-exposed as `req.body` (string) and
- * `req.jev` (the verdict). X-Jev-* are set on `req.headers` for the handlers.
+ * not, the stream is read here (whole, see readNodeBody) and re-exposed as
+ * `req.body` (string) and `req.jev` (the verdict). X-Jev-* are set on
+ * `req.headers` for the handlers; client-supplied ones are removed first.
+ * Any error fails open with x-jev-verdict: error, x-jev-source: adapter.
  */
 export function nodeMiddleware(opts: Options) {
   const rt = runtimeOnce(opts);
@@ -109,9 +131,14 @@ export function nodeMiddleware(opts: Options) {
       }
       if (!headers.has("x-forwarded-for") && req.socket?.remoteAddress) headers.set("x-forwarded-for", req.socket.remoteAddress);
       const method = req.method ?? "GET";
-      const body = method === "GET" || method === "HEAD" ? null : await readNodeBody(req, max);
+      const [body, size] = method === "GET" || method === "HEAD" ? [null, 0] : await readNodeBody(req);
       if (body !== null && req.body === undefined) req.body = body;
-      const request = new Request(url.toString(), { method, headers, body: body ?? undefined });
+      // Over the limit the body stays on req.body for the app but is not
+      // handed to the evaluation: Content-Length alone lets L1 pass it as
+      // "body too large", the same fail-open as the other hosts.
+      const tooLarge = body !== null && size > max;
+      if (tooLarge) headers.set("content-length", String(size));
+      const request = new Request(url.toString(), { method, headers, body: tooLarge ? undefined : body ?? undefined });
       if (r.opts.health !== false && url.pathname === "/_jev/health" && method === "GET") {
         const h = healthResponse(r);
         res.statusCode = 200;
@@ -119,7 +146,7 @@ export function nodeMiddleware(opts: Options) {
         res.end(await h.text());
         return;
       }
-      const { verdict, response, requestId } = await evaluate(request, r);
+      const { verdict, response, requestId, subjectId } = await evaluate(request, r);
       req.jev = verdict;
       if (response) {
         res.statusCode = response.status;
@@ -127,7 +154,7 @@ export function nodeMiddleware(opts: Options) {
         res.end(await response.text());
         return;
       }
-      const forwarded = withVerdictHeaders(request, verdict, requestId);
+      const forwarded = withVerdictHeaders(request, verdict, requestId, subjectId);
       for (const h of HEADERS) delete req.headers[h];
       forwarded.headers.forEach((v, k) => {
         if (k.startsWith("x-jev-")) req.headers[k] = v;
@@ -135,8 +162,10 @@ export function nodeMiddleware(opts: Options) {
       next();
     } catch (e) {
       console.error("jev-edge: middleware error, failing open: " + (e instanceof Error ? e.message : String(e)));
-      req.headers["x-jev-verdict"] = "error";
-      req.headers["x-jev-source"] = "adapter";
+      for (const h of HEADERS) delete req.headers[h];
+      const v = newVerdict({ verdict: ERROR, source: SRC_ADAPTER, reason: "adapter error" });
+      for (const [k, val] of Object.entries(verdictHeaders(v))) req.headers[k.toLowerCase()] = val;
+      req.jev = v;
       next();
     }
   };
@@ -155,17 +184,50 @@ export interface HonoContextLike {
 /**
  * app.use("/v1/*", honoMiddleware({ config: { ... } }))
  *
- * `c.get("jev")` is the verdict in handlers; X-Jev-* are also set on the
- * response so the client can see them if you want that. Blocked requests
- * return the 403 from the middleware.
+ * `c.get("jev")` is the verdict in handlers. The request handlers see is
+ * `c.req.raw` with every client-supplied X-Jev-* removed and the verdict's
+ * X-Jev-* set (Hono's `raw` is a plain property, so it is replaced in
+ * place); the same X-Jev-* are set on the response. Blocked requests return
+ * the 403 from the middleware; an adapter error fails open.
  */
 export function honoMiddleware(opts: Options) {
   const rt = runtimeOnce(opts);
   return async (c: HonoContextLike, next: () => Promise<void>): Promise<Response | void> => {
-    const r = rt();
-    const { verdict, response } = await evaluate(c.req.raw, r);
+    let verdict: Verdict;
+    let forwarded: Request | undefined;
+    try {
+      const r = rt();
+      const url = new URL(c.req.raw.url);
+      if (r.opts.health !== false && url.pathname === "/_jev/health" && c.req.raw.method === "GET") return healthResponse(r);
+      const ev = await evaluate(c.req.raw, r);
+      verdict = ev.verdict;
+      if (ev.response) {
+        c.set("jev", verdict);
+        return ev.response;
+      }
+      forwarded = withVerdictHeaders(c.req.raw, verdict, ev.requestId, ev.subjectId);
+    } catch (e) {
+      console.error("jev-edge: hono middleware error, failing open: " + (e instanceof Error ? e.message : String(e)));
+      verdict = newVerdict({ verdict: ERROR, source: SRC_ADAPTER, reason: "adapter error" });
+    }
     c.set("jev", verdict);
-    if (response) return response;
+    if (forwarded) {
+      try {
+        c.req.raw = forwarded;
+      } catch {
+        /* a context with a read-only raw keeps the original request */
+      }
+    }
+    const outHeaders: Record<string, string> = {};
+    if (forwarded) forwarded.headers.forEach((v, k) => { if (k.startsWith("x-jev-")) outHeaders[k] = v; });
+    else Object.assign(outHeaders, verdictHeaders(verdict));
+    for (const [k, v] of Object.entries(outHeaders)) {
+      try {
+        c.header(k, v);
+      } catch {
+        /* response headers are best effort */
+      }
+    }
     await next();
   };
 }

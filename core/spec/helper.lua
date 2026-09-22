@@ -30,6 +30,7 @@ function H.store()
   return {
     get = function(_, k) return data[k] end,
     set = function(_, k, v, _ttl) data[k] = v end,
+    incr = function(_, k, by, _ttl) data[k] = (tonumber(data[k]) or 0) + (by or 1); return data[k] end,
     dump = function() return data end,
   }
 end

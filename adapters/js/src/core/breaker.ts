@@ -1,4 +1,5 @@
-// Port of core/breaker.lua. Same store keys ("brk:state", "brk:w:<bucket>",
+// Port of core/breaker.lua: a circuit breaker over tumbling windows of
+// `window_s` seconds. Same store keys ("brk:state", "brk:w:<bucket>",
 // "brk:probe") so a store shared with another implementation would agree.
 import type { CacheLike } from "./rules";
 
@@ -31,7 +32,18 @@ export interface Store {
 interface StateRec { state?: number; until_ts?: number }
 interface Counters { ok: number; fail: number }
 
-export class Breaker {
+/** What core and the runtime need from a breaker; `Breaker` is the in-process
+ *  implementation, `durableBreaker` (cf/stores.ts) the one that runs it inside
+ *  a Durable Object. */
+export interface BreakerLike {
+  state(): Promise<State>;
+  allow(): Promise<boolean>;
+  trip(now?: number): Promise<void>;
+  success(): Promise<void>;
+  failure(): Promise<void>;
+}
+
+export class Breaker implements BreakerLike {
   constructor(private store: Store, private clock: () => number, private cfg: BreakerConfig = {}) {}
 
   private c<K extends keyof Required<BreakerConfig>>(k: K): Required<BreakerConfig>[K] {
@@ -83,6 +95,9 @@ export class Breaker {
       if (ok) {
         await this.store.set(this.c("key_prefix") + "state", { state: CLOSED }, 0);
         await this.store.set(this.c("key_prefix") + "probe", null, 0);
+        // The window that tripped us is still full of failures; start the
+        // closed period from a clean count or the next success re-trips.
+        await this.store.set(key, { ok: 1, fail: 0 }, this.c("window_s") * 2);
       } else {
         await this.trip(now);
       }

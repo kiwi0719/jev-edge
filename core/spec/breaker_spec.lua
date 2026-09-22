@@ -41,6 +41,21 @@ describe("breaker", function()
     assert.is_true(b:allow())
   end)
 
+  it("does not re-trip on the success that follows a probe inside the same window", function()
+    -- t = 960 sits at the start of bucket 960..1019, so the probe at t = 991
+    -- lands in the window that tripped the breaker.
+    local c2 = H.clock(960)
+    local b2 = B.new(store, c2.now, { window_s = 60, min_samples = 4, fail_ratio = 0.5, open_s = 30 })
+    b2:success(); b2:failure(); b2:failure(); b2:failure()
+    assert.equals(B.OPEN, b2:state())
+    c2.advance(31)
+    assert.is_true(b2:allow())
+    b2:success()
+    assert.equals(B.CLOSED, b2:state())
+    b2:success()
+    assert.equals(B.CLOSED, b2:state(), "a success after closing must not trip on the old failures")
+  end)
+
   it("re-opens on a failed probe", function()
     b:trip(); clock.advance(31)
     assert.is_true(b:allow())

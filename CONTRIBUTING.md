@@ -18,6 +18,16 @@
    make check
    ```
 
+   On macOS, Homebrew's `luacheck` is built against Lua 5.5 and crashes on
+   start (`attempt to assign to const variable`). Install one for LuaJIT
+   instead, which is the runtime the code targets anyway, and point the
+   Makefile at it:
+
+   ```bash
+   luarocks --lua-version 5.1 --lua-dir="$(brew --prefix luajit)" --local install luacheck
+   make lint LUACHECK=~/.luarocks/bin/luacheck
+   ```
+
 4. Run the OpenResty integration suite. It runs in the official OpenResty image, so it needs Docker and nothing else:
 
    ```bash

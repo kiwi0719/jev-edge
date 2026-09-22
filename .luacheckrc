@@ -24,7 +24,7 @@ files["bench/wrk-post.lua"] = {
   unused_args = false,
 }
 
-exclude_files = { "t/servroot/", "lua_modules/" }
+exclude_files = { "adapters/openresty/t/servroot/", "t/servroot/", "lua_modules/" }
 
 files["adapters/openresty/spec/"] = {
   std = "+busted",

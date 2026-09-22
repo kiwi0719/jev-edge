@@ -151,7 +151,8 @@ function _M.validate(c)
     return nil, "breaker.fail_ratio must be in (0,1]"
   end
   local ci = c.client_ip or {}
-  if ci.trusted_hops ~= nil and (type(ci.trusted_hops) ~= "number" or ci.trusted_hops < 1 or ci.trusted_hops % 1 ~= 0) then
+  local hops = ci.trusted_hops
+  if hops ~= nil and (type(hops) ~= "number" or hops < 1 or hops % 1 ~= 0) then
     return nil, "client_ip.trusted_hops must be an integer >= 1"
   end
   local as = c.async or {}

@@ -25,7 +25,8 @@ describe("subject extraction and hashing", function()
     assert.equals("header:H(pepper\0key-1)", id)
     assert.is_nil(subject.hash_id({ from = "header" }, "key-1", hash), "no salt, no id")
     assert.equals("header:abc123", subject.hash_id({ hashed = true }, "header:abc123", hash))
-    assert.is_nil(subject.hash_id({ hashed = true }, "not a hash; drop table", hash), "hashed = true only accepts our own id shape")
+    assert.is_nil(subject.hash_id({ hashed = true }, "not a hash; drop table", hash),
+      "hashed = true only accepts our own id shape")
     assert.is_nil(subject.extract({ enabled = true, from = "header", name = "x" },
       { header = function() return string.rep("k", 600) end }), "oversize values are dropped")
     assert.equals("cookie:abc", subject.hash_id({ from = "header", hashed = true }, "cookie:abc", hash))

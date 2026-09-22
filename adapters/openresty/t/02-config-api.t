@@ -123,7 +123,7 @@ location = /_jev/metrics { content_by_lua_block { require("resty.jev.edge").metr
 Content-Type: application/json
 --- response_body_like eval
 [ ("verdict=(error|safe)") x 40,
-  '(?s)(?=.*jev_l2_timeout_ms ([6-9]\d|[1-4]\d\d)\b)(?=.*jev_requests_total\{source="l2",verdict="safe"\} [1-9])' ]
+  '(?s)(?=.*jev_l2_timeout_ms ([6-9]\d|[1-4]\d\d)\b)(?=.*jev_l2_timeout_max_ms 400\n)(?=.*jev_requests_total\{source="l2",verdict="safe"\} [1-9])' ]
 
 
 

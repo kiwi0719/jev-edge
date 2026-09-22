@@ -1,0 +1,103 @@
+name: release-npm
+
+# Publishes adapters/js as @jev-edge/js. A tag push `vX.Y.Z` publishes when
+# X.Y.Z is the version in adapters/js/package.json; a manual run is a dry run
+# unless `dry_run` is unticked. Without the NPM_TOKEN secret the job builds,
+# tests and packs, then stops with a notice instead of failing.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "pnpm publish --dry-run (nothing is uploaded)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  id-token: write # npm provenance: the OIDC token that signs the attestation
+
+concurrency:
+  group: release-npm-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: adapters/js
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: 9
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: adapters/js/pnpm-lock.yaml
+          # writes an .npmrc that reads NODE_AUTH_TOKEN
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Tag matches package.json version
+        if: github.ref_type == 'tag'
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          pkg="$(node -p "require('./package.json').version")"
+          if [ "${TAG#v}" != "$pkg" ]; then
+            echo "::error::tag $TAG does not match adapters/js/package.json version $pkg"
+            exit 1
+          fi
+          echo "publishing @jev-edge/js $pkg"
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm build
+
+      - name: Every export resolves to a .js and a .d.ts
+        run: |
+          node --input-type=module -e '
+            import fs from "node:fs";
+            const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+            let bad = 0;
+            for (const [sub, t] of Object.entries(pkg.exports)) {
+              for (const f of typeof t === "string" ? [t] : [t.import, t.types]) {
+                if (!fs.existsSync(f)) { console.log(`::error::${sub}: ${f} missing`); bad++; }
+              }
+              if (typeof t !== "string") await import(sub === "." ? pkg.name : pkg.name + sub.slice(1));
+            }
+            process.exit(bad ? 1 : 0);
+          '
+
+      - name: LICENSE is the repository's
+        run: cmp LICENSE ../../LICENSE
+
+      - name: Pack listing
+        run: |
+          pnpm pack --pack-destination "$RUNNER_TEMP"
+          tar -tzf "$RUNNER_TEMP"/jev-edge-js-*.tgz
+
+      - name: NPM_TOKEN present?
+        id: token
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "$NPM_TOKEN" ]; then
+            echo "::notice::NPM_TOKEN is not set; built, tested and packed, not published"
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish
+        if: steps.token.outputs.present == 'true'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && '--dry-run' || '' }}
+        run: pnpm publish --access public --provenance --no-git-checks $DRY_RUN

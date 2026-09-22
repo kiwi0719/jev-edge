@@ -3,8 +3,8 @@
 // explicitly outside the parity contract. The three samples (n, mean, var)
 // live in ONE document under "adapt" so an observation is one read and one
 // write; inside a Durable Object (cf/stores.ts) that pair is atomic.
-import type { Store } from "../core/breaker";
-import type { JevConfig } from "../core/defaults";
+import type { Store } from "../core/breaker.js";
+import type { JevConfig } from "../core/defaults.js";
 
 export const KEY = "adapt";
 

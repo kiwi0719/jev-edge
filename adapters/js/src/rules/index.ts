@@ -1,7 +1,7 @@
 // Ports of rules/*.lua. Keep the pattern lists identical to the Lua files;
 // core/golden/rules.json has one positive per always_suspect pattern and
 // fails a named case when the two drift.
-import { patternError, type Rule } from "../core/rules";
+import { patternError, type Rule } from "../core/rules.js";
 
 export const llmEndpoints: Rule = {
   id: "llm-endpoints",

@@ -15,6 +15,7 @@ npm install @jev-edge/js      # or pnpm add / yarn add; Node 20+ (global crypto)
 | Node: Express, Connect, Fastify raw | `nodeMiddleware` | `(req, res, next)`; verdict on `req.jev` and `req.headers` |
 | Hono, and anything with a `Request` in its context | `honoMiddleware` | `c.get("jev")` in handlers |
 | AWS Lambda@Edge (CloudFront viewer-request / origin-request) | `lambdaEdgeHandler` | returns the request with headers or a 403 response |
+| Deno Deploy, `Deno.serve` | `denoHandler` | the whole core in the isolate, proxying to `upstream`; optional Deno KV store (`denoKvStore`) |
 | anything else | `createRuntime` + `handle` / `evaluate` | the primitives the presets are built from |
 
 All V8 hosts, so one golden-vector column covers them. What differs per host is the request shape and which store backs the cache and breaker state; the table under [What is the same as nginx](#what-is-the-same-as-nginx-and-what-is-not) has the details.
@@ -127,6 +128,24 @@ export const handler = lambdaEdgeHandler({
 
 CloudFront hands the body over base64-encoded, truncated at 40 KB on viewer-request (1 MB on origin-request) with `bodyTruncated` set. A truncated body is scanned as the head of a larger one for the text fields, with no tail (the reason ends in `(window)`; a head with no text is `unjudgeable: body too large`), and the full body still reaches the origin. Use origin-request if prompts can be longer than 40 KB. Lambda@Edge has no environment variables, no VPC and no KV: cache, breaker and adaptive timeout are per execution environment unless you pass Store implementations (DynamoDB Global Tables is the usual choice, at a round trip per lookup). API Gateway's Lambda authorizer and CloudFront Functions do not see the body and are not supported; [the recipes page](../../docs/recipes.md) explains what a headers-only integration can and cannot do. [examples/lambda-edge.ts](examples/lambda-edge.ts).
 
+## Deno Deploy
+
+```ts
+import { denoHandler } from "npm:@jev-edge/js/deno";
+
+Deno.serve(denoHandler({
+  upstream: "https://app.internal.example.com",
+  kv: await Deno.openKv(),   // optional: cache, breaker / adaptive state and subject ring in Deno KV
+  config: { jev: { provider: "jev", api_key: Deno.env.get("TYPESAFE_API_KEY"), deployment_context: "…" }, policy: { mode: "monitor" } },
+}));
+```
+
+`denoHandler` is `fullWorker` for `Deno.serve`: one runtime per isolate, allowed requests forwarded to `upstream`'s origin with the request's path and query (a `//host` path stays on the upstream) and `X-Jev-*` attached, redirects passed back rather than followed, blocks answered with the 403. The client IP is the peer Deno reports in `info.remoteAddr.hostname`, appended to `X-Forwarded-For` the way `nodeMiddleware` appends the socket address, so with the default `client_ip.trusted_hops = 1` a client-sent `X-Forwarded-For` cannot choose it. If Deploy sits behind a proxy of yours, raise `trusted_hops` to match.
+
+`denoKvStore(kv, prefix?)` is a `Store` over Deno KV, typed structurally (no dependency on Deno's types). ttl becomes `expireIn`, and reads check the expiry themselves because Deno KV deletes expired keys lazily. `incr` and `expire` are check-and-set loops on `kv.atomic()`, so the subject ring counter is atomic across isolates and regions; the breaker's counters use plain get / set and can lose an increment under contention. Without `kv` every store is memory per isolate.
+
+`Deno.serve` has no `waitUntil`: the subject write is fire-and-forget, not awaited on the request path and not guaranteed to finish if the isolate is stopped. `br` bodies decode through `node:zlib`, which Deno resolves via its Node compatibility layer. [examples/deno.ts](examples/deno.ts).
+
 ## Any other framework
 
 `handle(request, runtime, next)` is what the presets wrap:
@@ -159,15 +178,16 @@ Different, by platform:
 | Cloudflare Workers | KV: 60 s minimum TTL, eventually consistent | Durable Object: the breaker and adaptive read-modify-write run inside `JevState`, one hop per operation, atomic | per isolate without the bindings |
 | Next.js on Vercel, Node, Hono | memory per process / isolate | memory | pass a `Store` to share |
 | Lambda@Edge | memory per execution environment | memory | no env vars; key from Secrets Manager |
+| Deno Deploy | Deno KV (`kv`), else memory per isolate | Deno KV, get / set (not atomic), else memory | subject ring `incr` is atomic (check-and-set) |
 
-- **Client IP.** `cf-connecting-ip` on Cloudflare (presets, or a request carrying the `cf` object), a header you name with `clientIpHeader`, or else `X-Forwarded-For` element `client_ip.trusted_hops` from the right, as on nginx. The Node middleware appends the socket address to `X-Forwarded-For` first, so with no proxy in front the IP is the peer's.
+- **Client IP.** `cf-connecting-ip` on Cloudflare (presets, or a request carrying the `cf` object), a header you name with `clientIpHeader`, or else `X-Forwarded-For` element `client_ip.trusted_hops` from the right, as on nginx. The Node middleware and the Deno handler append the peer address (socket / `info.remoteAddr`) to `X-Forwarded-For` first, so with no proxy in front the IP is the peer's.
 - **Fingerprint hash.** SHA-256 hex over the whole normalized text, on both (`core.sha256Hex` here, `resty.sha256` on nginx), so the same text has the same fingerprint everywhere. `djb2` is only the golden vectors' reference hash. `cache.fp_prefix_bytes` only bounds sampled text.
 - **Byte truncation of sampled text.** Lua's `s:sub(1, n)` keeps the bytes of a code point split at `n`; this package drops the partial code point, so the sampled text is never longer than `n` bytes and never contains U+FFFD. The golden normalize vectors cut on ASCII and agree; only a logged sample that ends inside a multi-byte character differs, by at most three bytes.
 - **Adaptive timeout state.** One document (`adapt`) instead of the three `adapt:*` keys the OpenResty adapter keeps; the value is outside the parity contract either way.
 - **No `/_jev/config` hot reload.** Config is code; redeploy, or read it from your store in an options function.
 - **No L3 side-path yet.** `verdict.async` is set; nothing consumes it.
 - **Body size.** Up to the largest `max_body_bytes` (1 MiB by default) the body is parsed whole. Past it the runtime keeps the first `max_body_bytes` and the last 64 KiB, reading on to at most 4 x the limit; a body longer than that is scanned on its head and the last 64 KiB read, not the body's real tail. Workers cap request size by plan. See [Body size and what L1 reads](../../README.md#body-size-and-what-l1-reads).
-- **Content-Type and Content-Encoding.** Content-Type is a hint, as in the Lua core: the body decides the format, and only media types in `skip_content_types` are skipped. `gzip` and `deflate` are decoded with `DecompressionStream`, `br` with `node:zlib` where the runtime has it (Node, Lambda@Edge, Next on the Node runtime); elsewhere a `br` body is `unjudgeable`. Decoding is capped at `max_body_bytes`.
+- **Content-Type and Content-Encoding.** Content-Type is a hint, as in the Lua core: the body decides the format, and only media types in `skip_content_types` are skipped. `gzip` and `deflate` are decoded with `DecompressionStream`, `br` with `node:zlib` where the runtime has it (Node, Lambda@Edge, Next on the Node runtime, Deno via its `node:` compatibility layer); elsewhere a `br` body is `unjudgeable`. Decoding is capped at `max_body_bytes`.
 
 ## Development
 
@@ -179,3 +199,5 @@ pnpm build         # dist/ for publishing
 ```
 
 `pnpm golden` runs only the parity suite. When `core/golden/*.json` changes upstream, this suite is what tells you the port has to follow.
+
+The published build is plain ESM that Node and Deno load without a bundler, so relative imports in `src/` carry their `.js` extension; `tsconfig.build.json` uses `NodeNext` resolution and fails the build on one that does not. `pnpm pack` rebuilds `dist/` first (`prepack`) and ships `dist/`, this README, `LICENSE` (a copy of the repository's, checked by the release workflow) and the two wrangler configs. Releases go out from [.github/workflows/release-npm.yml](../../.github/workflows/release-npm.yml) on a `v<version>` tag.

@@ -1,7 +1,7 @@
 // Port of core/defaults.lua: default configuration and deep merge.
-import type { Policy } from "./policy";
-import type { BreakerConfig } from "./breaker";
-import type { FeedbackConfig } from "./trust";
+import type { Policy } from "./policy.js";
+import type { BreakerConfig } from "./breaker.js";
+import type { FeedbackConfig } from "./trust.js";
 
 export interface JevConfig {
   provider?: string;

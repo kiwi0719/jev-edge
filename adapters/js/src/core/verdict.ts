@@ -1,5 +1,5 @@
 // Port of core/verdict.lua. Flat structure: every field always present.
-import { utf8Bytes } from "./normalize";
+import { utf8Bytes } from "./normalize.js";
 
 export type Action = "pass" | "block";
 export type Label = "safe" | "suspicious" | "malicious" | "error" | "skipped";

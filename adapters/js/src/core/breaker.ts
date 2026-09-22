@@ -1,7 +1,7 @@
 // Port of core/breaker.lua: a circuit breaker over tumbling windows of
 // `window_s` seconds. Same store keys ("brk:state", "brk:w:<bucket>",
 // "brk:probe") so a store shared with another implementation would agree.
-import type { CacheLike } from "./rules";
+import type { CacheLike } from "./rules.js";
 
 export const CLOSED = 0;
 export const OPEN = 1;

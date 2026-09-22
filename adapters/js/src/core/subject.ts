@@ -16,8 +16,8 @@
 // without awaiting. On Workers that keeps a Durable Object hop (or its absence)
 // a deployment choice -- `record` can be dropped into waitUntil -- instead of
 // something the request path has to wait for.
-import type { Verdict } from "./verdict";
-import type { Store } from "./breaker";
+import type { Verdict } from "./verdict.js";
+import type { Store } from "./breaker.js";
 
 export const FORMAT = 1;
 export const KEY_PREFIX = "subj:";

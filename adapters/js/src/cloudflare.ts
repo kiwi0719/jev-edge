@@ -11,8 +11,8 @@
 //                         OpenAI-compatible endpoint) as the provider.
 //   pagesMiddleware(opts) same as fullWorker, exported as a Pages Functions
 //                         middleware: `export const onRequest = pagesMiddleware({...})`.
-import { createRuntime, handle, type Options, type Runtime, type RequestCtx } from "./runtime";
-import { JevState, type KVLike, type DOStubLike } from "./cf/stores";
+import { createRuntime, handle, type Options, type Runtime, type RequestCtx } from "./runtime.js";
+import { JevState, type KVLike, type DOStubLike } from "./cf/stores.js";
 
 export { JevState };
 

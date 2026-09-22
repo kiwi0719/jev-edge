@@ -1,9 +1,9 @@
 // Port of core/sampling.lua: decide and build. Storage is the host's job
 // (KV, a log line, an analytics binding), through Options.onSample.
-import * as normalize from "./core/normalize";
-import { MALICIOUS, SRC_L1, type Verdict } from "./core/verdict";
-import type { Config } from "./core/defaults";
-import { contentType, pathMatches, type Req, type Rule } from "./core/rules";
+import * as normalize from "./core/normalize.js";
+import { MALICIOUS, SRC_L1, type Verdict } from "./core/verdict.js";
+import type { Config } from "./core/defaults.js";
+import { contentType, pathMatches, type Req, type Rule } from "./core/rules.js";
 
 const RANK: Record<string, number> = { skipped: -1, error: 0, safe: 1, suspicious: 2, malicious: 3 };
 

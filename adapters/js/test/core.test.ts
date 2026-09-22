@@ -44,6 +44,15 @@ describe("luaPatternToRegExp", () => {
     expect(patternError("[^]]")).toBeNull();
     expect(() => luaPatternToRegExp("^/v1/[")).toThrow(/malformed/);
   });
+
+  it("patternError rejects capture errors like core/rules.lua", () => {
+    expect(patternError("^/v1/(chat")).toBe("unfinished capture");
+    expect(patternError("^/v1/chat)")).toBe("invalid pattern capture");
+    expect(patternError("^/v1/%1")).toBe("invalid capture index %1");
+    expect(patternError("^/(v1%1)")).toBe("invalid capture index %1");
+    expect(patternError("^/%0")).toBe("invalid capture index %0");
+    for (const ok of ["^/v1/(chat)", "^/(v1)/%1", "^/v1/()", "^/v1/[()]", "^/v1/%(", "^/%b()"]) expect(patternError(ok)).toBeNull();
+  });
 });
 
 describe("rules.resolve", () => {
@@ -112,7 +121,10 @@ describe("normalize.truncateBytes", () => {
     expect(fingerprint(a, { prefix_bytes: 10 }, djb2)).not.toBe(fingerprint(b, { prefix_bytes: 10 }, djb2));
     expect(fingerprint(a, { prefix_bytes: 10 }, djb2)).toBe(fingerprint(a, null, djb2));
     expect(fingerprint("12345678901234567890", null, djb2)).not.toBe("");
-    expect(fingerprint("   ", null, djb2)).toBe("");
+    expect(fingerprint("", null, djb2)).toBe("");
+    // whitespace-only text is cached like any other: one fingerprint for all of it
+    expect(fingerprint("   ", null, djb2)).not.toBe("");
+    expect(fingerprint("\n\t ".repeat(40), null, djb2)).toBe(fingerprint("   ", null, djb2));
   });
 
   it("extracts content parts to a bounded depth", () => {

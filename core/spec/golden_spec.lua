@@ -52,7 +52,7 @@ end)
 describe("golden: extract", function()
   for _, c in ipairs(load("extract").cases) do
     it(c.name, function()
-      local text, kind = normalize.extract(c.input.body, c.input.content_type, c.input.fields, H.json.decode)
+      local text, kind = normalize.extract(c.input.body, c.input.content_type, c.input.fields, H.body_decode)
       same(c.expect, { text = text, kind = kind })
     end)
   end
@@ -64,7 +64,7 @@ describe("golden: rules", function()
       local rule = require("jev.rules." .. c.input.rule)
       local ctx = {
         cache = store_from(c.input.cache), clock = function() return c.input.clock end,
-        json_decode = H.json.decode, re_find = H.re_find,
+        json_decode = H.body_decode, re_find = H.re_find,
       }
       local r, text, reason = rules_mod.evaluate(c.input.req, rule, ctx)
       same(c.expect, { result = r, text = text, reason = reason })
@@ -122,7 +122,7 @@ describe("golden: evaluate", function()
           set = function(_, k, v, ttl) writes[k] = { value = v, ttl = ttl }; cache:set(k, v, ttl) end,
         },
         clock = function() return inp.clock end,
-        hash = normalize.djb2, json_decode = H.json.decode, re_find = H.re_find,
+        hash = normalize.djb2, json_decode = H.body_decode, re_find = H.re_find,
         judge = { call = function(prompt)
           calls = calls + 1; seen = prompt
           if inp.judge.error then return nil, inp.judge.error end

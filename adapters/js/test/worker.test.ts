@@ -10,7 +10,7 @@ const BENIGN = '{"messages":[{"role":"user","content":"Please write a detailed s
 function chat(body: string, headers: Record<string, string> = {}, path = "/v1/chat/completions"): Request {
   return new Request("https://edge.example" + path, {
     method: "POST",
-    headers: { "content-type": "application/json", "cf-connecting-ip": "203.0.113.7", ...headers },
+    headers: { "content-type": "application/json", "x-forwarded-for": "203.0.113.7", ...headers },
     body,
   });
 }

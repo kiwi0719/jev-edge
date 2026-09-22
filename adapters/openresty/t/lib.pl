@@ -20,7 +20,7 @@ our $HttpConfig = qq{
 # Echo upstream: prints the X-Jev-* headers the gateway attached.
 our $Echo = q{
     content_by_lua_block {
-        local h = ngx.req.get_headers()
+        local h = ngx.req.get_headers(0)
         ngx.say("verdict=", h["x-jev-verdict"] or "-",
                 " score=", h["x-jev-score"] or "-",
                 " source=", h["x-jev-source"] or "-",

@@ -151,12 +151,13 @@ local PREFIX300 = string.rep("abcdefghij", 30)
 norm_case("fingerprint covers the whole text, not the prefix (a)", PREFIX300 .. " tail one", { prefix_bytes = 100 })
 norm_case("fingerprint covers the whole text, not the prefix (b)", PREFIX300 .. " tail two", { prefix_bytes = 100 })
 norm_case("digits-only text still fingerprints", "12345678901234567890")
+norm_case("whitespace-only text still fingerprints, one value for all of it", string.rep(" \n", 12))
 
 local extract_cases = {}
 local FIELDS = { "messages[*].content", "prompt", "input", "query", "text" }
 
 local function extract_case(name, body, ct, fields)
-  local text, kind = normalize.extract(body, ct, fields or FIELDS, H.json.decode)
+  local text, kind = normalize.extract(body, ct, fields or FIELDS, H.body_decode)
   extract_cases[#extract_cases + 1] = {
     name = name,
     input = { body = body, content_type = ct or NULL, fields = fields or FIELDS },
@@ -186,6 +187,10 @@ extract_case("responses api input_text parts",
 extract_case("json with charset parameter", '{"prompt":"with charset"}', "application/json; charset=utf-8")
 extract_case("vendor +json suffix", '{"prompt":"vendor"}', "application/vnd.acme+json")
 extract_case("invalid json", '{"prompt":', "application/json")
+extract_case("a null message does not end the list",
+  '{"messages":[null,{"role":"user","content":"after null"}]}', "application/json")
+extract_case("a null content part does not end the parts",
+  '{"messages":[{"role":"user","content":[null,{"type":"text","text":"after null part"}]}]}', "application/json")
 extract_case("UTF-8 BOM before json is skipped", "\239\187\191" .. '{"prompt":"after bom"}', "application/json")
 extract_case("empty body", "", "application/json")
 extract_case("form urlencoded decodes plus and percent",
@@ -207,7 +212,7 @@ local function rules_case(name, req, state)
   for k, v in pairs(state.cache or {}) do cache:set(k, v) end
   local ctx = {
     cache = cache, clock = function() return state.clock or 1000 end,
-    json_decode = H.json.decode, re_find = H.re_find,
+    json_decode = H.body_decode, re_find = H.re_find,
   }
   local r, text, reason = rules_mod.evaluate(req, llm, ctx)
   rules_cases[#rules_cases + 1] = {
@@ -399,7 +404,7 @@ local function eval_case(name, spec)
     config = cfg, rules = rule_list, cache = recording, breaker = breaker,
     subject = subject_ctx,
     clock = function() return spec.clock or 1000 end,
-    hash = normalize.djb2, json_decode = H.json.decode, re_find = H.re_find,
+    hash = normalize.djb2, json_decode = H.body_decode, re_find = H.re_find,
     judge = { call = function(prompt)
       calls = calls + 1
       seen_prompt = prompt
@@ -563,6 +568,8 @@ eval_case("subject: breaker skip is a step too", { req = req(ATTACK), subject = 
 eval_case("subject: L2 error is a step too", { req = req(ATTACK), subject = SUBJ_H,
   judge = { error = "timeout" } })
 
+eval_case("whitespace-only text is cached like any other", { req = req(string.rep(" \t", 15)),
+  judge = { answers = { injection = 0.1 } } })
 eval_case("custom cache ttl and prefix", { req = req(LONG),
   config = { cache = { fp_ttl = 60, fp_prefix_bytes = 16 } }, judge = { answers = { injection = 0.1 } } })
 

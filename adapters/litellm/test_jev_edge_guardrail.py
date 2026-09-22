@@ -43,6 +43,14 @@ def test_pass_annotates_and_forwards_ip_and_path():
     assert v["reason"] == "injection 0.20"
 
 
+def test_xff_chain_is_forwarded_whole_not_its_forgeable_first_entry():
+    transport, seen = fake_authz()
+    g = JevEdgeGuardrail(jev_edge_url="http://jev-edge:8080", transport=transport)
+    data = {"messages": CHAT["messages"], "proxy_server_request": {"headers": {"X-Forwarded-For": "6.6.6.6,  198.51.100.4"}}}
+    run(g.async_pre_call_hook({}, None, data, "completion"))
+    assert seen["xff"] == "6.6.6.6, 198.51.100.4"
+
+
 def test_block_raises_403():
     transport, _ = fake_authz(status=403, verdict="malicious", score="0.95", reason="injection+0.95")
     g = JevEdgeGuardrail(jev_edge_url="http://jev-edge:8080", transport=transport)

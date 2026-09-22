@@ -197,6 +197,42 @@
     {
       "expect": {
         "kind": "json",
+        "text": "after null"
+      },
+      "input": {
+        "body": "{\"messages\":[null,{\"role\":\"user\",\"content\":\"after null\"}]}",
+        "content_type": "application/json",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "a null message does not end the list"
+    },
+    {
+      "expect": {
+        "kind": "json",
+        "text": "after null part"
+      },
+      "input": {
+        "body": "{\"messages\":[{\"role\":\"user\",\"content\":[null,{\"type\":\"text\",\"text\":\"after null part\"}]}]}",
+        "content_type": "application/json",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "a null content part does not end the parts"
+    },
+    {
+      "expect": {
+        "kind": "json",
         "text": "after bom"
       },
       "input": {

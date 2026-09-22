@@ -51,7 +51,7 @@ local function run(spec)
     rules = { require "jev.rules.llm-endpoints" },
     cache = store, subject = subject_ctx,
     clock = function() return 1000 end,
-    hash = normalize.djb2, json_decode = H.json.decode, re_find = H.re_find,
+    hash = normalize.djb2, json_decode = H.body_decode, re_find = H.re_find,
     judge = { call = function()
       if spec.error then return nil, spec.error end
       return spec.answers or { injection = 0.1 }

@@ -3009,6 +3009,74 @@
     {
       "expect": {
         "cache_writes": {
+          "fp:e912b53a:0002b5c5": {
+            "ttl": 300,
+            "value": {
+              "reason": "injection 0.10",
+              "score": 0.1
+            }
+          }
+        },
+        "headers": {
+          "X-Jev-Reason": "injection+0.10",
+          "X-Jev-Score": "0.10",
+          "X-Jev-Source": "l2",
+          "X-Jev-Verdict": "safe"
+        },
+        "judge_calls": 1,
+        "prompt": {
+          "context": {
+            "deployment": "",
+            "method": "POST",
+            "path": "/v1/chat/completions"
+          },
+          "questions": [
+            "injection"
+          ],
+          "text": " \t \t \t \t \t \t \t \t \t \t \t \t \t \t \t"
+        },
+        "subject_record": null,
+        "verdict": {
+          "action": "pass",
+          "async": false,
+          "fingerprint": "0002b5c5",
+          "l2_ms": 0,
+          "reason": "injection 0.10",
+          "score": 0.1,
+          "source": "l2",
+          "verdict": "safe"
+        }
+      },
+      "input": {
+        "breaker": null,
+        "cache": {},
+        "clock": 1000,
+        "config": {},
+        "judge": {
+          "answers": {
+            "injection": 0.1
+          }
+        },
+        "req": {
+          "body": "{\"messages\":[{\"role\":\"user\",\"content\":\" \\t \\t \\t \\t \\t \\t \\t \\t \\t \\t \\t \\t \\t \\t \\t\"}]}",
+          "body_size": 88,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/v1/chat/completions"
+        },
+        "rules": [
+          "llm-endpoints"
+        ],
+        "subject": null
+      },
+      "name": "whitespace-only text is cached like any other"
+    },
+    {
+      "expect": {
+        "cache_writes": {
           "fp:e912b53a:cf223bdc": {
             "ttl": 60,
             "value": {

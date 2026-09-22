@@ -76,9 +76,29 @@ var skipHeader = map[string]bool{
 	"host": true, "content-length": true, "transfer-encoding": true, "connection": true,
 	"x-forwarded-for": true, "content-type": true, "expect": true, "accept-encoding": true,
 	"te": true, "upgrade": true, "keep-alive": true, "proxy-connection": true,
+	// client-IP headers jev-edge consults before X-Forwarded-For; a client
+	// copy would override the source address set below
+	"x-envoy-external-address": true, "x-real-ip": true,
 	// never trust a client-supplied verdict
 	"x-jev-verdict": true, "x-jev-score": true, "x-jev-source": true, "x-jev-reason": true,
 	"x-jev-request-id": true, "x-jev-subject": true,
+}
+
+// copyHeaders adds each "Name: value" line of a raw header block to dst,
+// minus skipHeader.
+func copyHeaders(dst http.Header, hdrs string) {
+	for _, line := range strings.Split(hdrs, "\n") {
+		line = strings.TrimRight(line, "\r")
+		i := strings.IndexByte(line, ':')
+		if i <= 0 {
+			continue
+		}
+		name := strings.TrimSpace(line[:i])
+		if skipHeader[strings.ToLower(name)] {
+			continue
+		}
+		dst.Add(name, strings.TrimSpace(line[i+1:]))
+	}
 }
 
 func setVars(req *request.Request, vars map[string]string) {
@@ -126,18 +146,7 @@ func handler(req *request.Request) {
 	// forward the original headers (req.hdrs is the raw header block) so
 	// jev-edge sees the same request Envoy or nginx would; hop-by-hop and
 	// framing headers are recomputed by the client
-	for _, line := range strings.Split(hdrs, "\n") {
-		line = strings.TrimRight(line, "\r")
-		i := strings.IndexByte(line, ':')
-		if i <= 0 {
-			continue
-		}
-		name := strings.TrimSpace(line[:i])
-		if skipHeader[strings.ToLower(name)] {
-			continue
-		}
-		hreq.Header.Add(name, strings.TrimSpace(line[i+1:]))
-	}
+	copyHeaders(hreq.Header, hdrs)
 	if ct != "" {
 		hreq.Header.Set("Content-Type", ct)
 	}

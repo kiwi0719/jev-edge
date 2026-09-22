@@ -18,7 +18,10 @@ http:
         # v3.3+: send the request body so jev-edge can judge it. Without this
         # the verdict is always `skipped` (headers only).
         forwardBody: true
-        maxBodySize: 65536            # matches rules.max_body_bytes
+        # no maxBodySize: past it Traefik answers 401 itself instead of calling
+        # jev-edge, so a large request would be denied rather than passed as
+        # "body too large" (fail-open). Cap request size with a `buffering`
+        # middleware (maxRequestBodyBytes) ahead of this one if you need to.
         # copy the verdict onto the request that reaches your service
         authResponseHeaders:
           - X-Jev-Verdict

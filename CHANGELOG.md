@@ -45,9 +45,59 @@ All notable changes to this project are recorded here. The format follows
   `input_text` parts and Anthropic `tool_result` arrived empty or were
   skipped without a call; a `prompt` next to `messages` was ignored.
 
+- **The client cannot pick the IP or path it is judged under.**
+  `forward_auth` no longer reads `X-Envoy-External-Address` (only Envoy sets
+  it; `authz` still does). The HAProxy SPOA agent, the Caddyfile and the
+  nginx `auth_request` conf drop client copies of `X-Envoy-External-Address`
+  and `X-Real-IP`, and the nginx sub-request sets `X-Forwarded-Uri` /
+  `X-Forwarded-Method` itself: a client's `X-Forwarded-Uri: /healthz` made the
+  request "path not watched" and skipped the reputation block. The JS runtime
+  reads `X-Forwarded-For` from the right (`client_ip.trusted_hops`), trusts
+  `cf-connecting-ip` only on Cloudflare (or a configured `clientIpHeader`),
+  and the Node middleware appends the socket address like any proxy. The
+  LiteLLM guardrail forwards the whole `X-Forwarded-For` chain, not its
+  client-written first entry.
+- **More than 100 request headers no longer hide `Content-Type`.** OpenResty
+  and APISIX read all headers (`ngx.req.get_headers(0)`); past the default
+  100 the rest were dropped and L1 passed "content-type not watched".
+- **A JSON `null` in `messages` or in content parts no longer ends the list.**
+  The JS port stopped there (it followed the test decoder, which leaves a
+  hole, not cjson, which keeps `null` as a value); the Lua specs now decode
+  bodies the way cjson does.
+- **The Node middleware judges the body the app will read.** A form parsed by
+  `express.urlencoded()` was re-encoded as JSON and yielded no text; Express
+  4's `json()` placeholder `{}` for a body it did not parse was judged instead
+  of the stream; and a stream that had fully arrived but was not yet read
+  (`req.complete`) was taken for consumed, so the request was not judged.
+
 ### Fixed
 - APISIX picks the rule for L3 and sampling by path, method and content type
   (`rules.rule_for`), like the OpenResty adapter; it used path alone.
+- APISIX keeps breaker, adaptive timeout and in-flight counters per provider,
+  endpoint and model instead of one set for every route, and skips L3 while
+  the breaker is not closed.
+- `jev_tokens_total` is recorded: the usage callback was called with an
+  extra argument and dropped every sample.
+- Subject trajectories: the ring counter's ttl is extended on every append
+  (it expired `history_ttl` after the subject's first request, however
+  active), and each slot carries its sequence number so a read between
+  another worker's `incr` and `set`, or after `max_entries` changed, skips
+  the slot instead of returning a stale entry.
+- The breaker's half-open probe is claimed with an atomic `add` where the
+  store has one, so exactly one worker probes.
+- `watch_paths` validation rejects capture errors (unbalanced parentheses,
+  back-references to a missing or open capture), which lstrlib only raises
+  once a request reaches them, silently failing that rule open.
+- Whitespace-only text has a fingerprint, so it is cached like any other
+  text instead of costing a judge call per request.
+- nginx `auth_request`: a deny answers with a JSON body; the README says
+  `block_status` must be 401 or 403 there (anything else becomes a 500).
+- Traefik: `maxBodySize` removed from the example; past it Traefik denied
+  with 401 instead of letting jev-edge pass the request as "body too large".
+- Envoy gRPC shim: default timeout 1.5 s, below Envoy's 2 s, so a slow
+  jev-edge still yields `X-Jev-Verdict: error` instead of a silent pass.
+- Makefile: Docker targets mount `$(CURDIR)`; `$$(PWD)` only worked on
+  case-insensitive filesystems.
 
 ## [0.3.1] - 2026-09-22
 

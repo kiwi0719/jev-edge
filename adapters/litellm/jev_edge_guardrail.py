@@ -149,9 +149,11 @@ class JevEdgeGuardrail(CustomGuardrail):
             return str(ip)
         psr = data.get("proxy_server_request") or {}
         headers = psr.get("headers") or {}
-        xff = headers.get("x-forwarded-for") or headers.get("X-Forwarded-For")
+        xff = next((v for k, v in headers.items() if str(k).lower() == "x-forwarded-for"), None)
+        # the whole chain, not its first entry: the leftmost value is whatever
+        # the client sent. jev-edge's client_ip.trusted_hops picks the hop.
         if xff:
-            return str(xff).split(",")[0].strip()
+            return ", ".join(p.strip() for p in str(xff).split(",") if p.strip()) or None
         return None
 
     # ------------------------------------------------------------------

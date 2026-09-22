@@ -57,7 +57,7 @@
     },
     {
       "expect": {
-        "fingerprint": "",
+        "fingerprint": "0002b5c5",
         "normalized": ""
       },
       "input": {
@@ -185,6 +185,17 @@
         "text": "12345678901234567890"
       },
       "name": "digits-only text still fingerprints"
+    },
+    {
+      "expect": {
+        "fingerprint": "0002b5c5",
+        "normalized": ""
+      },
+      "input": {
+        "opts": null,
+        "text": " \n \n \n \n \n \n \n \n \n \n \n \n"
+      },
+      "name": "whitespace-only text still fingerprints, one value for all of it"
     }
   ],
   "core_version": "0.3.1",

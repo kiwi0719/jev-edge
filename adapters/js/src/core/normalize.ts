@@ -74,9 +74,10 @@ function collect(node: JsonValue | undefined, out: string[], depth: number): voi
   }
   if (!isObj(node) || depth > LEAF_DEPTH) return;
   if (Array.isArray(node)) {
-    // Lua ipairs: stops at the first nil
+    // JSON null contributes nothing and does not end the array (Lua under
+    // cjson: cjson.null is a value, ipairs goes on past it)
     for (const item of node) {
-      if (item === null || item === undefined) break;
+      if (item === null || item === undefined) continue;
       collect(item, out, depth + 1);
     }
     return;
@@ -98,10 +99,10 @@ function walk(node: JsonValue | undefined, segs: Seg[], i: number, out: string[]
     child = Array.isArray(node) ? undefined : node[seg.key];
   }
   if (seg.each) {
-    // Lua ipairs: array part only, stops at the first nil
+    // Lua ipairs over a cjson array: null is a value, skipped, not the end
     if (!Array.isArray(child)) return;
     for (const item of child) {
-      if (item === null || item === undefined) break;
+      if (item === null || item === undefined) continue;
       walk(item, segs, i + 1, out);
     }
   } else {
@@ -223,6 +224,8 @@ export function fingerprint(
   const o: NormalizeOpts = { strip_digits: opts?.strip_digits, strip_uuid: opts?.strip_uuid, prefix_bytes: Infinity };
   let norm = normalize(text, o);
   if (norm === "") norm = normalize(text, { strip_digits: false, strip_uuid: false, prefix_bytes: Infinity });
+  // whitespace-only text: one fingerprint for all of it, never none (Lua: tostring(text) ~= "")
+  if (norm === "" && text !== null && text !== undefined && String(text) !== "") norm = " ";
   if (norm === "") return "";
   return String(hash(norm));
 }

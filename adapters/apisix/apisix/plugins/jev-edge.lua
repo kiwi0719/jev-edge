@@ -244,14 +244,21 @@ local function runtime_for(conf)
     end
   end
   cache = cache or cache_m.new(DICT)
-  local judge, err = http.new(cfg.jev, cache)
+  -- Breaker, adaptive timeout and in-flight counters describe one provider,
+  -- not the whole gateway: routes that call the same provider, endpoint and
+  -- model share them, a route with another provider (or a broken key on a
+  -- different endpoint) gets its own, so one cannot trip the other's breaker.
+  local st = cache:prefixed("p:" .. sha256_hex(table.concat({
+    tostring(cfg.jev.provider or ""), tostring(cfg.jev.endpoint or ""), tostring(cfg.jev.model or ""),
+  }, "\n")):sub(1, 12) .. ":")
+  local judge, err = http.new(cfg.jev, st)
   if not judge then
     core.log.error("jev-edge: ", err)
     judge = { call = function() return nil, err end }
   end
   rt = {
-    cfg = cfg, rules = load_rules(cfg.rules), judge = judge,
-    breaker = breaker_m.new(cache, ngx.now, cfg.breaker),
+    cfg = cfg, rules = load_rules(cfg.rules), judge = judge, state = st,
+    breaker = breaker_m.new(st, ngx.now, cfg.breaker),
   }
   runtimes[conf] = rt
   return rt
@@ -262,7 +269,9 @@ end
 -- ---------------------------------------------------------------------------
 
 local function build_req(rt, ctx)
-  local headers = core.request.headers(ctx)
+  -- 0 = no limit: past the default 100 the rest are dropped, and a
+  -- Content-Type sent after 100 junk headers would read as absent.
+  local headers = ngx.req.get_headers(0)
   local req = {
     method    = core.request.get_method(),
     path      = ctx.var.uri,
@@ -301,6 +310,9 @@ end
 
 local function maybe_async(rt, v, req)
   if not v.async then return end
+  -- L3 exists to get an answer L2 could not; while the breaker is open the
+  -- provider is the reason, and hammering it from timers only keeps it open.
+  if rt.breaker:state() ~= breaker_m.CLOSED then return end
   local rule = rule_for(rt, req)
   if not rule then return end
   local text = normalize.extract(req.body, rules_mod.content_type(req.headers), rule.text_fields, cjson.decode)
@@ -310,7 +322,7 @@ local function maybe_async(rt, v, req)
     deployment = rule.deployment_context or rt.cfg.jev.deployment_context or "",
   })
   if not prompt then return end
-  async.schedule({ cfg = rt.cfg, cache = cache, judge = rt.judge, prompt = prompt,
+  async.schedule({ cfg = rt.cfg, cache = cache, state = rt.state, judge = rt.judge, prompt = prompt,
     fingerprint = v.fingerprint, client_ip = req.client_ip,
     cache_key = v.fingerprint ~= "" and jev_core.cache_key(v.fingerprint, rule, rt.cfg, sha256_hex) or nil })
 end

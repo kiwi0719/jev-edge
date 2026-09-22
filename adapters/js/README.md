@@ -158,6 +158,7 @@ Different, by platform:
 | Next.js on Vercel, Node, Hono | memory per process / isolate | memory | pass a `Store` to share |
 | Lambda@Edge | memory per execution environment | memory | no env vars; key from Secrets Manager |
 
+- **Client IP.** `cf-connecting-ip` on Cloudflare (presets, or a request carrying the `cf` object), a header you name with `clientIpHeader`, or else `X-Forwarded-For` element `client_ip.trusted_hops` from the right, as on nginx. The Node middleware appends the socket address to `X-Forwarded-For` first, so with no proxy in front the IP is the peer's.
 - **Fingerprint hash.** SHA-256 hex over the whole normalized text, on both (`core.sha256Hex` here, `resty.sha256` on nginx), so the same text has the same fingerprint everywhere. `djb2` is only the golden vectors' reference hash. `cache.fp_prefix_bytes` only bounds sampled text.
 - **Byte truncation of sampled text.** Lua's `s:sub(1, n)` keeps the bytes of a code point split at `n`; this package drops the partial code point, so the sampled text is never longer than `n` bytes and never contains U+FFFD. The golden normalize vectors cut on ASCII and agree; only a logged sample that ends inside a multi-byte character differs, by at most three bytes.
 - **Adaptive timeout state.** One document (`adapt`) instead of the three `adapt:*` keys the OpenResty adapter keeps; the value is outside the parity contract either way.

@@ -53,12 +53,27 @@ export interface RulesCtx {
 export function patternError(p: string): string | null {
   const n = p.length;
   let i = 0;
+  // captures in opening order; true once closed (see the Lua original)
+  const caps: boolean[] = [];
   while (i < n) {
     const c = p[i];
-    if (c === "%") {
+    if (c === "(") {
+      if (caps.length >= 32) return "too many captures";
+      caps.push(false);
+      i++;
+    } else if (c === ")") {
+      const open = caps.lastIndexOf(false);
+      if (open < 0) return "invalid pattern capture";
+      caps[open] = true;
+      i++;
+    } else if (c === "%") {
       const d = p[i + 1];
       if (d === undefined) return "malformed pattern (ends with '%')";
-      if (d === "b") {
+      if (d >= "0" && d <= "9") {
+        const l = Number(d);
+        if (l === 0 || !caps[l - 1]) return "invalid capture index %" + d;
+        i += 2;
+      } else if (d === "b") {
         if (i + 3 >= n) return "malformed pattern (missing arguments to '%b')";
         i += 4;
       } else if (d === "f") {
@@ -91,6 +106,7 @@ export function patternError(p: string): string | null {
       i++;
     }
   }
+  if (caps.includes(false)) return "unfinished capture";
   return null;
 }
 

@@ -55,14 +55,14 @@ calibrate:
 # --init matters: without a reaper Test::Nginx waits on zombie masters.
 test-openresty:
 	docker build -q -t jev-edge-test -f adapters/openresty/Dockerfile.test adapters/openresty
-	docker run --rm --init -v "$$(PWD)":/work jev-edge-test
+	docker run --rm --init -v "$(CURDIR)":/work jev-edge-test
 
 bench-offline:
 	lua bench/offline.lua
 
 bench:
 	docker build -q -t jev-edge-test -f adapters/openresty/Dockerfile.test adapters/openresty
-	docker run --rm --init -v "$$(PWD)":/work jev-edge-test sh /work/bench/run.sh
+	docker run --rm --init -v "$(CURDIR)":/work jev-edge-test sh /work/bench/run.sh
 
 # Redraw docs/bench-latency-*.svg from a results.txt (default: the 4-connection run).
 bench-chart:
@@ -71,7 +71,7 @@ bench-chart:
 # One real round trip + 60-sample latency/agreement check against the provider.
 # Needs TYPESAFE_API_KEY in .env (gitignored). Costs ~40k input tokens.
 live-check:
-	docker run --rm --env-file .env -v "$$(PWD)":/work jev-edge-test sh -c \
+	docker run --rm --env-file .env -v "$(CURDIR)":/work jev-edge-test sh -c \
 	  'resty --http-conf "lua_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt; lua_ssl_verify_depth 5;" \
 	   -I /work/adapters/openresty/lib -I /work /work/bench/live.lua $${N:-60}'
 
@@ -79,7 +79,7 @@ live-check:
 # bench/datasets/live-<model>[-ctx].json. ~340k input tokens bare, ~400k with
 # JEV_DEPLOYMENT_CONTEXT set in the environment.
 live-full:
-	docker run --rm --env-file .env -e JEV_DEPLOYMENT_CONTEXT -v "$$(PWD)":/work jev-edge-test sh -c \
+	docker run --rm --env-file .env -e JEV_DEPLOYMENT_CONTEXT -v "$(CURDIR)":/work jev-edge-test sh -c \
 	  'resty --http-conf "lua_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt; lua_ssl_verify_depth 5;" \
 	   -I /work/adapters/openresty/lib -I /work /work/bench/live_full.lua'
 
@@ -87,12 +87,12 @@ live-full:
 #   docker network create jev-net; docker run -d --rm --name ollama --network jev-net ollama/ollama
 #   docker exec ollama ollama pull qwen2.5:0.5b
 live-openai:
-	docker run --rm --network jev-net -v "$$(PWD)":/work jev-edge-test \
+	docker run --rm --network jev-net -v "$(CURDIR)":/work jev-edge-test \
 	  resty -I /work/adapters/openresty/lib -I /work /work/bench/live_openai.lua $${N:-20}
 
 # 4 workers, tiny dicts, low caps, slow flaky mock: limits, drops, memory, crashes.
 soak:
-	docker run --rm --init -e DUR=$${DUR:-60s} -v "$$(PWD)":/work jev-edge-test sh /work/bench/soak.sh
+	docker run --rm --init -e DUR=$${DUR:-60s} -v "$(CURDIR)":/work jev-edge-test sh /work/bench/soak.sh
 
 # Envoy: gRPC shim build and the two-transport end-to-end (Docker Compose).
 shim:
@@ -148,7 +148,7 @@ opm-build: dist
 	else \
 	  echo "no local OpenResty install; running opm build in openresty/openresty:alpine-fat"; \
 	  test -f "$$HOME/.opmrc" || printf 'github_account=%s\n' "$$(sed -n 's/^author = //p' dist.ini)" > "$$HOME/.opmrc"; \
-	  docker run --rm -v "$$(PWD)/$(DIST)":/pkg -v "$$HOME/.opmrc":/root/.opmrc:ro -w /pkg openresty/openresty:alpine-fat opm build; \
+	  docker run --rm -v "$(CURDIR)/$(DIST)":/pkg -v "$$HOME/.opmrc":/root/.opmrc:ro -w /pkg openresty/openresty:alpine-fat opm build; \
 	fi
 
 # ---------------------------------------------------------------------------

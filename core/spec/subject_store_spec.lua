@@ -81,6 +81,36 @@ describe("subject ring store (no compare-and-swap needed)", function()
     assert.equals(3, h[2].score)
   end)
 
+  it("drops a slot still holding the previous lap instead of reading it as the newest", function()
+    local store = H.store()
+    for i = 1, 3 do subject.ring_append(store, "ip:c", { score = i }, 3, 60) end
+    -- another worker has incr'd to 4 but not yet written slot (4-1)%3 = 0
+    store:incr("subj:ip:c:n", 1, 60)
+    local h = subject.ring_load(store, "ip:c", 3)
+    assert.equals(2, #h)
+    assert.equals(2, h[1].score)
+    assert.equals(3, h[2].score)
+  end)
+
+  it("reads no misplaced entries after max_entries changes", function()
+    local store = H.store()
+    for i = 1, 5 do subject.ring_append(store, "ip:d", { score = i }, 3, 60) end
+    -- max 3 put seq 4 in slot 0 and seq 5 in slot 1; read with max 4 those
+    -- slots are expected to hold seq 5 and 2, so both are holes
+    local h = subject.ring_load(store, "ip:d", 4)
+    assert.equals(1, #h)
+    assert.equals(3, h[1].score)
+  end)
+
+  it("extends the counter ttl on every append", function()
+    local store = H.store()
+    local seen = {}
+    store.expire = function(_, k, ttl) seen[#seen + 1] = k .. "=" .. ttl; return true end
+    subject.ring_append(store, "ip:e", { score = 1 }, 3, 60)
+    subject.ring_append(store, "ip:e", { score = 2 }, 3, 60)
+    assert.same({ "subj:ip:e:n=60", "subj:ip:e:n=60" }, seen)
+  end)
+
   it("is a no-op on a store without incr", function()
     assert.is_false(subject.ring_append({ get = function() end, set = function() end }, "x", {}, 3, 60))
   end)

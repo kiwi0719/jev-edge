@@ -46,7 +46,7 @@ Both keep every property of the nginx deployment: L1 rules, cache, breaker, adap
 cd adapters/envoy/grpc-shim && go build -o jev-shim . && ./jev-shim -listen :9001 -upstream http://127.0.0.1:8080/_jev/authz
 ```
 
-or `docker build -t jev-shim adapters/envoy/grpc-shim`. Envoy side: [envoy-grpc.yaml](envoy-grpc.yaml), with `pack_as_bytes: true` so bodies arrive as `raw_body`.
+or `docker build -t jev-shim adapters/envoy/grpc-shim`. Envoy side: [envoy-grpc.yaml](envoy-grpc.yaml), with `pack_as_bytes: true` so bodies arrive as `raw_body`. Keep the timeouts ordered: jev-edge `timeout_max_ms` < the shim's `-timeout` (1.5 s by default) < the `grpc_service` `timeout` (2 s): when jev-edge is slow the shim gives up first and still answers `X-Jev-Verdict: error`, instead of Envoy passing the request via `failure_mode_allow` with no verdict at all.
 
 ## End-to-end test
 

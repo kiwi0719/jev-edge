@@ -26,7 +26,9 @@ end
 -- (`[{type="text", text="..."}, {type="image_url", ...}]`), the Responses API's
 -- `input_text`, and Anthropic's `tool_result` whose `content` nests once more.
 -- Collect every string, every part's `text`, and recurse into `content`, to a
--- bounded depth. Anything else (numbers, images) contributes nothing.
+-- bounded depth. Anything else (numbers, images, JSON null) contributes
+-- nothing. A decoder that keeps null as a value (cjson.null) is assumed:
+-- `[null, {...}]` goes on past the null, as the backend's parser does.
 local LEAF_DEPTH = 4
 local function collect(node, out, depth)
   if type(node) == "string" then
@@ -139,7 +141,8 @@ end
 -- covers a prefix lets any text that shares the prefix reuse a cached or
 -- trusted verdict (0.3.0 hashed the first 2048 bytes; fixed in 0.3.1).
 -- Text that normalizes to nothing (digit runs, UUIDs) is hashed as typed, so
--- it still gets a cache entry instead of a judge call per request.
+-- it still gets a cache entry instead of a judge call per request; text that
+-- is only whitespace is hashed as one space, one entry for every such body.
 --
 -- `hash` is injected by the adapter and MUST be collision-resistant
 -- (sha256 hex or better). The fingerprint keys the verdict cache and the
@@ -154,6 +157,7 @@ function _M.fingerprint(text, opts, hash)
   if norm == "" then
     norm = _M.normalize(text, { strip_digits = false, strip_uuid = false, prefix_bytes = math.huge })
   end
+  if norm == "" and text ~= nil and tostring(text) ~= "" then norm = " " end
   if norm == "" then return "" end
   return tostring(hash(norm))
 end

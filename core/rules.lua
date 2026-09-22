@@ -137,12 +137,32 @@ end
 -- raise on some subject. Returns nil when the pattern is well formed.
 function _M.pattern_error(p)
   local i, n = 1, #p
+  -- captures in the order they open; true once closed. A back-reference
+  -- (%1..%9) must name a closed one, `)` must close an open one, and none may
+  -- be left open, or lstrlib raises when a subject reaches that point.
+  local caps = {}
   while i <= n do
     local c = p:sub(i, i)
-    if c == "%" then
+    if c == "(" then
+      if #caps >= 32 then return "too many captures" end
+      caps[#caps + 1] = false
+      i = i + 1
+    elseif c == ")" then
+      local open
+      for k = #caps, 1, -1 do
+        if not caps[k] then open = k break end
+      end
+      if not open then return "invalid pattern capture" end
+      caps[open] = true
+      i = i + 1
+    elseif c == "%" then
       local d = p:sub(i + 1, i + 1)
       if d == "" then return "malformed pattern (ends with '%')" end
-      if d == "b" then
+      if d:match("%d") then
+        local l = tonumber(d)
+        if l == 0 or not caps[l] then return "invalid capture index %" .. d end
+        i = i + 2
+      elseif d == "b" then
         if i + 3 > n then return "malformed pattern (missing arguments to '%b')" end
         i = i + 4
       elseif d == "f" then
@@ -174,6 +194,9 @@ function _M.pattern_error(p)
     else
       i = i + 1
     end
+  end
+  for _, closed in ipairs(caps) do
+    if not closed then return "unfinished capture" end
   end
   return nil
 end

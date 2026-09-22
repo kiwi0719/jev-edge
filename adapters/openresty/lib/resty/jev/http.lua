@@ -23,7 +23,7 @@ local adaptive_m = require "resty.jev.adaptive"
 
 -- @param cfg      cfg.jev section (provider, endpoint, model, api_key, timeout_*, max_inflight)
 -- @param inflight cache-like object with get/set/incr (shared dict); also backs the adaptive timeout
--- @param metrics  optional function(event, fields)
+-- @param metrics  optional function(usage): token usage the provider reported
 function _M.new(cfg, inflight, metrics)
   local provider, perr = _M.load_provider(cfg.provider or "jev")
   if not provider then return nil, perr end
@@ -94,7 +94,7 @@ function _M.new(cfg, inflight, metrics)
     -- req.ctx: per-call state the provider needs to read its own answer
     -- (openai-compat's question set); never stored on the shared cfg table.
     local answers, perr2, usage = provider.parse_response(res.status, res.body, cfg, req.ctx)
-    if metrics and usage then metrics("usage", usage) end
+    if metrics and usage then metrics(usage) end
     if not answers then return nil, perr2 end
     if is_l2 then adaptive:success(elapsed) end
     return answers

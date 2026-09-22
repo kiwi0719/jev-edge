@@ -97,7 +97,9 @@ end
 
 local function build_req(rules, over)
   over = over or {}
-  local headers = ngx.req.get_headers()
+  -- 0 = no limit: past the default 100 the rest are dropped, and a
+  -- Content-Type sent after 100 junk headers would read as absent.
+  local headers = ngx.req.get_headers(0)
   local req = {
     method    = over.method or ngx.req.get_method(),
     path      = over.path or ngx.var.uri,
@@ -465,10 +467,12 @@ end
 -- The client address as seen by the proxy in front of us. Proxies append to
 -- X-Forwarded-For, so the client's own (forgeable) value is leftmost and the
 -- address the trusted hop saw is rightmost: element `trusted_hops` from the
--- right (1 = last). Envoy's x-envoy-external-address is already that value.
-local function client_ip_from(h, cfg)
+-- right (1 = last). Envoy's x-envoy-external-address is already that value,
+-- but only Envoy sets it: `envoy` is true for authz() alone. Traefik, Caddy
+-- and nginx pass a client's copy of it through to forward_auth().
+local function client_ip_from(h, cfg, envoy)
   local function first(v) if type(v) == "table" then return v[1] end return v end
-  local ext = first(h["x-envoy-external-address"])
+  local ext = envoy and first(h["x-envoy-external-address"])
   if type(ext) == "string" and ext ~= "" then return (ext:match("^%s*(%S+)")) end
   local xff = first(h["x-forwarded-for"])
   if type(xff) ~= "string" or xff == "" then
@@ -542,7 +546,7 @@ function _M.authz(prefix)
   if uri:sub(1, #prefix) == prefix then path = uri:sub(#prefix + 1) end
   if path == "" then path = "/" end
   -- Envoy sets x-envoy-external-address / x-forwarded-for; nginx sees Envoy's IP.
-  local client_ip = client_ip_from(ngx.req.get_headers(), cfg)
+  local client_ip = client_ip_from(ngx.req.get_headers(0), cfg, true)
 
   return respond_authz(cfg, rules, { path = path, client_ip = client_ip }, "authz")
 end
@@ -557,7 +561,7 @@ end
 function _M.forward_auth()
   local cfg = config.current()
   local rules = config.rules()
-  local h = ngx.req.get_headers()
+  local h = ngx.req.get_headers(0)
   local function first(v) if type(v) == "table" then return v[1] end return v end
   local method = first(h["x-forwarded-method"] or h["x-original-method"]) or ngx.req.get_method()
   -- nginx auth_request subrequests inherit the main request, so $request_uri

@@ -33,7 +33,11 @@ export interface Options {
   state?: DOStubLike | Store;
   /** Store for per-subject trajectories (KV or memory). Memory (per isolate) if absent. Only used with config.subject.enabled. */
   subjectStore?: KVLike | Store;
-  /** Header carrying the client IP (Cloudflare sets cf-connecting-ip). */
+  /** Header carrying the client IP, set by a proxy you trust to overwrite it.
+   *  Default: cf-connecting-ip on Cloudflare (a preset, or a request with the
+   *  platform's `cf` object), none elsewhere, where it is a client header.
+   *  Without one the IP is X-Forwarded-For element `client_ip.trusted_hops`
+   *  from the right, as on the OpenResty adapter. */
   clientIpHeader?: string;
   /** Called once per judged request with the verdict; wire to console.log or an analytics binding. */
   onVerdict?: (v: core.Verdict, req: Request) => void;
@@ -183,8 +187,7 @@ async function readReq(request: Request, rt: Runtime): Promise<[core.Req, Provid
   // usually with hashed = true behind a thin Worker). Otherwise it is noise
   // that must not reach core, the provider or the upstream.
   if (!consumesSubjectHeader(rt.config)) delete headers[SUBJECT_HEADER];
-  const ipHeader = rt.opts.clientIpHeader ?? "cf-connecting-ip";
-  const clientIp = request.headers.get(ipHeader) ?? (request.headers.get("x-forwarded-for") ?? "").split(",")[0].trim();
+  const clientIp = clientIpOf(request, rt);
   const maxBytes = Math.max(...rt.rules.map((r) => r.max_body_bytes ?? 65536));
   const lenHeader = request.headers.get("content-length");
   const len = lenHeader === null ? NaN : Number(lenHeader);
@@ -240,6 +243,23 @@ async function subjectCtx(rt: Runtime, request: Request, clientIp: string, rctx?
       }
     },
   };
+}
+
+/**
+ * The client address. A named header only when it is one the platform
+ * overwrites (cf-connecting-ip on Cloudflare) or the operator configured;
+ * otherwise X-Forwarded-For read from the right: proxies append, so the
+ * leftmost value is whatever the client typed. Element `trusted_hops` from
+ * the right (1 = last), as client_ip_from does on OpenResty.
+ */
+export function clientIpOf(request: Request, rt: Pick<Runtime, "opts" | "config">): string {
+  const onCf = rt.opts.platform === "cloudflare" || "cf" in request;
+  const ipHeader = rt.opts.clientIpHeader ?? (onCf ? "cf-connecting-ip" : undefined);
+  const named = ipHeader ? request.headers.get(ipHeader)?.trim() : undefined;
+  if (named) return named;
+  const hops = (request.headers.get("x-forwarded-for") ?? "").split(",").map((s) => s.trim()).filter((s) => s !== "");
+  const n = rt.config.client_ip?.trusted_hops ?? 1;
+  return hops[hops.length - n] ?? "";
 }
 
 function requestIdFor(request: Request, rt: Runtime): string {

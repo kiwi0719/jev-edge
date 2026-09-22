@@ -33,6 +33,28 @@ describe("breaker", function()
     assert.is_false(b:allow())
   end)
 
+  it("claims the probe with the store's atomic add when it has one", function()
+    local adds = 0
+    local add = store.add
+    store.add = function(...) adds = adds + 1; return add(...) end
+    b:trip(); clock.advance(31)
+    -- a get + set store would let a second worker in between the two calls
+    store.get = (function(get) return function(st, k)
+      if k:find("probe", 1, true) then return nil end
+      return get(st, k)
+    end end)(store.get)
+    assert.is_true(b:allow())
+    assert.is_false(b:allow())
+    assert.equals(2, adds)
+  end)
+
+  it("still admits one probe on a store without add", function()
+    store.add = nil
+    b:trip(); clock.advance(31)
+    assert.is_true(b:allow())
+    assert.is_false(b:allow())
+  end)
+
   it("closes on a successful probe", function()
     b:trip(); clock.advance(31)
     assert.is_true(b:allow())

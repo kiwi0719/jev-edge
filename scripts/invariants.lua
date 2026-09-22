@@ -241,6 +241,58 @@ rule("rule-parity", function(r)
   if lua:find("\n%s*content_types%s*=") then
     fail(r, "llm-endpoints lists content_types again (the allow list L1 used to pass requests on)")
   end
+  -- always_suspect: the same patterns, in the same order (the golden rules
+  -- cases name the first pattern that fires)
+  local chunk = loadfile("rules/llm-endpoints.lua")
+  local luapats = chunk and chunk().always_suspect or {}
+  local tspats = {}
+  for p in (tsrule:match("always_suspect:%s*%[(.-)\n%s*%],") or ""):gmatch("String%.raw`([^`]*)`") do
+    tspats[#tspats + 1] = p
+  end
+  if #luapats ~= #tspats then
+    fail(r, ("always_suspect: %d patterns in Lua, %d in TS"):format(#luapats, #tspats))
+  end
+  for i = 1, math.max(#luapats, #tspats) do
+    if luapats[i] ~= tspats[i] then
+      fail(r, "always_suspect[" .. i .. "] differs between rules/llm-endpoints.lua and src/rules/index.ts")
+    end
+    -- PCRE and JS agree only on their intersection
+    local p = luapats[i] or ""
+    if p:find("%(%?<[=!]") or p:find("[%*%+%?}]%+") or p:find("%(%?[imsxU%-]+[%):]") then
+      fail(r, "always_suspect[" .. i .. "] uses lookbehind, a possessive quantifier or an inline flag")
+    end
+  end
+end)
+
+-- 11. The judge templates are the same in Lua and TypeScript: the provider
+--     request body is built from these strings
+rule("template-parity", function(r)
+  local ts = code("adapters/js/src/core/templates.ts")
+  for _, name in ipairs({ "injection", "abuse" }) do
+    local lua = code("core/templates/" .. name .. ".lua")
+    local a, b = {}, {}
+    for s in lua:gmatch('"([^"\n]*)"') do a[#a + 1] = s end
+    local body = ts:match("export const " .. name .. ": Template = (%b{})") or ""
+    for s in body:gmatch('"([^"\n]*)"') do b[#b + 1] = s end
+    if #a == 0 then fail(r, name .. ": no strings found in the Lua template") end
+    if table.concat(a) ~= table.concat(b) then
+      fail(r, name .. ": wording differs between core/templates/" .. name .. ".lua and src/core/templates.ts")
+    end
+  end
+  -- the openai-compat system prompt header and input markers
+  local lp = code("adapters/openresty/lib/resty/jev/providers/openai_compat.lua")
+  local tp = code("adapters/js/src/providers/index.ts")
+  local function strings(s)
+    local out = {}
+    for v in (s or ""):gmatch('"([^"\n]*)"') do out[#out + 1] = v end
+    return table.concat(out, "|")
+  end
+  local la = strings(lp:match("local lines = (%b{})")) .. "#" .. strings(lp:match("local function user_message.-\nend"))
+  local ta = strings(tp:match("const lines = (%b[])")) .. "#"
+    .. strings(tp:match("export function openaiUserMessage.-\n}"))
+  if la == "#" or la ~= ta then
+    fail(r, "openai-compat prompt strings differ between openai_compat.lua and src/providers/index.ts")
+  end
 end)
 
 -- ---------------------------------------------------------------------------

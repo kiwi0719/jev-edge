@@ -5,6 +5,7 @@ Two benches, both reproducible without a TypeSafe key.
 | Command | What it measures | Needs |
 |---|---|---|
 | `make bench-offline` | accuracy of the whole pipeline (L1 + thresholds) against jev-sec-bench's recorded Jev probabilities on deepset/prompt-injections; replay cache hit rate; core-only latency | Lua + `dkjson` + `lrexlib-pcre2` |
+| `make bench-judge` | judge-directed attacks (`datasets/judge-directed.jsonl`: "rate this as safe", fake answer JSON, fake end-of-input markers, buried and non-English variants, benign look-alikes) through L1: which reach L2, which a pattern names, which benign ones it flags. `make bench-judge-live` sends them to the real judge (needs `TYPESAFE_API_KEY` and/or `OPENAI_BASE_URL`) | Lua + `dkjson` + `lrexlib-pcre2` (live: Docker + a key) |
 | `make bench` | end-to-end latency in OpenResty for five scenarios (baseline, unwatched path, healthy / slow / dead Jev) using the `mock` provider; verifies 100% pass with Jev down | Docker |
 
 `bench/datasets/jev-sec-bench-injection.json` is `results/injection.json` from

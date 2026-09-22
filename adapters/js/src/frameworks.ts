@@ -21,6 +21,11 @@ export interface NextResponseLike {
   next(init?: { request?: { headers?: Headers } }): Response;
 }
 
+/** The subset of NextFetchEvent (middleware's second argument) this module needs. */
+export interface NextFetchEventLike {
+  waitUntil(p: Promise<unknown>): void;
+}
+
 /**
  * middleware.ts:
  *
@@ -32,15 +37,17 @@ export interface NextResponseLike {
  * Allowed requests continue with X-Jev-* on the request headers (read them in
  * the route handler); blocked ones get the 403 from the middleware. Next
  * buffers the body for middleware, so `request.text()` works on the edge and
- * Node runtimes alike.
+ * Node runtimes alike. Next passes a `NextFetchEvent` as the second
+ * argument; its `waitUntil` keeps the subject write alive after the response.
  */
 export function nextMiddleware(opts: Options, NextResponse: NextResponseLike) {
   const rt = runtimeOnce(opts);
-  return async (request: Request): Promise<Response> => {
+  return async (request: Request, event?: NextFetchEventLike): Promise<Response> => {
     const r = rt();
     const url = new URL(request.url);
     if (r.opts.health !== false && url.pathname === "/_jev/health" && request.method === "GET") return healthResponse(r);
-    const { verdict, response, requestId, subjectId } = await evaluate(request, r); // never throws: fails open
+    // the event is a RequestCtx as is: evaluate calls event.waitUntil(p)
+    const { verdict, response, requestId, subjectId } = await evaluate(request, r, event); // never throws: fails open
     if (response) return response;
     const forwarded = withVerdictHeaders(request, verdict, requestId, subjectId);
     return NextResponse.next({ request: { headers: forwarded.headers } });

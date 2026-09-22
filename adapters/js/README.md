@@ -88,7 +88,7 @@ export const middleware = nextMiddleware(
 export const config = { matcher: ["/api/chat/:path*", "/v1/:path*"] };
 ```
 
-Next buffers the body for middleware on both runtimes, so the whole pipeline runs there. Route handlers read `X-Jev-Verdict` and `X-Jev-Score` from the request headers. On Vercel the edge runtime is V8 and the cache is per isolate; pass a `cache` Store (Vercel KV, Upstash) in the options to share it. [examples/next-middleware.ts](examples/next-middleware.ts).
+Next buffers the body for middleware on both runtimes, so the whole pipeline runs there. Route handlers read `X-Jev-Verdict` and `X-Jev-Score` from the request headers. The returned function takes Next's `(request, event)`, and with `config.subject` on the trajectory write goes to `event.waitUntil` so it outlives the response. On Vercel the edge runtime is V8 and the cache is per isolate; pass a `cache` Store (Vercel KV, Upstash) in the options to share it. [examples/next-middleware.ts](examples/next-middleware.ts).
 
 ## Node
 

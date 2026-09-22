@@ -1,6 +1,8 @@
 // middleware.ts at the root of a Next.js project. Runs on the edge runtime on
 // Vercel and on the Node runtime elsewhere; both are V8, both are covered by
-// the golden vectors.
+// the golden vectors. Next calls it as `middleware(request, event)`; the
+// event's waitUntil keeps the subject write (config.subject) alive after the
+// response.
 import { NextResponse } from "next/server";
 import { nextMiddleware } from "@jev-edge/js";
 

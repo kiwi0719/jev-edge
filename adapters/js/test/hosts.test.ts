@@ -39,6 +39,27 @@ describe("nextMiddleware", () => {
     expect(res.status).toBe(403);
     expect(res.headers.get("x-jev-verdict")).toBe("malicious");
   });
+
+  it("hands the subject write to the event's waitUntil", async () => {
+    const { memoryStore } = await import("../src/cf/stores");
+    const { ringLoad } = await import("../src/core/subject");
+    const store = memoryStore();
+    const mw = nextMiddleware(
+      { ...opts(), config: { ...opts().config, subject: { enabled: true, from: "ip", salt: "pepper" } }, subjectStore: store },
+      {
+        next: (init?: { request?: { headers?: Headers } }) =>
+          Response.json({ subject: init?.request?.headers?.get("x-jev-subject") ?? null }),
+      },
+    );
+    const kept: Promise<unknown>[] = [];
+    const event = { waitUntil(p: Promise<unknown>) { kept.push(p); } };
+    const res = await mw(chat(BENIGN), event);
+    const { subject } = (await res.json()) as { subject: string };
+    expect(subject).toMatch(/^ip:[0-9a-f]{64}$/);
+    expect(kept).toHaveLength(1);
+    await Promise.all(kept);
+    expect(await ringLoad(store, subject, 20)).toHaveLength(1);
+  });
 });
 
 describe("nodeMiddleware", () => {

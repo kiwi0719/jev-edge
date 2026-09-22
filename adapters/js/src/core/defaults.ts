@@ -1,7 +1,7 @@
 // Port of core/defaults.lua: default configuration and deep merge.
-import type { Policy } from "./policy";
-import type { BreakerConfig } from "./breaker";
-import type { FeedbackConfig } from "./trust";
+import type { Policy } from "./policy.js";
+import type { BreakerConfig } from "./breaker.js";
+import type { FeedbackConfig } from "./trust.js";
 
 export interface JevConfig {
   provider?: string;
@@ -35,7 +35,12 @@ export interface Config {
    */
   client_ip: { trusted_hops: number };
   async: { enabled: boolean; max_async: number; rep_block_after: number; rep_block_ttl: number };
-  subject: { enabled: boolean; from: "ip" | "header" | "cookie"; name: string | null; salt: string | null; hashed: boolean; history_ttl: number; max_entries: number };
+  subject: {
+    enabled: boolean; from: "ip" | "header" | "cookie"; name: string | null; salt: string | null; hashed: boolean;
+    history_ttl: number; max_entries: number;
+    /** see core/defaults.lua subject.reputation; block_at 0 is off */
+    reputation: { block_at: number; window_s: number; block_ttl: number; suspicious: number; malicious: number };
+  };
   sampling: { enabled: boolean; rate: number; min_verdict: "safe" | "suspicious" | "malicious"; max_samples: number; ttl: number; text_bytes: number; log: boolean };
   feedback: FeedbackConfig;
   breaker: BreakerConfig;
@@ -63,7 +68,10 @@ export const config: Config = {
   },
   cache: { fp_ttl: 300, rep_ttl: 600, fp_prefix_bytes: 2048 }, // fp_prefix_bytes: sampled/logged text only since 0.3.1
   async: { enabled: true, max_async: 32, rep_block_after: 0, rep_block_ttl: 600 },
-  subject: { enabled: false, from: "ip", name: null, salt: null, hashed: false, history_ttl: 3600, max_entries: 20 },
+  subject: {
+    enabled: false, from: "ip", name: null, salt: null, hashed: false, history_ttl: 3600, max_entries: 20,
+    reputation: { block_at: 0, window_s: 600, block_ttl: 600, suspicious: 1, malicious: 3 },
+  },
   sampling: { enabled: false, rate: 0.05, min_verdict: "suspicious", max_samples: 1000, ttl: 86400, text_bytes: 512, log: false },
   feedback: { enabled: false, trust_ttl: 604800, max_renewals: 4, token: null },
   breaker: { window_s: 60, min_samples: 20, fail_ratio: 0.5, open_s: 30 },
@@ -126,6 +134,14 @@ export function validate(c: Config): [true, null] | [null, string] {
     if (!sj.hashed && !sj.salt) return [null, "subject.enabled needs subject.salt (or hashed = true)"];
   }
   if (sj.max_entries !== undefined && (typeof sj.max_entries !== "number" || sj.max_entries < 1)) return [null, "subject.max_entries must be >= 1"];
+  const sr: Partial<Config["subject"]["reputation"]> = sj.reputation ?? {};
+  for (const k of ["block_at", "suspicious", "malicious"] as const) {
+    if (sr[k] !== undefined && (typeof sr[k] !== "number" || sr[k]! < 0)) return [null, `subject.reputation.${k} must be a number >= 0`];
+  }
+  for (const k of ["window_s", "block_ttl"] as const) {
+    if (sr[k] !== undefined && (typeof sr[k] !== "number" || sr[k]! <= 0)) return [null, `subject.reputation.${k} must be > 0`];
+  }
+  if ((sr.block_at ?? 0) > 0 && !sj.enabled) return [null, "subject.reputation.block_at needs subject.enabled"];
   if (sj.history_ttl !== undefined && (typeof sj.history_ttl !== "number" || sj.history_ttl <= 0)) return [null, "subject.history_ttl must be > 0"];
   const sm = c.sampling ?? {};
   if (sm.rate !== undefined && (typeof sm.rate !== "number" || sm.rate < 0 || sm.rate > 1)) return [null, "sampling.rate must be in [0,1]"];

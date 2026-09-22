@@ -20,7 +20,7 @@ local subject_m = require "jev.core.subject"
 local trust     = require "jev.core.trust"
 local cjson     = require "cjson.safe"
 
-local _M = { _VERSION = "0.4.0" }
+local _M = { _VERSION = "0.5.0" }
 
 local CACHE_DICT = "jev_cache"
 -- Safety-critical state (trust grants, breaker, in-flight counters, adaptive
@@ -125,7 +125,21 @@ local function build_req(rules, over)
     -- allow_partial_message, HAProxy past tune.bufsize): scan it as the head
     -- of a larger body instead of parsing truncated JSON as a whole.
     if over.partial and req.body then
-      req.body_head, req.body = req.body, nil
+      -- The gateway cuts at a byte count, so the head can end inside a UTF-8
+      -- sequence (a client picks where with its padding). Drop that
+      -- incomplete sequence: invalid UTF-8 in the L2 prompt can make the
+      -- provider reject the call, and a provider error fails open.
+      local b = req.body
+      for i = #b, math.max(1, #b - 3), -1 do
+        local c = b:byte(i)
+        if c < 0x80 then break end
+        if c >= 0xC0 then
+          local need = c >= 0xF0 and 4 or c >= 0xE0 and 3 or 2
+          if #b - i + 1 < need then b = b:sub(1, i - 1) end
+          break
+        end
+      end
+      req.body_head, req.body = b, nil
       req.body_size = math.max(req.body_size or 0, max + 1)
     end
   end
@@ -203,6 +217,8 @@ local function subject_ctx(cfg, req)
     record = function(e)
       subject_m.ring_append(store, id, e, scfg.max_entries, scfg.history_ttl)
     end,
+    -- reputation counters (subject.reputation): incr is atomic in the dict
+    store = store,
   }
 end
 
@@ -222,7 +238,7 @@ local function evaluate_current(cfg, rules, over)
   })
   metrics.record(v)
   if breaker then metrics.set_breaker_state(breaker:state()) end
-  if judge and judge.adaptive then metrics.set_l2_timeout(judge.adaptive:current()) end
+  if judge and judge.adaptive then metrics.set_l2_timeout(judge.adaptive:current(), judge.adaptive.ceil) end
   ngx.ctx.jev = v
   maybe_async(cfg, v, req, rules)
   maybe_sample(cfg, v, req, rules)
@@ -270,7 +286,7 @@ function _M.log()
   local v = ngx.ctx.jev
   if not v then return end
   emit({
-    rid = ngx.var.request_id, path = ngx.var.uri, ip = ngx.var.remote_addr,
+    ts = ngx.now(), rid = ngx.var.request_id, path = ngx.var.uri, ip = ngx.var.remote_addr,
     src = v.source, score = v.score, verdict = v.verdict, action = v.action,
     l2_ms = v.l2_ms, fp = v.fingerprint, reason = v.reason, subject = ngx.ctx.jev_subject,
   })
@@ -359,7 +375,7 @@ function _M.feedback()
     return
   end
 
-  local h = ngx.req.get_headers()
+  local h = ngx.req.get_headers(0)
   local given = h["x-jev-token"]
   if type(given) == "table" then given = given[1] end
   if not given then
@@ -389,12 +405,14 @@ function _M.feedback()
 
   if ATTACK[label] then
     trust.revoke(store, tbl.fp)
+    metrics.incr_feedback("attack", "revoked")
     emit({ ts = now, src = "feedback", fp = tbl.fp, label = "attack", by = by, rid = rid,
            action = "revoke", reason = "operator label" })
     ngx.say(cjson.encode({ ok = true, fp = tbl.fp, label = "attack", trusted = false }))
     return
   end
   if not BENIGN[label] then
+    metrics.incr_feedback("other", "invalid")
     ngx.status = 400
     ngx.say('{"error":"label must be benign|ok|good|0 or attack|bad|malicious|1"}')
     return
@@ -402,12 +420,14 @@ function _M.feedback()
 
   local rec, err = trust.grant(store, tbl.fp, now, fcfg, { by = by, rid = rid })
   if not rec then
+    metrics.incr_feedback("benign", "refused")
     emit({ ts = now, src = "feedback", fp = tbl.fp, label = "benign", by = by, rid = rid,
            action = "refused", reason = err })
     ngx.status = 409
     ngx.say(cjson.encode({ ok = false, fp = tbl.fp, error = err }))
     return
   end
+  metrics.incr_feedback("benign", "trusted")
   emit({ ts = now, src = "feedback", fp = tbl.fp, label = "benign", by = by, rid = rid,
          action = "trust", reason = "operator label", renewals = rec.renewals })
   ngx.say(cjson.encode({ ok = true, fp = tbl.fp, label = "benign", trusted = true,

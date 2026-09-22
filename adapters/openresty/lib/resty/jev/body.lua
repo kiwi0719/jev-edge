@@ -14,6 +14,7 @@
 -- reports the request unjudgeable.
 
 local rules_m = require "jev.core.rules"
+local normalize = require "jev.core.normalize"
 local decode  = require "resty.jev.decode"
 
 local _M = {}
@@ -28,12 +29,15 @@ local function read_file(path, max)
     f:close()
     return all, nil, nil, size
   end
-  local head = f:read(max)
+  -- one byte past max tells normalize.head whether max falls inside a character
+  local head = f:read(max + 1) or ""
   local t = math.min(rules_m.TAIL_BYTES, size - max)
   f:seek("set", size - t)
   local tail = f:read(t)
   f:close()
-  return nil, head, tail, size
+  -- a byte cut can land inside a UTF-8 sequence: keep whole characters only,
+  -- or the broken bytes reach the L2 prompt (and a provider may refuse it)
+  return nil, normalize.head(head, max), tail and (tail:gsub("^[\128-\191]+", "")), size
 end
 
 --- Fill `req` from the request body. `max` is the largest max_body_bytes of
@@ -47,8 +51,9 @@ function _M.fill(req, max)
     if size <= max then
       whole = data
     else
-      head = data:sub(1, max)
-      tail = data:sub(math.max(max + 1, size - rules_m.TAIL_BYTES + 1))
+      -- whole UTF-8 characters only (see read_file)
+      head = normalize.head(data, max)
+      tail = normalize.tail(data:sub(#head + 1), rules_m.TAIL_BYTES)
     end
   else
     local file = ngx.req.get_body_file()

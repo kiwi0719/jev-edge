@@ -1,0 +1,106 @@
+name: release-npm
+
+# Publishes adapters/js as @jev-edge/js. A tag push `vX.Y.Z` publishes when
+# X.Y.Z is the version in adapters/js/package.json; a manual run is a dry run
+# unless `dry_run` is unticked. Authentication is npm trusted publishing: npm
+# trusts this repository's release-npm.yml through GitHub's OIDC token, so no
+# npm token is stored anywhere (configured on npmjs.com, package settings ->
+# Trusted Publisher). A version already on npm is skipped with a notice.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "pnpm publish --dry-run (nothing is uploaded)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  id-token: write # trusted publishing and provenance: GitHub's OIDC token
+
+concurrency:
+  group: release-npm-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: adapters/js
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: 9
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: adapters/js/pnpm-lock.yaml
+          # no registry-url: its .npmrc reads NODE_AUTH_TOKEN, and trusted
+          # publishing needs no token at all
+
+      - name: Tag matches package.json version
+        if: github.ref_type == 'tag'
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          pkg="$(node -p "require('./package.json').version")"
+          if [ "${TAG#v}" != "$pkg" ]; then
+            echo "::error::tag $TAG does not match adapters/js/package.json version $pkg"
+            exit 1
+          fi
+          echo "publishing @jev-edge/js $pkg"
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm build
+
+      - name: Every export resolves to a .js and a .d.ts
+        run: |
+          node --input-type=module -e '
+            import fs from "node:fs";
+            const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+            let bad = 0;
+            for (const [sub, t] of Object.entries(pkg.exports)) {
+              for (const f of typeof t === "string" ? [t] : [t.import, t.types]) {
+                if (!fs.existsSync(f)) { console.log(`::error::${sub}: ${f} missing`); bad++; }
+              }
+              if (typeof t !== "string") await import(sub === "." ? pkg.name : pkg.name + sub.slice(1));
+            }
+            process.exit(bad ? 1 : 0);
+          '
+
+      - name: LICENSE is the repository's
+        run: cmp LICENSE ../../LICENSE
+
+      - name: Pack listing
+        run: |
+          pnpm pack --pack-destination "$RUNNER_TEMP"
+          tar -tzf "$RUNNER_TEMP"/jev-edge-js-*.tgz
+
+      - name: Already on npm?
+        id: exists
+        run: |
+          v="$(node -p "require('./package.json').version")"
+          if npm view "@jev-edge/js@$v" version >/dev/null 2>&1; then
+            echo "::notice::@jev-edge/js@$v is already on npm; nothing to publish"
+            echo "yes=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # trusted publishing needs npm >= 11.5.1 (Node 22 ships npm 10)
+      - name: npm for trusted publishing
+        if: steps.exists.outputs.yes != 'true'
+        run: npm install -g "npm@>=11.5.1" && npm --version
+
+      - name: Publish (trusted publishing, with provenance)
+        if: steps.exists.outputs.yes != 'true'
+        env:
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && '--dry-run' || '' }}
+        run: npm publish --access public --provenance $DRY_RUN

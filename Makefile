@@ -1,4 +1,4 @@
-.PHONY: test lint check luajit-check golden golden-check calibrate labels context-lint test-js test-openresty bench bench-offline bench-chart dist opm-build rock-lint rock-pack rock-upload install live-check live-full live-openai soak shim e2e-envoy e2e-forward-auth e2e-apisix e2e-haproxy test-litellm
+.PHONY: test lint check invariants luajit-check golden golden-check calibrate labels context-lint test-js test-openresty bench bench-offline bench-judge bench-judge-live bench-chart dist opm-build rock-lint rock-pack rock-upload install live-check live-full live-openai soak shim e2e-envoy e2e-forward-auth e2e-apisix e2e-kong e2e-haproxy test-litellm
 
 test:
 	busted
@@ -9,14 +9,19 @@ test:
 #   make lint LUACHECK=~/.luarocks/bin/luacheck
 LUACHECK ?= luacheck
 lint:
-	$(LUACHECK) core rules $$(ls -d adapters bench 2>/dev/null)
+	$(LUACHECK) core rules scripts $$(ls -d adapters bench 2>/dev/null)
 
 # Every core file must at least compile under LuaJIT (the OpenResty runtime).
+LUAJIT ?= luajit
 luajit-check:
 	@for f in $$(find core rules -name '*.lua' -not -path '*/spec/*'); do \
-	  luajit -bl $$f >/dev/null || exit 1; done; echo "luajit ok"
+	  $(LUAJIT) -e "assert(loadfile('$$f'))" || exit 1; done; echo "luajit ok"
 
-check: lint luajit-check golden-check test
+check: lint invariants luajit-check golden-check test
+
+# Tripwires for bug classes a past audit found (scripts/invariants.lua).
+invariants:
+	lua scripts/invariants.lua
 
 # Golden vectors: the cross-implementation contract for core (core/golden/README.md).
 # `golden` regenerates them from the Lua core after a deliberate behaviour change;
@@ -59,6 +64,19 @@ test-openresty:
 
 bench-offline:
 	lua bench/offline.lua
+
+# Judge-directed attacks (bench/datasets/judge-directed.jsonl) through L1:
+# which reach L2, which a pattern names, which benign look-alikes it flags.
+bench-judge:
+	lua bench/judge_robustness.lua
+
+# The same cases through the real judge, per-category detection. Costs
+# provider calls: TYPESAFE_API_KEY (jev) and/or OPENAI_BASE_URL [OPENAI_API_KEY,
+# OPENAI_MODEL] (openai-compat) in .env; JEV_DEPLOYMENT_CONTEXT optional.
+bench-judge-live:
+	docker run --rm --env-file .env -e JEV_DEPLOYMENT_CONTEXT -v "$(CURDIR)":/work jev-edge-test sh -c \
+	  'resty --http-conf "lua_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt; lua_ssl_verify_depth 5;" \
+	   -I /work/adapters/openresty/lib -I /work /work/bench/judge_robustness.lua --live'
 
 bench:
 	docker build -q -t jev-edge-test -f adapters/openresty/Dockerfile.test adapters/openresty
@@ -105,6 +123,10 @@ e2e-envoy:
 e2e-apisix:
 	docker build -q -t jev-edge-test -f adapters/openresty/Dockerfile.test adapters/openresty
 	sh adapters/apisix/e2e/run.sh
+
+e2e-kong:
+	docker build -q -t jev-edge-test -f adapters/openresty/Dockerfile.test adapters/openresty
+	sh adapters/kong/e2e/run.sh
 
 e2e-haproxy:
 	docker build -q -t jev-edge-test -f adapters/openresty/Dockerfile.test adapters/openresty

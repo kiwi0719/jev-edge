@@ -72,6 +72,17 @@ _M.config = {
     hashed       = false,
     history_ttl  = 3600,       -- seconds a subject's trajectory stays readable
     max_entries  = 20,         -- entries kept per subject; older ones drop
+    -- Subject reputation (core/subject.lua): judged verdicts add points over a
+    -- sliding window_s; at block_at points the subject is blocked at L1 for
+    -- block_ttl seconds. block_at = 0 is off. Pick block_at with
+    -- `make calibrate` from monitor-mode logs (it reports points per subject).
+    reputation = {
+      block_at   = 0,
+      window_s   = 600,
+      block_ttl  = 600,
+      suspicious = 1,          -- points per suspicious verdict
+      malicious  = 3,          -- points per malicious verdict
+    },
     -- Trajectories live in their own dict (`jev_subject`), sized by the
     -- operator: a scraper with a million sessions can fill it, and when it
     -- does only trajectories are evicted, never verdicts or trust.
@@ -196,6 +207,20 @@ function _M.validate(c)
   end
   if sj.max_entries ~= nil and (type(sj.max_entries) ~= "number" or sj.max_entries < 1) then
     return nil, "subject.max_entries must be >= 1"
+  end
+  local sr = sj.reputation or {}
+  for _, k in ipairs({ "block_at", "suspicious", "malicious" }) do
+    if sr[k] ~= nil and (type(sr[k]) ~= "number" or sr[k] < 0) then
+      return nil, "subject.reputation." .. k .. " must be a number >= 0"
+    end
+  end
+  for _, k in ipairs({ "window_s", "block_ttl" }) do
+    if sr[k] ~= nil and (type(sr[k]) ~= "number" or sr[k] <= 0) then
+      return nil, "subject.reputation." .. k .. " must be > 0"
+    end
+  end
+  if (tonumber(sr.block_at) or 0) > 0 and not sj.enabled then
+    return nil, "subject.reputation.block_at needs subject.enabled"
   end
   if sj.history_ttl ~= nil and (type(sj.history_ttl) ~= "number" or sj.history_ttl <= 0) then
     return nil, "subject.history_ttl must be > 0"

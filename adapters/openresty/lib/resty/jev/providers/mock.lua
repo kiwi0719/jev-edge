@@ -29,7 +29,7 @@ function _M.call(prompt, cfg, timeout_ms)
 
   local score = tonumber(cfg.mock_score) or 0.1
   if cfg.mock_header and ngx.get_phase() ~= "timer" then
-    local h = ngx.req.get_headers()[cfg.mock_header]
+    local h = ngx.req.get_headers(0)[cfg.mock_header]
     if h == "fail" then return nil, "mock failure (header)" end
     if h == "slow" then ngx.sleep(1) end
     local n = tonumber(h)

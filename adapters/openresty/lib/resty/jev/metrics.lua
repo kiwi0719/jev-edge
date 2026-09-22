@@ -22,6 +22,7 @@ function _M.record(v)
   local unj = v.reason:match("^unjudgeable: (%a[%a%-]*)")
   if unj then incr("unjudged:" .. unj) end
   if v.reason:find("(window)", 1, true) then incr("window") end
+  if v.reason == "subject reputation" then incr("subject_blocks") end
   if v.source == "l2" then
     incr("l2_count")
     incr("l2_sum_ms", math.floor(v.l2_ms))
@@ -45,9 +46,27 @@ end
 
 function _M.incr_async_dropped() incr("async_dropped") end
 
-function _M.set_l2_timeout(ms)
+-- The effective adaptive L2 timeout and, when given, the ceiling it is
+-- clamped to (jev.timeout_max_ms after adaptive.lua's defaulting), so an
+-- alert can tell "pinned at the ceiling" from "high but adapting".
+function _M.set_l2_timeout(ms, max_ms)
   local d = dict()
-  if d then d:set("l2_timeout_ms", ms) end
+  if not d then return end
+  d:set("l2_timeout_ms", ms)
+  if max_ms then d:set("l2_timeout_max_ms", max_ms) end
+end
+
+-- Operator feedback (POST /_jev/feedback), counted after the token check.
+-- label is the normalized label; anything outside the known set is folded
+-- into "other" so a caller cannot mint label values. result is what the
+-- endpoint did: trusted | refused | revoked | invalid.
+local FEEDBACK_LABELS = { benign = true, attack = true }
+local FEEDBACK_RESULTS = { trusted = true, refused = true, revoked = true, invalid = true }
+
+function _M.incr_feedback(label, result)
+  if not FEEDBACK_LABELS[label] then label = "other" end
+  if not FEEDBACK_RESULTS[result] then result = "invalid" end
+  incr("feedback:" .. label .. ":" .. result)
 end
 
 function _M.render()
@@ -65,6 +84,9 @@ function _M.render()
   line("# TYPE jev_l2_timeout_ms gauge")
   line("# TYPE jev_unjudged_total counter")
   line("# TYPE jev_window_total counter")
+  line("# TYPE jev_subject_blocks_total counter")
+  line("# TYPE jev_l2_timeout_max_ms gauge")
+  line("# TYPE jev_feedback_total counter")
   for _, key in ipairs(d:get_keys(0)) do
     local val = d:get(key)
     local src, verdict = key:match("^req:([^:]+):(.+)$")
@@ -92,6 +114,13 @@ function _M.render()
       line(string.format('jev_unjudged_total{reason="%s"} %d', key:sub(10), val))
     elseif key == "window" then
       line("jev_window_total " .. val)
+    elseif key == "subject_blocks" then
+      line("jev_subject_blocks_total " .. val)
+    elseif key == "l2_timeout_max_ms" then
+      line("jev_l2_timeout_max_ms " .. val)
+    elseif key:match("^feedback:") then
+      local label, result = key:match("^feedback:([^:]+):(.+)$")
+      line(string.format('jev_feedback_total{label="%s",result="%s"} %d', label, result, val))
     end
   end
   return table.concat(out, "\n") .. "\n"

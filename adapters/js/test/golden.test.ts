@@ -5,7 +5,7 @@ import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import * as core from "../src/core";
-import { load as loadRule } from "../src/rules";
+import { load as loadRule, resolve as resolveRule } from "../src/rules";
 import { Breaker, memoryStore, OPEN, CLOSED } from "../src/core/breaker";
 
 const GOLDEN = resolve(__dirname, "../../../core/golden");
@@ -92,12 +92,27 @@ describe("golden: evaluate", () => {
         breaker = new Breaker(bstore, () => inp.clock, {});
       }
       let recorded: core.SubjectEntry | null = null;
+      const swrites: Record<string, { value: unknown; ttl: number }> | null = inp.subject ? {} : null;
+      const sstore = storeFrom(inp.subject?.store ?? {});
       const ctx: core.Ctx = {
         config: core.defaults.merge(core.defaults.config, inp.config),
         subject: inp.subject
-          ? { id: inp.subject.id, history: inp.subject.history, record: (e) => { recorded = e; } }
+          ? {
+            id: inp.subject.id, history: inp.subject.history, record: (e) => { recorded = e; },
+            store: {
+              get: (k) => sstore.get(k),
+              set: (k, v, ttl) => { swrites![k] = { value: v, ttl }; sstore.set(k, v, ttl); },
+              incr: (k, by, ttl) => {
+                const n = (Number(sstore.get(k)) || 0) + by;
+                sstore.set(k, n, ttl);
+                swrites![k] = { value: n, ttl };
+                return n;
+              },
+            },
+          }
           : undefined,
-        rules: inp.rules.map(loadRule),
+        // an id, or an inline spec resolved the way a config's `rules` list is
+        rules: inp.rules.map((r: string | object) => (typeof r === "string" ? loadRule(r) : resolveRule(r as never))),
         breaker,
         cache: {
           get: (k) => cache.get(k),
@@ -121,7 +136,7 @@ describe("golden: evaluate", () => {
       const prompt = seen ? { text: seen.text, context: seen.context, questions: Object.keys(seen.questions).sort() } : null;
       expect({
         verdict: v, headers: core.verdict.headers(v), judge_calls: calls, prompt,
-        cache_writes: writes, subject_record: recorded,
+        cache_writes: writes, subject_record: recorded, subject_store_writes: swrites,
       }).toEqual(c.expect);
     });
   }

@@ -56,9 +56,9 @@ or `docker build -t jev-shim adapters/envoy/grpc-shim`. Envoy side: [envoy-grpc.
 make e2e-envoy
 ```
 
-Brings up one jev-edge (mock provider), a stub upstream, the shim, and two Envoys (HTTP on :10000, gRPC on :10001) with Docker Compose, then checks on each transport: unwatched path skipped, safe verdict reaches the app, malicious request blocked with jev-edge's body, provider failure fails open, forged inbound `X-Jev-Verdict` ignored. Finally it stops jev-edge and checks that the HTTP path passes via `failure_mode_allow` and the gRPC path passes via the shim's own fail-open.
+Brings up one jev-edge (mock provider), a stub upstream, the shim, and two Envoys (HTTP on :10000, gRPC on :10001) with Docker Compose, then checks on each transport: unwatched path skipped, safe verdict reaches the app, malicious request blocked with jev-edge's body, provider failure fails open, forged inbound `X-Jev-Verdict` ignored, and the partial-body path: the compose file runs the reference configs with `max_request_bytes` lowered to 64 KiB (`run.sh` writes them to `e2e/.gen/`), a ~110 KB body with the attack at its start is blocked with 403, a ~110 KB benign body passes with an `l2` verdict, jev-edge's log shows `x-envoy-auth-partial-body: true` arrived on both transports (Envoy puts it in the gRPC `CheckRequest` headers too) and a reason ending in `(window)`, and a client's own copy of the header is overwritten with `false`. Finally it stops jev-edge and checks that the HTTP path passes via `failure_mode_allow` and the gRPC path passes via the shim's own fail-open.
 
 ## Not covered yet
 
-- Bodies larger than `max_request_bytes`: Envoy sends only the head, so text that sits only in the tail is not seen. The partial-body path is not asserted by the e2e or Test::Nginx yet.
+- Bodies larger than `max_request_bytes`: Envoy sends only the head, so text that sits only past it (the tail included) is not seen. The partial-body path itself is tested (the e2e above on both transports, and `t/04-authz.t`); to refuse such bodies instead, set `allow_partial_message: false` and Envoy answers 413. See [Traffic L1 does not see](../../docs/design.md#traffic-l1-does-not-see).
 - Streaming / gRPC upstream traffic through Envoy. jev-edge only judges buffered HTTP bodies.

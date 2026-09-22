@@ -14,9 +14,9 @@
 //   memory          per isolate. The fallback when no binding is configured;
 //                   documented as "each isolate learns on its own".
 
-import { Breaker, type Store, type BreakerLike, type BreakerConfig, type State } from "../core/breaker";
-import { Adaptive, tuning, type AdaptiveLike } from "./adaptive";
-import type { JevConfig } from "../core/defaults";
+import { Breaker, type Store, type BreakerLike, type BreakerConfig, type State } from "../core/breaker.js";
+import { Adaptive, tuning, type AdaptiveLike } from "./adaptive.js";
+import type { JevConfig } from "../core/defaults.js";
 
 export interface KVLike {
   get(key: string, type: "json"): Promise<unknown>;

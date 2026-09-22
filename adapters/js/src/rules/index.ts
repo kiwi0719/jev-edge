@@ -1,7 +1,7 @@
 // Ports of rules/*.lua. Keep the pattern lists identical to the Lua files;
 // core/golden/rules.json has one positive per always_suspect pattern and
 // fails a named case when the two drift.
-import { patternError, type Rule } from "../core/rules";
+import { patternError, type Rule } from "../core/rules.js";
 
 export const llmEndpoints: Rule = {
   id: "llm-endpoints",
@@ -11,6 +11,7 @@ export const llmEndpoints: Rule = {
   min_body_bytes: 8,
   max_body_bytes: 1048576,
   max_judge_bytes: 32768,
+  max_judge_chunks: 1,
   text_fields: ["messages[*].content", "prompt", "input", "query", "text"],
   min_text_chars: 20,
   always_suspect: [
@@ -23,6 +24,13 @@ export const llmEndpoints: Rule = {
     String.raw`\b(DAN|do anything now)\b`,
     String.raw`\b(reveal|print|repeat|show)\b.{0,30}\b(instructions|system prompt|rules)\b`,
     String.raw`(?:[A-Za-z0-9+/]{4}){40,}={0,2}`,
+    // Judge-directed text: the input talks to the classifier judging it.
+    String.raw`\b(rate|classify|mark|label|score|flag|treat|judge)\b.{0,30}\b(this|it|me|the (above|following|message|request|input|prompt|text))\b.{0,30}\bas\s+(a\s+)?(safe|benign|harmless|clean|legitimate|non-?malicious|0(\.0+)?)\b(?!\s+(to|for)\b)`,
+    String.raw`\b(classifier|moderator|guardrail|safety (filter|model|system|check)|content filter|judge model)\b.{0,40}\b(output|return|respond|answer|reply|say|print)\b.{0,20}\b(0(\.0+)?|safe|benign|harmless|false)\b`,
+    String.raw`\b(to|for)\s+(the|any)\s+(ai|model|llm|classifier|moderator|reviewer|filter)\s+(reviewing|checking|scanning|screening|evaluating|analy[sz]ing|reading|judging)\s+(this|these|the)\b`,
+    String.raw`[\x7b,]\s*"(injection|abuse|noul|jailbreak|prompt_injection)"\s*:\s*(\x7b|\[|"?(0(\.\d+)?|false|safe|benign)\b)`,
+    String.raw`(={3,}|-{3,}|#{2,}|\*{3,}|\[|</?)\s*end[ _-]+(of[ _-]+)?(the[ _-]+)?(user[ _-]+)?(input|message|prompt|text|data|query)\b`,
+    String.raw`\b(real|actual|true|correct|final)\s+(verdict|rating|classification)(\s+(is|should be)|\s*[=:])\s*"?(safe|benign|harmless|clean|0(\.0+)?|not (malicious|an? (injection|attack)))\b`,
   ],
   templates: ["injection"],
 };

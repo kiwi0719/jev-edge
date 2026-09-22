@@ -198,7 +198,7 @@
       "name": "whitespace-only text still fingerprints, one value for all of it"
     }
   ],
-  "core_version": "0.4.0",
+  "core_version": "0.5.0",
   "format_version": 1,
   "generated_by": "core/golden/gen.lua",
   "suite": "normalize"

@@ -20,7 +20,7 @@ describe("rules.resolve", function()
     assert.same({ "^/v1/billing" }, r.watch_paths)
     assert.equals("Billing bot.", r.deployment_context)
     assert.equals(20, r.min_text_chars)
-    assert.equals(9, #r.always_suspect)
+    assert.equals(#require("jev.rules.llm-endpoints").always_suspect, #r.always_suspect)
   end)
 
   it("fills defaults for a complete inline rule", function()

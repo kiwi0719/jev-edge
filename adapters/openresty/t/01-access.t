@@ -389,3 +389,32 @@ Content-Type: application/json
 Content-Encoding: compress
 --- response_body_like eval
 ["verdict=skipped score=0.00 source=l1 reason=unjudgeable%3A\\+content-encoding\\+compress", 'jev_unjudged_total\{reason="content-encoding"\} 1']
+
+
+
+=== TEST 23: head and tail of an oversized body end on UTF-8 character boundaries, in memory and spooled to disk
+--- http_config eval: $::HttpConfig
+--- user_files eval: ::conf()
+--- config
+location = /t/mem {
+    client_body_buffer_size 64k;
+    content_by_lua_block {
+        local req = require("resty.jev.body").fill({ headers = ngx.req.get_headers(0) }, 1000)
+        ngx.say(#req.body_head % 3, " ", #req.body_tail % 3, " ", req.body_size)
+    }
+}
+location = /t/disk {
+    client_body_buffer_size 1k;
+    content_by_lua_block {
+        local req = require("resty.jev.body").fill({ headers = ngx.req.get_headers(0) }, 1000)
+        ngx.say(#req.body_head % 3, " ", #req.body_tail % 3, " ", req.body_size)
+    }
+}
+--- request eval
+["POST /t/mem\n" . ("\xE4\xB8\xAD" x 700), "POST /t/disk\n" . ("\xE4\xB8\xAD" x 700)]
+--- more_headers
+Content-Type: text/plain
+--- response_body eval
+["0 0 2100\n", "0 0 2100\n"]
+--- no_error_log
+[error]

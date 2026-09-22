@@ -29,7 +29,7 @@ local trust     = require "jev.core.trust"
 local verdict   = require "jev.core.verdict"
 local subject   = require "jev.core.subject"
 
-local _M = { _VERSION = "0.4.0" }
+local _M = { _VERSION = "0.5.0" }
 
 local function log(ctx, level, msg)
   if ctx.log then ctx.log(level, msg) end
@@ -45,6 +45,7 @@ end
 -- never a candidate, and that is the hot path.
 local function finish(ctx, v)
   subject.record(ctx, v)
+  subject.rep_record(ctx, v)
   return v
 end
 
@@ -70,11 +71,97 @@ function _M.cache_key(fp, rule, cfg, hash)
   return "fp:" .. tostring(hash(scope)):sub(1, 16) .. ":" .. fp
 end
 
+-- Judge text that did not fit one window, chunk by chunk (rule.max_judge_chunks).
+-- Each chunk has its own verdict-cache entry, so the unchanged history of a
+-- long conversation is not paid for again on every turn; the misses go to the
+-- judge together (ctx.judge.call_many, in parallel, when the adapter has it).
+-- The request's score is the highest chunk score. A chunk the judge failed on
+-- turns the request into an error unless another chunk already blocks.
+local function judge_chunks(req, ctx, rule, chunks, capped, fp, ckey, reason)
+  local cfg = ctx.config
+  local scores, tops, pending = {}, {}, {}
+  local context = {
+    path = req.path or "", method = req.method or "",
+    deployment = rule.deployment_context or cfg.jev.deployment_context or "",
+  }
+  for i, c in ipairs(chunks) do
+    local cfp = normalize.fingerprint(c, { prefix_bytes = cfg.cache.fp_prefix_bytes }, ctx.hash)
+    local ck = cfp ~= "" and _M.cache_key(cfp, rule, cfg, ctx.hash) or nil
+    local hit = ck and ctx.cache and ctx.cache:get(ck)
+    if type(hit) == "table" and type(hit.score) == "number" then
+      scores[i], tops[i] = hit.score, tostring(hit.reason or ""):match("^(%S+)") or ""
+    else
+      local prompt, perr = judge.build(rule.templates, c, context)
+      if not prompt then
+        log(ctx, "error", "jev-edge: " .. perr)
+        local action, label, async = policy.on_error()
+        return finish(ctx, verdict.new({ action = action, verdict = label, async = async,
+          source = verdict.SRC_L2, reason = perr, fingerprint = fp }))
+      end
+      pending[#pending + 1] = { i = i, prompt = prompt, ck = ck }
+    end
+  end
+
+  local t0 = now_ms(ctx)
+  local results = {}
+  if #pending > 1 and type(ctx.judge.call_many) == "function" then
+    local prompts = {}
+    for k, p in ipairs(pending) do prompts[k] = p.prompt end
+    results = ctx.judge.call_many(prompts, cfg.jev.timeout_ms) or {}
+  else
+    for k, p in ipairs(pending) do
+      local a, e = ctx.judge.call(p.prompt, cfg.jev.timeout_ms)
+      results[k] = { a, e }
+    end
+  end
+  local elapsed = now_ms(ctx) - t0
+
+  local err
+  for k, p in ipairs(pending) do
+    local a, e = results[k] and results[k][1], results[k] and results[k][2]
+    local s, t, n
+    if a then s, t, n = judge.reduce(a) end
+    if not a or n == 0 then
+      err = err or tostring(e or (a and "no scores in answer") or "error")
+    else
+      scores[p.i], tops[p.i] = s, t
+      if p.ck and ctx.cache then
+        ctx.cache:set(p.ck, { score = s, reason = t .. " " .. string.format("%.2f", s) }, cfg.cache.fp_ttl)
+      end
+    end
+  end
+  if ctx.breaker and #pending > 0 then
+    if err then ctx.breaker:failure() else ctx.breaker:success() end
+  end
+
+  local best, top = nil, ""
+  for i = 1, #chunks do
+    if scores[i] and (not best or scores[i] > best) then best, top = scores[i], tops[i] end
+  end
+  if err and not (best and best >= cfg.policy.block_threshold) then
+    log(ctx, "warn", "jev-edge: L2 failed on a chunk: " .. err)
+    local action, label, async = policy.on_error()
+    return finish(ctx, verdict.new({ action = action, verdict = label, async = async,
+      source = verdict.SRC_L2, reason = err, fingerprint = fp, l2_ms = elapsed }))
+  end
+
+  local action, label, async = policy.decide(best, cfg.policy)
+  local why = top ~= "" and (top .. " " .. string.format("%.2f", best)) or reason
+  if top ~= "" then why = why .. (capped and " (window)" or (" (" .. #chunks .. " chunks)")) end
+  if ckey and ctx.cache then
+    ctx.cache:set(ckey, { score = best, reason = why }, cfg.cache.fp_ttl)
+  end
+  return finish(ctx, verdict.new({
+    action = action, verdict = label, score = best, async = async,
+    source = verdict.SRC_L2, reason = why, fingerprint = fp, l2_ms = elapsed,
+  }))
+end
+
 function _M.evaluate(req, ctx)
   local cfg = ctx.config
 
   -- L1 ------------------------------------------------------------------
-  local r, text, reason, rule, windowed = rules_mod.evaluate_all(req, ctx.rules, ctx)
+  local r, text, reason, rule, windowed, chunks, capped = rules_mod.evaluate_all(req, ctx.rules, ctx)
 
   if r == rules_mod.PASS then
     return verdict.new({ verdict = verdict.SKIPPED, source = verdict.SRC_L1, reason = reason })
@@ -141,6 +228,18 @@ function _M.evaluate(req, ctx)
   end
 
   -- L2 ------------------------------------------------------------------
+  if chunks and #chunks > 1 then
+    -- max_judge_chunks > 1 was the operator's choice to judge long text in
+    -- full; what still did not fit is unjudgeable, and policy.unjudgeable
+    -- decides as it does for any other unreadable request
+    if capped and cfg.policy.unjudgeable == "block" and cfg.policy.mode == "enforce" then
+      return finish(ctx, verdict.new({
+        action = verdict.ACTION_BLOCK, verdict = verdict.SKIPPED, source = verdict.SRC_L1,
+        reason = "unjudgeable: text over max_judge_chunks", fingerprint = fp,
+      }))
+    end
+    return judge_chunks(req, ctx, rule, chunks, capped, fp, ckey, reason)
+  end
   local prompt, perr = judge.build(rule.templates, text, {
     path = req.path or "", method = req.method or "",
     deployment = rule.deployment_context or cfg.jev.deployment_context or "",

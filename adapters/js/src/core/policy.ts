@@ -1,5 +1,5 @@
 // Port of core/policy.lua.
-import { ACTION_BLOCK, ACTION_PASS, ERROR, MALICIOUS, SAFE, SKIPPED, SUSPICIOUS, type Action, type Label } from "./verdict";
+import { ACTION_BLOCK, ACTION_PASS, ERROR, MALICIOUS, SAFE, SKIPPED, SUSPICIOUS, type Action, type Label } from "./verdict.js";
 
 export interface Policy {
   mode?: "monitor" | "enforce" | string;

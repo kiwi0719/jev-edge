@@ -96,3 +96,31 @@ Content-Type: application/json
 [200, 200, 409]
 --- response_body_like eval
 ['"renewals":0', '"renewals":1', 'renewal cap reached']
+
+
+
+=== TEST 5: feedback is counted by normalized label and result; unknown labels fold into "other"
+Calls that fail the token check are not counted at all, so the series stay bounded.
+--- http_config eval: $::HttpConfig
+--- user_files eval: ::conf(q{feedback = { enabled = true, token = "s3cret", trust_ttl = 600, max_renewals = 0 },})
+--- config
+location = /_jev/feedback { content_by_lua_block { require("resty.jev.edge").feedback() } }
+location = /_jev/metrics { content_by_lua_block { require("resty.jev.edge").metrics() } }
+--- request eval
+["POST /_jev/feedback\n{\"fp\":\"cafe01\",\"label\":\"ok\"}",
+ "POST /_jev/feedback\n{\"fp\":\"cafe01\",\"label\":\"good\"}",
+ "POST /_jev/feedback\n{\"fp\":\"cafe01\",\"label\":\"MALICIOUS\"}",
+ "POST /_jev/feedback\n{\"fp\":\"cafe01\",\"label\":\"weird-label\"}",
+ "POST /_jev/feedback\n{\"fp\":\"cafe01\",\"label\":\"benign\"}",
+ "GET /_jev/metrics"]
+--- more_headers eval
+my $h = "Content-Type: application/json\nX-Jev-Token: s3cret\n";
+[$h, $h, $h, $h, "Content-Type: application/json\nX-Jev-Token: wrong\n", ""]
+--- error_code eval
+[200, 409, 200, 400, 403, 200]
+--- response_body_like eval
+['"trusted":true', 'renewal cap reached', '"label":"attack"', 'label must be',
+ 'bad or missing',
+ '(?s)^(?=.*# TYPE jev_feedback_total counter\n)(?=.*jev_feedback_total\{label="benign",result="trusted"\} 1\n)(?=.*jev_feedback_total\{label="benign",result="refused"\} 1\n)(?=.*jev_feedback_total\{label="attack",result="revoked"\} 1\n)(?=.*jev_feedback_total\{label="other",result="invalid"\} 1\n)(?!.*weird)']
+--- no_error_log
+[error]

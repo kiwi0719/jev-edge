@@ -1,5 +1,5 @@
 // Port of core/judge.lua: prompt building and answer reduction.
-import { TEMPLATES, type Template } from "./templates";
+import { TEMPLATES, type Template } from "./templates.js";
 
 export interface PromptContext {
   path: string;

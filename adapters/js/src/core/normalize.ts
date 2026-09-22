@@ -278,9 +278,16 @@ function readString(s: string, i: number): [string, number] {
 /** The last key of each text-field path: "messages[*].content" -> "content". */
 export function fieldKeys(fields: string[] | undefined): Set<string> {
   const keys = new Set<string>();
+  // Lua: f:match("([^%.%[%]%*]+)[%[%]%*]*$") -- the last run of name
+  // characters before any trailing "[", "]" or "*". A linear scan, not a
+  // regex: the unanchored pattern backtracks quadratically on long input.
+  const special = (c: string) => c === "." || c === "[" || c === "]" || c === "*";
   for (const f of fields ?? []) {
-    const m = /([^.[\]*]+)[[\]*]*$/.exec(f);
-    if (m) keys.add(m[1]);
+    let end = f.length;
+    while (end > 0 && (f[end - 1] === "[" || f[end - 1] === "]" || f[end - 1] === "*")) end--;
+    let start = end;
+    while (start > 0 && !special(f[start - 1])) start--;
+    if (end > start) keys.add(f.slice(start, end));
   }
   // content parts carry their text under "text"
   if (keys.has("content")) keys.add("text");
@@ -327,6 +334,45 @@ export function tail(s: string, n: number): string {
 }
 
 export const HIT_CONTEXT = 1024;
+
+/**
+ * Port of normalize.chunks: consecutive pieces of at most `budget` UTF-8
+ * bytes covering all of `text`; a cut prefers the last newline in the second
+ * half of a piece (dropped) and never splits a code point. Returns the pieces
+ * and each one's 1-based byte offset, as in Lua.
+ */
+export function chunks(text: string, budget: number): [string[], number[]] {
+  const b = enc.encode(text);
+  const n = b.length;
+  const half = Math.floor(budget / 2);
+  const pieces: string[] = [];
+  const starts: number[] = [];
+  let i = 1;
+  while (i <= n) {
+    if (n - i + 1 <= budget) {
+      pieces.push(dec.decode(b.subarray(i - 1)));
+      starts.push(i);
+      break;
+    }
+    let e = i + budget - 1;
+    let next: number | undefined;
+    for (let j = e; j >= i + half + 1; j--) {
+      if (b[j - 1] === 10) {
+        e = j - 1;
+        next = j + 1;
+        break;
+      }
+    }
+    if (next === undefined) {
+      while (e > i && isCont(b, e)) e--;
+      next = e + 1;
+    }
+    pieces.push(dec.decode(b.subarray(i - 1, e)));
+    starts.push(i);
+    i = next;
+  }
+  return [pieces, starts];
+}
 
 /**
  * @param from,to 1-based inclusive byte span of an always_suspect hit, or undefined

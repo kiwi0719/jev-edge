@@ -2,6 +2,8 @@
 # Two Envoy instances share one jev-edge (mock provider):
 #   :10000  HTTP ext_authz  -> jev-edge:8080/_jev/authz
 #   :10001  gRPC ext_authz  -> jev-shim:9001 -> jev-edge:8080/_jev/authz
+# The Envoy configs are the reference ones with max_request_bytes cut to 64 KiB
+# (run.sh writes them to .gen/), so the partial-body checks stay small.
 services:
   jev-edge:
     image: jev-edge-test
@@ -22,12 +24,12 @@ services:
   envoy-http:
     image: envoyproxy/envoy:v1.31-latest
     volumes:
-      - ../envoy-http.yaml:/etc/envoy/envoy.yaml:ro
+      - ./.gen/envoy-http.yaml:/etc/envoy/envoy.yaml:ro
     ports: ["10000:10000"]
     depends_on: [jev-edge, app]
   envoy-grpc:
     image: envoyproxy/envoy:v1.31-latest
     volumes:
-      - ../envoy-grpc.yaml:/etc/envoy/envoy.yaml:ro
+      - ./.gen/envoy-grpc.yaml:/etc/envoy/envoy.yaml:ro
     ports: ["10001:10000"]
     depends_on: [jev-shim, app]

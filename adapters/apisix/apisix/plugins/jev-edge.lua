@@ -198,6 +198,8 @@ local function subject_ctx(rt, req, ctx)
     record = function(e)
       subject_m.ring_append(store, id, e, scfg.max_entries, scfg.history_ttl)
     end,
+    -- reputation counters (subject.reputation): incr is atomic in the dict
+    store = store,
   }
 end
 
@@ -366,7 +368,7 @@ function _M.init()
     local v = ctx.jev
     if not v then return "" end
     return cjson.encode({
-      rid = ctx.var.request_id, path = ctx.var.uri, ip = ctx.var.remote_addr,
+      ts = ngx.now(), rid = ctx.var.request_id, path = ctx.var.uri, ip = ctx.var.remote_addr,
       src = v.source, score = v.score, verdict = v.verdict, action = v.action,
       l2_ms = v.l2_ms, fp = v.fingerprint, reason = v.reason, subject = ctx.jev_subject,
     })

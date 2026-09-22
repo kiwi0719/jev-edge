@@ -1,10 +1,10 @@
 rockspec_format = "3.0"
 package = "lua-resty-jev-edge"
-version = "0.4.0-1"
+version = "0.5.0-1"
 
 source = {
    url = "git+https://github.com/kiwi0719/jev-edge",
-   tag = "v0.4.0",
+   tag = "v0.5.0",
 }
 
 description = {
@@ -48,6 +48,10 @@ build = {
       ["resty.jev.providers.jev"]            = "adapters/openresty/lib/resty/jev/providers/jev.lua",
       ["resty.jev.providers.mock"]           = "adapters/openresty/lib/resty/jev/providers/mock.lua",
       ["resty.jev.providers.openai_compat"]  = "adapters/openresty/lib/resty/jev/providers/openai_compat.lua",
+
+      -- Kong Gateway plugin (KONG_PLUGINS=bundled,jev-edge); see adapters/kong/README.md
+      ["kong.plugins.jev-edge.handler"] = "adapters/kong/kong/plugins/jev-edge/handler.lua",
+      ["kong.plugins.jev-edge.schema"]  = "adapters/kong/kong/plugins/jev-edge/schema.lua",
 
       -- Gateway-independent core, flattened the same way `make dist` does it.
       ["jev.core"]           = "core/init.lua",

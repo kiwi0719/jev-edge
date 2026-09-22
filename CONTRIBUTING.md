@@ -18,6 +18,11 @@
    make check
    ```
 
+   `make check` includes `make invariants` (`scripts/invariants.lua`): text
+   tripwires for bug classes a past audit found, each rule naming the bug.
+   When one fires on purpose (a new adapter that legitimately needs the
+   pattern), change the rule in the same PR and say why.
+
    On macOS, Homebrew's `luacheck` is built against Lua 5.5 and crashes on
    start (`attempt to assign to const variable`). Install one for LuaJIT
    instead, which is the runtime the code targets anyway, and point the

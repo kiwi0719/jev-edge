@@ -3,6 +3,7 @@
 -- Returns "pass" | "block" | "suspect" plus the extracted text and a reason.
 
 local normalize = require "jev.core.normalize"
+local subject   = require "jev.core.subject"
 
 local _M = {}
 
@@ -121,7 +122,8 @@ end
 
 -- Text to judge from the body (or, past max_body_bytes, from the head and
 -- tail the adapter handed over), cut to the judging window.
--- @return text, reason-or-nil, hit pattern, windowed
+-- @return text, reason-or-nil, hit pattern, windowed, chunks (list, when
+--         judged in more than one piece), capped (chunks did not cover it all)
 local function judged(req, rule, ctx, ct, size)
   local max = rule.max_body_bytes or _M.MAX_BODY_BYTES
   local values, text
@@ -149,8 +151,26 @@ local function judged(req, rule, ctx, ct, size)
   end
   if text == "" then return "" end
   local hit, from, to = text_matches(text, rule.always_suspect, ctx)
+  local budget = rule.max_judge_bytes or _M.MAX_JUDGE_BYTES
+  local maxc = math.floor(tonumber(rule.max_judge_chunks) or 1)
+  if maxc > 1 and #text > budget then
+    -- judged in chunks: all of the text when it fits in max_judge_chunks
+    -- pieces; otherwise the newest max_judge_chunks - 1 pieces whole and a
+    -- window over everything older (capped: some of the text is not judged)
+    local pieces, starts = normalize.chunks(text, budget)
+    if #pieces <= maxc then
+      return table.concat(pieces, "\n"), nil, hit, partial, pieces, false
+    end
+    local first_kept = #pieces - (maxc - 1) + 1
+    local older = text:sub(1, starts[first_kept] - 1):gsub("\n$", "")
+    local inside = from and to and to <= #older
+    local win = normalize.window(older, { older }, budget, inside and from or nil, inside and to or nil)
+    local out = { win }
+    for k = first_kept, #pieces do out[#out + 1] = pieces[k] end
+    return table.concat(out, "\n"), nil, hit, true, out, true
+  end
   local windowed
-  text, windowed = normalize.window(text, values, rule.max_judge_bytes or _M.MAX_JUDGE_BYTES, from, to)
+  text, windowed = normalize.window(text, values, budget, from, to)
   return text, nil, hit, windowed or partial
 end
 
@@ -179,6 +199,10 @@ function _M.evaluate(req, rule, ctx)
         return _M.PASS, "", "ip trusted"
       end
     end
+  end
+  -- the same for the subject (core/subject.lua), when reputation is on
+  if ctx and ctx.subject and subject.rep_blocked(ctx) then
+    return _M.BLOCK, "", "subject reputation"
   end
 
   -- 3. method + content type (a deny list of media types, unless the rule
@@ -209,17 +233,18 @@ function _M.evaluate(req, rule, ctx)
 
   -- 6+7. extract text (whole body, or head + tail past max_body_bytes), regex
   --      prefilter over all of it, judging window, natural-language length
-  local text, unj, hit, windowed = judged(req, rule, ctx, ct, size)
+  local text, unj, hit, windowed, chunks, capped = judged(req, rule, ctx, ct, size)
   if unj then return _M.UNJUDGEABLE, "", unj end
   if text == "" then
     return _M.PASS, "", "no text"
   end
   local tag = windowed and " (window)" or ""
+  if chunks and not capped then tag = " (" .. #chunks .. " chunks)" end
   if hit then
-    return _M.SUSPECT, text, "pattern: " .. hit .. tag, windowed
+    return _M.SUSPECT, text, "pattern: " .. hit .. tag, windowed, chunks, capped
   end
   if #text >= (rule.min_text_chars or 20) then
-    return _M.SUSPECT, text, "natural language" .. tag, windowed
+    return _M.SUSPECT, text, "natural language" .. tag, windowed, chunks, capped
   end
   return _M.PASS, "", "text too short"
 end
@@ -230,7 +255,9 @@ end
 function _M.judged_text(req, rule, ctx)
   if not rule or not req then return "" end
   local size = math.max(tonumber(req.body_size) or 0, req.body and #req.body or 0)
-  local text = judged(req, rule, ctx, _M.content_type(req.headers), size)
+  -- one window, never chunks: L3 re-judges off the request path with one call
+  local one = setmetatable({ max_judge_chunks = 1 }, { __index = rule })
+  local text = judged(req, one, ctx, _M.content_type(req.headers), size)
   return text or ""
 end
 
@@ -374,8 +401,8 @@ end
 function _M.evaluate_all(req, rules, ctx)
   local last_reason = "no rules"
   for _, rule in ipairs(rules or {}) do
-    local r, text, reason, windowed = _M.evaluate(req, rule, ctx)
-    if r ~= _M.PASS then return r, text, reason, rule, windowed end
+    local r, text, reason, windowed, chunks, capped = _M.evaluate(req, rule, ctx)
+    if r ~= _M.PASS then return r, text, reason, rule, windowed, chunks, capped end
     last_reason = reason
   end
   return _M.PASS, "", last_reason, nil

@@ -1,5 +1,6 @@
 // Port of core/rules.lua: L1, cheap and short-circuiting.
-import { extract, byteLength, head, tail, fieldKeys, scanStrings, window, type JsonValue } from "./normalize";
+import { extract, byteLength, head, tail, fieldKeys, scanStrings, window, chunks as splitChunks, utf8Bytes, type JsonValue } from "./normalize.js";
+import { repBlocked, type SubjectCtx, type ReputationConfig } from "./subject.js";
 
 export type RuleResult = "pass" | "block" | "suspect" | "unjudgeable";
 export const PASS: RuleResult = "pass";
@@ -27,6 +28,8 @@ export interface Rule {
   min_body_bytes?: number;
   max_body_bytes?: number;
   max_judge_bytes?: number;
+  /** Judge text over max_judge_bytes in up to this many chunks (default 1: one window). */
+  max_judge_chunks?: number;
   text_fields: string[];
   min_text_chars?: number;
   always_suspect?: string[];
@@ -61,6 +64,8 @@ export interface RulesCtx {
   /** Truthy on a match; a [from, to] 1-based inclusive UTF-8 byte span places the hit in the judging window. */
   re_find?: (subject: string, pattern: string) => boolean | readonly [number, number] | null;
   log?: (level: string, msg: string) => void;
+  subject?: SubjectCtx;
+  config?: { subject?: { reputation?: ReputationConfig } };
 }
 
 /**
@@ -293,7 +298,7 @@ export function reFind(subject: string, pattern: string): readonly [number, numb
 // Port of judged() in core/rules.lua.
 async function judged(
   req: Req, rule: Rule, ctx: RulesCtx | undefined, ct: string, size: number,
-): Promise<{ text: string; unj?: string; hit?: string; windowed?: boolean }> {
+): Promise<{ text: string; unj?: string; hit?: string; windowed?: boolean; chunks?: string[]; capped?: boolean }> {
   const max = rule.max_body_bytes ?? MAX_BODY_BYTES;
   let values: string[];
   let text: string;
@@ -320,7 +325,23 @@ async function judged(
   }
   if (text === "") return { text: "" };
   const hit = textMatches(text, rule.always_suspect, ctx);
-  const [w, cut] = window(text, values, rule.max_judge_bytes ?? MAX_JUDGE_BYTES, hit?.[1], hit?.[2]);
+  const budget = rule.max_judge_bytes ?? MAX_JUDGE_BYTES;
+  const maxc = Math.floor(Number(rule.max_judge_chunks ?? 1)) || 1;
+  if (maxc > 1 && byteLength(text) > budget) {
+    // port of the chunked branch of judged() in core/rules.lua
+    const [pieces, starts] = splitChunks(text, budget);
+    if (pieces.length <= maxc) return { text: pieces.join("\n"), hit: hit?.[0], windowed: partial, chunks: pieces, capped: false };
+    const firstKept = pieces.length - (maxc - 1); // 0-based
+    const tb = utf8Bytes(text);
+    let older = new TextDecoder().decode(tb.subarray(0, starts[firstKept] - 1));
+    if (older.endsWith("\n")) older = older.slice(0, -1);
+    const olderLen = byteLength(older);
+    const inside = hit?.[1] !== undefined && hit?.[2] !== undefined && hit[2] <= olderLen;
+    const [win] = window(older, [older], budget, inside ? hit![1] : undefined, inside ? hit![2] : undefined);
+    const out = [win, ...pieces.slice(firstKept)];
+    return { text: out.join("\n"), hit: hit?.[0], windowed: true, chunks: out, capped: true };
+  }
+  const [w, cut] = window(text, values, budget, hit?.[1], hit?.[2]);
   return { text: w, hit: hit?.[0], windowed: cut || partial };
 }
 
@@ -329,11 +350,14 @@ export async function judgedText(req: Req, rule: Rule | undefined, ctx?: RulesCt
   if (!rule || !req) return "";
   const declared = Number(req.body_size);
   const size = Math.max(Number.isFinite(declared) ? declared : 0, typeof req.body === "string" ? byteLength(req.body) : 0);
-  const r = await judged(req, rule, ctx, contentType(req.headers), size);
+  // one window, never chunks: L3-style re-judging uses one call
+  const r = await judged(req, { ...rule, max_judge_chunks: 1 }, ctx, contentType(req.headers), size);
   return r.text;
 }
 
-export async function evaluate(req: Req, rule: Rule, ctx?: RulesCtx): Promise<[RuleResult, string, string, boolean?]> {
+export async function evaluate(
+  req: Req, rule: Rule, ctx?: RulesCtx,
+): Promise<[RuleResult, string, string, boolean?, string[]?, boolean?]> {
   // 1. path watch list
   if (!pathMatches(req.path ?? "", rule.watch_paths)) return [PASS, "", "path not watched"];
 
@@ -346,6 +370,8 @@ export async function evaluate(req: Req, rule: Rule, ctx?: RulesCtx): Promise<[R
       if (rep.trusted_until !== undefined && rep.trusted_until > now) return [PASS, "", "ip trusted"];
     }
   }
+  // the same for the subject (core/subject.lua), when reputation is on
+  if (ctx?.subject && (await repBlocked(ctx))) return [BLOCK, "", "subject reputation"];
 
   // 3. method + content type (deny list of media types unless content_types allows)
   if (rule.methods && !rule.methods[(req.method ?? "").toUpperCase()]) return [PASS, "", "method not watched"];
@@ -370,9 +396,10 @@ export async function evaluate(req: Req, rule: Rule, ctx?: RulesCtx): Promise<[R
   const j = await judged(req, rule, ctx, ct, size);
   if (j.unj) return [UNJUDGEABLE, "", j.unj];
   if (j.text === "") return [PASS, "", "no text"];
-  const tag = j.windowed ? " (window)" : "";
-  if (j.hit) return [SUSPECT, j.text, "pattern: " + j.hit + tag, j.windowed];
-  if (byteLength(j.text) >= (rule.min_text_chars ?? 20)) return [SUSPECT, j.text, "natural language" + tag, j.windowed];
+  let tag = j.windowed ? " (window)" : "";
+  if (j.chunks && !j.capped) tag = ` (${j.chunks.length} chunks)`;
+  if (j.hit) return [SUSPECT, j.text, "pattern: " + j.hit + tag, j.windowed, j.chunks, j.capped];
+  if (byteLength(j.text) >= (rule.min_text_chars ?? 20)) return [SUSPECT, j.text, "natural language" + tag, j.windowed, j.chunks, j.capped];
   return [PASS, "", "text too short"];
 }
 
@@ -389,11 +416,11 @@ export function ruleFor(req: Req, rules: Rule[] | undefined): Rule | undefined {
 
 export async function evaluateAll(
   req: Req, rules: Rule[] | undefined, ctx?: RulesCtx,
-): Promise<[RuleResult, string, string, Rule | undefined, boolean?]> {
+): Promise<[RuleResult, string, string, Rule | undefined, boolean?, string[]?, boolean?]> {
   let lastReason = "no rules";
   for (const rule of rules ?? []) {
-    const [r, text, reason, windowed] = await evaluate(req, rule, ctx);
-    if (r !== PASS) return [r, text, reason, rule, windowed];
+    const [r, text, reason, windowed, chunks, capped] = await evaluate(req, rule, ctx);
+    if (r !== PASS) return [r, text, reason, rule, windowed, chunks, capped];
     lastReason = reason;
   }
   return [PASS, "", lastReason, undefined];

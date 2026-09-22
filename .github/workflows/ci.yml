@@ -35,10 +35,10 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
-      - uses: leafo/gh-actions-lua@v13
+      - uses: leafo/gh-actions-lua@6919171ccf181b826f44b9bca76307b577217377 # v13.0.0
         with:
           luaVersion: "5.1"
-      - uses: leafo/gh-actions-luarocks@v6
+      - uses: leafo/gh-actions-luarocks@35d062def313a7699a0d513e996bcf4352f05389 # v6.1.0
       - run: luarocks install luacheck
       - run: make lint
       # tripwires for bug classes a past audit found (scripts/invariants.lua)
@@ -56,10 +56,10 @@ jobs:
         lua: ["5.1", "5.4", "5.5", "luajit-openresty"]
     steps:
       - uses: actions/checkout@v7
-      - uses: leafo/gh-actions-lua@v13
+      - uses: leafo/gh-actions-lua@6919171ccf181b826f44b9bca76307b577217377 # v13.0.0
         with:
           luaVersion: ${{ matrix.lua }}
-      - uses: leafo/gh-actions-luarocks@v6
+      - uses: leafo/gh-actions-luarocks@35d062def313a7699a0d513e996bcf4352f05389 # v6.1.0
       - run: luarocks install busted && luarocks install dkjson && luarocks install lrexlib-pcre2
       - run: make golden-check
       - run: busted
@@ -73,8 +73,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
-      - uses: docker/setup-buildx-action@v4
-      - uses: docker/build-push-action@v7
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: adapters/openresty
           file: adapters/openresty/Dockerfile.test
@@ -93,8 +93,8 @@ jobs:
         gateway: [envoy, haproxy, apisix, forward-auth]
     steps:
       - uses: actions/checkout@v7
-      - uses: docker/setup-buildx-action@v4
-      - uses: docker/build-push-action@v7
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: adapters/openresty
           file: adapters/openresty/Dockerfile.test
@@ -111,7 +111,7 @@ jobs:
         working-directory: adapters/js
     steps:
       - uses: actions/checkout@v7
-      - uses: pnpm/action-setup@v6
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
           version: 9
       - uses: actions/setup-node@v7

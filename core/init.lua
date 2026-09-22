@@ -45,6 +45,7 @@ end
 -- never a candidate, and that is the hot path.
 local function finish(ctx, v)
   subject.record(ctx, v)
+  subject.rep_record(ctx, v)
   return v
 end
 

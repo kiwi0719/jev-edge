@@ -185,6 +185,88 @@ export interface SubjectCtx {
   /** Sink, off the request path. Not awaited, and a throw is swallowed: a
    *  trajectory write must never be able to fail a request. */
   record?: (entry: Entry) => void | Promise<void>;
+  /** Store for subject reputation counters (see repRecord); optional. */
+  store?: Store;
+}
+
+// ---------------------------------------------------------------------------
+// Subject reputation: port of rep_blocked / rep_record in core/subject.lua.
+// Judged verdicts add points over a sliding window (current bucket plus the
+// previous one weighted by its overlap); at block_at the subject is blocked
+// at L1 for block_ttl seconds. Off unless config.subject.reputation.block_at > 0.
+// ---------------------------------------------------------------------------
+
+export const REP_PREFIX = "srep:";
+
+export interface ReputationConfig {
+  block_at?: number;
+  window_s?: number;
+  block_ttl?: number;
+  suspicious?: number;
+  malicious?: number;
+}
+
+type RepCtx = { subject?: SubjectCtx; clock?: () => number; config?: { subject?: { reputation?: ReputationConfig } } };
+
+function repCfg(ctx: RepCtx): [ReputationConfig, number] | null {
+  const r = ctx.config?.subject?.reputation;
+  if (!r || typeof r !== "object") return null;
+  const at = Number(r.block_at);
+  if (!Number.isFinite(at) || at <= 0) return null;
+  return [r, at];
+}
+
+/** true when the subject of this request is blocked by its reputation. */
+export async function repBlocked(ctx: RepCtx): Promise<boolean> {
+  if (!repCfg(ctx)) return false;
+  const id = idOf(ctx);
+  const store = ctx.subject?.store;
+  if (!id || !store) return false;
+  try {
+    const until = Number(await store.get(REP_PREFIX + id + ":until"));
+    const now = ctx.clock ? ctx.clock() : 0;
+    return Number.isFinite(until) && until > now;
+  } catch {
+    return false;
+  }
+}
+
+async function incrBy(store: Store, key: string, by: number, ttl: number): Promise<number> {
+  if (typeof store.incr === "function") return Number(await store.incr(key, by, ttl));
+  const n = (Number(await store.get(key)) || 0) + by;
+  await store.set(key, n, ttl);
+  return n;
+}
+
+/** Add this verdict's points and block the subject when it crosses block_at.
+ *  Only judged verdicts count (not L1). Never throws. Returns the points, or null. */
+export async function repRecord(ctx: RepCtx, v: Verdict): Promise<number | null> {
+  const c = repCfg(ctx);
+  if (!c || v.source === "l1") return null;
+  const [r, at] = c;
+  const id = idOf(ctx);
+  const store = ctx.subject?.store;
+  if (!id || !store) return null;
+  let w = 0;
+  if (v.verdict === "malicious") w = r.malicious ?? 3;
+  else if (v.verdict === "suspicious") w = r.suspicious ?? 1;
+  if (!(w > 0)) return null;
+  try {
+    const win = r.window_s ?? 600;
+    const now = ctx.clock ? ctx.clock() : 0;
+    const b = Math.floor(now / win);
+    const key = REP_PREFIX + id + ":b:";
+    const cur = (await incrBy(store, key + b, w, win * 2)) || 0;
+    const prev = Number(await store.get(key + (b - 1))) || 0;
+    const p = cur + prev * (1 - (now - b * win) / win);
+    if (p >= at) {
+      const ttl = r.block_ttl ?? 600;
+      await store.set(REP_PREFIX + id + ":until", now + ttl, ttl);
+    }
+    return p;
+  } catch {
+    return null;
+  }
 }
 
 export function entry(id: string, v: Verdict, now: number): Entry {

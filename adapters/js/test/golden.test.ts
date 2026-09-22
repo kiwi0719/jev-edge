@@ -92,10 +92,24 @@ describe("golden: evaluate", () => {
         breaker = new Breaker(bstore, () => inp.clock, {});
       }
       let recorded: core.SubjectEntry | null = null;
+      const swrites: Record<string, { value: unknown; ttl: number }> | null = inp.subject ? {} : null;
+      const sstore = storeFrom(inp.subject?.store ?? {});
       const ctx: core.Ctx = {
         config: core.defaults.merge(core.defaults.config, inp.config),
         subject: inp.subject
-          ? { id: inp.subject.id, history: inp.subject.history, record: (e) => { recorded = e; } }
+          ? {
+            id: inp.subject.id, history: inp.subject.history, record: (e) => { recorded = e; },
+            store: {
+              get: (k) => sstore.get(k),
+              set: (k, v, ttl) => { swrites![k] = { value: v, ttl }; sstore.set(k, v, ttl); },
+              incr: (k, by, ttl) => {
+                const n = (Number(sstore.get(k)) || 0) + by;
+                sstore.set(k, n, ttl);
+                swrites![k] = { value: n, ttl };
+                return n;
+              },
+            },
+          }
           : undefined,
         rules: inp.rules.map(loadRule),
         breaker,
@@ -121,7 +135,7 @@ describe("golden: evaluate", () => {
       const prompt = seen ? { text: seen.text, context: seen.context, questions: Object.keys(seen.questions).sort() } : null;
       expect({
         verdict: v, headers: core.verdict.headers(v), judge_calls: calls, prompt,
-        cache_writes: writes, subject_record: recorded,
+        cache_writes: writes, subject_record: recorded, subject_store_writes: swrites,
       }).toEqual(c.expect);
     });
   }

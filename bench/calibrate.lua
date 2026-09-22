@@ -17,8 +17,15 @@
 -- threshold, and a recommended block_threshold / suspect_threshold under a
 -- false-positive budget.
 --
+-- Subject reputation: when the log lines carry `subject` and `ts` (0.5.0+),
+-- the judged verdicts are replayed per subject with the same sliding window
+-- as core/subject.lua, and the report shows the highest points each subject
+-- reached and what each `subject.reputation.block_at` would have blocked
+-- (with labels: benign subjects vs subjects that sent a labelled attack).
+--
 -- Usage (from the repo root, or via `make calibrate LOG=... LABELS=...`):
 --   lua bench/calibrate.lua <jev.log> [labels.csv] [--max-fp 0.001] [--json]
+--       [--rep-window 600] [--rep-suspicious 1] [--rep-malicious 3]
 --
 -- No dependencies beyond dkjson. Never reads request bodies; the log does not
 -- contain them.
@@ -32,12 +39,16 @@ local json = require "dkjson"
 
 local log_path, labels_path
 local max_fp, as_json = 0.001, false
+local rep_window, rep_w_susp, rep_w_mal = 600, 1, 3
 do
   local i = 1
   while i <= #arg do
     local a = arg[i]
     if a == "--max-fp" then max_fp = assert(tonumber(arg[i + 1]), "--max-fp needs a number"); i = i + 1
     elseif a == "--json" then as_json = true
+    elseif a == "--rep-window" then rep_window = assert(tonumber(arg[i + 1]), "--rep-window needs seconds"); i = i + 1
+    elseif a == "--rep-suspicious" then rep_w_susp = assert(tonumber(arg[i + 1])); i = i + 1
+    elseif a == "--rep-malicious" then rep_w_mal = assert(tonumber(arg[i + 1])); i = i + 1
     elseif a == "-h" or a == "--help" then
       io.stderr:write("usage: lua bench/calibrate.lua <jev.log> [labels] [--max-fp 0.001] [--json]\n")
       os.exit(0)
@@ -58,6 +69,7 @@ end
 
 local rows, skipped, bad = {}, 0, 0
 local by_src = {}
+local by_subject, n_subject_lines = {}, 0
 do
   local f = assert(io.open(log_path, "rb"), "cannot open " .. log_path)
   for raw in f:lines() do
@@ -68,6 +80,12 @@ do
         bad = bad + 1
       else
         by_src[obj.src or "?"] = (by_src[obj.src or "?"] or 0) + 1
+        if type(obj.subject) == "string" and obj.subject ~= "" and tonumber(obj.ts) then
+          local list = by_subject[obj.subject]
+          if not list then list = {}; by_subject[obj.subject] = list end
+          list[#list + 1] = { ts = tonumber(obj.ts), verdict = obj.verdict, src = obj.src, rid = obj.rid, fp = obj.fp }
+          n_subject_lines = n_subject_lines + 1
+        end
         local score = tonumber(obj.score)
         if (obj.src == "l2" or obj.src == "cache") and score then
           rows[#rows + 1] = { rid = obj.rid, fp = obj.fp, score = score, path = obj.path,
@@ -196,6 +214,69 @@ local function recommend(budget)
   return best
 end
 
+-- ---------------------------------------------------------------------------
+-- subject reputation: replay core/subject.lua's sliding window per subject
+-- ---------------------------------------------------------------------------
+
+local subj_stats = {}   -- { max_points, label = 1 | 0 | nil }
+do
+  for sid, entries in pairs(by_subject) do
+    table.sort(entries, function(a, b) return a.ts < b.ts end)
+    local buckets, best, label = {}, 0, nil
+    for _, e in ipairs(entries) do
+      local lab = (e.rid and labels_by_key[e.rid]) or (e.fp and e.fp ~= "" and labels_by_key[e.fp])
+      if lab == 1 then label = 1 elseif lab == 0 and label == nil then label = 0 end
+      local w = 0
+      if e.src ~= "l1" then
+        if e.verdict == "malicious" then w = rep_w_mal elseif e.verdict == "suspicious" then w = rep_w_susp end
+      end
+      if w > 0 then
+        local b = math.floor(e.ts / rep_window)
+        buckets[b] = (buckets[b] or 0) + w
+        local pts = buckets[b] + (buckets[b - 1] or 0) * (1 - (e.ts - b * rep_window) / rep_window)
+        if pts > best then best = pts end
+      end
+    end
+    subj_stats[#subj_stats + 1] = { id = sid, max_points = best, label = label }
+  end
+end
+
+local rep_cands = { 3, 4, 5, 6, 8, 10, 12, 15, 20, 30, 50 }
+local function rep_at(at)
+  local all, benign, attackers, n_benign, n_att = 0, 0, 0, 0, 0
+  for _, s in ipairs(subj_stats) do
+    local hit = s.max_points >= at
+    if hit then all = all + 1 end
+    if s.label == 0 then n_benign = n_benign + 1; if hit then benign = benign + 1 end end
+    if s.label == 1 then n_att = n_att + 1; if hit then attackers = attackers + 1 end end
+  end
+  return all, benign, attackers, n_benign, n_att
+end
+
+local rep_rec
+do
+  local _, _, _, n_benign, n_att = rep_at(1)
+  if n_benign > 0 and n_att > 0 then
+    -- lowest block_at that keeps benign subjects blocked within the budget
+    for _, at in ipairs(rep_cands) do
+      local _, b, a = rep_at(at)
+      if b / n_benign <= max_fp then
+        rep_rec = { block_at = at, benign_blocked = b, attackers_blocked = a, basis = "labels" }
+        break
+      end
+    end
+  elseif #subj_stats > 0 then
+    -- no labels: above what 99.9% of subjects ever reached
+    local pts = {}
+    for i, s in ipairs(subj_stats) do pts[i] = s.max_points end
+    table.sort(pts)
+    local q = pts[math.max(1, math.ceil(#pts * 0.999))]
+    for _, at in ipairs(rep_cands) do
+      if at > q then rep_rec = { block_at = at, p999 = q, basis = "p99.9 of subjects" } break end
+    end
+  end
+end
+
 local the_auc = auc()
 local rec_block = recommend(max_fp)
 local rec_suspect = recommend(math.min(0.05, max_fp * 10))
@@ -215,7 +296,8 @@ if as_json then
     scored = #rows, skipped = skipped, malformed = bad, by_source = by_src,
     labelled = #labelled, attacks = n_pos, benign = n_neg, auc = the_auc,
     thresholds = per_t, max_fp = max_fp,
-    recommended = { block_threshold = rec_block, suspect_threshold = rec_suspect },
+    recommended = { block_threshold = rec_block, suspect_threshold = rec_suspect, subject_block_at = rep_rec },
+    subjects = #subj_stats, subject_lines = n_subject_lines,
   }, { indent = true }))
   os.exit(0)
 end
@@ -250,6 +332,30 @@ for _, t in ipairs(thresholds) do
   p("| %.2f | %d | %.2f%% |", t, share_above[t], pct(share_above[t], #rows))
 end
 p("")
+
+if #subj_stats > 0 then
+  p("## subject reputation (`subject.reputation.block_at`)")
+  p("")
+  p("%d subjects, %d lines with subject and ts; window %ds, suspicious = %g, malicious = %g points",
+    #subj_stats, n_subject_lines, rep_window, rep_w_susp, rep_w_mal)
+  p("")
+  p("| block_at | subjects blocked | benign subjects blocked | attacking subjects blocked |")
+  p("|---|---|---|---|")
+  for _, at in ipairs(rep_cands) do
+    local all, b, a, nb, na = rep_at(at)
+    p("| %g | %d | %s | %s |", at, all, nb > 0 and (b .. " / " .. nb) or "-", na > 0 and (a .. " / " .. na) or "-")
+  end
+  p("")
+  if rep_rec and rep_rec.basis == "labels" then
+    p("- `subject.reputation.block_at = %g`: blocks %d benign and %d attacking subjects on this sample",
+      rep_rec.block_at, rep_rec.benign_blocked, rep_rec.attackers_blocked)
+  elseif rep_rec then
+    p("- `subject.reputation.block_at = %g`: above the %.3g points 99.9%% of subjects reached (no subject labels;",
+      rep_rec.block_at, rep_rec.p999)
+    p("  label the subjects that sent attacks to get a number with a false-positive budget)")
+  end
+  p("")
+end
 
 if n_labels == 0 then
   p("No labels given, so no accuracy numbers. Label some of these requests (by rid or fp,")

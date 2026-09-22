@@ -426,13 +426,26 @@ local function eval_case(name, spec)
   -- subject: spec.subject is nil (no subject at all), or { id = ..., history = ... }.
   -- The history is deliberately non-nil in some cases and must change nothing:
   -- these vectors are what pins "accepted and ignored" across implementations.
-  local recorded
-  local subject_ctx
+  -- spec.subject.store seeds the subject store (reputation counters); every
+  -- write to it is recorded as { value, ttl } like cache_writes.
+  local recorded, subject_ctx, subject_writes
   if spec.subject then
+    local sstore = H.store()
+    for k, val in pairs(spec.subject.store or {}) do sstore:set(k, val) end
+    subject_writes = {}
     subject_ctx = {
       id = spec.subject.id,
       history = spec.subject.history,
       record = function(e) recorded = e end,
+      store = {
+        get = function(_, k) return sstore:get(k) end,
+        set = function(_, k, val, ttl) subject_writes[k] = { value = val, ttl = ttl }; sstore:set(k, val, ttl) end,
+        incr = function(_, k, by, ttl)
+          local n = sstore:incr(k, by, ttl)
+          subject_writes[k] = { value = n, ttl = ttl }
+          return n
+        end,
+      },
     }
   end
 
@@ -472,6 +485,7 @@ local function eval_case(name, spec)
       verdict = v, headers = verdict.headers(v),
       judge_calls = calls, prompt = prompt_seen or NULL, cache_writes = writes,
       subject_record = recorded or NULL,
+      subject_store_writes = subject_writes or NULL,
     },
   }
 end
@@ -603,6 +617,42 @@ eval_case("subject: breaker skip is a step too", { req = req(ATTACK), subject = 
   breaker = "open", judge = { answers = { injection = 0.9 } } })
 eval_case("subject: L2 error is a step too", { req = req(ATTACK), subject = SUBJ_H,
   judge = { error = "timeout" } })
+
+-- subject reputation -------------------------------------------------------
+-- block_at 5, window 600 s, suspicious 1, malicious 3. clock 1000 sits 400 s
+-- into bucket 1 (600..1199), so the previous bucket (0) still counts 1/3.
+local REP = { subject = { enabled = true, salt = "s", reputation = { block_at = 5 } } }
+local REP_ENF = { policy = { mode = "enforce" }, subject = REP.subject }
+eval_case("subject reputation: malicious adds 3 points, under block_at", { req = req(ATTACK),
+  config = REP, subject = { id = "u-1" }, judge = { answers = { injection = 0.95 } } })
+eval_case("subject reputation: suspicious adds 1 point", { req = req(LONG),
+  config = REP, subject = { id = "u-1" }, judge = { answers = { injection = 0.55 } } })
+eval_case("subject reputation: safe adds nothing", { req = req(LONG),
+  config = REP, subject = { id = "u-1" }, judge = { answers = { injection = 0.1 } } })
+eval_case("subject reputation: crossing block_at blocks the subject from the next request", { req = req(ATTACK),
+  config = REP, subject = { id = "u-1", store = { ["srep:u-1:b:1"] = 2 } },
+  judge = { answers = { injection = 0.95 } } })
+eval_case("subject reputation: the previous bucket counts for the overlap", { req = req(ATTACK),
+  config = REP, subject = { id = "u-1", store = { ["srep:u-1:b:0"] = 6 } },
+  judge = { answers = { injection = 0.95 } } })
+eval_case("subject reputation: a blocked subject is blocked at L1 without a judge call", { req = req(LONG),
+  config = REP_ENF, subject = { id = "u-1", store = { ["srep:u-1:until"] = 1300 } },
+  judge = { answers = { injection = 0.1 } } })
+eval_case("subject reputation: monitor mode reports the block and passes", { req = req(LONG),
+  config = REP, subject = { id = "u-1", store = { ["srep:u-1:until"] = 1300 } },
+  judge = { answers = { injection = 0.1 } } })
+eval_case("subject reputation: an expired block no longer applies", { req = req(LONG),
+  config = REP_ENF, subject = { id = "u-1", store = { ["srep:u-1:until"] = 900 } },
+  judge = { answers = { injection = 0.1 } } })
+eval_case("subject reputation: off (block_at 0) ignores a stored block", { req = req(LONG),
+  config = { policy = { mode = "enforce" } }, subject = { id = "u-1", store = { ["srep:u-1:until"] = 1300 } },
+  judge = { answers = { injection = 0.1 } } })
+eval_case("subject reputation: a malicious cache hit counts", { req = req(ATTACK), config = REP,
+  subject = { id = "u-1" }, cache = { [key_of(ATTACK)] = { score = 0.95, reason = "injection 0.95" } },
+  judge = { answers = { injection = 0.1 } } })
+eval_case("subject reputation: unwatched path is not blocked", { req = req(LONG, { path = "/healthz" }),
+  config = REP_ENF, subject = { id = "u-1", store = { ["srep:u-1:until"] = 1300 } },
+  judge = { answers = { injection = 0.1 } } })
 
 eval_case("whitespace-only text is cached like any other", { req = req(string.rep(" \t", 15)),
   judge = { answers = { injection = 0.1 } } })

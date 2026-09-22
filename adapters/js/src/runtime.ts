@@ -283,6 +283,8 @@ async function subjectCtx(rt: Runtime, request: Request, clientIp: string, rctx?
     // ring layout (incr + one key per entry) when the store has incr, so
     // concurrent requests do not lose entries; the one-list layout otherwise
     history: await subjectMod.loadHistory(store, id, scfg.max_entries),
+    // reputation counters (subject.reputation); atomic where the store has incr
+    store,
     record: (e) => {
       const p = subjectMod.appendHistory(store, id, e, scfg.max_entries, scfg.history_ttl ?? 3600).catch(() => {});
       // On Workers the isolate may be torn down right after the response;

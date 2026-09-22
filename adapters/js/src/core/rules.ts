@@ -1,5 +1,6 @@
 // Port of core/rules.lua: L1, cheap and short-circuiting.
 import { extract, byteLength, head, tail, fieldKeys, scanStrings, window, type JsonValue } from "./normalize";
+import { repBlocked, type SubjectCtx, type ReputationConfig } from "./subject";
 
 export type RuleResult = "pass" | "block" | "suspect" | "unjudgeable";
 export const PASS: RuleResult = "pass";
@@ -61,6 +62,8 @@ export interface RulesCtx {
   /** Truthy on a match; a [from, to] 1-based inclusive UTF-8 byte span places the hit in the judging window. */
   re_find?: (subject: string, pattern: string) => boolean | readonly [number, number] | null;
   log?: (level: string, msg: string) => void;
+  subject?: SubjectCtx;
+  config?: { subject?: { reputation?: ReputationConfig } };
 }
 
 /**
@@ -346,6 +349,8 @@ export async function evaluate(req: Req, rule: Rule, ctx?: RulesCtx): Promise<[R
       if (rep.trusted_until !== undefined && rep.trusted_until > now) return [PASS, "", "ip trusted"];
     }
   }
+  // the same for the subject (core/subject.lua), when reputation is on
+  if (ctx?.subject && (await repBlocked(ctx))) return [BLOCK, "", "subject reputation"];
 
   // 3. method + content type (deny list of media types unless content_types allows)
   if (rule.methods && !rule.methods[(req.method ?? "").toUpperCase()]) return [PASS, "", "method not watched"];

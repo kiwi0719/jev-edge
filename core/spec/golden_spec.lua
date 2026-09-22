@@ -108,11 +108,21 @@ describe("golden: evaluate", function()
         bstore:set("brk:state", { state = st, until_ts = inp.clock + 30 })
         breaker = breaker_m.new(bstore, function() return inp.clock end, {})
       end
-      local recorded
-      local subject_ctx
+      local recorded, subject_ctx, swrites
       if inp.subject then
+        local sstore = store_from(inp.subject.store)
+        swrites = {}
         subject_ctx = { id = inp.subject.id, history = inp.subject.history,
-                        record = function(e) recorded = e end }
+                        record = function(e) recorded = e end,
+                        store = {
+                          get = function(_, k) return sstore:get(k) end,
+                          set = function(_, k, v, ttl) swrites[k] = { value = v, ttl = ttl }; sstore:set(k, v, ttl) end,
+                          incr = function(_, k, by, ttl)
+                            local n = sstore:incr(k, by, ttl)
+                            swrites[k] = { value = n, ttl = ttl }
+                            return n
+                          end,
+                        } }
       end
       local ctx = {
         config = defaults.merge(defaults.config, inp.config), rules = rules, breaker = breaker,
@@ -139,7 +149,7 @@ describe("golden: evaluate", function()
         prompt = { text = seen.text, context = seen.context, questions = names }
       end
       same(c.expect, { verdict = v, headers = verdict.headers(v), judge_calls = calls,
-        prompt = prompt, cache_writes = writes, subject_record = recorded })
+        prompt = prompt, cache_writes = writes, subject_record = recorded, subject_store_writes = swrites })
     end)
   end
 end)

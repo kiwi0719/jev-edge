@@ -3,6 +3,7 @@
 -- Returns "pass" | "block" | "suspect" plus the extracted text and a reason.
 
 local normalize = require "jev.core.normalize"
+local subject   = require "jev.core.subject"
 
 local _M = {}
 
@@ -179,6 +180,10 @@ function _M.evaluate(req, rule, ctx)
         return _M.PASS, "", "ip trusted"
       end
     end
+  end
+  -- the same for the subject (core/subject.lua), when reputation is on
+  if ctx and ctx.subject and subject.rep_blocked(ctx) then
+    return _M.BLOCK, "", "subject reputation"
   end
 
   -- 3. method + content type (a deny list of media types, unless the rule

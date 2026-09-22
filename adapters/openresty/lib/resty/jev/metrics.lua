@@ -22,6 +22,7 @@ function _M.record(v)
   local unj = v.reason:match("^unjudgeable: (%a[%a%-]*)")
   if unj then incr("unjudged:" .. unj) end
   if v.reason:find("(window)", 1, true) then incr("window") end
+  if v.reason == "subject reputation" then incr("subject_blocks") end
   if v.source == "l2" then
     incr("l2_count")
     incr("l2_sum_ms", math.floor(v.l2_ms))
@@ -65,6 +66,7 @@ function _M.render()
   line("# TYPE jev_l2_timeout_ms gauge")
   line("# TYPE jev_unjudged_total counter")
   line("# TYPE jev_window_total counter")
+  line("# TYPE jev_subject_blocks_total counter")
   for _, key in ipairs(d:get_keys(0)) do
     local val = d:get(key)
     local src, verdict = key:match("^req:([^:]+):(.+)$")
@@ -92,6 +94,8 @@ function _M.render()
       line(string.format('jev_unjudged_total{reason="%s"} %d', key:sub(10), val))
     elseif key == "window" then
       line("jev_window_total " .. val)
+    elseif key == "subject_blocks" then
+      line("jev_subject_blocks_total " .. val)
     end
   end
   return table.concat(out, "\n") .. "\n"

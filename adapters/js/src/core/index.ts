@@ -50,8 +50,9 @@ function nowMs(ctx: Ctx): number {
 // holes: a cache hit and a breaker skip are as much a step in an attack as an
 // L2 call is. The one exit that does not is L1 PASS -- the request was never a
 // candidate, and that is the hot path.
-function finish(ctx: Ctx, v: verdict.Verdict): verdict.Verdict {
+async function finish(ctx: Ctx, v: verdict.Verdict): Promise<verdict.Verdict> {
   subject.record(ctx, v);
+  await subject.repRecord(ctx, v);
   return v;
 }
 

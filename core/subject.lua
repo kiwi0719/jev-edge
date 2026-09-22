@@ -78,6 +78,86 @@ function _M.record(ctx, v)
 end
 
 -- ---------------------------------------------------------------------------
+-- Subject reputation. What IP reputation does per address, per subject: the
+-- judged verdicts of one subject (a user header, a cookie, or an IP) add
+-- points over a sliding window, and past `block_at` points the subject is
+-- blocked at L1 for `block_ttl` seconds. It catches one user probing variants
+-- across sessions and addresses, and APIs that do not resend history, and it
+-- needs no dataset: `make calibrate` reads the points per subject from
+-- monitor-mode logs. Off unless cfg.subject.reputation.block_at > 0.
+--
+-- store: ctx.subject.store, { get, set, incr = fn(self, key, by, ttl) }
+-- (incr optional: without it the count is a get + set, best effort).
+-- Keys: srep:<id>:b:<bucket> (points in one window-sized bucket),
+--       srep:<id>:until      (blocked until, seconds).
+-- The sliding window is the current bucket plus the previous one weighted by
+-- how much of it still overlaps the window: two counters, no list.
+-- ---------------------------------------------------------------------------
+
+_M.REP_PREFIX = "srep:"
+
+local function rep_cfg(ctx)
+  local c = ctx.config and ctx.config.subject
+  local r = type(c) == "table" and c.reputation
+  if type(r) ~= "table" then return nil end
+  local at = tonumber(r.block_at)
+  if not at or at <= 0 then return nil end
+  return r, at
+end
+
+local function rep_store(ctx)
+  local s = ctx.subject
+  if type(s) == "table" and type(s.store) == "table" then return s.store end
+  return nil
+end
+
+--- true when the subject of this request is blocked by its reputation.
+function _M.rep_blocked(ctx)
+  if not rep_cfg(ctx) then return false end
+  local id, store = _M.id_of(ctx), rep_store(ctx)
+  if not id or not store then return false end
+  local ok, untl = pcall(store.get, store, _M.REP_PREFIX .. id .. ":until")
+  local now = ctx.clock and ctx.clock() or 0
+  return ok and tonumber(untl) ~= nil and tonumber(untl) > now
+end
+
+local function incr(store, key, by, ttl)
+  if type(store.incr) == "function" then return tonumber(store:incr(key, by, ttl)) end
+  local n = (tonumber(store:get(key)) or 0) + by
+  store:set(key, n, ttl)
+  return n
+end
+
+--- Add this verdict's points and block the subject when it crosses block_at.
+-- Only judged verdicts count (L2, cache): an L1 block is the consequence, and
+-- counting it would extend the block by itself. Errors are swallowed.
+function _M.rep_record(ctx, v)
+  local r, at = rep_cfg(ctx)
+  if not r or v.source == "l1" then return nil end
+  local id, store = _M.id_of(ctx), rep_store(ctx)
+  if not id or not store then return nil end
+  local w = 0
+  if v.verdict == "malicious" then w = tonumber(r.malicious) or 3
+  elseif v.verdict == "suspicious" then w = tonumber(r.suspicious) or 1 end
+  if w <= 0 then return nil end
+  local ok, points = pcall(function()
+    local win = tonumber(r.window_s) or 600
+    local now = ctx.clock and ctx.clock() or 0
+    local b = math.floor(now / win)
+    local key = _M.REP_PREFIX .. id .. ":b:"
+    local cur = incr(store, key .. b, w, win * 2) or 0
+    local prev = tonumber(store:get(key .. (b - 1))) or 0
+    local p = cur + prev * (1 - (now - b * win) / win)
+    if p >= at then
+      local ttl = tonumber(r.block_ttl) or 600
+      store:set(_M.REP_PREFIX .. id .. ":until", now + ttl, ttl)
+    end
+    return p
+  end)
+  return ok and points or nil
+end
+
+-- ---------------------------------------------------------------------------
 -- Extraction, hashing and the bounded history. Pure; adapters supply the
 -- request view, the hash function and the store.
 -- ---------------------------------------------------------------------------

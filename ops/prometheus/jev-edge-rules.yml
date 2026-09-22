@@ -1,0 +1,152 @@
+# Prometheus alert rules for jev-edge (lua-resty-jev).
+#
+# Every metric here is rendered by adapters/openresty/lib/resty/jev/metrics.lua
+# at /_jev/metrics. Each nginx instance keeps its own `jev_metrics` shared
+# dict, so every rule is evaluated per (job, instance).
+#
+# Validate:  promtool check rules ops/prometheus/jev-edge-rules.yml
+# Test:      promtool test rules ops/prometheus/jev-edge-rules.test.yml
+# What each alert means and what to do: ops/README.md.
+
+groups:
+  - name: jev-edge
+    rules:
+      # core/breaker.lua: CLOSED=0, OPEN=1, HALF_OPEN=2. A provider that stays
+      # down cycles OPEN (open_s, 30 s) -> HALF_OPEN (one probe) -> OPEN, so
+      # "never closed for a minute" is the signal, not "== 1 on every sample".
+      - alert: JevBreakerOpen
+        expr: min_over_time(jev_breaker_state[1m]) >= 1
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "jev-edge L2 breaker open on {{ $labels.instance }}"
+          description: >-
+            The L2 circuit breaker on {{ $labels.instance }} has not been closed
+            for over 3 minutes (state {{ $value }}; 1=open, 2=half-open).
+            Requests that would reach L2 are passed with verdict=skipped,
+            source=breaker: nothing past L1 is being judged.
+          runbook: >-
+            Check `curl <gateway>/_jev/health` and the error log for
+            "L2 failed". Provider outage or bad key: fix upstream, the breaker
+            closes on the next successful half-open probe. Timeouts: see
+            JevL2TimeoutAtCeiling. The gauge is written per request, so with
+            no traffic it keeps its last value.
+
+      # L2 calls that failed (timeout, 5xx, unparseable answer, no scores):
+      # policy.on_error() passes them with verdict=error.
+      - alert: JevL2ErrorRatioHigh
+        expr: |
+          sum by (job, instance) (rate(jev_requests_total{source="l2",verdict="error"}[5m]))
+            /
+          sum by (job, instance) (rate(jev_requests_total{source="l2"}[5m]))
+            > 0.10
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "jev-edge L2 error ratio {{ $value | humanizePercentage }} on {{ $labels.instance }}"
+          description: >-
+            More than 10% of L2 calls on {{ $labels.instance }} have failed for
+            10 minutes. Failed calls pass (verdict=error) and are queued for
+            async re-judging, so protection is degraded, not traffic.
+          runbook: >-
+            Read the error log for "jev-edge: L2 failed: <reason>". Timeouts:
+            compare jev_l2_latency_ms quantiles with jev_l2_timeout_ms and
+            raise jev.timeout_max_ms if the provider is slow but healthy.
+            401/403: rotate the key. 5xx: provider incident. Past fail_ratio
+            the breaker opens (JevBreakerOpen).
+
+      # Watched requests nobody could read (body too large, binary body,
+      # unknown content-encoding). Denominator: every request that got past
+      # L1's "not watched" pass, i.e. all sources except l1, plus L1 blocks,
+      # plus the unjudgeable ones themselves.
+      - alert: JevUnjudgeableRatioHigh
+        expr: |
+          sum by (job, instance) (rate(jev_unjudged_total[5m]))
+            /
+          sum by (job, instance) (
+              rate(jev_requests_total{source!="l1"}[5m])
+            or rate(jev_requests_total{source="l1",verdict="malicious"}[5m])
+            or rate(jev_unjudged_total[5m])
+          )
+            > 0.05
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "jev-edge unjudgeable ratio {{ $value | humanizePercentage }} on {{ $labels.instance }}"
+          description: >-
+            More than 5% of watched requests on {{ $labels.instance }} could
+            not be read for 15 minutes. With policy.unjudgeable = "pass"
+            (default) they go through unjudged; with "block" in enforce mode
+            they are rejected.
+          runbook: >-
+            Break down by reason: sum by (reason) (rate(jev_unjudged_total[5m])).
+            body: no text in the head/tail of an oversized body; raise the
+            rule max_body_bytes or confirm clients really send such bodies.
+            content-encoding: a compressed body this build could not decode
+            (zlib/libbrotlidec missing, corrupt, too big). binary: a
+            non-text body on an LLM route; check the rule's path match.
+
+      # jev_l2_timeout_max_ms is the ceiling adaptive.lua clamps to
+      # (jev.timeout_max_ms, default 2.5 x timeout_ms). Pinned at it means
+      # observed provider latency has outgrown the operator's budget.
+      - alert: JevL2TimeoutAtCeiling
+        expr: jev_l2_timeout_ms >= jev_l2_timeout_max_ms
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "jev-edge adaptive L2 timeout pinned at its ceiling on {{ $labels.instance }}"
+          description: >-
+            The adaptive L2 timeout on {{ $labels.instance }} has sat at
+            jev.timeout_max_ms ({{ $value }} ms) for 10 minutes: the provider
+            is slower than the budget allows and slow calls are being cut.
+          runbook: >-
+            Compare the L2 latency p95/p99 panel with the ceiling. If the
+            provider is healthy but slower, raise jev.timeout_max_ms
+            (PUT /_jev/config or the config file). If it is degrading, expect
+            JevL2ErrorRatioHigh and then JevBreakerOpen. False positive when
+            timeout_max_ms equals timeout_ms (no adaptive range): silence it.
+
+      # An async (L3) job was due but not scheduled: over async.max_async, or
+      # the timer could not be created. async.enabled = false is not counted.
+      - alert: JevAsyncDropped
+        expr: increase(jev_async_dropped_total[10m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "jev-edge dropping async re-judge work on {{ $labels.instance }}"
+          description: >-
+            {{ $value | humanize }} async re-judge jobs were dropped on
+            {{ $labels.instance }} in the last 10 minutes. Suspicious and
+            errored requests that should get a second look are not getting
+            one, and reputation blocking does not learn from them.
+          runbook: >-
+            Raise async.max_async if the provider has headroom; otherwise
+            look for a burst of suspicious/error verdicts (requests panel)
+            or a slow provider holding async slots (async.timeout_ms).
+
+      # Requests keep arriving at the L2 stage but none is judged: every one
+      # short-circuits at the breaker or fails. Catches a stuck breaker even
+      # when the gauge is sampled at the wrong moments.
+      - alert: JevL2Starved
+        expr: |
+          sum by (job, instance) (rate(jev_requests_total{source="breaker"}[5m])) > 0
+          unless on (job, instance)
+          sum by (job, instance) (rate(jev_requests_total{source="l2",verdict!="error"}[5m])) > 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "jev-edge sends traffic to L2 but gets no verdicts on {{ $labels.instance }}"
+          description: >-
+            For 10 minutes {{ $labels.instance }} has had requests reach the L2
+            stage (source=breaker) and no successful L2 verdict. Only L1, the
+            verdict cache and trusted fingerprints are protecting traffic.
+          runbook: >-
+            Same as JevBreakerOpen: check /_jev/health, the provider and the
+            key. The verdict cache keeps serving known texts; new texts pass
+            unjudged until L2 recovers.

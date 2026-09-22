@@ -1,0 +1,213 @@
+# promtool test rules ops/prometheus/jev-edge-rules.test.yml
+rule_files:
+  - jev-edge-rules.yml
+
+evaluation_interval: 1m
+
+tests:
+  # Breaker: a dead provider cycles OPEN -> HALF_OPEN -> OPEN and never
+  # closes (gw1, fires); a flapping one closes at least once a minute (gw2,
+  # never fires).
+  - interval: 30s
+    input_series:
+      - series: 'jev_breaker_state{job="jev",instance="gw1"}'
+        values: '0 0 1 2 1 1 2 1 1 2 1 1 2 1 1 2 1 1 2 1 1 2'
+      - series: 'jev_breaker_state{job="jev",instance="gw2"}'
+        values: '1 1 0 1 1 0 1 1 0 1 1 0 1 1 0 1 1 0 1 1 0 1'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: JevBreakerOpen
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: JevBreakerOpen
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: JevBreakerOpen
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: jev
+              instance: gw1
+            exp_annotations:
+              summary: "jev-edge L2 breaker open on gw1"
+              description: >-
+                The L2 circuit breaker on gw1 has not been closed
+                for over 3 minutes (state 1; 1=open, 2=half-open).
+                Requests that would reach L2 are passed with verdict=skipped,
+                source=breaker: nothing past L1 is being judged.
+              runbook: >-
+                Check `curl <gateway>/_jev/health` and the error log for
+                "L2 failed". Provider outage or bad key: fix upstream, the breaker
+                closes on the next successful half-open probe. Timeouts: see
+                JevL2TimeoutAtCeiling. The gauge is written per request, so with
+                no traffic it keeps its last value.
+
+  # Unjudgeable: gw1 has 10 unreadable per 90 judged (10%), gw2 1 per 99 (1%).
+  # A large volume of unwatched traffic (l1/skipped) must not dilute the ratio.
+  - interval: 1m
+    input_series:
+      - series: 'jev_requests_total{job="jev",instance="gw1",source="l2",verdict="safe"}'
+        values: '0+90x30'
+      - series: 'jev_requests_total{job="jev",instance="gw1",source="l1",verdict="skipped"}'
+        values: '0+10000x30'
+      - series: 'jev_unjudged_total{job="jev",instance="gw1",reason="body"}'
+        values: '0+10x30'
+      - series: 'jev_requests_total{job="jev",instance="gw2",source="l2",verdict="safe"}'
+        values: '0+99x30'
+      - series: 'jev_unjudged_total{job="jev",instance="gw2",reason="content-encoding"}'
+        values: '0+1x30'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: JevUnjudgeableRatioHigh
+        exp_alerts: []
+      - eval_time: 25m
+        alertname: JevUnjudgeableRatioHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: jev
+              instance: gw1
+            exp_annotations:
+              summary: "jev-edge unjudgeable ratio 10% on gw1"
+              description: >-
+                More than 5% of watched requests on gw1 could
+                not be read for 15 minutes. With policy.unjudgeable = "pass"
+                (default) they go through unjudged; with "block" in enforce mode
+                they are rejected.
+              runbook: >-
+                Break down by reason: sum by (reason) (rate(jev_unjudged_total[5m])).
+                body: no text in the head/tail of an oversized body; raise the
+                rule max_body_bytes or confirm clients really send such bodies.
+                content-encoding: a compressed body this build could not decode
+                (zlib/libbrotlidec missing, corrupt, too big). binary: a
+                non-text body on an LLM route; check the rule's path match.
+
+  # Adaptive timeout: gw1 pinned at its 1000 ms ceiling, gw2 adapting below it.
+  - interval: 1m
+    input_series:
+      - series: 'jev_l2_timeout_ms{job="jev",instance="gw1"}'
+        values: '600 800 1000x20'
+      - series: 'jev_l2_timeout_max_ms{job="jev",instance="gw1"}'
+        values: '1000x22'
+      - series: 'jev_l2_timeout_ms{job="jev",instance="gw2"}'
+        values: '900x22'
+      - series: 'jev_l2_timeout_max_ms{job="jev",instance="gw2"}'
+        values: '1000x22'
+    promql_expr_test:
+      - expr: jev_l2_timeout_ms >= jev_l2_timeout_max_ms
+        eval_time: 15m
+        exp_samples:
+          - labels: 'jev_l2_timeout_ms{job="jev",instance="gw1"}'
+            value: 1000
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: JevL2TimeoutAtCeiling
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: JevL2TimeoutAtCeiling
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: jev
+              instance: gw1
+            exp_annotations:
+              summary: "jev-edge adaptive L2 timeout pinned at its ceiling on gw1"
+              description: >-
+                The adaptive L2 timeout on gw1 has sat at
+                jev.timeout_max_ms (1000 ms) for 10 minutes: the provider
+                is slower than the budget allows and slow calls are being cut.
+              runbook: >-
+                Compare the L2 latency p95/p99 panel with the ceiling. If the
+                provider is healthy but slower, raise jev.timeout_max_ms
+                (PUT /_jev/config or the config file). If it is degrading, expect
+                JevL2ErrorRatioHigh and then JevBreakerOpen. False positive when
+                timeout_max_ms equals timeout_ms (no adaptive range): silence it.
+
+  # Starved: gw1 only ever hits the open breaker; gw2 still gets L2 verdicts.
+  - interval: 1m
+    input_series:
+      - series: 'jev_requests_total{job="jev",instance="gw1",source="breaker",verdict="skipped"}'
+        values: '0+30x30'
+      - series: 'jev_requests_total{job="jev",instance="gw1",source="l2",verdict="error"}'
+        values: '0+1x30'
+      - series: 'jev_requests_total{job="jev",instance="gw2",source="breaker",verdict="skipped"}'
+        values: '0+30x30'
+      - series: 'jev_requests_total{job="jev",instance="gw2",source="l2",verdict="safe"}'
+        values: '0+5x30'
+    promql_expr_test:
+      - expr: |
+          sum by (job, instance) (rate(jev_requests_total{source="breaker"}[5m])) > 0
+          unless on (job, instance)
+          sum by (job, instance) (rate(jev_requests_total{source="l2",verdict!="error"}[5m])) > 0
+        eval_time: 20m
+        exp_samples:
+          - labels: '{job="jev",instance="gw1"}'
+            value: 0.5
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: JevL2Starved
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: jev
+              instance: gw1
+            exp_annotations:
+              summary: "jev-edge sends traffic to L2 but gets no verdicts on gw1"
+              description: >-
+                For 10 minutes gw1 has had requests reach the L2
+                stage (source=breaker) and no successful L2 verdict. Only L1, the
+                verdict cache and trusted fingerprints are protecting traffic.
+              runbook: >-
+                Same as JevBreakerOpen: check /_jev/health, the provider and the
+                key. The verdict cache keeps serving known texts; new texts pass
+                unjudged until L2 recovers.
+      - eval_time: 20m
+        alertname: JevL2ErrorRatioHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: jev
+              instance: gw1
+            exp_annotations:
+              summary: "jev-edge L2 error ratio 100% on gw1"
+              description: >-
+                More than 10% of L2 calls on gw1 have failed for
+                10 minutes. Failed calls pass (verdict=error) and are queued for
+                async re-judging, so protection is degraded, not traffic.
+              runbook: >-
+                Read the error log for "jev-edge: L2 failed: <reason>". Timeouts:
+                compare jev_l2_latency_ms quantiles with jev_l2_timeout_ms and
+                raise jev.timeout_max_ms if the provider is slow but healthy.
+                401/403: rotate the key. 5xx: provider incident. Past fail_ratio
+                the breaker opens (JevBreakerOpen).
+
+  # Async drops: gw1 drops a job once at minute 5; no drops afterwards.
+  - interval: 1m
+    input_series:
+      - series: 'jev_async_dropped_total{job="jev",instance="gw1"}'
+        values: '0x5 1x25'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: JevAsyncDropped
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: JevAsyncDropped
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: jev
+              instance: gw1
+            exp_annotations:
+              summary: "jev-edge dropping async re-judge work on gw1"
+              description: >-
+                1 async re-judge jobs were dropped on
+                gw1 in the last 10 minutes. Suspicious and
+                errored requests that should get a second look are not getting
+                one, and reputation blocking does not learn from them.
+              runbook: >-
+                Raise async.max_async if the provider has headroom; otherwise
+                look for a burst of suspicious/error verdicts (requests panel)
+                or a slow provider holding async slots (async.timeout_ms).
+      - eval_time: 25m
+        alertname: JevAsyncDropped
+        exp_alerts: []

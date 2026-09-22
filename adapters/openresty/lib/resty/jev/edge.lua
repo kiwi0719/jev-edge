@@ -224,7 +224,7 @@ local function evaluate_current(cfg, rules, over)
   })
   metrics.record(v)
   if breaker then metrics.set_breaker_state(breaker:state()) end
-  if judge and judge.adaptive then metrics.set_l2_timeout(judge.adaptive:current()) end
+  if judge and judge.adaptive then metrics.set_l2_timeout(judge.adaptive:current(), judge.adaptive.ceil) end
   ngx.ctx.jev = v
   maybe_async(cfg, v, req, rules)
   maybe_sample(cfg, v, req, rules)
@@ -391,12 +391,14 @@ function _M.feedback()
 
   if ATTACK[label] then
     trust.revoke(store, tbl.fp)
+    metrics.incr_feedback("attack", "revoked")
     emit({ ts = now, src = "feedback", fp = tbl.fp, label = "attack", by = by, rid = rid,
            action = "revoke", reason = "operator label" })
     ngx.say(cjson.encode({ ok = true, fp = tbl.fp, label = "attack", trusted = false }))
     return
   end
   if not BENIGN[label] then
+    metrics.incr_feedback("other", "invalid")
     ngx.status = 400
     ngx.say('{"error":"label must be benign|ok|good|0 or attack|bad|malicious|1"}')
     return
@@ -404,12 +406,14 @@ function _M.feedback()
 
   local rec, err = trust.grant(store, tbl.fp, now, fcfg, { by = by, rid = rid })
   if not rec then
+    metrics.incr_feedback("benign", "refused")
     emit({ ts = now, src = "feedback", fp = tbl.fp, label = "benign", by = by, rid = rid,
            action = "refused", reason = err })
     ngx.status = 409
     ngx.say(cjson.encode({ ok = false, fp = tbl.fp, error = err }))
     return
   end
+  metrics.incr_feedback("benign", "trusted")
   emit({ ts = now, src = "feedback", fp = tbl.fp, label = "benign", by = by, rid = rid,
          action = "trust", reason = "operator label", renewals = rec.renewals })
   ngx.say(cjson.encode({ ok = true, fp = tbl.fp, label = "benign", trusted = true,

@@ -143,18 +143,21 @@ class JevEdgeGuardrail(CustomGuardrail):
 
     @staticmethod
     def client_ip(data: dict) -> Optional[str]:
-        md = data.get("metadata") or {}
-        ip = md.get("requester_ip_address")
-        if ip:
-            return str(ip)
+        """What jev-edge gets as X-Forwarded-For: the request's whole
+        X-Forwarded-For chain when it has one, else LiteLLM's
+        ``requester_ip_address``. The chain wins because with LiteLLM's
+        ``use_x_forwarded_for`` on, requester_ip_address is the chain's
+        leftmost entry, which is whatever the client sent; jev-edge's
+        ``client_ip.trusted_hops`` picks the real hop from the whole chain."""
         psr = data.get("proxy_server_request") or {}
         headers = psr.get("headers") or {}
         xff = next((v for k, v in headers.items() if str(k).lower() == "x-forwarded-for"), None)
-        # the whole chain, not its first entry: the leftmost value is whatever
-        # the client sent. jev-edge's client_ip.trusted_hops picks the hop.
-        if xff:
-            return ", ".join(p.strip() for p in str(xff).split(",") if p.strip()) or None
-        return None
+        chain = ", ".join(p.strip() for p in str(xff).split(",") if p.strip()) if xff else ""
+        if chain:
+            return chain
+        md = data.get("metadata") or {}
+        ip = md.get("requester_ip_address")
+        return str(ip) if ip else None
 
     # ------------------------------------------------------------------
     # LiteLLM hook

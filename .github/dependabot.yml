@@ -1,0 +1,19 @@
+# Weekly update PRs, grouped per ecosystem so CI runs once per batch.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly }
+    groups: { actions: { patterns: ["*"] } }
+  - package-ecosystem: npm
+    directory: /adapters/js
+    schedule: { interval: weekly }
+    groups: { js: { patterns: ["*"] } }
+  - package-ecosystem: gomod
+    directories: [/adapters/envoy/grpc-shim, /adapters/haproxy/spoa]
+    schedule: { interval: weekly }
+    groups: { go: { patterns: ["*"] } }
+  - package-ecosystem: docker
+    directories: [/adapters/openresty, /adapters/envoy/grpc-shim, /adapters/haproxy/spoa, /demo]
+    schedule: { interval: weekly }
+    groups: { docker: { patterns: ["*"] } }

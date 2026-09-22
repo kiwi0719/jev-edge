@@ -359,7 +359,7 @@ function _M.feedback()
     return
   end
 
-  local h = ngx.req.get_headers()
+  local h = ngx.req.get_headers(0)
   local given = h["x-jev-token"]
   if type(given) == "table" then given = given[1] end
   if not given then

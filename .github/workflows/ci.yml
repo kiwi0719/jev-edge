@@ -3,12 +3,36 @@ name: ci
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "LICENSE"
+      - ".github/ISSUE_TEMPLATE/**"
   pull_request:
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "LICENSE"
+      - ".github/ISSUE_TEMPLATE/**"
+  workflow_dispatch:
+  # Weekly: the e2e jobs pull upstream Envoy, HAProxy, APISIX, Traefik, Caddy
+  # and nginx images, which move without a commit here.
+  schedule:
+    - cron: "17 4 * * 1"
+
+permissions:
+  contents: read
+
+# A newer push to the same PR makes the running one obsolete; main keeps
+# every run so each merge has a result.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   lint:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
       - uses: leafo/gh-actions-lua@v13
@@ -16,39 +40,72 @@ jobs:
           luaVersion: "5.1"
       - uses: leafo/gh-actions-luarocks@v6
       - run: luarocks install luacheck
-      - run: luacheck core rules $(ls -d adapters bench 2>/dev/null)
+      - run: make lint
+      # tripwires for bug classes a past audit found (scripts/invariants.lua)
+      - run: make invariants
+      - run: luarocks lint *.rockspec
 
+  # Core runs on LuaJIT in production (OpenResty) and is tested on PUC Lua as
+  # well: 5.5 made for-loop variables const, which LuaJIT never complains about.
   core-tests:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        lua: ["5.1", "5.4", "5.5", "luajit-openresty"]
     steps:
       - uses: actions/checkout@v7
       - uses: leafo/gh-actions-lua@v13
         with:
-          luaVersion: "5.1"
+          luaVersion: ${{ matrix.lua }}
       - uses: leafo/gh-actions-luarocks@v6
       - run: luarocks install busted && luarocks install dkjson && luarocks install lrexlib-pcre2
       - run: make golden-check
-      - run: |
-          busted
+      - run: busted
+      - if: matrix.lua == 'luajit-openresty'
+        run: make luajit-check LUAJIT=lua
 
+  # One image for the Test::Nginx suite and every e2e job, the same one
+  # `make test-openresty` builds; layers come from the Actions cache.
   openresty-tests:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    container:
-      image: openresty/openresty:alpine-fat
-      options: --init
     steps:
       - uses: actions/checkout@v7
-      - run: |
-          apk add --no-cache perl perl-app-cpanminus perl-dev make gcc musl-dev
-          cpanm --notest --quiet Test::Nginx
-          opm get ledgetech/lua-resty-http
-          cd adapters/openresty && prove -r t/
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
+        with:
+          context: adapters/openresty
+          file: adapters/openresty/Dockerfile.test
+          tags: jev-edge-test
+          load: true
+          cache-from: type=gha,scope=jev-edge-test
+          cache-to: type=gha,scope=jev-edge-test,mode=max
+      - run: docker run --rm --init -v "$PWD":/work jev-edge-test
+
+  e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        gateway: [envoy, haproxy, apisix, forward-auth]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
+        with:
+          context: adapters/openresty
+          file: adapters/openresty/Dockerfile.test
+          tags: jev-edge-test
+          load: true
+          cache-from: type=gha,scope=jev-edge-test
+      - run: sh adapters/${{ matrix.gateway }}/e2e/run.sh
 
   js:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 10
     defaults:
       run:
         working-directory: adapters/js
@@ -65,60 +122,44 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
       - run: pnpm test
+      # the published build config, not only the typecheck one
+      - run: pnpm build
 
-  grpc-shim:
+  go:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [adapters/envoy/grpc-shim, adapters/haproxy/spoa]
+    defaults:
+      run:
+        working-directory: ${{ matrix.module }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
-          go-version-file: adapters/envoy/grpc-shim/go.mod
-          cache-dependency-path: |
-            adapters/envoy/grpc-shim/go.sum
-            adapters/haproxy/spoa/go.sum
-      - run: cd adapters/envoy/grpc-shim && go vet ./... && go build ./... && go test ./...
-      - run: cd adapters/haproxy/spoa && go vet ./... && go build ./...
+          # latest 1.26 patch: standard-library security fixes land there
+          go-version: "1.26.x"
+          check-latest: true
+          cache-dependency-path: ${{ matrix.module }}/go.sum
+      - run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - run: go vet ./...
+      - run: go test -race ./...
+      - run: go build ./...
 
   litellm:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: adapters/litellm
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - run: pip install httpx pytest
-      - run: cd adapters/litellm && python3 -m pytest -q
-
-  haproxy-e2e:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v7
-      - run: docker build -q -t jev-edge-test -f adapters/openresty/Dockerfile.test adapters/openresty
-      - run: sh adapters/haproxy/e2e/run.sh
-
-  apisix-e2e:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v7
-      - run: docker build -q -t jev-edge-test -f adapters/openresty/Dockerfile.test adapters/openresty
-      - run: sh adapters/apisix/e2e/run.sh
-
-  envoy-e2e:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v7
-      - run: docker build -q -t jev-edge-test -f adapters/openresty/Dockerfile.test adapters/openresty
-      - run: sh adapters/envoy/e2e/run.sh
-
-  forward-auth-e2e:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v7
-      - run: docker build -q -t jev-edge-test -f adapters/openresty/Dockerfile.test adapters/openresty
-      - run: sh adapters/forward-auth/e2e/run.sh
+      - run: pip install httpx pytest ruff
+      # pyflakes and bugbear: real bugs, not style
+      - run: ruff check --select F,B,E --ignore E501 --target-version py39 .
+      - run: python3 -m pytest -q

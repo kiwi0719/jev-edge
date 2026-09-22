@@ -6,6 +6,37 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+- `scripts/invariants.lua` (`make invariants`, part of `make check` and CI):
+  tripwires for the bug classes the 0.4.0 audit found (one version
+  everywhere, every module in the rockspec, headers read without the 100
+  limit, cache keys only through `core.cache_key`, SHA-256 fingerprints,
+  X-Forwarded-For read from the right, upstream URLs that keep their host,
+  gateway configs that drop forged identity headers, `$(CURDIR)` in the
+  Makefile, the same rule set in Lua and TypeScript). Run against v0.3.1 it
+  reports 25 problems.
+- `security` workflow: CodeQL (TypeScript, Go, Python, workflows),
+  govulncheck on both Go binaries (blocks when a released fix exists) and
+  `pnpm audit`. Dependabot for actions, npm, Go modules and Dockerfiles.
+
+### Changed
+- CI: core specs on Lua 5.1, 5.4, 5.5 and OpenResty's LuaJIT (plus the LuaJIT
+  bytecode check); the Test::Nginx suite and the four e2e jobs share one
+  image built from `Dockerfile.test` with a layer cache; e2e is one matrix
+  job; the HAProxy agent's Go tests run (with `-race`, as the shim's do),
+  `gofmt` is enforced, Go is the latest 1.26 patch; `pnpm build` runs;
+  LiteLLM gets `ruff` (pyflakes, bugbear); docs-only changes skip CI; a
+  newer push cancels a PR's running CI; the token is read-only; a weekly
+  run catches upstream gateway images that moved.
+
+### Fixed
+- The feedback endpoint and the mock provider read request headers without
+  the 100-header limit, like the rest of the adapter.
+- HAProxy SPOA image built with Go 1.26 (was 1.23, out of support, with
+  standard-library advisories open) on Alpine 3.22.
+- JS dev dependencies: vitest 4 and vite 7 (vitest 2 and its vite had a
+  critical and a high advisory; dev only, nothing shipped in the package).
+
 ## [0.4.0] - 2026-09-23
 
 L1 now reads a watched request the way the backend will, and reports the

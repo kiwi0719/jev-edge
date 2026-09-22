@@ -1,4 +1,4 @@
-.PHONY: test lint check luajit-check golden golden-check calibrate labels context-lint test-js test-openresty bench bench-offline bench-chart dist opm-build rock-lint rock-pack rock-upload install live-check live-full live-openai soak shim e2e-envoy e2e-forward-auth e2e-apisix e2e-haproxy test-litellm
+.PHONY: test lint check invariants luajit-check golden golden-check calibrate labels context-lint test-js test-openresty bench bench-offline bench-chart dist opm-build rock-lint rock-pack rock-upload install live-check live-full live-openai soak shim e2e-envoy e2e-forward-auth e2e-apisix e2e-haproxy test-litellm
 
 test:
 	busted
@@ -9,14 +9,19 @@ test:
 #   make lint LUACHECK=~/.luarocks/bin/luacheck
 LUACHECK ?= luacheck
 lint:
-	$(LUACHECK) core rules $$(ls -d adapters bench 2>/dev/null)
+	$(LUACHECK) core rules scripts $$(ls -d adapters bench 2>/dev/null)
 
 # Every core file must at least compile under LuaJIT (the OpenResty runtime).
+LUAJIT ?= luajit
 luajit-check:
 	@for f in $$(find core rules -name '*.lua' -not -path '*/spec/*'); do \
-	  luajit -bl $$f >/dev/null || exit 1; done; echo "luajit ok"
+	  $(LUAJIT) -bl $$f >/dev/null || exit 1; done; echo "luajit ok"
 
-check: lint luajit-check golden-check test
+check: lint invariants luajit-check golden-check test
+
+# Tripwires for bug classes a past audit found (scripts/invariants.lua).
+invariants:
+	lua scripts/invariants.lua
 
 # Golden vectors: the cross-implementation contract for core (core/golden/README.md).
 # `golden` regenerates them from the Lua core after a deliberate behaviour change;

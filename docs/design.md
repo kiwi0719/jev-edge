@@ -224,7 +224,7 @@ adapters/
   js/            TypeScript port of core; Cloudflare, Next.js, Node, Hono, Lambda@Edge, Deno presets; vitest replays core/golden
 rules/           L1 rule sets (PCRE prefilter, watch paths, text fields)
 bench/           offline accuracy bench, Docker latency bench, live checks, soak, calibrate, labels-from-log, context lint, report; suite/ for Chinese, multi-turn, indirect and held-out runs
-demo/            docker compose demo from "Try it in 30 seconds"
+demo/            docker compose demo from the README's "Quick look"
 docs/            design.md, cost.md, recipes.md (Istio, Envoy Gateway, APIM, Apigee), bench charts
 ops/             Grafana dashboard, Prometheus alert rules and their promtool tests
 scripts/         invariants.lua: tripwires for bug classes a past audit found

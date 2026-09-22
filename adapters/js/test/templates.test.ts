@@ -10,8 +10,10 @@ const dir = fileURLToPath(new URL("../../../core/templates/", import.meta.url));
 
 // The value of `key = "..." .. "..."` in a Lua template file: string literals
 // joined with `..`, across lines. Enough for these files (no long strings).
+const reEscape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
 function luaString(src: string, key: string): string | undefined {
-  const m = new RegExp(`(^|\\s)${key.replace(/[[\]]/g, "\\$&")}\\s*=\\s*`, "m").exec(src);
+  const m = new RegExp(`(^|\\s)${reEscape(key)}\\s*=\\s*`, "m").exec(src);
   if (!m) return undefined;
   let i = m.index + m[0].length;
   let out = "";
@@ -32,7 +34,7 @@ function luaString(src: string, key: string): string | undefined {
 
 // the criteria tables: `criteria = { [true] = ..., [false] = ... }`
 function luaCriteria(src: string, table: string): { true: string; false: string } | undefined {
-  const start = new RegExp(`(^|\\s)${table}\\s*=\\s*\\{`, "m").exec(src);
+  const start = new RegExp(`(^|\\s)${reEscape(table)}\\s*=\\s*\\{`, "m").exec(src);
   if (!start) return undefined;
   const body = src.slice(start.index + start[0].length, src.indexOf("\n  },", start.index));
   const t = luaString(body, "[true]");

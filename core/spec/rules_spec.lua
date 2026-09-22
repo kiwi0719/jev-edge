@@ -149,10 +149,10 @@ describe("rules.evaluate", function()
     assert.equals("ip reputation", reason)
   end)
 
-  it("passes trusted ips", function()
+  it("never passes on reputation: a run of safe verdicts earns an ip nothing", function()
     ctx.cache:set("rep:203.0.113.7", { trusted_until = ctx.clock() + 100 })
     local r = R.evaluate(H.chat_req("anything long enough to be judged"), rule, ctx)
-    assert.equals(R.PASS, r)
+    assert.equals(R.SUSPECT, r)
   end)
 
   -- forward-auth style request: headers only, no body at all

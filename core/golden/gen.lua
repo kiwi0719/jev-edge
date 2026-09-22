@@ -300,7 +300,9 @@ rules_case("exactly min_text_chars", req(string.rep("a", 20)))
 rules_case("one under min_text_chars", req(string.rep("a", 19)))
 rules_case("ip reputation blocked", req(LONG), { cache = { ["rep:203.0.113.7"] = { blocked_until = 2000 } } })
 rules_case("ip reputation expired", req(LONG), { cache = { ["rep:203.0.113.7"] = { blocked_until = 900 } } })
-rules_case("ip trusted", req(LONG), { cache = { ["rep:203.0.113.7"] = { trusted_until = 2000 } } })
+-- reputation never passes: a stray trusted_until (IP trust was read here once,
+-- and never written) must not skip L2
+rules_case("ip trust is not a bypass", req(LONG), { cache = { ["rep:203.0.113.7"] = { trusted_until = 2000 } } })
 rules_case("reputation checked before body", req("", { no_body = true }),
   { cache = { ["rep:203.0.113.7"] = { blocked_until = 2000 } } })
 

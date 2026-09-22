@@ -50,10 +50,9 @@ local function handler(premature, job)
     if job.client_ip and job.client_ip ~= "" then
       local key = "rep:" .. job.client_ip
       local rep = cache:get(key)
-      if type(rep) ~= "table" then rep = { malicious = 0, safe = 0 } end
+      if type(rep) ~= "table" then rep = { malicious = 0 } end
       if label == verdict.MALICIOUS then
         rep.malicious = (rep.malicious or 0) + 1
-        rep.safe = 0
         local after = tonumber(cfg.async.rep_block_after) or 0
         if after > 0 and rep.malicious >= after then
           rep.blocked_until = ngx.now() + (cfg.async.rep_block_ttl or 600)
@@ -63,8 +62,6 @@ local function handler(premature, job)
         else
           ngx.log(ngx.ERR, "jev-edge: ALERT ip=", job.client_ip, " score=", score, " reason=", why)
         end
-      elseif label == verdict.SAFE then
-        rep.safe = (rep.safe or 0) + 1
       end
       cache:set(key, rep, cfg.cache.rep_ttl)
     end

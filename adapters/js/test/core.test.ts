@@ -207,6 +207,33 @@ describe("breaker", () => {
   });
 });
 
+describe("in-flight cap and the breaker", () => {
+  // a burst over max_inflight never reached the provider; counting it let a
+  // burst of concurrent requests trip the breaker and switch L2 off for open_s
+  it("a busy judge is not a breaker failure", async () => {
+    const breaker = new Breaker(memoryStore(), () => 1000, { min_samples: 1, fail_ratio: 0.5 });
+    for (let i = 0; i < 50; i++) {
+      const body = JSON.stringify({ messages: [{ role: "user", content: "Please write a detailed summary, variant " + "x".repeat(i + 1) }] });
+      const v = await core.evaluate(
+        { method: "POST", path: "/v1/chat/completions", headers: { "content-type": "application/json" }, body, body_size: body.length, client_ip: "203.0.113.7" },
+        {
+          config: core.defaults.merge(core.defaults.config, {}),
+          rules: [load("llm-endpoints")],
+          cache: memoryStore(),
+          breaker,
+          clock: () => 1000,
+          hash: djb2,
+          json_decode: JSON.parse,
+          judge: { call: () => [null, core.judge.BUSY] },
+        } as core.Ctx,
+      );
+      expect(v.verdict).toBe(core.verdict.ERROR);
+      expect(v.reason).toBe(core.judge.BUSY);
+    }
+    expect(await breaker.state()).toBe(CLOSED);
+  });
+});
+
 describe("normalize.fieldKeys", () => {
   it("matches core/normalize.lua field_keys, in linear time", () => {
     const want: Record<string, string> = {

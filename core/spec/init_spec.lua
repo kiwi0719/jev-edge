@@ -67,6 +67,43 @@ describe("core.evaluate end to end", function()
     assert.matches("L2 failed", ctx.logs[1])
   end)
 
+  it("does not count its own in-flight cap as a breaker failure", function()
+    -- a burst over max_inflight never reached the provider; counting it let
+    -- ~85 concurrent requests trip the breaker and switch L2 off for open_s
+    local J = require "jev.core.judge"
+    local ctx = H.ctx({ judge = { call = function() return nil, J.BUSY end } })
+    ctx.breaker = B.new(H.store(), ctx.clock, { min_samples = 1, fail_ratio = 0.5 })
+    for i = 1, 50 do
+      local v = core.evaluate(H.chat_req(LONG .. " variant " .. string.rep("x", i)), ctx)
+      assert.equals(V.ERROR, v.verdict)
+      assert.equals(J.BUSY, v.reason)
+      assert.is_true(v.async)
+    end
+    assert.equals(B.CLOSED, ctx.breaker:state())
+  end)
+
+  it("chunks: a busy chunk is not a failure, an answered one is a success", function()
+    local J = require "jev.core.judge"
+    local rules = require "jev.core.rules"
+    local rule = assert(rules.resolve({ id = "long", extends = "llm-endpoints", max_judge_bytes = 512,
+      max_judge_chunks = 4 }, function(x) return require("jev.rules." .. x) end))
+    local n = 0
+    local ctx = H.ctx({ rules = { rule }, judge = { call = function()
+      n = n + 1
+      if n % 2 == 0 then return nil, J.BUSY end
+      return { injection = 0.1 }
+    end } })
+    local store = H.store()
+    ctx.breaker = B.new(store, ctx.clock, { min_samples = 1, fail_ratio = 0.5 })
+    local v = core.evaluate(H.chat_req(string.rep("The quarterly report covers revenue. ", 40)), ctx)
+    assert.is_true(n > 1)
+    assert.equals(V.ERROR, v.verdict)
+    assert.equals(J.BUSY, v.reason)
+    assert.equals(B.CLOSED, ctx.breaker:state())
+    local w = store:get("brk:w:" .. math.floor(ctx.clock() / 60))
+    assert.same({ ok = 1, fail = 0 }, w)
+  end)
+
   it("skips L2 while the breaker is open", function()
     local calls = 0
     local ctx = H.ctx({ judge = { call = function() calls = calls + 1; return { injection = 0 } end } })

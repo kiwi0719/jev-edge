@@ -133,6 +133,7 @@ async function judgeParts(
   const elapsed = nowMs(ctx) - t0;
 
   let err: string | undefined;
+  let failed = false, answered = false;
   for (let k = 0; k < pending.length; k++) {
     const p = pending[k];
     const [a, e] = results[k] ?? [null, "error"];
@@ -140,15 +141,18 @@ async function judgeParts(
     if (a) [s, t, n] = judge.reduce(a);
     if (!a || n === 0) {
       err ??= String(e ?? (a ? "no scores in answer" : "error"));
+      if (e !== judge.BUSY) failed = true;
     } else {
+      answered = true;
       scores[p.i] = s;
       tops[p.i] = t;
       if (p.ck && ctx.cache) await ctx.cache.set(p.ck, { score: s, reason: `${t} ${verdict.format2(s)}` }, cfg.cache.fp_ttl);
     }
   }
-  if (ctx.breaker && pending.length > 0) {
-    if (err) await ctx.breaker.failure();
-    else await ctx.breaker.success();
+  // only calls that reached the provider say anything about its health
+  if (ctx.breaker) {
+    if (failed) await ctx.breaker.failure();
+    else if (answered) await ctx.breaker.success();
   }
 
   let best: number | undefined;
@@ -294,7 +298,7 @@ export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
   const elapsed = nowMs(ctx) - t0;
 
   if (!answers) {
-    if (ctx.breaker) await ctx.breaker.failure();
+    if (ctx.breaker && jerr !== judge.BUSY) await ctx.breaker.failure();
     log(ctx, "warn", "jev-edge: L2 failed: " + String(jerr));
     const [action, label, async] = policy.onError();
     return finish(ctx, verdict.newVerdict({

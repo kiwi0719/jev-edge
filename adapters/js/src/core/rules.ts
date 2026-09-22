@@ -382,13 +382,13 @@ export async function evaluate(
   // 1. path watch list
   if (!pathMatches(req.path ?? "", rule.watch_paths)) return [PASS, "", "path not watched"];
 
-  // 2. reputation, before anything that needs a body
+  // 2. reputation, before anything that needs a body. It only ever blocks:
+  //    safe verdicts earn an IP nothing (see core/rules.lua)
   if (ctx?.cache && req.client_ip) {
-    const rep = (await ctx.cache.get("rep:" + req.client_ip)) as { blocked_until?: number; trusted_until?: number } | undefined;
+    const rep = (await ctx.cache.get("rep:" + req.client_ip)) as { blocked_until?: number } | undefined;
     if (rep && typeof rep === "object") {
       const now = ctx.clock ? ctx.clock() : 0;
       if (rep.blocked_until !== undefined && rep.blocked_until > now) return [BLOCK, "", "ip reputation"];
-      if (rep.trusted_until !== undefined && rep.trusted_until > now) return [PASS, "", "ip trusted"];
     }
   }
   // the same for the subject (core/subject.lua), when reputation is on

@@ -18,9 +18,10 @@ function _M.load_provider(name)
   return p
 end
 
---- Build a judge object for the current config.
 local adaptive_m = require "resty.jev.adaptive"
+local judge      = require "jev.core.judge"
 
+--- Build a judge object for the current config.
 -- @param cfg      cfg.jev section (provider, endpoint, model, api_key, timeout_*, max_inflight)
 -- @param inflight cache-like object with get/set/incr (shared dict); also backs the adaptive timeout
 -- @param metrics  optional function(usage): token usage the provider reported
@@ -109,7 +110,7 @@ function _M.new(cfg, inflight, metrics)
       local n = inflight:incr(key, 1, 0)
       if n and n > max then
         release()
-        return nil, "max_inflight exceeded"
+        return nil, judge.BUSY
       end
     end
     local ok, answers, err = pcall(do_call, prompt, requested_timeout)

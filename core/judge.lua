@@ -6,6 +6,13 @@ local _M = {}
 
 local templates = {}
 
+--- The error a judge returns when it refused a call because the gateway's own
+-- concurrency cap (jev.max_inflight) was full. The call never reached the
+-- provider, so it says nothing about the provider's health: core does not
+-- count it as a breaker failure. Counting it let a burst of concurrent
+-- requests trip the breaker and switch L2 off for everyone for open_s.
+_M.BUSY = "max_inflight exceeded"
+
 --- Register a template. Ships with core/templates/*.lua.
 -- @param name string
 -- @param t { instructions = string, criteria = { [true]=..., [false]=... }|nil }

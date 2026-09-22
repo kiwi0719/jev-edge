@@ -754,9 +754,9 @@
     },
     {
       "expect": {
-        "reason": "ip trusted",
-        "result": "pass",
-        "text": ""
+        "reason": "natural language",
+        "result": "suspect",
+        "text": "Please write a detailed summary of the attached quarterly report."
       },
       "input": {
         "cache": {
@@ -777,7 +777,7 @@
         },
         "rule": "llm-endpoints"
       },
-      "name": "ip trusted"
+      "name": "ip trust is not a bypass"
     },
     {
       "expect": {

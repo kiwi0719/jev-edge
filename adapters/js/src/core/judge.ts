@@ -17,6 +17,15 @@ export type Answers = Record<string, unknown>;
 
 const registry: Record<string, Template> = { ...TEMPLATES };
 
+/**
+ * The error a judge returns when it refused a call because the gateway's own
+ * concurrency cap was full. The call never reached the provider, so it says
+ * nothing about the provider's health: core does not count it as a breaker
+ * failure (a burst of concurrent requests must not be able to trip the
+ * breaker and switch L2 off for everyone). Same string as core/judge.lua.
+ */
+export const BUSY = "max_inflight exceeded";
+
 export function register(name: string, t: Template): void {
   registry[name] = t;
 }

@@ -49,7 +49,7 @@ jev-edge 跑在 nginx / OpenResty 或 Apache APISIX 里，站在 Envoy、Istio�
 | JavaScript 宿主 | Cloudflare Workers 和 Pages、Next.js、Node、Hono、Lambda@Edge、Deno Deploy，共用一份受同一批 golden vectors 约束的 TypeScript core 移植（npm 上的 [`@jev-edge/js`](https://www.npmjs.com/package/@jev-edge/js)） |
 | 运维 | `/_jev/metrics` 暴露 Prometheus 指标，[ops/](ops/README.zh-CN.md) 里有 Grafana dashboard 和带单元测试的告警规则 |
 | 测试覆盖 | 349 个 busted spec（含 194 个 golden vectors）、348 个 vitest 用例（回放同一批向量加 JS 宿主）、431 条 Test::Nginx 断言、16 个 guardrail 测试、7 个 Go 测试（gRPC shim、SPOE agent）、对真实 Envoy、Traefik / Caddy / nginx、APISIX、Kong 和 HAProxy 的五套端到端、告警规则单元测试、仓库不变量检查、两套 bench、一次 soak |
-| provider 真实联调 | `jev` 对 TypeSafe API 跑完 662 条全量数据集；`openai-compat` 对 Ollama 容器 |
+| provider 真实联调 | `jev` 对 TypeSafe API 跑完 662 条全量数据集和 2,735 条的 [suite v1](bench/suite/README.md)；`openai-compat` 对 Ollama 容器 |
 | 生产使用 | 目前没有已知案例。先用 `monitor` 模式跑 |
 
 各版本加了什么、接下来做什么见[路线图](#路线图)。
@@ -243,7 +243,7 @@ L1 按后端读 body 的方式读受监控的请求：格式由 body 决定，�
 
 ## 写好部署上下文
 
-`jev.deployment_context` 是一段话，告诉 Jev 你的助手是*干什么的*。有了它，Jev 回答的问题从"这段文本像不像攻击"变成"这条消息是不是对*这个*服务的误用"。同样的 662 条文本、同样的模型，AUC 从 0.983 提到 0.996，阈值 0.5 下的漏报率从 37% 降到 5%。配置里没有别的东西能接近这个效果。
+`jev.deployment_context` 是一段话，告诉 Jev 你的助手是*干什么的*。有了它，Jev 回答的问题从"这段文本像不像攻击"变成"这条消息是不是对*这个*服务的误用"。同样的 662 条文本、同样的模型，AUC 从 0.983 提到 0.996，阈值 0.5 下的漏报率从 37% 降到 5%。配置里没有别的东西能接近这个效果。写得含糊反而有代价：在 [suite v1](bench/suite/README.md) 上，一段泛泛的通用助手上下文把良性样本和攻击样本的分数一起抬高，良性近似样本在 0.5 下的误报率从 0.9% 升到 11.5%。
 
 写得太泛就会失效。"一个有帮助的 AI 助手"没有给 Jev 任何可以守护的目的，于是偏离目的的请求都被打成无害。把它写成一份带拒绝清单的岗位描述：
 
@@ -388,6 +388,18 @@ L1 放行的流量 p99 多花 24 µs。"健康 Jev"那组是一个 100 ms 应答
 | 文本 + `deployment_context` | **0.996** | 0.8% / 5.3% | 0.0% / 13.3% |
 
 一个数据集、一种部署、主要是德语和英语。把它当作"部署上下文很重要"的证据，不要当作你流量上会看到的比率；用 `monitor` 模式量你自己的。
+
+**这个数据集没覆盖到的**（`make suite-live`，[suite v1](bench/suite/README.md)：2,735 个完整的 chat 请求体，来自七个 MIT / Apache-2.0 数据源，只有文本，阈值 0.5）：
+
+| 切片 | AUC | 0.50 下 FP / 漏报 |
+|---|---|---|
+| 中文指令劫持（Safety-Prompts Goal_Hijacking 对 alpaca-zh） | 0.994 | 0.0% / 9.3% |
+| 多轮，攻击插入 OpenAssistant 对话 | 0.997 | 1.6% / 8.4% |
+| 间接注入，LLMail-Inject 邮件放在 user 消息或 tool 结果里 | 0.967 | 0.0% / 29.8% |
+| 间接注入，BIPIA EmailQA | 0.993 | 0.0% / 81.5% |
+| 良性近似样本（NotInject） | - | 0.9% / - |
+
+间接注入是短板：良性邮件分数很低，所以排序没问题，但藏在邮件里的攻击大多低于任何你会上线的阈值。带部署上下文的那一轮结果和各项局限见 [suite README](bench/suite/README.md)，其中包括两个源标签站不住的类别。
 
 ## 设计
 

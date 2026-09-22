@@ -6,6 +6,20 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+- **Suite v1: accuracy beyond deepset.** `bench/datasets/suite-v1.jsonl`, 2,735
+  whole chat request bodies from seven MIT / Apache-2.0 sources: Chinese
+  instruction attacks (Safety-Prompts) against Chinese benign instructions,
+  over-defense look-alikes (NotInject), indirect injection in retrieved emails
+  and tool results (LLMail-Inject, BIPIA), and attacks spliced into real
+  multi-turn threads (OpenAssistant, Gandalf). `make suite-fetch` /
+  `suite-build` / `suite-live [CTX=1]` / `suite-report`. First live run
+  committed with its results: strong on Chinese override and multi-turn, weak
+  on indirect injection (BIPIA 81.5% miss at 0.5), and the general-assistant
+  deployment context raised false positives instead of helping. See
+  `bench/suite/README.md`, including two source categories whose labels did
+  not hold up.
+
 ## [0.5.0] - 2026-09-23
 
 Subject reputation, a Kong plugin, a Deno preset and the npm package, an

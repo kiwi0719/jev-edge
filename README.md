@@ -43,7 +43,7 @@ It is built for SREs and platform engineers, not agent authors. Existing Jev gua
 | Gateways, native | OpenResty; Apache APISIX (plugin, same engine) |
 | Gateways, via `/_jev/authz` | Envoy (HTTP and gRPC ext_authz), HAProxy (SPOE agent), Traefik, Caddy and plain nginx (forward-auth), each end-to-end tested against the real gateway; Istio, Envoy Gateway, Azure APIM and Apigee as [recipes](docs/recipes.md); LiteLLM proxy as a guardrail |
 | JavaScript hosts | Cloudflare Workers and Pages, Next.js, Node, Hono, Lambda@Edge, through one TypeScript port of core held to the same golden vectors (on `main`, unreleased) |
-| Test coverage | 262 busted specs including the 142 golden vectors, 223 vitest cases replaying the same vectors plus the JS hosts, 316 Test::Nginx assertions, 12 guardrail tests, 4 gRPC shim tests, four gateway e2e suites against real Envoy, Traefik / Caddy / nginx, APISIX and HAProxy, two benches, a soak run |
+| Test coverage | 265 busted specs including the 142 golden vectors, 223 vitest cases replaying the same vectors plus the JS hosts, 316 Test::Nginx assertions, 12 guardrail tests, 4 gRPC shim tests, four gateway e2e suites against real Envoy, Traefik / Caddy / nginx, APISIX and HAProxy, two benches, a soak run |
 | Providers verified live | `jev` against the TypeSafe API on the full 662-sample dataset; `openai-compat` against an Ollama container |
 | Production use | none known yet. Run in `monitor` mode first |
 

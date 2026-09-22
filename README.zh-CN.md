@@ -43,7 +43,7 @@ jev-edge 跑在 nginx / OpenResty 或 Apache APISIX 里，站在 Envoy、Istio�
 | 网关，原生 | OpenResty；Apache APISIX（插件，同一套引擎） |
 | 网关，走 `/_jev/authz` | Envoy（HTTP 和 gRPC ext_authz）、HAProxy（SPOE agent）、Traefik、Caddy 和普通 nginx（forward-auth），各自对真实网关做了端到端测试；Istio、Envoy Gateway、Azure APIM 和 Apigee 以[配方](docs/recipes.zh-CN.md)形式提供；LiteLLM proxy 作为 guardrail |
 | JavaScript 宿主 | Cloudflare Workers 和 Pages、Next.js、Node、Hono、Lambda@Edge，共用一份受同一批 golden vectors 约束的 TypeScript core 移植（在 `main` 上，未发版） |
-| 测试覆盖 | 262 个 busted spec（含 142 个 golden vectors）、223 个 vitest 用例（回放同一批向量加 JS 宿主）、316 条 Test::Nginx 断言、12 个 guardrail 测试、4 个 gRPC shim 测试、对真实 Envoy、Traefik / Caddy / nginx、APISIX 和 HAProxy 的四套端到端、两套 bench、一次 soak |
+| 测试覆盖 | 265 个 busted spec（含 142 个 golden vectors）、223 个 vitest 用例（回放同一批向量加 JS 宿主）、316 条 Test::Nginx 断言、12 个 guardrail 测试、4 个 gRPC shim 测试、对真实 Envoy、Traefik / Caddy / nginx、APISIX 和 HAProxy 的四套端到端、两套 bench、一次 soak |
 | provider 真实联调 | `jev` 对 TypeSafe API 跑完 662 条全量数据集；`openai-compat` 对 Ollama 容器 |
 | 生产使用 | 目前没有已知案例。先用 `monitor` 模式跑 |
 

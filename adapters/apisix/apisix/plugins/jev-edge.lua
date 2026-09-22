@@ -192,13 +192,11 @@ local function subject_ctx(rt, req, ctx)
   local store = subject_store
   return {
     id = id,
-    history = subject_m.load(store, id),
+    history = subject_m.ring_load(store, id, scfg.max_entries),
+    -- Two atomic dict operations, inline: cheaper than the timer it
+    -- replaces and safe across workers (no read-modify-write).
     record = function(e)
-      ngx.timer.at(0, function(premature)
-        if premature then return end
-        local h = subject_m.append(subject_m.load(store, id), e, scfg.max_entries)
-        subject_m.save(store, id, h, scfg.history_ttl)
-      end)
+      subject_m.ring_append(store, id, e, scfg.max_entries, scfg.history_ttl)
     end,
   }
 end

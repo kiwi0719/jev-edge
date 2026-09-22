@@ -17,14 +17,20 @@ qq{
 location /v1/chat/completions { $::Access $::Echo }
 location = /_t/subject {
     content_by_lua_block {
-        ngx.sleep(0.05)   -- let the 0-delay timers run
         local d = ngx.shared.jev_subject
-        local keys = d:get_keys(0)
-        table.sort(keys)
+        local store = require("resty.jev.cache").new("jev_subject")
+        local subject = require("jev.core.subject")
+        local ids, raw = {}, false
+        for _, k in ipairs(d:get_keys(0)) do
+            local id = k:match("^subj:(.-):n\$")
+            if id then ids[#ids + 1] = id end
+            if (k .. tostring(d:get(k))):find("secret%-key", 1, true) then raw = true end
+        end
+        table.sort(ids)
         local out = {}
-        for _, k in ipairs(keys) do
-            local h = require("cjson.safe").decode(d:get(k))
-            out[#out + 1] = k .. " n=" .. #h .. " last=" .. h[#h].score .. " raw=" .. tostring((k .. d:get(k)):find("secret%-key", 1, true) ~= nil)
+        for _, id in ipairs(ids) do
+            local h = subject.ring_load(store, id, 2)
+            out[#out + 1] = "subj:" .. id .. " n=" .. #h .. " last=" .. h[#h].score .. " raw=" .. tostring(raw)
         end
         ngx.say(table.concat(out, "\\n"))
     }
@@ -53,7 +59,12 @@ location = /_t/subject {
 --- config eval
 qq{
 location /v1/chat/completions { $::Access $::Echo }
-location = /_t/count { content_by_lua_block { ngx.sleep(0.05) ngx.say(#ngx.shared.jev_subject:get_keys(0)) } }
+location = /_t/count { content_by_lua_block {
+    -- one subject = one counter key; count those, not the per-entry slots
+    local n = 0
+    for _, k in ipairs(ngx.shared.jev_subject:get_keys(0)) do if k:match(":n\$") then n = n + 1 end end
+    ngx.say(n)
+} }
 }
 --- request eval
 ["POST /v1/chat/completions\n{\"messages\":[{\"role\":\"user\",\"content\":\"Please write a detailed summary of the attached quarterly report.\"}]}",

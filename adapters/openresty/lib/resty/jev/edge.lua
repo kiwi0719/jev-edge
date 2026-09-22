@@ -213,8 +213,8 @@ local function maybe_sample(cfg, v, req, rules)
 end
 
 -- Per-subject trajectory: id extracted per cfg.subject, hashed with the salt
--- before anything stores or logs it; history read once here; the write goes
--- through a 0-delay timer so the request never waits on it.
+-- before anything stores or logs it; history read once here; the write is a
+-- ring append (see core/subject.lua) and does not yield.
 local function subject_ctx(cfg, req)
   local scfg = cfg.subject
   if not scfg or not scfg.enabled then return nil end
@@ -229,14 +229,11 @@ local function subject_ctx(cfg, req)
   local store = subject_store
   return {
     id = id,
-    history = subject_m.load(store, id),
+    history = subject_m.ring_load(store, id, scfg.max_entries),
+    -- Two atomic dict operations, inline: cheaper than the timer it
+    -- replaces and safe across workers (no read-modify-write).
     record = function(e)
-      local ok, err = ngx.timer.at(0, function(premature)
-        if premature then return end
-        local h = subject_m.append(subject_m.load(store, id), e, scfg.max_entries)
-        subject_m.save(store, id, h, scfg.history_ttl)
-      end)
-      if not ok then ngx.log(ngx.WARN, "jev-edge: subject write skipped: ", err) end
+      subject_m.ring_append(store, id, e, scfg.max_entries, scfg.history_ttl)
     end,
   }
 end

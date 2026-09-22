@@ -76,6 +76,11 @@ values: fingerprints and subject ids are different strings than in 0.3.0
   normalised (`//`, `.`, `..`) before matching `watch_paths`. `resty.jev.cache`
   warns once when a dict starts evicting. The `+json` content types the
   extractor already decoded are now watched by `llm-endpoints`.
+- Subject trajectories on OpenResty and APISIX are stored as a ring (one
+  atomic counter plus one key per entry) instead of one list per subject:
+  the old append was a read-modify-write in a per-request timer, so two
+  workers recording the same subject lost entries and a burst could exhaust
+  `lua_max_pending_timers`. Existing `subj:` list keys are simply ignored.
 - New optional `lua_shared_dict jev_state`: trust grants, breaker state,
   in-flight counters and the adaptive estimate move there when it is
   declared, so a flood of new prompts filling `jev_cache` cannot evict them.
@@ -87,7 +92,7 @@ values: fingerprints and subject ids are different strings than in 0.3.0
   stops at a UTF-8 boundary; bodies without `Content-Length` are bounded;
   `nodeMiddleware` no longer hands the app a placeholder body; `cf-ray` is
   only trusted on Cloudflare; Hono and Lambda@Edge presets strip inbound
-  `X-Jev-*` and honour `block_status`; `engines` is `node >= 20`.
+  `X-Jev-*` and honour `block_status`; `engines` is `node >= 20` and `@types/node` follows the Node 20 line.
 - Envoy gRPC shim: a response without `X-Jev-Verdict` (404, 5xx, a sidecar
   error) is fail-open, as documented, instead of a deny; fail-open overwrites
   forged headers. HAProxy SPOE agent and LiteLLM guardrail: block is

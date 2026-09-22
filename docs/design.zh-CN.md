@@ -313,7 +313,7 @@ flowchart LR
 
 **决策原则：** 每一层只能把请求判得*更*可疑，或者放行。任何一层出错，都退回到放行，并记下 `X-Jev-Verdict: error`。有一个例外是故意留的，就是运维人员的信任（见下文）：运维人员标记为误报的指纹，会在 L1.5、也就是判定缓存之前，直接以 `safe` 放行。这是唯一能把分数往下调的输入，它一定会过期，而它之所以存在，是因为有人亲自看过。另一个例外同样由运维人员决定：设置 `policy.unjudgeable = "block"` 后，在 `enforce` 模式下，L1 读不了的受监控请求会被拒绝（比如解不开的编码、二进制请求体、超大且开头和结尾都找不到文本的请求体）。默认情况下这类请求以 `skipped` 放行，但绝不会被悄悄当成"没有文本"。
 
-**所有实现遵守同一份契约。** `core/` 的行为由 [core/golden/](../core/golden/README.md) 里的 golden vectors 固定下来：输入是手写的，期望结果由 Lua core 生成，`core/spec/golden_spec.lua` 负责回放，CI 里用 `make golden-check` 检查有没有漂移。`adapters/js` 里的 TypeScript 移植版在 vitest 下跑同一批文件并全部通过，这就是"移植版"的定义。向量覆盖归一化、文本抽取、L1、策略、判定响应头和整条流水线的顺序；缓存 TTL 的精度、跨 worker 的熔断器统计以及自适应超时的具体取值，则有意留给各个平台自己处理。
+**所有实现遵守同一份契约。** `core/` 的行为由 [core/golden/](../core/golden/README.md) 里的 golden vectors 固定下来：输入是手写的，期望结果由 Lua core 生成，`core/spec/golden_spec.lua` 负责回放，CI 里用 `make golden-check` 检查有没有漂移。`adapters/js` 里的 TypeScript 移植版在 vitest 下跑同一批文件并全部通过，这就是"移植版"的定义。向量覆盖归一化、文本抽取、L1、策略、判定头和整条流水线的顺序；缓存 TTL 的精度、跨 worker 的熔断器统计以及自适应超时的具体取值，则有意留给各个平台自己处理。
 
 **core 与适配器的边界。** `core/` 从不 require `ngx`。所有 IO（缓存、HTTP、时钟、哈希、JSON、正则、日志）都通过一个 `ctx` table 注入。正因为这样，才能有 Envoy、APISIX、HAProxy 和 JavaScript 适配器，core 也才能脱离 OpenResty 直接在 busted 下运行。
 

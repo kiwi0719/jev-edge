@@ -6,6 +6,34 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+- **Laya as an L2 judge.** `provider = "laya"` (Lua and JS) sends the jev
+  System One request to a server you run; its scores stay apart from jev's in
+  the cache, the log and calibration. `adapters/laya-server/` serves a
+  fine-tuned Laya model over that protocol (Python, Dockerfile; ONNX, your
+  own Python scorer, or a mock backend): long text is judged in overlapping
+  windows in one batch and refused with 413 past `LAYA_MAX_WINDOWS`, never
+  silently cut; `fit_temperature.py` fits the temperature that makes `noul` a
+  calibrated probability; `jev-laya.conf.lua` is the gateway profile (L2
+  timeout 100 / 300 ms instead of 400 / 1000, `max_judge_bytes = 4096`,
+  monitor mode). The base Laya model is not usable for this task without
+  fine-tuning, so no Laya benchmark and no default thresholds ship.
+- **Protocol conformance suite.** `conformance/`: System One vectors built
+  by the real provider from the real templates (`make conformance-vectors`,
+  `conformance-check` in `make check`) and `run.py`, which checks any judge
+  server for the answer set, `noul` range, determinism, error codes, long
+  input, keepalive, aborted and stalled clients and p99 latency
+  (`make conformance ENDPOINT=... [STRICT=1] [MOCK=1]`). `make test-laya`
+  runs it against laya-server, including a server that truncates, which must
+  fail.
+- **Per-provider question wording.** `jev.questions.<template>` replaces
+  `instructions`, `criteria`, `instructions_ctx` or `criteria_ctx` for the
+  `jev` / `laya` request only, for wording validated on another judge.
+- **Calibration per judge.** The access log records `provider` and `model`;
+  `make calibrate` refuses a log that mixes judges until `PROVIDER=` /
+  `MODEL=` (`--provider` / `--model`) picks one, since their scores are not
+  comparable.
+
 ## [0.5.0] - 2026-09-23
 
 Subject reputation, a Kong plugin, a Deno preset and the npm package, an

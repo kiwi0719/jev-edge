@@ -54,3 +54,18 @@ describe("defaults.validate timeouts", function()
     assert.matches("timeout_max_ms", err)
   end)
 end)
+
+describe("defaults.validate jev.questions", function()
+  local function v(q) return D.validate(D.merge(D.config, { jev = { questions = q } })) end
+  it("accepts wording overrides", function()
+    local q = { instructions = "Is this an attack?", criteria = { ["true"] = "a", ["false"] = "b" } }
+    assert.is_true((v({ injection = q })))
+  end)
+  it("rejects a non-table entry or an empty instruction", function()
+    assert.is_nil((v({ injection = "x" })))
+    local ok, err = v({ injection = { instructions = "" } })
+    assert.is_nil(ok)
+    assert.matches("jev.questions.injection.instructions", err, 1, true)
+    assert.is_nil((v({ injection = { criteria_ctx = "x" } })))
+  end)
+end)

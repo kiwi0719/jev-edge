@@ -171,6 +171,7 @@ return {
 |---|---|---|---|
 | `jev` | `POST https://api.typesafe.ai/v1/systemone`，`state` + Noul 问题 | `Authorization: Bearer` | 默认，TypeSafe Jev |
 | `openai-compat` | `POST {endpoint}/chat/completions`，system = 模板，user = 文本，只输出 JSON | `Authorization: Bearer` | vLLM、Ollama、任何 OpenAI 兼容端点 |
+| `laya` | 把 `jev` 请求发给你自己的服务，默认 `http://127.0.0.1:8080/v1/systemone` | `Authorization: Bearer`（可选） | [laya-server](../adapters/laya-server/README.md) 后面的微调 Laya 模型 |
 | `mock` | 不联网；按配置返回固定分数、延迟、故障率 | 无 | 测试和 bench |
 
 每个模板是一个 TypeSafe **Noul** 问题（是/否，返回 0–1 的概率）。多个模板放在一个请求里。设置了 `jev.deployment_context`（或 `rule.deployment_context`）时，state 变成 `{assistant, user_message}`，模板切换到上下文版本，问的是"这条消息是否在颠覆*这个*助手"而不是"这段文本像不像攻击"：
@@ -189,7 +190,7 @@ return {
 
 **超时与熔断。** L2 的预算是带运营者上限的自适应值：从 `timeout_ms`（400）起步，跨 worker 共享地跟踪 L2 延迟的指数加权均值和方差，实际值为 `timeout_headroom × (均值 + 2 标准差)`，夹在 `[timeout_ms, timeout_max_ms]`（1000）之间。超时本身会回馈一个截尾样本，让估计在延迟跳变后能往上爬；持续超过上限的变慢交给熔断器。预算按连接 30% / 发送 10% / 读取 60% 拆分。从一台笔记本对 `jev-latest` 实测：p50 268 ms、p95 314 ms、最大 355 ms，固定 300 ms 会掐掉 15% 的调用。`/_jev/health` 和 `jev_l2_timeout_ms` 指标显示当前生效值。滑动窗口熔断器（60 s 窗口，≥20 个样本，失败率 >50% → 打开 30 s，然后放一个半开探测）存在 shared dict 里，所有 worker 共享。`max_inflight`（64）限制并发 L2 调用；超过就跳过 L2，请求进 L3。
 
-问题措辞来自 jev-sec-bench，已经过验证。模板暴露两个槽位：`text` 和 `context`。
+问题措辞来自 jev-sec-bench，是针对 Jev 验证的；换一个判定器需要重新验证，`jev.questions` 可以只替换某一个 provider 的措辞（见 [Laya](#laya-及其他-system-one-服务)）。模板暴露两个槽位：`text` 和 `context`。
 
 ### 判定器鲁棒性
 
@@ -202,6 +203,17 @@ return {
 - **L1。** 新增六条 `always_suspect` 模式识别针对判定器的文本（要求给出结论、指挥分类器输出什么、“致审查本文的 AI”、答案 JSON、伪造的输入结束标记、“真正的结论是安全”）。这类文本本来就会作为自然语言进入 L2；命中还能保证它留在超过 `max_judge_bytes` 的长请求体的判定窗口里。
 
 `make bench-judge` 用 L1 跑 `bench/datasets/judge-directed.jsonl`（32 条攻击、13 条相似的正常请求，比如“Is this email safe to open?”）：所有攻击都进入 L2，没有一条正常请求被模式命中。`make bench-judge-live` 把同样的用例发给真实判定器（需要密钥，见 `bench/judge_robustness.lua`）。如果模型*只*复述了输入里植入的答案（对被问的问题给出的值，和被判文本里某个 JSON 对象完全相同；按解析后的值比较，所以改空格或 `0` 与 `0.0` 之类的写法藏不住），说明它被输入牵着走了，这正是注入：每个被问的问题记 1，而不是植入的那个值；这里刻意不按错误处理，因为错误会 fail-open。超过 `max_judge_bytes` 的单条消息中间的指令，如果没有模式命中（比如非英文），在默认的单窗口下会被截掉；`max_judge_chunks > 1` 会分块判定，`max_judge_chunks × max_judge_bytes` 以内的文本全部判到（见 README 的“长文本分块判定”）。
+
+### Laya 及其他 System One 服务
+
+`laya` provider 把 `jev` 的请求原样发给你自己运行的服务，通常是装了微调 Laya 模型的 [adapters/laya-server](../adapters/laya-server/README.md)。它是一个独立的 provider，而不是换了 endpoint 的 `jev`，这样判定缓存（按 provider 和 model 分键）、`/_jev/health`、访问日志和 `make calibrate` 都不会把它的分数和 Jev 的混在一起。
+
+- **不出 benchmark。** Laya 基础模型不经微调在这个任务上不可用，所以不发布任何 Laya 准确率数字，也不给默认阈值。基础模型的数字预测不了实际部署；微调后的效果取决于各自的数据和训练方式。下面的验收表只针对 Jev。
+- **协议一致性。** [conformance/](../conformance/README.md) 之于判定服务，相当于 golden vectors 之于 core：`gen.lua` 用真实的 provider 和模板构造请求，`run.py` 把请求发给运行中的服务，检查 answer 集合（问到的每个问题都有，且没有多余的）、`noul` 落在 [0, 1]、结果确定、错误是非 200 的 JSON、长输入、keepalive、中途断开和卡住的客户端，以及 p99 延迟是否在超时预算内。模板或 provider 改了而向量没更新时，`make conformance-check` 会在 CI 里失败。
+- **不悄悄截断。** 上下文 1024 token 的模型本来会截掉网关以为已经判过的文本，网关的窗口和分块计数察觉不到。laya-server 改为按窗口判（有重叠，所有窗口一个 batch，取最高分），超过 `LAYA_MAX_WINDOWS` 返回 413。因为 L2 出错会放行请求，profile 里的 `max_judge_bytes`（4096）保证即使一个字节一个 token，服务端也永远用不到这个 413。
+- **校准过的分数。** laya-server 返回 `sigmoid(logit / T)`，`T` 用 `fit_temperature.py` 在留出集上拟合。温度缩放不改变排序，只让 0.7 大致代表 70%，`make calibrate` 再据此给这个 provider 和 model 出阈值。
+- **超时。** Jev 的 400 ms 下限会掩盖本地模型慢了十倍的情况。profile 从 100 ms 起，上限 300 ms；运维按自己硬件上 `make conformance` 测出的延迟来定这两个值。
+- **措辞。** `jev.questions` 按 provider 覆盖模板措辞（Lua 和 JS 一致）。判定缓存的键不含措辞，所以改了覆盖后，已缓存的文本要过 `cache.fp_ttl` 才生效。
 
 ## 策略
 

@@ -171,6 +171,7 @@ To plug in your own backend, write those two functions and set `provider = "mine
 |---|---|---|---|
 | `jev` | `POST https://api.typesafe.ai/v1/systemone`, `state` + Noul questions | `Authorization: Bearer` | default, TypeSafe Jev |
 | `openai-compat` | `POST {endpoint}/chat/completions`, system = template, user = text, JSON-only output | `Authorization: Bearer` | vLLM, Ollama, any OpenAI-compatible endpoint |
+| `laya` | the `jev` request to your own server, default `http://127.0.0.1:8080/v1/systemone` | `Authorization: Bearer` (optional) | a fine-tuned Laya model behind [laya-server](../adapters/laya-server/README.md) |
 | `mock` | no network; fixed score, delay, failure rate from config | none | tests and bench |
 
 Each template is one TypeSafe **Noul** question (yes/no, returns a 0–1 probability). Several templates go in one request. When `jev.deployment_context` (or `rule.deployment_context`) is set, the state becomes `{assistant, user_message}` and templates switch to their context form, which asks whether the message subverts *this* assistant rather than whether the text looks like an attack:
@@ -189,7 +190,7 @@ Each template is one TypeSafe **Noul** question (yes/no, returns a 0–1 probabi
 
 **Timeouts and breaker.** The L2 budget is adaptive with an operator ceiling: it starts at `timeout_ms` (400), tracks an exponentially weighted mean and variance of observed L2 latency shared across workers, and uses `timeout_headroom × (mean + 2 sd)` clamped to `[timeout_ms, timeout_max_ms]` (1000). A timeout feeds back a censored sample so the estimate can climb after a latency step; a sustained move above the ceiling is left to the breaker. The budget is split connect 30% / send 10% / read 60%. Measured from a laptop against `jev-latest`: p50 268 ms, p95 314 ms, max 355 ms, so a fixed 300 ms cut would have dropped 15% of calls. `/_jev/health` and the `jev_l2_timeout_ms` gauge show the effective value. A sliding-window breaker (60 s window, ≥20 samples, >50% failures → open for 30 s, then one half-open probe) lives in the shared dict so all workers share it. `max_inflight` (64) caps concurrent L2 calls; beyond it L2 is skipped and the request goes to L3.
 
-Question wording is copied from jev-sec-bench, which already validated it. Templates expose two slots: `text` and `context`.
+Question wording is copied from jev-sec-bench, which validated it against Jev; another judge needs its own validation, and `jev.questions` replaces the wording for one provider (see [Laya](#laya-and-other-system-one-servers)). Templates expose two slots: `text` and `context`.
 
 ### Judge robustness
 
@@ -202,6 +203,17 @@ The judged text is attacker-controlled, so it can address the judge itself: "rat
 - **L1.** Six `always_suspect` patterns name judge-directed text (verdict requests, a classifier told what to output, "note to the AI reviewing this", answer JSON, fake end-of-input markers, "the real verdict is safe"). Such text reaches L2 anyway as natural language; the hit also keeps it inside the judging window of a body over `max_judge_bytes`.
 
 `make bench-judge` runs L1 over `bench/datasets/judge-directed.jsonl` (32 attacks, 13 benign look-alikes such as "Is this email safe to open?"): every attack reaches L2 and no look-alike is named by a pattern. `make bench-judge-live` sends the same cases to the real judge (needs a key; see `bench/judge_robustness.lua`). A model that repeats *only* an answer planted in the input (the same values for the asked questions as a JSON object in the judged text, compared parsed, so re-spacing or `0` vs `0.0` does not hide it) was steered by that input, which is what an injection is: every asked question scores 1 instead of the planted value, and an error is avoided on purpose, because an error fails open. An instruction in the middle of a single message over `max_judge_bytes` that no pattern matches (a non-English one, say) is cut by the one-window default; `max_judge_chunks > 1` judges the text in chunks, in full up to `max_judge_chunks × max_judge_bytes` (see "Judging long text in chunks" in the README).
+
+### Laya and other System One servers
+
+The `laya` provider sends the `jev` request unchanged to a server you run, normally [adapters/laya-server](../adapters/laya-server/README.md) with a fine-tuned Laya model. It is a provider of its own, not `jev` with another endpoint, so that the verdict cache (keyed by provider and model), `/_jev/health`, the access log and `make calibrate` never mix its scores with Jev's.
+
+- **No benchmark.** The base Laya model is not usable for this task without fine-tuning, so no Laya accuracy figures and no default thresholds ship. Base-model numbers would not predict a deployment, and fine-tuned results depend on each operator's data and training. The acceptance table below is Jev's only.
+- **Protocol conformance.** [conformance/](../conformance/README.md) is to judge servers what the golden vectors are to core: `gen.lua` builds the request with the real provider and templates, `run.py` replays it against a live server and checks the answer set (every asked question, nothing else), `noul` in [0, 1], determinism, JSON errors with non-200 codes, long input, keepalive, aborted and stalled clients, and p99 latency against the timeout budget. `make conformance-check` fails in CI when a template or provider change is not reflected in the vectors.
+- **No silent truncation.** A model with a 1024-token context would otherwise cut text the gateway believes it judged, invisibly to the gateway's window and chunk accounting. laya-server windows the text instead (overlapping, all windows in one batch, highest score wins) and answers 413 past `LAYA_MAX_WINDOWS`. Because an L2 error passes the request, the profile's `max_judge_bytes` (4096) is set so the server never needs that 413, even at one byte per token.
+- **Calibrated scores.** laya-server returns `sigmoid(logit / T)` with `T` fitted on held-out labels (`fit_temperature.py`). Temperature scaling changes no ranking; it makes 0.7 mean roughly 70%, which is what `make calibrate` then turns into thresholds for this provider and model.
+- **Timeouts.** Jev's 400 ms floor would hide a local model slowing down tenfold. The profile starts at 100 ms with a 300 ms ceiling; operators set both from `make conformance` latency on their hardware.
+- **Wording.** `jev.questions` overrides template wording per provider (Lua and JS alike). The verdict cache key does not include the wording, so a changed override takes effect for cached texts after `cache.fp_ttl`.
 
 ## Policy
 

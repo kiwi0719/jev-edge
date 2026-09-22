@@ -29,6 +29,7 @@ jev-edge 跑在 nginx / OpenResty 或 Apache APISIX 里，站在 Envoy、Istio�
 - [body 大小与 L1 读什么](#body-大小与-l1-读什么)
 - [写好部署上下文](#写好部署上下文)
 - [选阈值](#选阈值)
+- [用 Laya 代替 Jev](#用-laya-代替-jev)
 - [误报](#误报)
 - [主体信誉](#主体信誉)
 - [花多少钱](#花多少钱)
@@ -316,6 +317,25 @@ make calibrate LOG=jev.log LABELS=labels.csv MAX_FP=0.001
 
 标注少于几百条时，比率只是方向，不是测量；脚本会说明这一点，并告诉你一条标错会让数字动多少。
 
+一次只校准一个判定器：不同 provider 或 model 的分数不在同一个尺度上，所以混合了它们的日志（换过 `jev.model`，或 Jev 和 Laya 并行）会被拒绝，直到用 `PROVIDER=` 和 `MODEL=` 选定一个。
+
+## 用 Laya 代替 Jev
+
+jev-edge 可以改用你自己部署、微调过的 [Laya](adapters/laya-server/README.md) 模型做判定，走 `laya` provider 和 [adapters/laya-server](adapters/laya-server/)。和 Jev 不同的有四处，每处都有对应的工具。
+
+**不提供 Laya 的 benchmark。** Laya 基础模型不经微调在这个任务上不可用，所以本仓库不发布任何 Laya 的准确率数字、检出率或误报率，也不给默认阈值。基础模型的数字对实际部署没有参考价值；微调后的效果取决于你的数据和训练方式。先按下面的方法测你自己的版本，再考虑 enforce。
+
+1. **HTTP 服务。** Laya 以 Python 库或 ONNX 包的形式提供，本身没有 HTTP 接口。`adapters/laya-server` 按 System One 协议（`POST /v1/systemone`）对外提供服务，附 Dockerfile。它不会悄悄截断：超过一个模型窗口的文本按重叠窗口打分（一个 batch 跑完，取最高分），需要超过 `LAYA_MAX_WINDOWS` 个窗口的文本直接返回 413。
+2. **配置 profile。** [`jev-laya.conf.lua`](adapters/laya-server/jev-laya.conf.lua) 替换掉按 Jev 设的值：L2 超时的下限和上限按本地模型设，不沿用 Jev 的 400 / 1000 ms；`max_judge_bytes = 4096`，保证网关发出的任何文本都在服务端能判的范围内（L2 出错会放行请求，所以生产环境里绝不能出现 413）。
+3. **单独的分数和阈值。** laya-server 使用 `fit_temperature.py` 在留出集上拟合的温度，`noul` 是校准过的概率。访问日志记录 `provider` 和 `model`，`make calibrate` 拒绝混合了多个判定器的日志：用 `PROVIDER=laya MODEL=<你的版本>` 跑。Jev 的 0.7 不能照搬。
+4. **判定问题的措辞需要重新验证。** 自带措辞是针对 Jev（jev-sec-bench）验证的，不是针对 Laya；`deployment_context` 形式最不可能直接适用。按 [`conformance/questions.json`](conformance/questions.json) 里的原文微调，或者在 profile 的 `jev.questions` 里写你自己的措辞，只对这个 provider 生效。
+
+"和 Jev 格式相同"要靠测试验证，而不是默认成立：[`conformance/`](conformance/README.md) 把网关实际构造的请求原样发给任意服务，检查字段、answer 结构、错误码、长输入和超时行为。每个新的服务版本都跑一遍：
+
+```bash
+make conformance ENDPOINT=http://127.0.0.1:8080/v1/systemone STRICT=1 BUDGET_MS=300
+```
+
 ## 误报
 
 值班的人判定某个被拦的请求是正常流量。这个判断要落到两个地方：网关，立刻生效，让同一段文本不再被拦；标注文件，让下一次校准知道这件事。`POST /_jev/feedback` 一次做完两件事。
@@ -400,6 +420,7 @@ L1 放行的流量 p99 多花 24 µs。"健康 Jev"那组是一个 100 ms 应答
 ```
 core/            判定逻辑、模板、策略、熔断 — 不碰 ngx.*；busted spec 在 core/spec
   golden/        golden vectors：跨实现契约，由 gen.lua 生成
+conformance/     System One 协议向量和 run.py：按网关的实际请求检查判定服务（Jev、laya-server）
 adapters/
   openresty/     access_by_lua 胶水、/_jev/{authz,config,forward-auth,health,metrics}、providers/、
                  shared dict 缓存、自适应超时、L3 定时器；Test::Nginx 在 t/
@@ -409,6 +430,7 @@ adapters/
   haproxy/       SPOE agent（Go）、spoe.conf、haproxy.cfg、对真实 HAProxy 的 e2e/
   forward-auth/  traefik.yml、Caddyfile、nginx-auth-request.conf、e2e/（Docker Compose）
   litellm/       调 /_jev/authz 的 LiteLLM proxy guardrail（Python）
+  laya-server/   以 System One 协议提供微调后的 Laya 模型（Python、Dockerfile）、配置 profile、温度拟合
   js/            core 的 TypeScript 移植；Cloudflare、Next.js、Node、Hono、Lambda@Edge、Deno 预设；vitest 回放 core/golden
 rules/           L1 规则集（PCRE 预筛、监控路径、文本字段）
 bench/           离线准确率 bench、Docker 延迟 bench、live 检查、soak、calibrate、labels-from-log、context lint、报告

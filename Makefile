@@ -1,4 +1,4 @@
-.PHONY: test lint check invariants luajit-check golden golden-check calibrate labels context-lint test-js test-openresty bench bench-offline bench-judge bench-judge-live bench-chart dist opm-build rock-lint rock-pack rock-upload install live-check live-full live-openai soak shim e2e-envoy e2e-forward-auth e2e-apisix e2e-kong e2e-haproxy test-litellm
+.PHONY: test lint check invariants luajit-check golden golden-check calibrate labels context-lint test-js test-openresty bench bench-offline bench-judge bench-judge-live bench-chart dist opm-build rock-lint rock-pack rock-upload install live-check live-full live-openai soak shim e2e-envoy e2e-forward-auth e2e-apisix e2e-kong e2e-haproxy test-litellm conformance conformance-vectors conformance-check test-laya
 
 test:
 	busted
@@ -9,7 +9,7 @@ test:
 #   make lint LUACHECK=~/.luarocks/bin/luacheck
 LUACHECK ?= luacheck
 lint:
-	$(LUACHECK) core rules scripts $$(ls -d adapters bench 2>/dev/null)
+	$(LUACHECK) core rules scripts conformance $$(ls -d adapters bench 2>/dev/null)
 
 # Every core file must at least compile under LuaJIT (the OpenResty runtime).
 LUAJIT ?= luajit
@@ -17,7 +17,7 @@ luajit-check:
 	@for f in $$(find core rules -name '*.lua' -not -path '*/spec/*'); do \
 	  $(LUAJIT) -e "assert(loadfile('$$f'))" || exit 1; done; echo "luajit ok"
 
-check: lint invariants luajit-check golden-check test
+check: lint invariants luajit-check golden-check conformance-check test
 
 # Tripwires for bug classes a past audit found (scripts/invariants.lua).
 invariants:
@@ -36,6 +36,33 @@ golden-check:
 	  else diff -ru core/golden $$tmp --exclude=gen.lua --exclude=README.md | head -40; \
 	    echo "golden vectors are stale: run 'make golden' and commit core/golden/*.json"; rm -rf $$tmp; exit 1; fi
 
+# Protocol conformance for judge servers (conformance/gen.lua): the System One
+# request as the gateway builds it, checked against a live server.
+#   make conformance ENDPOINT=http://127.0.0.1:8080/v1/systemone [API_KEY=...] [MODEL=laya]
+#                    [STRICT=1] [MOCK=1] [BUDGET_MS=250]
+# `conformance-vectors` regenerates the vectors after a template or provider
+# change; `conformance-check` fails when the committed ones are stale.
+conformance:
+	python3 conformance/run.py --endpoint $${ENDPOINT:?set ENDPOINT=<judge url>} \
+	  $${API_KEY:+--api-key $$API_KEY} $${MODEL:+--model $$MODEL} $${BUDGET_MS:+--budget-ms $$BUDGET_MS} \
+	  $(if $(STRICT),--strict) $(if $(MOCK),--mock)
+
+conformance-vectors:
+	lua conformance/gen.lua
+
+conformance-check:
+	@tmp=$$(mktemp -d) && lua conformance/gen.lua $$tmp 2>/dev/null && \
+	  if diff -u conformance/vectors.json $$tmp/vectors.json >/dev/null && \
+	     diff -u conformance/questions.json $$tmp/questions.json >/dev/null; then \
+	    echo "conformance vectors ok"; rm -rf $$tmp; \
+	  else diff -u conformance $$tmp | head -40; \
+	    echo "conformance vectors are stale: run 'make conformance-vectors' and commit conformance/*.json"; rm -rf $$tmp; exit 1; fi
+
+# laya-server (adapters/laya-server): unit tests, and the whole conformance
+# suite in process against its mock backend. Standard library only.
+test-laya:
+	cd adapters/laya-server && python3 -m unittest -v test_laya_server
+
 # JavaScript adapter: the TypeScript core replays the same golden vectors (needs pnpm).
 test-js:
 	cd adapters/js && pnpm install --frozen-lockfile --silent && pnpm typecheck && pnpm test
@@ -47,6 +74,8 @@ context-lint:
 
 # Threshold calibration from monitor-mode logs plus labels:
 #   make calibrate LOG=/var/log/nginx/jev.log LABELS=labels.csv [MAX_FP=0.001]
+# One judge per run: a log with scores from several providers / models is
+# refused until PROVIDER= (and MODEL=) picks one, e.g. PROVIDER=jev MODEL=laya.
 # Operator feedback (POST /_jev/feedback) is written to the jev access log, not
 # to a file; this derives the labels file calibrate reads from those log lines:
 #   make labels LOG=/var/log/nginx/jev.log OUT=bench/datasets/labels.csv
@@ -54,7 +83,8 @@ labels:
 	lua bench/labels-from-log.lua $${LOG:?set LOG=<jev access log>} $${OUT:+-o $$OUT}
 
 calibrate:
-	lua bench/calibrate.lua $${LOG:?set LOG=<jev access log>} $${LABELS:-} $${MAX_FP:+--max-fp $$MAX_FP}
+	lua bench/calibrate.lua $${LOG:?set LOG=<jev access log>} $${LABELS:-} $${MAX_FP:+--max-fp $$MAX_FP} \
+	  $${PROVIDER:+--provider $$PROVIDER} $${MODEL:+--model $$MODEL}
 
 # Integration tests run in the official OpenResty image (needs Docker).
 # --init matters: without a reaper Test::Nginx waits on zombie masters.

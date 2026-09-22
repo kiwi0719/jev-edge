@@ -29,6 +29,7 @@ It is built for SREs and platform engineers, not agent authors. Existing Jev gua
 - [Body size and what L1 reads](#body-size-and-what-l1-reads)
 - [Writing the deployment context](#writing-the-deployment-context)
 - [Choosing thresholds](#choosing-thresholds)
+- [Using Laya instead of Jev](#using-laya-instead-of-jev)
 - [False positives](#false-positives)
 - [Subject reputation](#subject-reputation)
 - [What it costs](#what-it-costs)
@@ -316,6 +317,25 @@ make calibrate LOG=jev.log LABELS=labels.csv MAX_FP=0.001
 
 Under a few hundred labelled requests the rates are a direction, not a measurement; the script says so and tells you how far one mislabel moves them.
 
+One judge per run: scores from different providers or models are not on the same scale, so a log that mixes them (after switching `jev.model`, or Jev and Laya side by side) is refused until `PROVIDER=` and `MODEL=` pick one.
+
+## Using Laya instead of Jev
+
+jev-edge can judge with a fine-tuned [Laya](adapters/laya-server/README.md) model you host yourself, through the `laya` provider and [adapters/laya-server](adapters/laya-server/). Four things differ from Jev, and each has its own tooling.
+
+**No benchmark ships for Laya.** The base Laya model is not usable for this task without fine-tuning, so this repository publishes no Laya accuracy numbers, no detection or false-positive rates, and no default thresholds. Numbers for the base model would say nothing about a deployment, and the result after fine-tuning depends on your data and your training. Measure your own build (below) before you enforce anything.
+
+1. **An HTTP server.** Laya ships as a Python library or ONNX package, not as an HTTP API. `adapters/laya-server` serves it over the System One protocol (`POST /v1/systemone`), with a Dockerfile. It never truncates silently: text longer than one model window is scored in overlapping windows (all in one batch, highest score wins), and text past `LAYA_MAX_WINDOWS` windows is refused with 413.
+2. **A config profile.** [`jev-laya.conf.lua`](adapters/laya-server/jev-laya.conf.lua) replaces the Jev-sized values: an L2 timeout floor and ceiling sized for a local model instead of Jev's 400 / 1000 ms, and `max_judge_bytes = 4096` so no text the gateway sends can exceed what the server judges (an L2 error passes the request, so a 413 must never happen in production).
+3. **Scores and thresholds of its own.** laya-server applies a temperature fitted by `fit_temperature.py` on held-out labels, so `noul` is a calibrated probability. The access log records `provider` and `model`, and `make calibrate` refuses a log that mixes judges: run it with `PROVIDER=laya MODEL=<your build>`. Jev's 0.7 does not carry over.
+4. **Question wording to re-validate.** The bundled wording was validated against Jev (jev-sec-bench), not Laya, and the `deployment_context` form is the least likely to transfer. Fine-tune on the exact wording in [`conformance/questions.json`](conformance/questions.json), or put your own under `jev.questions` in the profile; it applies to that provider only.
+
+"Same format as Jev" is checked, not assumed: [`conformance/`](conformance/README.md) replays the request exactly as the gateway builds it against any server and checks fields, the answer structure, error codes, long input and timeout behaviour. Run it against every new server build:
+
+```bash
+make conformance ENDPOINT=http://127.0.0.1:8080/v1/systemone STRICT=1 BUDGET_MS=300
+```
+
 ## False positives
 
 Someone on call decides a blocked request was legitimate. That decision has to reach two places: the gateway, now, so the same text stops being blocked; and the labels, so the next calibration knows about it. `POST /_jev/feedback` does both.
@@ -400,6 +420,7 @@ The full design lives in [docs/design.md](docs/design.md): scope, architecture, 
 ```
 core/            judgment logic, templates, policy, breaker — no ngx.*; busted specs in core/spec
   golden/        golden vectors: the cross-implementation contract, gen.lua produces them
+conformance/     System One protocol vectors and run.py: checks a judge server (Jev, laya-server) against the gateway's request
 adapters/
   openresty/     access_by_lua glue, /_jev/{authz,config,forward-auth,health,metrics}, providers/,
                  shared-dict cache, adaptive timeout, L3 timer; Test::Nginx in t/
@@ -409,6 +430,7 @@ adapters/
   haproxy/       SPOE agent (Go), spoe.conf, haproxy.cfg, e2e/ against real HAProxy
   forward-auth/  traefik.yml, Caddyfile, nginx-auth-request.conf, e2e/ (Docker Compose)
   litellm/       LiteLLM proxy guardrail (Python) that calls /_jev/authz
+  laya-server/   a fine-tuned Laya model over the System One protocol (Python, Dockerfile), config profile, temperature fit
   js/            TypeScript port of core; Cloudflare, Next.js, Node, Hono, Lambda@Edge, Deno presets; vitest replays core/golden
 rules/           L1 rule sets (PCRE prefilter, watch paths, text fields)
 bench/           offline accuracy bench, Docker latency bench, live checks, soak, calibrate, labels-from-log, context lint, report

@@ -1,11 +1,13 @@
-// Providers turn a core prompt into an L2 answer map. Four ship:
+// Providers turn a core prompt into an L2 answer map. Five ship:
 //   jev            TypeSafe System One HTTP API (same request as the Lua provider)
+//   laya           the same protocol, served by adapters/laya-server
 //   openai-compat  any OpenAI-style chat endpoint
 //   backend        an existing jev-edge (OpenResty/Envoy) reached at /_jev/authz:
 //                  the "thin Worker" mode, one set of thresholds for edge and origin
 //   mock           fixed score, no network
 import type { Prompt, Answers } from "../core/judge.js";
-import type { JevConfig } from "../core/defaults.js";
+import type { JevConfig, QuestionWording } from "../core/defaults.js";
+import type { Template } from "../core/templates.js";
 
 export type JudgeResult = [Answers, null] | [null, string];
 
@@ -75,46 +77,71 @@ function errorString(e: unknown, timeoutMs: number): string {
 
 // ---------------------------------------------------------------------------
 
-export const jev: Provider = {
-  name: "jev",
-  async call(prompt, cfg, timeoutMs) {
-    const deployment = prompt.context.deployment || undefined;
-    const questions: Record<string, unknown> = {};
-    for (const [name, t] of Object.entries(prompt.questions)) {
-      const instr = (deployment && t.instructions_ctx) || t.instructions;
-      const crit = (deployment && t.criteria_ctx) || t.criteria;
-      const q: Record<string, unknown> = { type: "noul", instructions: instr };
-      if (crit) q.criteria = { true: crit.true, false: crit.false };
-      questions[name] = q;
-    }
-    const state: unknown = deployment ? { assistant: deployment, user_message: prompt.text } : prompt.text;
-    const body = JSON.stringify({ model: cfg.model ?? "jev-latest", state, questions });
-    const headers: Record<string, string> = { "Content-Type": "application/json" };
-    if (cfg.api_key) headers.Authorization = "Bearer " + cfg.api_key;
-    let decoded: { answers?: Record<string, { noul?: unknown }> };
-    try {
-      decoded = await fetchWithin(cfg.endpoint ?? "https://api.typesafe.ai/v1/systemone", { method: "POST", headers, body }, timeoutMs, async (res) => {
-        if (res.status !== 200) throw new HttpStatus(res.status);
-        try {
-          return (await res.json()) as typeof decoded;
-        } catch (e) {
-          if (e instanceof Error && e.name === "AbortError") throw e;
-          throw new Error("malformed response");
-        }
-      });
-    } catch (e) {
-      if (e instanceof HttpStatus) return [null, "jev http " + e.status];
-      if (e instanceof Error && e.message === "malformed response") return [null, "jev: malformed response"];
-      return [null, errorString(e, timeoutMs)];
-    }
-    if (!decoded || typeof decoded.answers !== "object" || decoded.answers === null) return [null, "jev: malformed response"];
-    const answers: Answers = {};
-    for (const [name, a] of Object.entries(decoded.answers)) {
-      if (a && typeof a === "object" && typeof a.noul === "number") answers[name] = a.noul;
-    }
-    return [answers, null];
-  },
-};
+/**
+ * A System One provider (the jev request and response). `laya` reuses it with
+ * its own name, default model and endpoint, so its scores stay apart from
+ * jev's in the cache and the log. Mirrors providers/jev.lua, including the
+ * per-provider question wording in cfg.questions.
+ */
+function systemOne(name: string, defaults: { model: string; url: string }): Provider {
+  return {
+    name,
+    async call(prompt, cfg, timeoutMs) {
+      const deployment = prompt.context.deployment || undefined;
+      const questions: Record<string, unknown> = {};
+      for (const [qname, base] of Object.entries(prompt.questions)) {
+        const over = cfg.questions?.[qname];
+        const t = over ? { ...base, ...pickWording(over) } : base;
+        const instr = (deployment && t.instructions_ctx) || t.instructions;
+        const crit = (deployment && t.criteria_ctx) || t.criteria;
+        const q: Record<string, unknown> = { type: "noul", instructions: instr };
+        if (crit) q.criteria = { true: crit.true, false: crit.false };
+        questions[qname] = q;
+      }
+      const state: unknown = deployment ? { assistant: deployment, user_message: prompt.text } : prompt.text;
+      const body = JSON.stringify({ model: cfg.model ?? defaults.model, state, questions });
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (cfg.api_key) headers.Authorization = "Bearer " + cfg.api_key;
+      let decoded: { answers?: Record<string, { noul?: unknown }> };
+      try {
+        decoded = await fetchWithin(cfg.endpoint ?? defaults.url, { method: "POST", headers, body }, timeoutMs, async (res) => {
+          if (res.status !== 200) throw new HttpStatus(res.status);
+          try {
+            return (await res.json()) as typeof decoded;
+          } catch (e) {
+            if (e instanceof Error && e.name === "AbortError") throw e;
+            throw new Error("malformed response");
+          }
+        });
+      } catch (e) {
+        if (e instanceof HttpStatus) return [null, `${name} http ${e.status}`];
+        if (e instanceof Error && e.message === "malformed response") return [null, `${name}: malformed response`];
+        return [null, errorString(e, timeoutMs)];
+      }
+      if (!decoded || typeof decoded.answers !== "object" || decoded.answers === null) return [null, `${name}: malformed response`];
+      const answers: Answers = {};
+      for (const [qname, a] of Object.entries(decoded.answers)) {
+        if (a && typeof a === "object" && typeof a.noul === "number") answers[qname] = a.noul;
+      }
+      return [answers, null];
+    },
+  };
+}
+
+/** Only the four wording fields of an override; anything else is ignored. */
+function pickWording(o: QuestionWording): Partial<Template> {
+  const out: Partial<Template> = {};
+  if (o.instructions !== undefined) out.instructions = o.instructions;
+  if (o.instructions_ctx !== undefined) out.instructions_ctx = o.instructions_ctx;
+  if (o.criteria !== undefined) out.criteria = { true: o.criteria.true ?? "", false: o.criteria.false ?? "" };
+  if (o.criteria_ctx !== undefined) out.criteria_ctx = { true: o.criteria_ctx.true ?? "", false: o.criteria_ctx.false ?? "" };
+  return out;
+}
+
+export const jev: Provider = systemOne("jev", { model: "jev-latest", url: "https://api.typesafe.ai/v1/systemone" });
+
+/** A fine-tuned Laya model behind adapters/laya-server (or any server that passes conformance/). */
+export const laya: Provider = systemOne("laya", { model: "laya", url: "http://127.0.0.1:8080/v1/systemone" });
 
 // ---------------------------------------------------------------------------
 
@@ -425,7 +452,7 @@ export const mock: Provider = {
   },
 };
 
-export const PROVIDERS: Record<string, Provider> = { jev, "openai-compat": openaiCompat, backend, mock };
+export const PROVIDERS: Record<string, Provider> = { jev, laya, "openai-compat": openaiCompat, backend, mock };
 
 export function load(name: string): Provider {
   const p = PROVIDERS[name];

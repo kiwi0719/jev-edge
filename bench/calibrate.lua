@@ -26,6 +26,14 @@
 -- Usage (from the repo root, or via `make calibrate LOG=... LABELS=...`):
 --   lua bench/calibrate.lua <jev.log> [labels.csv] [--max-fp 0.001] [--json]
 --       [--rep-window 600] [--rep-suspicious 1] [--rep-malicious 3]
+--       [--provider jev] [--model jev-latest]
+--
+-- One judge at a time: scores from different providers or models are not on
+-- the same scale (a threshold tuned on jev means nothing for a Laya server),
+-- so lines are grouped by their `provider` / `model` fields (0.6.0+ logs).
+-- A log that mixes groups is refused until --provider (and, when one provider
+-- ran several models, --model) picks one; run calibrate once per group.
+-- Lines written before those fields existed form the group "?".
 --
 -- No dependencies beyond dkjson. Never reads request bodies; the log does not
 -- contain them.
@@ -40,17 +48,20 @@ local json = require "dkjson"
 local log_path, labels_path
 local max_fp, as_json = 0.001, false
 local rep_window, rep_w_susp, rep_w_mal = 600, 1, 3
+local want_provider, want_model
 do
   local i = 1
   while i <= #arg do
     local a = arg[i]
     if a == "--max-fp" then max_fp = assert(tonumber(arg[i + 1]), "--max-fp needs a number"); i = i + 1
     elseif a == "--json" then as_json = true
+    elseif a == "--provider" then want_provider = assert(arg[i + 1], "--provider needs a name"); i = i + 1
+    elseif a == "--model" then want_model = assert(arg[i + 1], "--model needs a name"); i = i + 1
     elseif a == "--rep-window" then rep_window = assert(tonumber(arg[i + 1]), "--rep-window needs seconds"); i = i + 1
     elseif a == "--rep-suspicious" then rep_w_susp = assert(tonumber(arg[i + 1])); i = i + 1
     elseif a == "--rep-malicious" then rep_w_mal = assert(tonumber(arg[i + 1])); i = i + 1
     elseif a == "-h" or a == "--help" then
-      io.stderr:write("usage: lua bench/calibrate.lua <jev.log> [labels] [--max-fp 0.001] [--json]\n")
+      io.stderr:write("usage: lua bench/calibrate.lua <jev.log> [labels] [--max-fp 0.001] [--json] [--provider P] [--model M]\n")
       os.exit(0)
     elseif not log_path then log_path = a
     elseif not labels_path and a ~= "" then labels_path = a
@@ -59,7 +70,7 @@ do
   end
 end
 if not log_path then
-  io.stderr:write("usage: lua bench/calibrate.lua <jev.log> [labels] [--max-fp 0.001] [--json]\n")
+  io.stderr:write("usage: lua bench/calibrate.lua <jev.log> [labels] [--max-fp 0.001] [--json] [--provider P] [--model M]\n")
   os.exit(2)
 end
 
@@ -67,7 +78,15 @@ end
 -- read the log
 -- ---------------------------------------------------------------------------
 
+-- "?" for lines written before provider / model were logged
+local function judge_of(obj)
+  local pr = type(obj.provider) == "string" and obj.provider ~= "" and obj.provider or "?"
+  local mo = type(obj.model) == "string" and obj.model ~= "" and obj.model or "?"
+  return pr, mo
+end
+
 local rows, skipped, bad = {}, 0, 0
+local groups, other_judge = {}, 0
 local by_src = {}
 local by_subject, n_subject_lines = {}, 0
 do
@@ -76,8 +95,12 @@ do
     local line = raw:match("^%s*(.-)%s*$")
     if line ~= "" then
       local obj = json.decode(line)
+      local pr, mo
+      if type(obj) == "table" then pr, mo = judge_of(obj) end
       if type(obj) ~= "table" then
         bad = bad + 1
+      elseif (want_provider and pr ~= want_provider) or (want_model and mo ~= want_model) then
+        other_judge = other_judge + 1
       else
         by_src[obj.src or "?"] = (by_src[obj.src or "?"] or 0) + 1
         if type(obj.subject) == "string" and obj.subject ~= "" and tonumber(obj.ts) then
@@ -88,6 +111,8 @@ do
         end
         local score = tonumber(obj.score)
         if (obj.src == "l2" or obj.src == "cache") and score then
+          local g = pr .. " / " .. mo
+          groups[g] = (groups[g] or 0) + 1
           rows[#rows + 1] = { rid = obj.rid, fp = obj.fp, score = score, path = obj.path,
             verdict = obj.verdict, action = obj.action }
         else
@@ -100,9 +125,23 @@ do
 end
 
 if #rows == 0 then
-  io.stderr:write("no scored requests in " .. log_path .. " (need src=l2 or src=cache lines)\n")
+  io.stderr:write("no scored requests in " .. log_path .. " (need src=l2 or src=cache lines"
+    .. ((want_provider or want_model) and ", from the selected provider / model" or "") .. ")\n")
   os.exit(1)
 end
+
+local group_names = {}
+for g in pairs(groups) do group_names[#group_names + 1] = g end
+table.sort(group_names)
+if #group_names > 1 then
+  io.stderr:write("the log mixes scores from several judges; their scores are not comparable.\n"
+    .. "Run calibrate once per judge with --provider (and --model):\n")
+  for _, g in ipairs(group_names) do
+    io.stderr:write(string.format("  %-40s %d scored\n", g, groups[g]))
+  end
+  os.exit(2)
+end
+local judge_name = group_names[1]
 
 -- ---------------------------------------------------------------------------
 -- read labels (optional)
@@ -293,6 +332,7 @@ if as_json then
       fp_rate = n_labels > 0 and fpr or nil, miss_rate = n_labels > 0 and miss or nil }
   end
   print(json.encode({
+    judge = judge_name, other_judge = other_judge,
     scored = #rows, skipped = skipped, malformed = bad, by_source = by_src,
     labelled = #labelled, attacks = n_pos, benign = n_neg, auc = the_auc,
     thresholds = per_t, max_fp = max_fp,
@@ -307,6 +347,8 @@ local function p(...) io.write(string.format(...), "\n") end
 p("# jev-edge calibration")
 p("")
 p("log: %s", log_path)
+p("judge (provider / model): %s%s", judge_name,
+  other_judge > 0 and string.format("   (%d lines from other judges left out)", other_judge) or "")
 p("scored requests (src=l2 or cache): %d   ignored (l1 / breaker / error): %d   malformed lines: %d", #rows, skipped, bad)
 do
   local parts = {}

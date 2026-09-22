@@ -17,6 +17,7 @@
 // a deployment choice -- `record` can be dropped into waitUntil -- instead of
 // something the request path has to wait for.
 import type { Verdict } from "./verdict";
+import type { Store } from "./breaker";
 
 export const FORMAT = 1;
 export const KEY_PREFIX = "subj:";
@@ -83,6 +84,71 @@ export function append(history: unknown, e: Entry, maxEntries = 20): Entry[] {
 
 export function key(id: string): string {
   return KEY_PREFIX + id;
+}
+
+// ---------------------------------------------------------------------------
+// Ring layout, port of core/subject.lua ring_append / ring_load. Same keys, so
+// a store shared with another implementation agrees.
+// One list per subject (`append` above) is a read-modify-write, and two
+// requests appending at once lose an entry. The ring keeps one counter per
+// subject (`incr`, atomic in the memory and Durable Object stores) and one key
+// per entry, `subj:<id>:<(n-1) % max>`, so a write is an incr and a set and
+// needs no lock. Reading is `max` gets, newest last.
+// Each slot holds `{ n: <sequence>, e: <entry> }`; a reader keeps a slot only
+// when its sequence is the one it expects there, so a slot still holding the
+// previous lap (read between another request's incr and set) or written under
+// a different max_entries is a hole, not a misplaced entry.
+// `incr` sets the ttl only when it creates the counter; `expire` (when the
+// store has it) extends it on every append, so an active subject keeps its
+// history for `ttl` after its last request, not after its first.
+// ---------------------------------------------------------------------------
+
+interface Slot { n: number; e: Entry }
+
+/** Append one entry to the ring. false on a store without `incr`. */
+export async function ringAppend(store: Store | undefined, id: string | null, e: Entry, maxEntries = 20, ttl = 3600): Promise<boolean> {
+  if (!store || !id || typeof store.incr !== "function") return false;
+  const max = Math.max(1, Number(maxEntries) || 20);
+  const t = Number.isFinite(Number(ttl)) ? Number(ttl) : 3600;
+  const k = key(id);
+  const n = Number(await store.incr(k + ":n", 1, t));
+  if (!Number.isFinite(n) || n < 1) return false;
+  if (typeof store.expire === "function") await store.expire(k + ":n", t);
+  await store.set(k + ":" + ((n - 1) % max), { n, e } satisfies Slot, t);
+  return true;
+}
+
+/** The newest `maxEntries` entries, oldest first, or null when there are none. */
+export async function ringLoad(store: Store | undefined, id: string | null, maxEntries = 20): Promise<Entry[] | null> {
+  if (!store || !id) return null;
+  const max = Math.max(1, Number(maxEntries) || 20);
+  const k = key(id);
+  const n = Number(await store.get(k + ":n")) || 0;
+  if (n <= 0) return null;
+  const out: Entry[] = [];
+  for (let i = Math.max(1, n - max + 1); i <= n; i++) {
+    const s = (await store.get(k + ":" + ((i - 1) % max))) as Slot | undefined;
+    // an evicted, expired, stale or foreign slot is a hole, not an error
+    if (s && typeof s === "object" && s.n === i && s.e && typeof s.e === "object") out.push(s.e);
+  }
+  return out.length ? out : null;
+}
+
+/** History for the request path: the ring when the store has `incr`, else the
+ *  one-list layout (custom stores with only get/set keep working). */
+export async function loadHistory(store: Store, id: string, maxEntries = 20): Promise<unknown> {
+  if (typeof store.incr === "function") return ringLoad(store, id, maxEntries);
+  return store.get(key(id));
+}
+
+/** The write behind `record`: ring append, or the list read-then-write on a
+ *  store without `incr` (which can lose an entry to a concurrent append). */
+export async function appendHistory(store: Store, id: string, e: Entry, maxEntries = 20, ttl = 3600): Promise<void> {
+  if (typeof store.incr === "function") {
+    await ringAppend(store, id, e, maxEntries, ttl);
+    return;
+  }
+  await store.set(key(id), append(await store.get(key(id)), e, maxEntries), ttl);
 }
 
 /** Cookie header -> one cookie's value, or null. */

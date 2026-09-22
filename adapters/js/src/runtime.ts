@@ -223,15 +223,13 @@ async function subjectCtx(rt: Runtime, request: Request, clientIp: string, rctx?
   const id = await subjectMod.hashId(scfg, raw, subjectMod.sha256Hex);
   if (!id) return undefined;
   const store = rt.subjectStore;
-  const k = subjectMod.key(id);
   return {
     id,
-    history: await store.get(k),
+    // ring layout (incr + one key per entry) when the store has incr, so
+    // concurrent requests do not lose entries; the one-list layout otherwise
+    history: await subjectMod.loadHistory(store, id, scfg.max_entries),
     record: (e) => {
-      const p = (async () => {
-        const h = subjectMod.append(await store.get(k), e, scfg.max_entries);
-        await store.set(k, h, scfg.history_ttl ?? 3600);
-      })().catch(() => {});
+      const p = subjectMod.appendHistory(store, id, e, scfg.max_entries, scfg.history_ttl ?? 3600).catch(() => {});
       // On Workers the isolate may be torn down right after the response;
       // waitUntil keeps the write alive. Elsewhere it is plain fire-and-forget.
       if (rctx?.waitUntil) {

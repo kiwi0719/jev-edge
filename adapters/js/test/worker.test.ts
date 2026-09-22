@@ -139,7 +139,10 @@ describe("handle", () => {
     expect(subjectId).toMatch(/^ip:[0-9a-f]{64}$/);
     expect(kept).toHaveLength(1);
     await Promise.all(kept);
-    expect(await rt.subjectStore.get("subj:" + subjectId)).toHaveLength(1);
+    // the default memory store has incr, so the write went to the ring
+    const { ringLoad } = await import("../src/core/subject");
+    expect(await ringLoad(rt.subjectStore, subjectId!, 20)).toHaveLength(1);
+    expect(await rt.subjectStore.get("subj:" + subjectId)).toBeUndefined();
   });
 
   it("fails open when the provider errors", async () => {

@@ -27,6 +27,13 @@ export const DEFAULTS: Required<BreakerConfig> = {
 export interface Store {
   get(key: string): unknown | Promise<unknown>;
   set(key: string, value: unknown, ttl: number): void | Promise<void>;
+  /** Optional: add `by` to a numeric key and return the new value, creating
+   *  it (with `ttl`) when absent. Atomic in the memory and Durable Object
+   *  stores; the subject ring (core/subject.ts) uses it and falls back to a
+   *  read-modify-write list on a store without it. */
+  incr?(key: string, by: number, ttl: number): number | Promise<number>;
+  /** Optional: reset a key's ttl without rewriting it. */
+  expire?(key: string, ttl: number): void | Promise<void>;
 }
 
 interface StateRec { state?: number; until_ts?: number }
@@ -132,6 +139,12 @@ export function memoryStore(): Store & { dump(): Map<string, unknown> } {
     set: (k, v) => {
       if (v === null || v === undefined) m.delete(k);
       else m.set(k, v);
+    },
+    // synchronous, so atomic within the process; no ttl here, as for set
+    incr: (k, by) => {
+      const n = (Number(m.get(k)) || 0) + by;
+      m.set(k, n);
+      return n;
     },
     dump: () => m,
   };

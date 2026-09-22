@@ -754,9 +754,9 @@
     },
     {
       "expect": {
-        "reason": "ip trusted",
-        "result": "pass",
-        "text": ""
+        "reason": "natural language",
+        "result": "suspect",
+        "text": "Please write a detailed summary of the attached quarterly report."
       },
       "input": {
         "cache": {
@@ -777,7 +777,7 @@
         },
         "rule": "llm-endpoints"
       },
-      "name": "ip trusted"
+      "name": "ip trust is not a bypass"
     },
     {
       "expect": {
@@ -1450,7 +1450,7 @@
       "name": "a JSON field mentioned in prose is not an answer"
     }
   ],
-  "core_version": "0.6.0",
+  "core_version": "0.6.1",
   "format_version": 1,
   "generated_by": "core/golden/gen.lua",
   "suite": "rules"

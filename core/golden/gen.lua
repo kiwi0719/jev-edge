@@ -300,7 +300,9 @@ rules_case("exactly min_text_chars", req(string.rep("a", 20)))
 rules_case("one under min_text_chars", req(string.rep("a", 19)))
 rules_case("ip reputation blocked", req(LONG), { cache = { ["rep:203.0.113.7"] = { blocked_until = 2000 } } })
 rules_case("ip reputation expired", req(LONG), { cache = { ["rep:203.0.113.7"] = { blocked_until = 900 } } })
-rules_case("ip trusted", req(LONG), { cache = { ["rep:203.0.113.7"] = { trusted_until = 2000 } } })
+-- reputation never passes: a stray trusted_until (IP trust was read here once,
+-- and never written) must not skip L2
+rules_case("ip trust is not a bypass", req(LONG), { cache = { ["rep:203.0.113.7"] = { trusted_until = 2000 } } })
 rules_case("reputation checked before body", req("", { no_body = true }),
   { cache = { ["rep:203.0.113.7"] = { blocked_until = 2000 } } })
 
@@ -758,6 +760,8 @@ eval_case("untrusted: an Anthropic tool_result block", {
   req = raw_req(U_ANTHROPIC), config = U_ON_ENF, judge = U_SCORES })
 eval_case("untrusted: a Responses function_call_output item", {
   req = raw_req(U_RESPONSES), config = U_ON_ENF, judge = U_SCORES })
+eval_case("untrusted off: a Responses function_call_output is judged with the whole text", {
+  req = raw_req(U_RESPONSES), config = { policy = { mode = "enforce" } }, judge = U_SCORES })
 eval_case("untrusted: tool_results = false leaves tool messages to the whole text", {
   req = raw_req(U_TOOL), judge = U_SCORES,
   config = { untrusted = { enabled = true, tool_results = false }, policy = { mode = "enforce" } } })

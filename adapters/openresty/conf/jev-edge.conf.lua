@@ -51,6 +51,6 @@ return {
   breaker = { window_s = 60, min_samples = 20, fail_ratio = 0.5, open_s = 30 },
   -- Retrieved content (tool results, and any `fields` path) judged on its own
   -- with the `untrusted` question, in a parallel call; one more provider call
-  -- per request that carries it. README, "Retrieved content".
+  -- per request that carries it. docs/design.md, "Retrieved content".
   untrusted = { enabled = false, tool_results = true, fields = {} },
 }

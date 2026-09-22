@@ -62,7 +62,7 @@ export const abuse: Template = {
 
 // Asked of retrieved content only (tool results, untrusted.fields), and only
 // when untrusted.enabled is on; no context form, it is asked without the
-// deployment context. Measured in bench/suite (README, "Experiment: judging
+// deployment context. Measured in bench/suite (bench/suite/README.md, "Experiment: judging
 // retrieved content on its own").
 export const untrusted: Template = {
   instructions:

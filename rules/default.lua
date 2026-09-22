@@ -4,6 +4,6 @@ return {
   id = "default",
   watch_paths = {},
   methods = { POST = true },
-  text_fields = { "prompt", "input", "text" },
+  text_fields = { "prompt", "input", "input[*].output", "text" },
   templates = { "injection" },
 }

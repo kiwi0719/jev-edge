@@ -10,6 +10,8 @@
 --               moving the hot verdict cache too.
 --   judge       { call = fn(prompt, timeout_ms) -> answers|nil, err }
 --                 answers: { [template_name] = probability }
+--                 err == judge.BUSY: the adapter's own in-flight cap refused
+--                 the call; not a provider failure, not fed to the breaker
 --   breaker     object from core/breaker.lua (optional)
 --   subject     optional { id = string, history = table|nil, record = fn(entry) }
 --                 Per-subject trajectory (core/subject.lua). Absent, or absent
@@ -30,7 +32,7 @@ local verdict   = require "jev.core.verdict"
 local subject   = require "jev.core.subject"
 local defaults  = require "jev.core.defaults"
 
-local _M = { _VERSION = "0.6.0" }
+local _M = { _VERSION = "0.6.1" }
 
 local function log(ctx, level, msg)
   if ctx.log then ctx.log(level, msg) end
@@ -127,22 +129,25 @@ local function judge_parts(ctx, rule, parts, suffix, fp, ckey, reason)
   end
   local elapsed = now_ms(ctx) - t0
 
-  local err
+  local err, failed, answered
   for k, p in ipairs(pending) do
     local a, e = results[k] and results[k][1], results[k] and results[k][2]
     local s, t, n
     if a then s, t, n = judge.reduce(a) end
     if not a or n == 0 then
       err = err or tostring(e or (a and "no scores in answer") or "error")
+      if e ~= judge.BUSY then failed = true end
     else
+      answered = true
       scores[p.i], tops[p.i] = s, t
       if p.ck and ctx.cache then
         ctx.cache:set(p.ck, { score = s, reason = t .. " " .. string.format("%.2f", s) }, cfg.cache.fp_ttl)
       end
     end
   end
-  if ctx.breaker and #pending > 0 then
-    if err then ctx.breaker:failure() else ctx.breaker:success() end
+  -- only calls that reached the provider say anything about its health
+  if ctx.breaker then
+    if failed then ctx.breaker:failure() elseif answered then ctx.breaker:success() end
   end
 
   local best, top = nil, ""
@@ -295,7 +300,7 @@ function _M.evaluate(req, ctx)
   local elapsed = now_ms(ctx) - t0
 
   if not answers then
-    if ctx.breaker then ctx.breaker:failure() end
+    if ctx.breaker and jerr ~= judge.BUSY then ctx.breaker:failure() end
     log(ctx, "warn", "jev-edge: L2 failed: " .. tostring(jerr))
     local action, label, async = policy.on_error()
     return finish(ctx, verdict.new({ action = action, verdict = label, async = async,

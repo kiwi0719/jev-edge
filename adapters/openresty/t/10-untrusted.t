@@ -102,7 +102,7 @@ Content-Type: application/json
 
 
 
-=== TEST 5: a Responses function_call_output is read only with untrusted on
+=== TEST 5: a Responses function_call_output: whole text off, on its own with untrusted on
 --- http_config eval: $::HttpConfig
 --- user_files eval: ::uconf('policy = { mode = "monitor" },')
 --- config eval

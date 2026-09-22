@@ -207,16 +207,15 @@ function _M.evaluate(req, rule, ctx)
   end
 
   -- 2. reputation: one dict lookup, before anything that needs a body, so a
-  --    headers-only forward-auth request can still be rejected or trusted
+  --    headers-only forward-auth request can still be rejected. Reputation
+  --    only ever blocks: a run of safe verdicts earns an IP nothing, or an
+  --    attacker could warm one up with harmless requests and skip L2 after.
   if ctx and ctx.cache and req.client_ip then
     local rep = ctx.cache:get("rep:" .. req.client_ip)
     if type(rep) == "table" then
       local now = ctx.clock and ctx.clock() or 0
       if rep.blocked_until and rep.blocked_until > now then
         return _M.BLOCK, "", "ip reputation"
-      end
-      if rep.trusted_until and rep.trusted_until > now then
-        return _M.PASS, "", "ip trusted"
       end
     end
   end
@@ -396,7 +395,9 @@ function _M.resolve(spec, load)
   end
   local uok, uerr = defaults.validate_untrusted(out.untrusted, "rule " .. out.id .. ": untrusted")
   if not uok then return nil, uerr end
-  if not out.text_fields then out.text_fields = { "messages[*].content", "prompt", "input", "query", "text" } end
+  if not out.text_fields then
+    out.text_fields = { "messages[*].content", "prompt", "input", "input[*].output", "query", "text" }
+  end
   if not out.templates then out.templates = { "injection" } end
   return out
 end

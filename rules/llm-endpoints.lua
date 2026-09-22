@@ -16,7 +16,7 @@ return {
   -- Bodies up to this size are parsed whole: 1 MiB, nginx's default
   -- client_max_body_size. Past it only the head and tail are scanned. Raise
   -- it with client_max_body_size (and your gateway's body buffer) for
-  -- long-context or vision traffic; see README "Body size".
+  -- long-context or vision traffic; see docs/design.md "Body size".
   max_body_bytes = 1048576,
   -- Text over this many bytes is cut to a window before the fingerprint and
   -- L2: the always_suspect hit, then the newest messages.
@@ -26,7 +26,8 @@ return {
   -- cheapest; raise it (4 covers 128 KiB) to judge long text in full, and
   -- policy.unjudgeable then decides what still does not fit. See README.
   max_judge_chunks = 1,
-  text_fields = { "messages[*].content", "prompt", "input", "query", "text" },
+  -- input[*].output: a Responses API function_call_output (a tool result)
+  text_fields = { "messages[*].content", "prompt", "input", "input[*].output", "query", "text" },
   min_text_chars = 20,
   always_suspect = {
     [[\b(ignore|disregard|forget)\b.{0,20}\b(previous|prior|above|earlier|all)\b]]

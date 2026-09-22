@@ -19,7 +19,7 @@ Measured on the live runs (`make live-full`, deepset/prompt-injections, `jev-lat
 
 Add the `abuse` template and the per-call count rises slightly; the questions share one request. Longer user messages cost more: these figures are for the dataset's short prompts, and `rules.max_judge_bytes` (32 KiB of text) is the upper bound per call. Longer text is cut to that window before L2 (`jev_window_total` counts how often), so a large body puts at most 32 KiB of text into the prompt.
 
-With `untrusted` on (README, "Retrieved content"), a request that carries tool results or `untrusted.fields` makes a second call: the retrieved text alone with the `untrusted` question, no deployment context. Count those requests twice; a tool result repeated in a conversation's history hits the cache after its first turn.
+With `untrusted` on ([Retrieved content](design.md#retrieved-content)), a request that carries tool results or `untrusted.fields` makes a second call: the retrieved text alone with the `untrusted` question, no deployment context. Count those requests twice; a tool result repeated in a conversation's history hits the cache after its first turn.
 
 ## Worked table
 

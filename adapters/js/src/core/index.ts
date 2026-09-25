@@ -53,13 +53,25 @@ function nowMs(ctx: Ctx): number {
   return (ctx.clock ? ctx.clock() : 0) * 1000;
 }
 
+// Port of rep_of in core/init.lua: what subject reputation charges for a
+// request judged in parts. undefined: the verdict's own label; a number: the
+// subject's own text scored lower than a part it is not charged for (the tool
+// definitions); false: none of its own text was judged.
+type Rep = number | false | undefined;
+function repOf(best: number | undefined, own: number | undefined): Rep {
+  if (own === undefined) return false;
+  if (own === best) return undefined;
+  return own;
+}
+
 // Every exit that produced a decision goes through here, so a trajectory has no
 // holes: a cache hit and a breaker skip are as much a step in an attack as an
 // L2 call is. The one exit that does not is L1 PASS -- the request was never a
 // candidate, and that is the hot path.
-async function finish(ctx: Ctx, v: verdict.Verdict): Promise<verdict.Verdict> {
+async function finish(ctx: Ctx, v: verdict.Verdict, rep?: Rep): Promise<verdict.Verdict> {
   subject.record(ctx, v);
-  await subject.repRecord(ctx, v);
+  const charge = rep === false ? false : typeof rep === "number" ? policy.decide(rep, ctx.config.policy)[1] : undefined;
+  await subject.repRecord(ctx, v, charge);
   return v;
 }
 
@@ -111,6 +123,8 @@ interface Part {
   over?: { templates?: string[]; deployment?: string };
   /** put before the template name in the reason when this part's score decides */
   label?: string;
+  /** false: not the subject's own text, its score is not charged to it */
+  rep?: false;
 }
 
 // Port of judge_parts in core/init.lua: each part (a chunk, the retrieved
@@ -179,6 +193,7 @@ async function judgeParts(
   await settle(ctx, failed, answered);
 
   let best: number | undefined;
+  let own: number | undefined;
   let top = "";
   for (let i = 0; i < parts.length; i++) {
     const s = scores[i];
@@ -187,7 +202,9 @@ async function judgeParts(
       top = tops[i];
       if (top !== "" && parts[i].label) top = parts[i].label + top;
     }
+    if (s !== undefined && parts[i].rep !== false && (own === undefined || s > own)) own = s;
   }
+  const rep = repOf(best, own);
   if (err && !(best !== undefined && best >= (cfg.policy.block_threshold ?? 0.7))) {
     log(ctx, "warn", "jev-edge: L2 failed on a chunk: " + err);
     const [action, label, async] = policy.onError();
@@ -199,10 +216,10 @@ async function judgeParts(
   const [action, label, async] = policy.decide(score, cfg.policy);
   let why = top !== "" ? `${top} ${verdict.format2(score)}` : reason;
   if (top !== "") why += suffix;
-  if (ckey && ctx.cache) await ctx.cache.set(ckey, { score, reason: why }, cfg.cache.fp_ttl);
+  if (ckey && ctx.cache) await ctx.cache.set(ckey, { score, reason: why, ...(rep !== undefined ? { rep } : {}) }, cfg.cache.fp_ttl);
   return finish(ctx, verdict.newVerdict({
     action, verdict: label, score, async, source: verdict.SRC_L2, reason: why, fingerprint: fp, l2_ms: elapsed,
-  }));
+  }), rep);
 }
 
 export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
@@ -266,16 +283,17 @@ export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
   }
   const ckey = fp !== "" ? cacheKey(fp, rule, cfg, ctx.hash, over) : undefined;
   if (ckey && ctx.cache) {
-    const hit = (await ctx.cache.get(ckey)) as { score?: unknown; reason?: string } | undefined;
+    const hit = (await ctx.cache.get(ckey)) as { score?: unknown; reason?: string; rep?: unknown } | undefined;
     if (hit && typeof hit === "object" && typeof hit.score === "number") {
       const [action, label] = policy.decide(hit.score, cfg.policy);
       // Never async on a hit: the cached score already is the judge's
       // answer, and a re-judge per hit would turn the cache into an
       // amplifier (one suspicious prompt repeated N times = N L3 calls).
+      const rep: Rep = hit.rep === false || typeof hit.rep === "number" ? hit.rep : undefined;
       return finish(ctx, verdict.newVerdict({
         action, verdict: label, score: hit.score, async: false,
         source: verdict.SRC_CACHE, reason: hit.reason ?? reason, fingerprint: fp,
-      }));
+      }), rep);
     }
   }
 
@@ -318,8 +336,9 @@ export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
     }
     if (tools) {
       // the client sent them: the same question and scope as its own text,
-      // so the entry is the one any text like it gets
-      parts.push({ text: tools.text, templates: rule!.templates, context, label: TOOLS_LABEL });
+      // so the entry is the one any text like it gets. Their score decides
+      // the request; the subject's reputation is charged for its own text.
+      parts.push({ text: tools.text, templates: rule!.templates, context, label: TOOLS_LABEL, rep: false });
     }
     return judgeParts(ctx, rule!, parts, suffix, fp, ckey, reason);
   }

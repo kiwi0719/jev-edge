@@ -44,13 +44,31 @@ local function now_ms(ctx)
   return (ctx.clock and ctx.clock() or 0) * 1000
 end
 
+-- What subject reputation charges for a request judged in parts: nil (the
+-- verdict's own label) when the subject's own text scored the request's
+-- score, its own score when a part it is not charged for (the tool
+-- definitions) scored higher, and false when none of its own text was judged.
+-- The whole request's cache entry keeps it as `rep`, so a hit charges the same.
+local function rep_of(best, own)
+  if own == nil then return false end
+  if own == best then return nil end
+  return own
+end
+
 -- Every exit that produced a decision goes through here, so a trajectory has
 -- no holes: a cache hit and a breaker skip are as much a step in an attack as
 -- an L2 call is. The one exit that does not is L1 PASS -- the request was
 -- never a candidate, and that is the hot path.
-local function finish(ctx, v)
+-- @param rep optional, rep_of(): what subject reputation charges
+local function finish(ctx, v, rep)
   subject.record(ctx, v)
-  subject.rep_record(ctx, v)
+  local charge
+  if rep == false then
+    charge = false
+  elseif type(rep) == "number" then
+    charge = select(2, policy.decide(rep, ctx.config.policy))
+  end
+  subject.rep_record(ctx, v, charge)
   return v
 end
 
@@ -111,9 +129,10 @@ local TOOLS_LABEL = "tools+"
 -- (ctx.judge.call_many, in parallel, when the adapter has it). The request's
 -- score is the highest part score. A part the judge failed on turns the
 -- request into an error unless another part already blocks.
--- @param parts  list of { text, templates, context, over, label } (over:
+-- @param parts  list of { text, templates, context, over, label, rep } (over:
 --               cache_key's; label: put before the template name in the
---               reason when this part's score decides)
+--               reason when this part's score decides; rep = false: not the
+--               subject's own text, its score is not charged to it)
 -- @param suffix appended to the reason when a part answered
 local function judge_parts(ctx, rule, parts, suffix, fp, ckey, reason)
   local cfg = ctx.config
@@ -174,13 +193,15 @@ local function judge_parts(ctx, rule, parts, suffix, fp, ckey, reason)
   -- only calls that reached the provider say anything about its health
   settle(ctx, failed, answered)
 
-  local best, top = nil, ""
+  local best, top, own = nil, "", nil
   for i = 1, #parts do
     if scores[i] and (not best or scores[i] > best) then
       best, top = scores[i], tops[i]
       if top ~= "" and parts[i].label then top = parts[i].label .. top end
     end
+    if scores[i] and parts[i].rep ~= false and (not own or scores[i] > own) then own = scores[i] end
   end
+  local rep = rep_of(best, own)
   if err and not (best and best >= cfg.policy.block_threshold) then
     log(ctx, "warn", "jev-edge: L2 failed on a chunk: " .. err)
     local action, label, async = policy.on_error()
@@ -192,12 +213,12 @@ local function judge_parts(ctx, rule, parts, suffix, fp, ckey, reason)
   local why = top ~= "" and (top .. " " .. string.format("%.2f", best)) or reason
   if top ~= "" then why = why .. suffix end
   if ckey and ctx.cache then
-    ctx.cache:set(ckey, { score = best, reason = why }, cfg.cache.fp_ttl)
+    ctx.cache:set(ckey, { score = best, reason = why, rep = rep }, cfg.cache.fp_ttl)
   end
   return finish(ctx, verdict.new({
     action = action, verdict = label, score = best, async = async,
     source = verdict.SRC_L2, reason = why, fingerprint = fp, l2_ms = elapsed,
-  }))
+  }), rep)
 end
 
 function _M.evaluate(req, ctx)
@@ -269,10 +290,12 @@ function _M.evaluate(req, ctx)
       -- Never async on a hit: the cached score already is the judge's
       -- answer, and a re-judge per hit would turn the cache into an
       -- amplifier (one suspicious prompt repeated N times = N L3 calls).
+      local rep = hit.rep
+      if rep ~= false and type(rep) ~= "number" then rep = nil end
       return finish(ctx, verdict.new({
         action = action, verdict = label, score = hit.score, async = false,
         source = verdict.SRC_CACHE, reason = hit.reason or reason, fingerprint = fp,
-      }))
+      }), rep)
     end
   end
 
@@ -323,9 +346,11 @@ function _M.evaluate(req, ctx)
     end
     if tools then
       -- the client sent them: the same question and scope as its own text,
-      -- so the entry is the one any text like it gets
+      -- so the entry is the one any text like it gets. An agent loads them
+      -- from servers the user may not control: their score decides the
+      -- request, but the subject's reputation is charged for its own text.
       parts[#parts + 1] = { text = tools.text, templates = rule.templates, context = context,
-        label = TOOLS_LABEL }
+        label = TOOLS_LABEL, rep = false }
     end
     return judge_parts(ctx, rule, parts, suffix, fp, ckey, reason)
   end

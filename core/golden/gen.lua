@@ -1291,8 +1291,20 @@ do
     req = r, config = ENF, cache = { [key_of(tools_text_of(r))] = { score = 0.95, reason = "injection 0.95" } },
     judge = { error = "timeout" } })
 end
-eval_case("tools: a malicious verdict on them counts toward the subject's reputation", {
+-- subject reputation charges the subject's own text: the tool definitions'
+-- score decides the request but is not charged (an agent loads them from
+-- servers the user may not control)
+eval_case("tools: a malicious verdict on them alone does not count toward the subject's reputation", {
   req = T_ONLY, config = REP_ENF, subject = { id = "u-3" }, judge = { answers = { injection = 0.95 } } })
+eval_case("tools: when theirs decides, the subject is charged for its own text's score", {
+  req = T_BOTH, config = REP_ENF, subject = { id = "u-4" },
+  cache = { [key_of(LONG)] = { score = 0.6, reason = "injection 0.60" } }, judge = { answers = { injection = 0.95 } } })
+eval_case("tools: a whole-request cache hit charges what its entry says", {
+  req = T_BOTH, config = REP_ENF, subject = { id = "u-5" },
+  cache = { [core.cache_key(fp_of(LONG .. "\n<tool definitions>\n" .. tools_text_of(T_BOTH)), llm,
+    defaults.merge(defaults.config, {}), normalize.djb2, { templates = { "injection", "+tools" } })] =
+    { score = 0.95, reason = "tools+injection 0.95", rep = 0.1 } },
+  judge = { answers = { injection = 0.9 } } })
 eval_case("tools: retrieved content, tool definitions and the text are three parts", {
   req = raw_req(U_TOOL:sub(1, -2) .. ',"tools":' .. oai_tools(T_DESC) .. '}'), config = U_ON, judge = U_SCORES })
 eval_case("tools: a huge tool set is capped, the reason says window", {

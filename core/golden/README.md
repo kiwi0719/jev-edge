@@ -57,6 +57,7 @@ An implementation replays a case by constructing its IO from `input` exactly as 
 - the order in which the pipeline consults L1, cache, breaker and L2, and what it writes to the cache
 - what core reports to the breaker: a failure only for a judge error of kind `transport`, `timeout` or `unavailable` (or with no kind), a success for an answer, and a release for anything else (`rejected`, `unusable`, an answer with no scores, `max_inflight exceeded`, no call at all); the reason of a `rejected` or `unusable` error starts with its kind
 - the subject trajectory entry: its fields, which exits produce one (every exit that made a decision; not L1 pass), and that a supplied `history` is ignored
+- subject reputation: the points a verdict adds, and that a request judged in parts is charged for the subject's own text only, not for the tool definitions' score; the whole request's cache entry keeps what to charge as `rep` (its own text's score, or `false` when none of it was judged; absent when that is the request's score) and a hit on it charges the same
 
 **Not covered** (platform semantics; each adapter documents its own):
 

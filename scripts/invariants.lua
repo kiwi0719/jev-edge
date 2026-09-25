@@ -343,20 +343,50 @@ rule("template-parity", function(r)
 end)
 
 -- 12. The ruleset's one required check covers every CI job: `ci-ok` needs
---     all of them (a job left out could fail and still let a PR merge)
+--     all of them, runs when one failed, and fails unless all succeeded (a
+--     job left out could fail and still let a PR merge; a skipped ci-ok
+--     counts as passing)
 rule("ci-ok", function(r)
-  local ci = read(".github/workflows/ci.yml") or ""
-  local jobs_block = ci:match("\njobs:\n(.*)$") or ""
-  local jobs = {}
-  for name in jobs_block:gmatch("\n  ([%w_%-]+):") do jobs[#jobs + 1] = name end
-  local first = jobs_block:match("^  ([%w_%-]+):")
-  if first then table.insert(jobs, 1, first) end
-  local needs = ci:match("\n  ci%-ok:.-\n    needs:%s*%[([^%]]*)%]")
-  if not needs then return fail(r, "ci.yml has no ci-ok job with a needs list") end
+  local ci = (read(".github/workflows/ci.yml") or ""):gsub("\r\n?", "\n")
+  -- the top-level jobs mapping: job ids at two spaces, each with its lines
+  local jobs, body, cur, injobs = {}, {}, nil, false
+  for l in (ci .. "\n"):gmatch("([^\n]*)\n") do
+    if not injobs then
+      injobs = l:match("^jobs:%s*$") or l:match("^jobs:%s*#")
+    elseif l:match("^[^%s#]") then
+      break
+    else
+      local name = l:match("^  ([%w_%-]+):")
+      if name then
+        jobs[#jobs + 1], cur, body[name] = name, name, {}
+      elseif cur then
+        table.insert(body[cur], l)
+      end
+    end
+  end
+  if #jobs < 2 then return fail(r, "found " .. #jobs .. " jobs in ci.yml") end
+  if not body["ci-ok"] then return fail(r, "ci.yml has no ci-ok job") end
+  local ok_job = "\n" .. table.concat(body["ci-ok"], "\n")
+  local needs = ok_job:match("\n    needs:%s*%[([^%]]*)%]")
+  if not needs then return fail(r, "ci-ok has no needs: [...] list") end
   local listed = {}
   for n in needs:gmatch("[%w_%-]+") do listed[n] = true end
   for _, j in ipairs(jobs) do
     if j ~= "ci-ok" and not listed[j] then fail(r, "ci-ok does not need job " .. j) end
+  end
+  local cond = ok_job:match("\n    if:([^\n]*)") or ""
+  if not (cond:find("always()", 1, true) or cond:find("!cancelled()", 1, true)) then
+    fail(r, "ci-ok has no `if: always()` (or `!cancelled()`): it is skipped when a job fails")
+  end
+  local tested = false
+  for l in ok_job:gmatch("[^\n]+") do
+    if not l:match("^%s*#") and l:find("jq -e", 1, true)
+       and l:find([['all(.[]; .result == "success")']], 1, true) then
+      tested = true
+    end
+  end
+  if not tested then
+    fail(r, [[ci-ok does not run jq -e 'all(.[]; .result == "success")' on its needs]])
   end
 end)
 

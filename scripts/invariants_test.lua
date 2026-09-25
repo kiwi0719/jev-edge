@@ -59,8 +59,13 @@ for f in p:lines() do
 end
 p:close()
 assert(spec, "no rockspec at the repo root")
-local rs = read(spec)
+local CI = ".github/workflows/ci.yml"
+local rs, ci = read(spec), read(CI)
 
+local function with_newjob(s)
+  return edit(s, "\n  ci%-ok:\n",
+    "\n  newjob:\n    runs-on: ubuntu-24.04\n    steps:\n      - run: exit 1\n\n  ci-ok:\n")
+end
 local breaker = '%["jev%.core%.breaker"%][^\n]*'
 
 -- { name, { [path] = contents }, rule expected to fail (nil: all pass), text in its message }
@@ -89,6 +94,39 @@ local cases = {
   { "rockspec: does not load", { [spec] = edit(rs, "\nbuild = {", "\nbuild = {{") },
     "rockspec-modules", "does not load" },
 
+  -- ci-ok: every job, whatever the jobs: line looks like (audit ci-release#5)
+  { "ci.yml: new job not in needs", { [CI] = with_newjob(ci) }, "ci-ok", "ci-ok does not need job newjob" },
+  { "ci.yml: jobs: with a comment, new job not in needs",
+    { [CI] = with_newjob(edit(ci, "\njobs:\n", "\njobs: # every job below\n")) },
+    "ci-ok", "ci-ok does not need job newjob" },
+  { "ci.yml: jobs: with a trailing space, new job not in needs",
+    { [CI] = with_newjob(edit(ci, "\njobs:\n", "\njobs: \n")) },
+    "ci-ok", "ci-ok does not need job newjob" },
+  { "ci.yml: CRLF, new job not in needs", { [CI] = (with_newjob(ci):gsub("\n", "\r\n")) },
+    "ci-ok", "ci-ok does not need job newjob" },
+  { "ci.yml: CRLF, unchanged otherwise", { [CI] = (ci:gsub("\n", "\r\n")) } },
+  { "ci.yml: job dropped from needs", { [CI] = edit(ci, "(\n    needs: %[[^%]\n]*)e2e, ", "%1") },
+    "ci-ok", "ci-ok does not need job e2e" },
+  { "ci.yml: no jobs found", { [CI] = edit(ci, "\njobs:\n", "\njobs_:\n") }, "ci-ok", "found 0 jobs in ci.yml" },
+  { "ci.yml: ci-ok without needs", { [CI] = edit(ci, "(\n  ci%-ok:\n    if: [^\n]*)\n    needs: [^\n]*", "%1") },
+    "ci-ok", "ci-ok has no needs" },
+
+  -- ci-ok: runs when a job failed and fails unless all succeeded (audit ci-release#6)
+  { "ci.yml: ci-ok without if: always()", { [CI] = edit(ci, "(\n  ci%-ok:)\n    if: always%(%)", "%1") },
+    "ci-ok", "ci-ok has no `if: always()`" },
+  { "ci.yml: ci-ok with if: success()", { [CI] = edit(ci, "(\n  ci%-ok:\n    if: )always%(%)", "%1success()") },
+    "ci-ok", "ci-ok has no `if: always()`" },
+  { "ci.yml: ci-ok with if: !cancelled()",
+    { [CI] = edit(ci, "(\n  ci%-ok:\n    if: )always%(%)", "%1${{ !cancelled() }}") } },
+  { "ci.yml: jq test weakened", { [CI] = edit(ci, '%.result == "success"', '.result != "failure"') },
+    "ci-ok", "ci-ok does not run jq -e" },
+  { "ci.yml: jq test replaced by true", { [CI] = edit(ci, "jq %-e 'all[^\n]*'", "jq -e 'true'") },
+    "ci-ok", "ci-ok does not run jq -e" },
+  { "ci.yml: jq without -e", { [CI] = edit(ci, "jq %-e 'all", "jq 'all") }, "ci-ok", "ci-ok does not run jq -e" },
+  { "ci.yml: jq line removed", { [CI] = edit(ci, "\n[^\n]*jq %-e 'all[^\n]*", "") },
+    "ci-ok", "ci-ok does not run jq -e" },
+  { "ci.yml: jq line commented out", { [CI] = edit(ci, "\n(%s*)(echo[^\n]*jq %-e 'all)", "\n%1# %2") },
+    "ci-ok", "ci-ok does not run jq -e" },
 }
 
 local bad = 0

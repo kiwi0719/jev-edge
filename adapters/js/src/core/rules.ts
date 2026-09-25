@@ -1,5 +1,5 @@
 // Port of core/rules.lua: L1, cheap and short-circuiting.
-import { extract, extractUntrustedValues, byteLength, head, tail, fieldKeys, scanStrings, window, chunks as splitChunks, utf8Bytes, type JsonValue } from "./normalize.js";
+import { extract, extractUntrustedValues, isText, byteLength, head, tail, fieldKeys, scanStrings, window, chunks as splitChunks, utf8Bytes, type JsonValue } from "./normalize.js";
 import { untrustedSpec, type UntrustedConfig } from "./defaults.js";
 import { repBlocked, type SubjectCtx, type ReputationConfig } from "./subject.js";
 
@@ -313,7 +313,12 @@ export function contentEncoding(headers: Req["headers"]): string {
   return (ce.toLowerCase().match(/[^,\s]+/g) ?? []).filter((t) => t !== "identity").join(", ");
 }
 
-function ctWatched(ct: string, rule: Rule): boolean {
+// Port of ct_watched() in core/rules.lua: true when the rule reads this
+// content type, false when its allow list leaves it out, "media" when every
+// value is a skip_content_types entry. The client picks the header and Ollama
+// and llama.cpp parse JSON whatever it says, so the body is still read and
+// only one that really is binary is skipped (judged()).
+function ctWatched(ct: string, rule: Rule): boolean | "media" {
   const c = ct.toLowerCase();
   const allowed = rule.content_types;
   if (allowed && allowed.length > 0) {
@@ -329,8 +334,10 @@ function ctWatched(ct: string, rule: Rule): boolean {
     any = true;
     if (!skip.some((sk) => v.startsWith(sk))) return true;
   }
-  return !any;
+  return !any || "media";
 }
+
+const CT_NOT_WATCHED = "content-type not watched";
 
 /**
  * Case-insensitive regex search with the same contract the OpenResty adapter
@@ -366,6 +373,9 @@ async function judged(
   req: Req, rule: Rule, ctx: RulesCtx | undefined, ct: string, size: number,
 ): Promise<{ text: string; unj?: string; hit?: string; windowed?: boolean; chunks?: string[]; capped?: boolean; untrusted?: UntrustedPart }> {
   const max = rule.max_body_bytes ?? MAX_BODY_BYTES;
+  // a media type is taken at its word only when the bytes agree (or there
+  // are none to look at): anything that reads as JSON or text is judged
+  const media = ctWatched(ct, rule) === "media";
   let values: string[];
   let text: string;
   let partial = false;
@@ -378,6 +388,7 @@ async function judged(
       const rest = req.body.slice(hd.length);
       if (rest !== "") tl = tail(rest, TAIL_BYTES);
     }
+    if (media && !(hd !== undefined && isText(hd))) return { text: "", unj: CT_NOT_WATCHED };
     if (hd === undefined) return { text: "", unj: "unjudgeable: body too large" };
     const keys = fieldKeys(rule.text_fields);
     values = scanStrings(hd, keys, []);
@@ -389,6 +400,7 @@ async function judged(
     let kind: string;
     let decoded: JsonValue | undefined;
     [text, kind, values, decoded] = extract(req.body, ct, rule.text_fields, ctx?.json_decode);
+    if (media && (kind === "binary" || kind === "none")) return { text: "", unj: CT_NOT_WATCHED };
     if (kind === "binary") return { text: "", unj: "unjudgeable: binary body" };
     untrusted = untrustedPart(decoded, rule, ctx);
   }
@@ -442,10 +454,12 @@ export async function evaluate(
   // the same for the subject (core/subject.lua), when reputation is on
   if (ctx?.subject && (await repBlocked(ctx))) return [BLOCK, "", "subject reputation"];
 
-  // 3. method + content type (deny list of media types unless content_types allows)
+  // 3. method + content type (an allow list when the rule lists
+  //    content_types; the deny list of media types is only settled once the
+  //    body shows it is binary, in step 6)
   if (rule.methods && !rule.methods[(req.method ?? "").toUpperCase()]) return [PASS, "", "method not watched"];
   const ct = contentType(req.headers);
-  if (!ctWatched(ct, rule)) return [PASS, "", "content-type not watched"];
+  if (!ctWatched(ct, rule)) return [PASS, "", CT_NOT_WATCHED];
 
   // 4. body size: the larger of what the adapter declared and what it handed
   //    over, so a wrong or missing Content-Length cannot shrink the body
@@ -463,6 +477,7 @@ export async function evaluate(
 
   // 6+7. extract, prefilter over all of it, judging window, length
   const j = await judged(req, rule, ctx, ct, size);
+  if (j.unj === CT_NOT_WATCHED) return [PASS, "", j.unj];
   if (j.unj) return [UNJUDGEABLE, "", j.unj];
   const minChars = rule.min_text_chars ?? 20;
   // retrieved content is judged on its own when there is enough of it, even

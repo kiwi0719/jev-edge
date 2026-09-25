@@ -392,6 +392,22 @@ def test_tool_definitions_are_forwarded_unchanged_and_first():
     assert body({"tools": tools}) == {"tools": tools}
 
 
+def test_responses_text_format_is_forwarded_like_response_format():
+    # the Responses API's text.format is its response_format: jev-edge reads
+    # it with the tool definitions, so it goes unchanged, media-named
+    # properties and all
+    fmt = {"type": "json_schema", "name": "out", "strict": True, "schema": {"type": "object", "properties": {
+        "image_url": {"type": "string", "description": ATTACK}, "inline_data": {"type": "string"}}}}
+    text = {"format": fmt, "verbosity": "low"}
+    got = body({"model": "gpt-4o", "input": "hi", "text": text, "tools": [{"type": "function", "name": "f"}]})
+    assert list(got) == ["tools", "text", "input"]
+    assert got["text"] == text
+    assert body({"text": text}) == {"text": text}
+    # a string `text` (other APIs) is still text, media rules and all
+    assert body({"text": "plain text"}) == {"text": "plain text"}
+    assert body({"text": [{"type": "input_image", "image_url": "data:x"}, "t"]}) == {"text": [{"type": "input_image"}, "t"]}
+
+
 def test_function_call_output_alone_is_judged_not_skipped():
     transport, seen = fake_authz()
     g = guard(transport)

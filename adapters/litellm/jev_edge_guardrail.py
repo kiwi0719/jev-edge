@@ -87,7 +87,9 @@ MAX_BODY_BYTES = 1048576  # jev-edge's rules.max_body_bytes, nginx's default cli
 TAIL_BYTES = 65536        # jev-edge's rules.TAIL_BYTES: the tail scanned with the head of a larger body
 
 # Tool definitions, sent first and unchanged: jev-edge judges them on their
-# own, apart from the conversation.
+# own, apart from the conversation. The Responses API's `text` is one when it
+# is an object: its `format` is that API's response_format (a string `text`
+# elsewhere is text).
 DEFINITION_KEYS = ("tools", "functions", "response_format")
 # Top-level keys that carry text, in the order they are sent: the
 # conversation last, so the newest turn is in the tail of a body that has to
@@ -295,11 +297,16 @@ def _parse_fields(value: Any) -> tuple:
     return tuple(out)
 
 
+def _is_definition(key: str, value: Any) -> bool:
+    return key in DEFINITION_KEYS or (key == "text" and isinstance(value, dict))
+
+
 def _body_dict(data: dict, extra_fields: tuple = ()) -> Optional[dict]:
     body: dict[str, Any] = {}
-    for key in DEFINITION_KEYS:
-        if data.get(key) is not None:
-            c = _clean(data[key], media=False)
+    for key in DEFINITION_KEYS + ("text",):
+        value = data.get(key)
+        if value is not None and _is_definition(key, value):
+            c = _clean(value, media=False)
             if c is not _DROP:
                 body[key] = c
     system = _system_messages(data)
@@ -320,7 +327,7 @@ def _body_dict(data: dict, extra_fields: tuple = ()) -> Optional[dict]:
             if convo is None:
                 continue
             value = system + convo
-        if value is None:
+        if value is None or _is_definition(key, value):
             continue
         c = _clean(value)
         if c is not _DROP:
@@ -579,7 +586,8 @@ class JevEdgeGuardrail(_ApplyGuardrailBase):
     def body_for(data: dict, extra_fields: Any = ()) -> Optional[str]:
         """The request's text as the compact JSON body jev-edge judges, in its
         original structure: the tool definitions (`tools`, `functions`,
-        `response_format`) unchanged, the `extra_fields`, `query`, `text`,
+        `response_format`, the Responses API's `text` object with its
+        `format`) unchanged, the `extra_fields`, `query`, `text`,
         `prompt`, `input` and `messages`, with the system prompt (`system`,
         `instructions`, Gemini's `systemInstruction`) as the first message
         and Gemini `contents` joining `messages`, and media payloads removed.

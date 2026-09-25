@@ -33,7 +33,14 @@ function runtimeFor<E extends WorkerEnv>(resolve: Resolve<E>, env: E, cache: Wea
   if (hit) return hit;
   const o: Options = { ...(typeof resolve === "function" ? resolve(env) : resolve), platform: "cloudflare" };
   if (!o.cache && env.JEV_CACHE) o.cache = env.JEV_CACHE;
-  if (!o.state && env.JEV_STATE) o.state = env.JEV_STATE.get(env.JEV_STATE.idFromName("jev-edge"));
+  if (!o.state && env.JEV_STATE) {
+    // A stub is an I/O object of the request that made it: workerd refuses
+    // it in any later one ("Cannot perform I/O on behalf of a different
+    // request"), and this runtime lives as long as the isolate. So every
+    // call gets a fresh stub; idFromName is a hash and get() no round trip.
+    const ns = env.JEV_STATE;
+    o.state = { fetch: (input, init) => ns.get(ns.idFromName("jev-edge")).fetch(input, init) };
+  }
   if (env.TYPESAFE_API_KEY) o.config = { ...o.config, jev: { api_key: env.TYPESAFE_API_KEY, ...o.config?.jev } };
   const rt = createRuntime(o);
   cache.set(env, rt);

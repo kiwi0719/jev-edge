@@ -62,6 +62,9 @@ export function nextMiddleware(opts: Options, NextResponse: NextResponseLike) {
 export interface NodeRequestLike {
   method?: string;
   url?: string;
+  /** Express / Connect: the whole request-target. Under a mount path
+   *  (`app.use("/v1", ...)`, a Router) `url` has the prefix cut off. */
+  originalUrl?: string;
   headers: Record<string, string | string[] | undefined>;
   socket?: { remoteAddress?: string };
   /** set by express.json() / body-parser; used instead of the stream when present */
@@ -161,9 +164,36 @@ async function readNodeBody(req: NodeRequestLike): Promise<[string | Buffer | nu
 }
 
 /**
+ * A request-target as origin-form (path and query). An absolute-form target
+ * (`http://host/v1/...`, what a client talking to a proxy sends) keeps only
+ * its path, which is what Express routes on; `*` and authority-form are "/".
+ */
+function originForm(target: string): string {
+  if (target.startsWith("/")) return target;
+  const m = /^[a-z][a-z0-9+.-]*:\/\/[^/?#]*/i.exec(target);
+  if (!m) return "/";
+  const rest = target.slice(m[0].length);
+  return rest.startsWith("/") ? rest : "/" + rest;
+}
+
+/**
+ * The URL the runtime judges: the whole path the app routes on
+ * (`originalUrl`, not the mount-relative `url`) under a fixed origin. Never
+ * the client's Host header as the base, which the URL parser can reject
+ * (`a b`, `x:99999`), and never the target resolved as a reference, where
+ * `//v1/chat/completions` would make `v1` the host. The runtime then
+ * normalizes the path (`//v1/...` -> `/v1/...`) as on every other host.
+ */
+function judgedUrl(req: NodeRequestLike): URL {
+  return new URL("http://localhost" + originForm(req.originalUrl ?? req.url ?? "/"));
+}
+
+/**
  * app.use(nodeMiddleware({ config: { ... } }))
  *
- * Mount before the routes that carry natural language. If you use
+ * Mount before the routes that carry natural language. Under a mount path
+ * (`app.use("/v1", ...)`, a Router) the whole path is still what is judged,
+ * `req.originalUrl`, since that is what the rules' watch_paths name. If you use
  * express.json() first, the parsed body is re-serialised for evaluation; if
  * not, the stream is read here (whole, see readNodeBody) and re-exposed as
  * `req.body` (string) and `req.jev` (the verdict). X-Jev-* are set on
@@ -175,8 +205,7 @@ export function nodeMiddleware(opts: Options) {
   return async (req: NodeRequestLike & { jev?: Verdict }, res: NodeResponseLike, next: (err?: unknown) => void): Promise<void> => {
     try {
       const r = rt();
-      const host = (req.headers.host as string) ?? "localhost";
-      const url = new URL(req.url ?? "/", "http://" + host);
+      const url = judgedUrl(req);
       const headers = new Headers();
       for (const [k, v] of Object.entries(req.headers)) {
         if (v === undefined) continue;
@@ -201,7 +230,9 @@ export function nodeMiddleware(opts: Options) {
       const request = new Request(url.toString(), {
         method, headers, body: body === null ? undefined : (asBuffer(body) ? new Uint8Array(asBuffer(body)!) : body) as BodyInit,
       });
-      if (r.opts.health !== false && url.pathname === "/_jev/health" && method === "GET") {
+      // the middleware's own route, so under the mount path like any other
+      const own = new URL("http://localhost" + originForm(req.url ?? "/")).pathname;
+      if (r.opts.health !== false && own === "/_jev/health" && method === "GET") {
         const h = healthResponse(r);
         res.statusCode = 200;
         res.setHeader("Content-Type", "application/json");

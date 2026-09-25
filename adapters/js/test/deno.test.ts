@@ -157,6 +157,38 @@ describe("denoHandler", () => {
     expect(keys.some((k) => k.startsWith('["jev","cache",'))).toBe(true);
   });
 
+  it("keeps the verdict when Deno KV rejects the writes after it", async () => {
+    const seen = captureUpstream();
+    const kv = fakeKv();
+    // reads work; every plain write and every commit fails, as over a write quota
+    kv.set = async () => { throw new Error("Deno KV: write quota exceeded"); };
+    const atomic = kv.atomic.bind(kv);
+    kv.atomic = () => {
+      const op = atomic();
+      op.commit = async () => { throw new Error("Deno KV: write quota exceeded"); };
+      return op;
+    };
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const cfg = mockConfig({ jev: { provider: "mock", mock_score: 0.95, mock_delay_ms: 2, timeout_ms: 400 }, subject: { enabled: true, from: "ip", salt: "pepper" } });
+      const h = denoHandler({ upstream: UPSTREAM, config: cfg, kv });
+      const res = await h(chat(ATTACK), PEER);
+      expect(res.status).toBe(403);
+      expect(res.headers.get("x-jev-source")).toBe("l2");
+      expect(seen).toHaveLength(0);
+      for (let i = 0; i < 20; i++) await tick(); // the fire-and-forget subject write
+      const warned = warn.mock.calls.map((c) => String(c[0]));
+      expect(warned.some((m) => m.includes("cache write failed") && m.includes("write quota"))).toBe(true);
+      expect(warned.some((m) => m.includes("breaker success failed"))).toBe(true);
+      expect(warned.some((m) => m.includes("subject store incr failed"))).toBe(true);
+      expect(error).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+      error.mockRestore();
+    }
+  });
+
   it("requires an upstream", () => {
     expect(() => denoHandler({ upstream: "" })).toThrow(/upstream/);
   });

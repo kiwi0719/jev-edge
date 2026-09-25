@@ -33,6 +33,13 @@ check "suspicious labels and passes" "app verdict=suspicious score=0.55 source=l
 code=$(curl -s -o "$tmp/body" -w '%{http_code}' -H 'Content-Type: application/json' -H 'X-Jev-Mock-Score: 0.97' -d "$ATTACK" $base/v1/chat/completions)
 check "malicious is blocked with 403" "403" "$code"
 check "block body is the configured one" "$BLOCK_BODY" "$(cat "$tmp/body")"
+# watch_paths match the decoded path: Kong forwards %2F as is, and a backend
+# that decodes it (uvicorn/Starlette) serves /v1/chat/completions
+for p in /v1%2Fchat/completions /v1%2fchat/completions; do
+  code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' -H 'X-Jev-Mock-Score: 0.97' -d "$ATTACK" "$base$p")
+  check "malicious on $p is blocked" "403" "$code"
+done
+check "benign on /v1%2Fchat/completions is judged at L2" "app verdict=safe score=0.20 source=l2" "$(post /v1%2Fchat/completions '' "$LONG")"
 hdr=$(curl -s -D - -o /dev/null -H 'Content-Type: application/json' -H 'X-Jev-Mock-Score: 0.97' -d "$ATTACK" $base/v1/chat/completions | grep -i '^x-jev-verdict' | tr -d '\r' | awk '{print $2}')
 check "block response carries verdict header" "malicious" "$hdr"
 check "client-supplied X-Jev-* is stripped" "app verdict=skipped score=0.00 source=l1" "$(curl -s -H 'X-Jev-Verdict: safe' -H 'X-Jev-Score: 0.00' -H 'X-Jev-Source: l2' $base/healthz)"

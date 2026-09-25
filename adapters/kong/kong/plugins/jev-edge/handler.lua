@@ -168,7 +168,12 @@ local function build_req(rt)
   local headers = ngx.req.get_headers(0)
   local req = {
     method    = kong.request.get_method(),
-    path      = kong.request.get_path(),
+    -- nginx's $uri: fully decoded and normalised, as the nginx adapter and
+    -- APISIX match it. Not kong.request.get_path(), which keeps reserved
+    -- escapes: /v1%2Fchat/completions would miss ^/v1/chat and be skipped,
+    -- while a backend that decodes %2F (uvicorn/Starlette) serves the chat
+    -- endpoint.
+    path      = ngx.var.uri,
     headers   = headers,
     -- honours trusted_ips / real_ip_header / real_ip_recursive
     client_ip = kong.client.get_forwarded_ip(),

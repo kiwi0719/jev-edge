@@ -1,6 +1,8 @@
 -- core/defaults.lua
 -- Default configuration and a deep-merge helper.
 
+local normalize = require "jev.core.normalize"
+
 local _M = {}
 
 _M.config = {
@@ -155,6 +157,9 @@ function _M.validate_untrusted(u, where)
         if type(v) ~= "string" or v == "" then
           return nil, where .. "." .. k .. "[" .. i .. "] must be a non-empty string"
         end
+        -- a field path is checked the way a rule's text_fields are
+        local perr = k == "fields" and normalize.path_error(v)
+        if perr then return nil, where .. "." .. k .. "[" .. i .. "] " .. perr end
       end
     end
   end

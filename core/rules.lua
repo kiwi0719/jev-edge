@@ -185,7 +185,7 @@ local CT_NOT_WATCHED = "content-type not watched"
 local function untrusted_part(decoded, rule, ctx)
   local spec = defaults.untrusted_spec(ctx and ctx.config, rule)
   if not spec.enabled or type(decoded) ~= "table" then return nil end
-  local utext, uvalues = normalize.extract_untrusted(decoded, spec)
+  local utext, uvalues = normalize.extract_untrusted(decoded, spec, ctx and ctx.json_decode)
   if utext == "" then return nil end
   local windowed
   utext, windowed = normalize.window(utext, uvalues, rule.max_judge_bytes or _M.MAX_JUDGE_BYTES)

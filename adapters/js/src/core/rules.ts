@@ -366,7 +366,7 @@ export function reFind(subject: string, pattern: string): readonly [number, numb
 function untrustedPart(decoded: JsonValue | undefined, rule: Rule, ctx: RulesCtx | undefined): UntrustedPart | undefined {
   const spec = untrustedSpec(ctx?.config, rule);
   if (!spec.enabled || decoded === undefined || decoded === null || typeof decoded !== "object") return undefined;
-  const values = extractUntrustedValues(decoded, spec);
+  const values = extractUntrustedValues(decoded, spec, ctx?.json_decode);
   const utext = values.join("\n");
   if (utext === "") return undefined;
   const [w, cut] = window(utext, values, rule.max_judge_bytes ?? MAX_JUDGE_BYTES);

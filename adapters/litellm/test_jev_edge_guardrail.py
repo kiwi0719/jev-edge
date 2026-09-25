@@ -565,6 +565,28 @@ def test_bounded_tail_starting_anywhere_around_the_newest_value_keeps_it():
         assert any(v.startswith(ATTACK) for v in scan_strings(out)), p
 
 
+@pytest.mark.parametrize("data", [
+    {"input": ["x" * 3000, ATTACK + " " + "y" * 600]},                      # after a comma
+    {"messages": [{"role": "user", "content": "x" * 3000}], "input": [ATTACK + " " + "y" * 600]},  # first in its array
+    {"messages": [{"role": "user", "content": "x" * 3000}], "prompt": [[1, 2], ATTACK + " " + "y" * 600]},
+])
+def test_bounded_tail_starting_before_an_array_element_keeps_it(data):
+    # an unkeyed string the tail starts on (its opening quote) or just before
+    # (the comma or bracket, the colon, inside its array's key): jev-edge's
+    # partial scanner reads only "key":"value", so it is keyed "text". (A
+    # tail that starts on or before the array's key leaves the elements
+    # unkeyed, as jev-edge in-line reads the same bytes.)
+    raw = json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode()
+    quote = raw.rindex(ATTACK.encode()) - 1
+    ps, pe = [m.span() for m in jg._STRING_RE.finditer(raw) if m.end() <= quote][-1]  # the string before it
+    first = ps + 1 if raw[pe:pe + 1] == b":" else pe  # inside its array's key, or right after the string before it
+    for p in range(first, quote + 1):
+        limit = 2 * (len(raw) - p)
+        out = jg.bounded(raw, limit)
+        assert len(out) <= limit
+        assert any(v.startswith(ATTACK) for v in scan_strings(out)), (p, raw[p:p + 12])
+
+
 def test_bounded_head_ending_anywhere_around_a_value():
     first = "FIRST " + "f" * 40
     raw = json.dumps({"messages": [{"role": "user", "content": first}, {"role": "user", "content": "z" * 6000},

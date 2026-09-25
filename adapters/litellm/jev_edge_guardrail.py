@@ -372,13 +372,15 @@ def bounded(raw: bytes, limit: int) -> bytes:
     reads the string values that follow a `"key":` it can see, so the join
     keeps that true on both sides of each cut: a string the head cuts is
     closed, and a value the tail starts inside, at, or just before (on its
-    key or colon) is given its key again ("text" when it has none)."""
+    key or colon, or on the comma or bracket before an array element) is
+    given its key again ("text" when it has none)."""
     tail_len = min(TAIL_BYTES, limit // 2)
     h = _head_cut(raw, limit - tail_len - (2 + MAX_KEY_PREFIX + 4))
     t = _tail_cut(raw, len(raw) - tail_len)
     in_head = False
     prev = cur = None  # the first string token that ends after t, and the one before it
-    for m in _STRING_RE.finditer(raw):
+    tokens = _STRING_RE.finditer(raw)
+    for m in tokens:
         s, e = m.span()
         if s < h < e:
             in_head = True
@@ -386,20 +388,28 @@ def bounded(raw: bytes, limit: int) -> bytes:
             cur = (s, e)
             break
         prev = (s, e)
+    if cur is not None and cur[0] < t and raw[cur[1]:cur[1] + 1] == b":":
+        # inside a key: start after it, on its colon, and look at what follows
+        t, prev = cur[1], cur
+        m = next(tokens, None)
+        cur = m.span() if m else None
     prefix = b""
     if cur is not None:
         s, e = cur
         is_key = raw[e:e + 1] == b":"
         keyed = prev is not None and prev[1] == s - 1 and raw[s - 1:s] == b":"
         key = raw[prev[0]:prev[1]] if keyed and prev[1] - prev[0] <= MAX_KEY_PREFIX + 2 else b'"text"'
-        if s < t < e and is_key:  # inside a key: start after it, send it whole
-            t, prefix = e, (raw[s:e] if e - s <= MAX_KEY_PREFIX + 2 else b'"text"')
-        elif s < t < e:           # inside a value
+        if s < t < e:             # inside a value
             prefix = key + b':"'
         elif t == s and keyed:    # at a value's opening quote
             prefix = key + b":"
         elif t == s - 1 and keyed:  # at the colon before a value
             prefix = key
+        elif t <= s and not is_key and not keyed:
+            # at an array element's opening quote or anywhere in the
+            # punctuation before it (`:[`, `,`): an unkeyed string the
+            # scanner would not read
+            t, prefix = s, b'"text":'
     return raw[:h] + (b'"' if in_head else b"0,") + prefix + raw[t:]
 
 

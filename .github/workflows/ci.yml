@@ -93,6 +93,9 @@ jobs:
           cache-from: type=gha,scope=jev-edge-test
           cache-to: type=gha,scope=jev-edge-test,mode=max
       - run: docker run --rm --init -v "$PWD":/work jev-edge-test
+      # the rock and the opm tree as users install them, every module
+      # required from each (make package-check)
+      - run: docker run --rm -v "$PWD":/work:ro -w /tmp jev-edge-test sh /work/scripts/package-smoke.sh
 
   e2e:
     runs-on: ubuntu-24.04

@@ -1,4 +1,4 @@
-.PHONY: test lint check invariants luajit-check golden golden-check calibrate labels context-lint test-js test-openresty bench bench-offline bench-judge bench-judge-live bench-chart dist opm-build rock-lint rock-pack rock-upload install live-check live-full live-openai soak shim e2e-envoy e2e-forward-auth e2e-apisix e2e-kong e2e-haproxy test-litellm suite-fetch suite-build suite-live suite-report suite-tooldocs-build suite-untrusted suite-untrusted-report suite-heldout-build suite-heldout suite-heldout-report conformance conformance-vectors conformance-check test-laya
+.PHONY: test lint check invariants luajit-check golden golden-check calibrate labels context-lint test-js test-openresty bench bench-offline bench-judge bench-judge-live bench-chart dist opm-build rock-lint rock-pack rock-upload install package-check live-check live-full live-openai soak shim e2e-envoy e2e-forward-auth e2e-apisix e2e-kong e2e-haproxy test-litellm suite-fetch suite-build suite-live suite-report suite-tooldocs-build suite-untrusted suite-untrusted-report suite-heldout-build suite-heldout suite-heldout-report conformance conformance-vectors conformance-check test-laya
 
 test:
 	busted
@@ -292,6 +292,13 @@ rock-pack: rock-lint
 # luarocks then saves it to ~/.luarocks/upload_config.lua for later runs.
 rock-upload: rock-lint
 	luarocks upload $(ARGS) $(ROCKSPEC)
+
+# What actually installs: the rock (luarocks make) and the `make dist` tree,
+# each loaded on its own in the test image, every module required from it
+# (scripts/package-smoke.sh). Run it after a rockspec or dist change.
+package-check:
+	docker build -q -t jev-edge-test -f adapters/openresty/Dockerfile.test adapters/openresty
+	docker run --rm -v "$(CURDIR)":/work:ro -w /tmp jev-edge-test sh /work/scripts/package-smoke.sh
 
 install: dist
 	mkdir -p $(LUA_LIB_DIR)/jev $(LUA_LIB_DIR)/resty

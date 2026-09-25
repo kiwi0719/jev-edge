@@ -84,8 +84,8 @@ export function memoryStore(clock: () => number = () => Date.now() / 1000): Stor
 
 /**
  * A Durable Object holding breaker and adaptive state for every isolate. One
- * instance per deployment (`idFromName("jev-edge")`). Export it from your
- * Worker and bind it as JEV_STATE.
+ * instance per deployment (`idFromName("jev-edge")`, or the name passed as
+ * `{ namespace, name }`). Export it from your Worker and bind it as JEV_STATE.
  *
  * Two kinds of endpoint:
  *   /get, /set, /incr, /expire  the plain Store interface (durableStore);
@@ -199,8 +199,22 @@ export interface DONamespaceLike {
   get(id: unknown): DOStubLike;
 }
 
-/** The one JevState object a deployment uses: `idFromName` of this. */
+/** The JevState object a namespace given as is resolves to: `idFromName` of this. */
 export const STATE_OBJECT = "jev-edge";
+
+/**
+ * A namespace and the name of the JevState object to use in it, for more
+ * than one breaker and adaptive timeout on one binding (a Worker per
+ * environment or per upstream sharing the class): `{ namespace:
+ * env.JEV_STATE, name: "staging" }`. Without `name`, STATE_OBJECT.
+ */
+export interface DONamed {
+  namespace: DONamespaceLike;
+  name?: string;
+}
+
+/** Where the durable* helpers find JevState: a namespace, a namespace and a name, or a stub. */
+export type StateTarget = DONamespaceLike | DONamed | DOStubLike;
 
 /**
  * A Durable Object stub, told apart from a Store by the one thing it always
@@ -218,6 +232,16 @@ export function isNamespace(x: unknown): x is DONamespaceLike {
   if (typeof x !== "object" || x === null || isStub(x)) return false;
   const n = x as DONamespaceLike;
   return typeof n.idFromName === "function" && typeof n.get === "function";
+}
+
+/** `{ namespace, name }`: a plain object with a `namespace` key (a stub has every key, so not one). */
+export function isNamed(x: unknown): x is DONamed {
+  return typeof x === "object" && x !== null && !isStub(x) && "namespace" in x;
+}
+
+/** A namespace, `{ namespace, name }` or a stub: what createRuntime runs through JevState. */
+export function isStateTarget(x: unknown): x is StateTarget {
+  return isStub(x) || isNamespace(x) || isNamed(x);
 }
 
 // A stub is an I/O object of the request that made it: workerd refuses it in
@@ -297,21 +321,36 @@ function isolateState(): (req: Request) => Promise<Response> {
 
 /**
  * What the durable* helpers call: for a namespace, a stub made per call
- * (`idFromName(name)`); for a stub, the stub guarded against use past its
- * request. Idempotent.
+ * (`idFromName(STATE_OBJECT)`, or the name given with it); for a stub, the
+ * stub guarded against use past its request. Idempotent. Throws on anything
+ * else, and on a `{ namespace, name }` whose namespace is not one (a binding
+ * missing from this environment) or whose name is not a non-empty string.
  */
-export function stateStub(target: DOStubLike | DONamespaceLike, name = STATE_OBJECT): DOStubLike {
+export function stateStub(target: StateTarget): DOStubLike {
   if (resolved.has(target)) return target as DOStubLike;
+  if (isStub(target)) return guarded(target);
+  let ns: DONamespaceLike;
+  let name = STATE_OBJECT;
   if (isNamespace(target)) {
-    const ns = target;
-    const s: DOStubLike = { fetch: (input, init) => ns.get(ns.idFromName(name)).fetch(input, init) };
-    resolved.add(s);
-    return s;
+    ns = target;
+  } else if (isNamed(target)) {
+    if (!isNamespace(target.namespace)) {
+      throw new TypeError("jev-edge: { namespace, name }: namespace is not a Durable Object namespace (idFromName and get); is the binding configured?");
+    }
+    if (target.name !== undefined && (typeof target.name !== "string" || target.name === "")) {
+      throw new TypeError("jev-edge: { namespace, name }: name must be a non-empty string");
+    }
+    ns = target.namespace;
+    name = target.name ?? STATE_OBJECT;
+  } else {
+    throw new TypeError("jev-edge: not a Durable Object namespace, { namespace, name } or stub");
   }
-  return guarded(target);
+  const s: DOStubLike = { fetch: (input, init) => ns.get(ns.idFromName(name)).fetch(input, init) };
+  resolved.add(s);
+  return s;
 }
 
-function caller(target: DOStubLike | DONamespaceLike) {
+function caller(target: StateTarget) {
   const stub = stateStub(target);
   return async (path: string, payload: unknown): Promise<{ value?: unknown; ok?: boolean }> => {
     const res = await stub.fetch("https://jev-state" + path, {
@@ -324,9 +363,9 @@ function caller(target: DOStubLike | DONamespaceLike) {
   };
 }
 
-/** The plain Store interface over JevState (a namespace, or a stub): two hops per read-modify-write, one (atomic) per incr. */
-export function durableStore(stub: DOStubLike | DONamespaceLike): Store {
-  const call = caller(stub);
+/** The plain Store interface over JevState (a namespace, `{ namespace, name }` or a stub): two hops per read-modify-write, one (atomic) per incr. */
+export function durableStore(target: StateTarget): Store {
+  const call = caller(target);
   return {
     get: async (k) => (await call("/get", { key: k })).value ?? undefined,
     set: async (k, v, ttl) => {
@@ -340,8 +379,8 @@ export function durableStore(stub: DOStubLike | DONamespaceLike): Store {
 }
 
 /** A breaker whose every operation is one fetch, executed inside the Durable Object. */
-export function durableBreaker(stub: DOStubLike | DONamespaceLike, cfg: BreakerConfig = {}): BreakerLike {
-  const call = caller(stub);
+export function durableBreaker(target: StateTarget, cfg: BreakerConfig = {}): BreakerLike {
+  const call = caller(target);
   const op = (o: BreakerOp["op"], extra: Record<string, unknown> = {}) => call("/breaker", { op: o, cfg, ...extra });
   return {
     state: async () => (await op("state")).value as State,
@@ -354,8 +393,8 @@ export function durableBreaker(stub: DOStubLike | DONamespaceLike, cfg: BreakerC
 }
 
 /** Adaptive timeout whose observe() runs inside the Durable Object: one fetch, atomic. */
-export function durableAdaptive(stub: DOStubLike | DONamespaceLike, cfg: JevConfig): AdaptiveLike {
-  const call = caller(stub);
+export function durableAdaptive(target: StateTarget, cfg: JevConfig): AdaptiveLike {
+  const call = caller(target);
   const t = tuning(cfg);
   const op = (o: AdaptiveOp["op"], extra: Record<string, unknown> = {}) => call("/adaptive", { op: o, cfg, ...extra });
   return {

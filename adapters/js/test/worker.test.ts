@@ -543,16 +543,72 @@ describe("stores", () => {
   });
 
   it("tells a namespace from a stub and from a Store", async () => {
-    const { isNamespace, isStub } = await import("../src/cf/stores");
+    const { isNamespace, isStub, isNamed } = await import("../src/cf/stores");
     const { stub } = dobj();
     const { ns } = namespace(stub);
     expect(isNamespace(ns)).toBe(true);
     expect(isStub(ns)).toBe(false);
+    expect(isNamed(ns)).toBe(false);
     const rpc = rpcStub(stub);
     expect(isStub(rpc)).toBe(true);
     expect(isNamespace(rpc)).toBe(false); // answers idFromName and get, but has fetch
+    expect(isNamed(rpc)).toBe(false); // answers "namespace" too, but has fetch
+    expect(isNamed({ namespace: ns, name: "staging" })).toBe(true);
     expect(isNamespace(memoryStore())).toBe(false);
     expect(isStub(memoryStore())).toBe(false);
+    expect(isNamed(memoryStore())).toBe(false);
+  });
+
+  /** A namespace whose every name is its own JevState object, made on first use. */
+  function namespaces() {
+    const objects = new Map<string, ReturnType<typeof dobj>>();
+    const ns = {
+      idFromName: (n: string) => ({ name: n }),
+      get: (id: unknown) => {
+        const n = (id as { name: string }).name;
+        if (!objects.has(n)) objects.set(n, dobj());
+        return rpcStub(objects.get(n)!.stub);
+      },
+    };
+    return { ns, objects };
+  }
+
+  it("state takes { namespace, name }: the object of that name, not jev-edge", async () => {
+    const { ns, objects } = namespaces();
+    const config = { ...ENFORCE95, breaker: { min_samples: 2, fail_ratio: 0.5, open_s: 10 } };
+    const staging = createRuntime({ config, state: { namespace: ns, name: "staging" } });
+    const plain = createRuntime({ config, state: ns });
+    await staging.breaker.failure();
+    await staging.breaker.failure();
+    expect(await staging.breaker.state()).toBe(OPEN);
+    expect(await plain.breaker.state()).toBe(0); // closed: jev-edge is another object
+    expect([...objects.keys()].sort()).toEqual(["jev-edge", "staging"]);
+    // the durable* helpers take the same forms; without a name, jev-edge
+    expect(await durableStore({ namespace: ns, name: "staging" }).get("brk:state")).toMatchObject({ state: OPEN });
+    expect(await durableBreaker({ namespace: ns }, config.breaker).state()).toBe(0);
+    await durableAdaptive({ namespace: ns, name: "staging" }, config.jev).success(50);
+    expect(await staging.state.get("adapt")).toMatchObject({ n: 1, mean: 50 });
+  });
+
+  it("a preset keeps the { namespace, name } the options give instead of env.JEV_STATE as is", async () => {
+    const { ns, objects } = namespaces();
+    const mw = pagesMiddleware((env: { JEV_STATE?: typeof ns }) => ({
+      config: ENFORCE95,
+      state: { namespace: env.JEV_STATE!, name: "pages" },
+    }));
+    const res = await mw({ request: chat(attack(0)), env: { JEV_STATE: ns }, next: async () => Response.json({ reached: true }) });
+    expect(res.status).toBe(403);
+    expect([...objects.keys()]).toEqual(["pages"]);
+    expect(objects.get("pages")!.calls()).toBeGreaterThan(0);
+  });
+
+  it("a { namespace, name } that cannot work is refused when the runtime is built", async () => {
+    const { ns } = namespaces();
+    const unbound = { namespace: undefined as unknown as typeof ns, name: "staging" }; // binding missing here
+    expect(() => createRuntime({ state: unbound })).toThrow(/namespace is not a Durable Object namespace.*binding configured/);
+    expect(() => durableStore(unbound)).toThrow(/binding configured/);
+    expect(() => createRuntime({ state: { namespace: ns, name: "" } })).toThrow(/name must be a non-empty string/);
+    expect(() => createRuntime({ state: { namespace: ns, name: 7 as unknown as string } })).toThrow(/name must be a non-empty string/);
   });
 
   it("the adaptive estimate is one document", async () => {

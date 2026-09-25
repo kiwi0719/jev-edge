@@ -15,8 +15,8 @@ import { shouldSample, buildSample, type Sample } from "./sampling.js";
 import * as subjectMod from "./core/subject.js";
 import { load as loadProvider, type Provider, type ProviderRequestInfo } from "./providers/index.js";
 import {
-  kvStore, memoryStore, durableStore, durableBreaker, durableAdaptive, isStub, isNamespace, stateStub,
-  type KVLike, type DOStubLike, type DONamespaceLike,
+  kvStore, memoryStore, durableStore, durableBreaker, durableAdaptive, isStateTarget, stateStub,
+  type KVLike, type StateTarget,
 } from "./cf/stores.js";
 import { Adaptive, type AdaptiveLike } from "./cf/adaptive.js";
 import type { Store, BreakerLike } from "./core/breaker.js";
@@ -33,15 +33,17 @@ export interface Options {
   provider?: Provider;
   /** KV namespace for the fingerprint / reputation cache. Memory (per isolate) if absent. */
   cache?: KVLike | Store;
-  /** Breaker + adaptive timeout state: the JevState Durable Object namespace (env.JEV_STATE), a stub of it,
-   *  or any Store. Memory (per isolate) if absent. With the Durable Object the breaker and adaptive
-   *  read-modify-write run inside it, one fetch per operation.
-   *  Pass the namespace: the runtime makes a stub per operation (`idFromName("jev-edge")`), so it can be kept
-   *  at module scope. workerd binds a stub to the request that created it; a runtime kept across requests
-   *  with a stub logs that once per stub and isolate, and from then on keeps breaker and adaptive state in
-   *  that isolate's memory, one operation at a time (cf/stores.ts). Anything with a `fetch` method is taken
-   *  for a stub, and idFromName + get without one for a namespace, so a Store must have neither. */
-  state?: DONamespaceLike | DOStubLike | Store;
+  /** Breaker + adaptive timeout state: the JevState Durable Object namespace (env.JEV_STATE), the namespace
+   *  and an object name (`{ namespace: env.JEV_STATE, name: "staging" }`), a stub, or any Store. Memory (per
+   *  isolate) if absent. With the Durable Object the breaker and adaptive read-modify-write run inside it,
+   *  one fetch per operation.
+   *  Pass the namespace: the runtime makes a stub per operation (`idFromName("jev-edge")`, or the name
+   *  given), so it can be kept at module scope. workerd binds a stub to the request that created it; a
+   *  runtime kept across requests with a stub logs that once per stub and isolate, and from then on keeps
+   *  breaker and adaptive state in that isolate's memory, one operation at a time (cf/stores.ts). Anything
+   *  with a `fetch` method is taken for a stub, idFromName + get without one for a namespace, and an object
+   *  with a `namespace` key for `{ namespace, name }`, so a Store must have none of these. */
+  state?: StateTarget | Store;
   /** Store for per-subject trajectories (KV or memory). Memory (per isolate) if absent. Only used with config.subject.enabled. */
   subjectStore?: KVLike | Store;
   /** Header carrying the client IP, set by a proxy you trust to overwrite it.
@@ -92,12 +94,13 @@ export function createRuntime(opts: Options): Runtime {
   let state: Store;
   let breaker: BreakerLike;
   let adaptive: AdaptiveLike;
-  if (isNamespace(opts.state) || isStub(opts.state)) {
+  if (isStateTarget(opts.state)) {
     // One hop per operation: the Durable Object runs the same Breaker and
     // Adaptive classes against its own storage, so the read-modify-write is
     // atomic there instead of three or four round trips from here. The stub
-    // is made per call from a namespace; a stub given as is is guarded
-    // against use past its request (cf/stores.ts), one guard for all three.
+    // is made per call from a namespace (and name); a stub given as is is
+    // guarded against use past its request (cf/stores.ts), one guard for all
+    // three.
     const stub = stateStub(opts.state);
     state = durableStore(stub);
     breaker = durableBreaker(stub, config.breaker);

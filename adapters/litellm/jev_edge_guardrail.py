@@ -51,7 +51,7 @@ import math
 import os
 import re
 from typing import Any, Callable, Optional, Union
-from urllib.parse import unquote_plus
+from urllib.parse import unquote_plus, urlsplit
 
 import httpx
 
@@ -122,6 +122,12 @@ SKIP_CALLS = frozenset({
 # Calls whose prompts reach the model without passing through this hook's
 # data: nothing to judge, so the request is unjudgeable.
 NOT_VISIBLE_CALLS = frozenset({"create_batch", "acreate_batch", "realtime", "arealtime"})
+
+# The routes whose proxy metadata LiteLLM keeps in `litellm_metadata` (their
+# API has a `metadata` parameter of its own, which is the client's), from
+# litellm.proxy.litellm_pre_call_utils._get_metadata_variable_name.
+LITELLM_METADATA_ROUTES = ("thread", "assistant", "batches", "bedrock", "/v1/messages", "responses", "files")
+
 
 def _thread_message(data: dict) -> dict:
     """add_message: one message, top-level role and content."""
@@ -412,6 +418,34 @@ def _number(name: str, value: Any, cast: Callable[[Any], Any], minimum: float) -
     return n
 
 
+def _proxy_path(data: dict) -> Optional[str]:
+    """The path of the request as LiteLLM's proxy received it, from the
+    proxy_server_request it builds (and overwrites, so a client cannot set
+    it); None when the hook was called for something else (a batch line,
+    code calling it directly)."""
+    psr = data.get("proxy_server_request")
+    url = psr.get("url") if isinstance(psr, dict) else None
+    if not isinstance(url, str) or not url:
+        return None
+    try:
+        return urlsplit(url).path
+    except ValueError:
+        return None
+
+
+def _metadata_key(data: dict) -> str:
+    """Where LiteLLM keeps its own metadata for this request: `litellm_metadata`
+    on the routes whose API has a `metadata` parameter (Responses, Anthropic
+    messages, batches, files, assistants), `metadata` elsewhere. Decided by
+    the route, as LiteLLM decides it, so the client's own `metadata` (sent on
+    to the provider) or a `litellm_metadata` a client put in a chat request
+    is never taken for the proxy's."""
+    path = _proxy_path(data)
+    if path is not None:
+        return "litellm_metadata" if any(r in path for r in LITELLM_METADATA_ROUTES) else "metadata"
+    return "litellm_metadata" if isinstance(data.get("litellm_metadata"), dict) else "metadata"
+
+
 class JevEdgeBlocked(Exception):
     """Raised on a block when FastAPI is not installed (tests)."""
 
@@ -522,33 +556,24 @@ class JevEdgeGuardrail(CustomGuardrail):
         return merged
 
     @staticmethod
-    def _metadata(data: dict) -> dict:
-        """Where LiteLLM keeps its own metadata for this route: routes whose
-        API has a `metadata` parameter (Responses, Anthropic messages,
-        batches, files, assistants) use `litellm_metadata`."""
-        md = data.get("litellm_metadata")
-        if isinstance(md, dict):
-            return md
-        md = data.get("metadata")
-        if not isinstance(md, dict):
-            md = data["metadata"] = {}
-        return md
-
-    @staticmethod
     def client_ip(data: dict) -> Optional[str]:
-        """What jev-edge gets as X-Forwarded-For: the request's whole
-        X-Forwarded-For chain when it has one, else LiteLLM's
+        """What jev-edge gets as X-Forwarded-For, from what LiteLLM's proxy
+        itself recorded (the client can set neither): the request's whole
+        X-Forwarded-For chain when it has one, else the proxy's own
         ``requester_ip_address``. The chain wins because with LiteLLM's
         ``use_x_forwarded_for`` on, requester_ip_address is the chain's
         leftmost entry, which is whatever the client sent; jev-edge's
         ``client_ip.trusted_hops`` picks the real hop from the whole chain."""
-        psr = data.get("proxy_server_request") or {}
-        headers = psr.get("headers") or {}
+        psr = data.get("proxy_server_request")
+        if not isinstance(psr, dict):
+            return None
+        headers = psr.get("headers")
+        headers = headers if isinstance(headers, dict) else {}
         xff = next((v for k, v in headers.items() if str(k).lower() == "x-forwarded-for"), None)
         chain = ", ".join(p.strip() for p in str(xff).split(",") if p.strip()) if xff else ""
         if chain:
             return chain
-        md = data.get("litellm_metadata") or data.get("metadata") or {}
+        md = data.get(_metadata_key(data))
         ip = md.get("requester_ip_address") if isinstance(md, dict) else None
         return str(ip) if ip else None
 
@@ -574,7 +599,11 @@ class JevEdgeGuardrail(CustomGuardrail):
         else:
             verdict = await self.judge(arg, self.client_ip(data))
 
-        self._metadata(data)["jev_verdict"] = verdict
+        key = _metadata_key(data)
+        md = data.get(key)
+        if not isinstance(md, dict):
+            md = data[key] = {}
+        md["jev_verdict"] = verdict
 
         if verdict.get("action") == "block" and self.enforce:
             status = int(verdict.get("status") or 403)

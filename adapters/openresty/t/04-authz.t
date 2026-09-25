@@ -187,3 +187,63 @@ location /_jev/authz/ { content_by_lua_block { require("resty.jev.edge").authz()
 
 
 
+=== TEST 8: no x-envoy-external-address and no X-Forwarded-For: the peer is a relay, never the client
+--- http_config eval: $::HttpConfig
+--- user_files eval: ::conf('policy = { mode = "enforce", block_threshold = 0.7, suspect_threshold = 0.5 }, subject = { enabled = true, from = "ip", salt = "s" },')
+--- config
+location /_jev/authz/ {
+    content_by_lua_block { require("resty.jev.edge").authz() }
+    log_by_lua_block { ngx.log(ngx.WARN, "authz subject=", tostring(ngx.ctx.jev_subject)) }
+}
+location = /poison {
+    content_by_lua_block {
+        -- the relay's own address (the peer every request arrives from)
+        local cache = require("resty.jev.cache").new("jev_cache")
+        cache:set("rep:127.0.0.1", { blocked_until = ngx.now() + 60 })
+        ngx.say("ok")
+    }
+}
+location = /m { content_by_lua_block { require("resty.jev.edge").metrics() } }
+--- request eval
+["GET /poison",
+ "POST /_jev/authz/v1/chat/completions\n{\"messages\":[{\"role\":\"user\",\"content\":\"a perfectly ordinary question about invoices\"}]}",
+ "POST /_jev/authz/v1/chat/completions\n{\"messages\":[{\"role\":\"user\",\"content\":\"a perfectly ordinary question about invoices\"}]}",
+ "GET /m"]
+--- more_headers eval
+["",
+ "Content-Type: application/json\nX-Jev-Mock-Score: 0.2",
+ "Content-Type: application/json\nX-Jev-Mock-Score: 0.2\nX-Real-IP: 127.0.0.1",
+ ""]
+--- error_code eval
+[200, 200, 200, 200]
+--- response_headers eval
+["", "X-Jev-Verdict: safe", "X-Jev-Verdict: safe", ""]
+--- response_body_like eval
+["ok", "^\$", "^\$", qr/jev_authz_events_total\{event="no_client_ip"\} 2/]
+--- no_error_log
+[error]
+
+
+
+=== TEST 9: no client address, no subject = "ip" either
+--- http_config eval: $::HttpConfig
+--- user_files eval: ::conf('subject = { enabled = true, from = "ip", salt = "s" },')
+--- config
+location /_jev/authz/ {
+    content_by_lua_block { require("resty.jev.edge").authz() }
+    log_by_lua_block { ngx.log(ngx.WARN, "authz subject=", tostring(ngx.ctx.jev_subject)) }
+}
+--- request
+POST /_jev/authz/v1/chat/completions
+{"messages":[{"role":"user","content":"a perfectly ordinary question about invoices"}]}
+--- more_headers
+Content-Type: application/json
+X-Jev-Mock-Score: 0.2
+--- error_code: 200
+--- error_log
+authz subject=nil
+--- no_error_log
+[error]
+
+
+

@@ -101,11 +101,15 @@ local function build_req(rules, over)
   -- 0 = no limit: past the default 100 the rest are dropped, and a
   -- Content-Type sent after 100 junk headers would read as absent.
   local headers = ngx.req.get_headers(0)
+  -- false: the adapter knows there is no client address (authz behind a
+  -- relay that did not say who its client was); nil: the peer is the client
+  local client_ip = over.client_ip
+  if client_ip == nil then client_ip = ngx.var.remote_addr end
   local req = {
     method    = over.method or ngx.req.get_method(),
     path      = over.path or ngx.var.uri,
     headers   = headers,
-    client_ip = over.client_ip or ngx.var.remote_addr,
+    client_ip = client_ip or nil,
     body      = nil,
     body_size = tonumber(headers["content-length"]) or 0,
   }
@@ -482,12 +486,19 @@ end
 -- right (1 = last). Envoy's x-envoy-external-address is already that value,
 -- but only Envoy sets it: `envoy` is true for authz() alone. Traefik, Caddy
 -- and nginx pass a client's copy of it through to forward_auth().
+--
+-- authz() is always called by a relay (Envoy, an Istio sidecar or gateway,
+-- the gRPC shim, HAProxy's agent), never by the client: without either
+-- header, or with fewer X-Forwarded-For hops than trusted_hops, the peer
+-- address is the relay's own, and every request through it would share one
+-- IP reputation and one subject. It returns nil there (no client address).
 local function client_ip_from(h, cfg, envoy)
   local function first(v) if type(v) == "table" then return v[1] end return v end
   local ext = envoy and first(h["x-envoy-external-address"])
   if type(ext) == "string" and ext ~= "" then return (ext:match("^%s*(%S+)")) end
   local xff = first(h["x-forwarded-for"])
   if type(xff) ~= "string" or xff == "" then
+    if envoy then return nil end
     local real = first(h["x-real-ip"])
     if type(real) == "string" and real ~= "" then return (real:match("^%s*(%S+)")) end
     return ngx.var.remote_addr
@@ -496,7 +507,8 @@ local function client_ip_from(h, cfg, envoy)
   for ip in xff:gmatch("[^,%s]+") do hops[#hops + 1] = ip end
   local n = tonumber(cfg.client_ip and cfg.client_ip.trusted_hops) or 1
   local ip = hops[#hops - n + 1]
-  return ip or ngx.var.remote_addr
+  if ip or envoy then return ip end
+  return ngx.var.remote_addr
 end
 
 -- What Envoy removes from the request it lets through: on a 200 answer,
@@ -591,13 +603,14 @@ function _M.authz(prefix)
   -- Envoy sets x-envoy-external-address / x-forwarded-for; nginx sees Envoy's IP.
   local h = ngx.req.get_headers(0)
   local client_ip = client_ip_from(h, cfg, true)
+  if not client_ip then metrics.incr_authz("no_client_ip") end
   -- set by Envoy (with_request_body.allow_partial_message) and the HAProxy
   -- SPOA agent, which both strip client copies
   local partial = h["x-envoy-auth-partial-body"] == "true" or h["x-jev-body-partial"] == "1"
   local okr, remove = pcall(headers_to_remove, h, cfg)
   if okr then ngx.header["x-envoy-auth-headers-to-remove"] = remove end
 
-  return respond_authz(cfg, rules, { path = path, client_ip = client_ip, partial = partial }, "authz")
+  return respond_authz(cfg, rules, { path = path, client_ip = client_ip or false, partial = partial }, "authz")
 end
 
 --- content_by_lua for generic forward-auth: Traefik ForwardAuth, Caddy

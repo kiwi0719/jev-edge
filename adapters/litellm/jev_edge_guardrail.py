@@ -1,41 +1,56 @@
 """jev-edge as a LiteLLM proxy guardrail.
 
 LiteLLM proxy is where a lot of LLM traffic actually flows. This guardrail
-sends each request's messages to a running jev-edge (``/_jev/authz``, the same
-endpoint Envoy and the recipes use) and blocks or annotates the request with
-the verdict. No core port, no second set of thresholds: jev-edge decides,
-this file only carries the answer.
+sends each request's text, in its original structure, to a running jev-edge
+(``/_jev/authz``, the same endpoint Envoy and the recipes use) and blocks or
+annotates the request with the verdict. No core port, no second set of
+thresholds: jev-edge decides, this file only carries the answer.
 
-config.yaml::
+config.yaml (the file sits next to it; LiteLLM loads ``<file>.<Class>`` from
+the config's directory)::
 
     guardrails:
       - guardrail_name: jev-edge
         litellm_params:
           guardrail: jev_edge_guardrail.JevEdgeGuardrail
           mode: pre_call
-          jev_edge_url: http://jev-edge:8080      # or env JEV_EDGE_URL
-          # optional
-          enforce: true          # false = monitor: never block, only annotate
-          timeout: 2.0           # seconds; exceeded = fail open
-          path: /v1/chat/completions   # what jev-edge's L1 sees as the path
+          default_on: true
+
+LiteLLM builds a custom guardrail with ``guardrail_name``, ``event_hook`` and
+``default_on`` only, so every setting has an environment variable, and a
+keyword argument (for code that builds the class itself) wins over it:
+
+    JEV_EDGE_URL             jev-edge's base URL (required)
+    JEV_EDGE_ENFORCE         true (default) | false = monitor: never block
+    JEV_EDGE_TIMEOUT         seconds, default 2.0; exceeded = fail open
+    JEV_EDGE_PATH            the path jev-edge's L1 sees, default /v1/chat/completions
+    JEV_EDGE_MAX_BODY_BYTES  largest body sent, default 1048576 (jev-edge's
+                             max_body_bytes and nginx's client_max_body_size)
+    JEV_EDGE_EXTRA_FIELDS    comma list of top-level keys also sent, for the
+                             paths jev-edge's untrusted.fields names
+    JEV_EDGE_UNJUDGED        pass (default) | block: what a request nobody
+                             could judge gets
 
 Contract: only an answer carrying ``X-Jev-Verdict`` is trusted. 200 with the
 header is a decision; any status >= 400 with the header is a block (whatever
-``policy.block_status`` is); anything else, and any error reaching jev-edge
-(connection refused, timeout, a 5xx from something that is not jev-edge),
-fails open: the request goes through with
-``metadata.jev_verdict == {"verdict": "error", ...}``.
-
-Put ``adapters/litellm`` on ``PYTHONPATH`` (or copy this file next to your
-config). Requires ``httpx``, which LiteLLM already depends on.
+``policy.block_status`` is). An answer without the header below 500 (nginx
+refusing the request before jev-edge ran: 400, 413, 414, a 404 from something
+that is not jev-edge) means nobody judged it: ``verdict: skipped``,
+``source: adapter``, reason ``unjudgeable: authz answered <status>``, passed or
+blocked as ``unjudged`` says. Any error reaching jev-edge (connection refused,
+timeout, a 5xx without the header) fails open with
+``metadata.jev_verdict == {"verdict": "error", ...}``, whatever ``unjudged``
+says. Requires ``httpx``, which LiteLLM already depends on.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import math
 import os
-from typing import Any, Optional, Union
+import re
+from typing import Any, Callable, Optional, Union
 from urllib.parse import unquote_plus
 
 import httpx
@@ -58,6 +73,307 @@ log = logging.getLogger("jev_edge")
 
 HEADER_NAMES = ("x-jev-verdict", "x-jev-score", "x-jev-source", "x-jev-reason", "x-jev-request-id")
 
+MAX_BODY_BYTES = 1048576  # jev-edge's rules.max_body_bytes, nginx's default client_max_body_size
+TAIL_BYTES = 65536        # jev-edge's rules.TAIL_BYTES: the tail scanned with the head of a larger body
+
+# Top-level keys that carry text, in the order they are sent: the
+# conversation last, so the newest turn is in the tail of a body that has to
+# be cut. `messages` / `input` keep their structure (roles, content parts,
+# tool_result / tool_use blocks, function_call_output items) so jev-edge's
+# untrusted judging finds tool results exactly as it does in-line.
+LEAD_KEYS = ("system", "instructions")
+TEXT_KEYS = ("query", "text", "prompt", "input", "messages")
+
+# Content parts that carry media: only their `type` (and any `text` or
+# `content`, which jev-edge would read in-line too) is sent.
+MEDIA_PARTS = frozenset({"image_url", "input_image", "image", "input_audio", "audio", "file", "input_file"})
+# Keys whose values are media payloads wherever they appear.
+MEDIA_KEYS = frozenset({"image_url", "input_audio", "file_data", "inline_data", "inlineData"})
+# Strings under these keys name structure, not text: a body with nothing else
+# is not worth a round trip.
+STRUCTURAL_KEYS = frozenset({"role", "type", "id", "call_id", "tool_call_id", "tool_use_id", "name",
+                             "media_type", "status", "model", "cache_control"})
+MAX_DEPTH = 32  # deeper values are dropped; jev-edge reads 4 levels below a text field
+
+# ---------------------------------------------------------------------------
+# call types (LiteLLM passes the route's call type to async_pre_call_hook,
+# sync and async names both seen)
+# ---------------------------------------------------------------------------
+
+# Not model input, and not watched by in-line jev-edge either.
+SKIP_CALLS = frozenset({
+    "embedding", "aembedding", "embeddings",
+    "moderation", "amoderation",
+    "transcription", "atranscription", "audio_transcription",
+    "speech", "aspeech",
+    "rerank", "arerank",
+    "image_generation", "aimage_generation", "image_edit", "aimage_edit",
+    "image_variation", "aimage_variation",
+    "video_generation", "avideo_generation",
+})
+
+# Calls whose prompts reach the model without passing through this hook's
+# data: nothing to judge, so the request is unjudgeable.
+NOT_VISIBLE_CALLS = frozenset({"create_batch", "acreate_batch", "realtime", "arealtime"})
+
+def _thread_message(data: dict) -> dict:
+    """add_message: one message, top-level role and content."""
+    return {"messages": [{"role": data.get("role") or "user", "content": data.get("content")}]}
+
+
+def _run(data: dict) -> dict:
+    """run_thread: instructions and additional_instructions (system), then
+    additional_messages."""
+    msgs: list = []
+    for key in ("instructions", "additional_instructions"):
+        if data.get(key) is not None:
+            msgs.append({"role": "system", "content": data[key]})
+    extra = data.get("additional_messages")
+    if isinstance(extra, list):
+        msgs.extend(extra)
+    return {"messages": msgs}
+
+
+def _assistant(data: dict) -> dict:
+    """create_assistants: the instructions every run of it starts with."""
+    return {"messages": [{"role": "system", "content": data.get("instructions")}]}
+
+
+def _is_generation_url(url: str) -> bool:
+    path = url.split("?", 1)[0].rstrip("/")
+    return path.endswith(("/chat/completions", "/completions", "/responses", "/messages"))
+
+
+def _file_text(f: Any) -> Optional[str]:
+    """The text of an uploaded file as LiteLLM holds it: the content, or a
+    (filename, content[, content_type]) tuple. None when it is not UTF-8."""
+    content = f[1] if isinstance(f, (tuple, list)) and len(f) >= 2 else f
+    if isinstance(content, (bytes, bytearray)):
+        try:
+            content = bytes(content).decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    if not isinstance(content, str):
+        return None
+    return content[1:] if content.startswith("\ufeff") else content
+
+
+# ---------------------------------------------------------------------------
+# the body jev-edge judges
+# ---------------------------------------------------------------------------
+
+_DROP = object()
+
+
+def _clean(node: Any, depth: int = 1) -> Any:
+    """A JSON-safe copy of `node` without media payloads, to MAX_DEPTH."""
+    if isinstance(node, str) or node is None or isinstance(node, (bool, int)):
+        return node
+    if isinstance(node, float):
+        return node if math.isfinite(node) else _DROP
+    if depth > MAX_DEPTH:
+        return _DROP
+    if not isinstance(node, (dict, list, tuple)) and callable(getattr(node, "model_dump", None)):
+        try:  # a pydantic object LiteLLM put in the request
+            node = node.model_dump()
+        except Exception:
+            return _DROP
+    if isinstance(node, dict):
+        t = node.get("type")
+        keep = None
+        if t == "base64":  # Anthropic source: the bytes are the payload
+            keep = ("type", "media_type")
+        elif isinstance(t, str) and t in MEDIA_PARTS:
+            keep = ("type", "text", "content")
+        out = {}
+        for k, v in node.items():
+            k = str(k)
+            if k in MEDIA_KEYS or (keep is not None and k not in keep):
+                continue
+            c = _clean(v, depth + 1)
+            if c is not _DROP:
+                out[k] = c
+        return out
+    if isinstance(node, (list, tuple)):
+        return [c for c in (_clean(v, depth + 1) for v in node) if c is not _DROP]
+    return _DROP
+
+
+def _has_text(node: Any, key: str = "") -> bool:
+    if isinstance(node, str):
+        return node != "" and key not in STRUCTURAL_KEYS
+    if isinstance(node, dict):
+        return any(_has_text(v, k) for k, v in node.items())
+    if isinstance(node, list):
+        return any(_has_text(v, key) for v in node)
+    return False
+
+
+def _contents_as_messages(data: dict) -> list:
+    """Gemini `contents` (generate_content, pass-through) as messages: each
+    part's `text` is read by jev-edge's content-part rule."""
+    msgs: list = []
+    si = data.get("systemInstruction", data.get("system_instruction"))
+    if isinstance(si, dict):
+        msgs.append({"role": "system", "content": si.get("parts")})
+    elif isinstance(si, str):
+        msgs.append({"role": "system", "content": si})
+    contents = data.get("contents")
+    if isinstance(contents, str):
+        contents = [contents]
+    if isinstance(contents, list):
+        for c in contents:
+            if isinstance(c, dict):
+                msgs.append({"role": c.get("role") or "user", "content": c.get("parts")})
+            elif isinstance(c, str):
+                msgs.append({"role": "user", "content": c})
+    return msgs
+
+
+def _top_key(field: str) -> str:
+    """The top-level key of a path: documents[*].text -> documents."""
+    return re.split(r"[.\[]", field.strip(), maxsplit=1)[0]
+
+
+def _parse_fields(value: Any) -> tuple:
+    if value is None:
+        return ()
+    items = value.split(",") if isinstance(value, str) else list(value)
+    out = []
+    for item in items:
+        k = _top_key(str(item))
+        if k and k not in out:
+            out.append(k)
+    return tuple(out)
+
+
+def _body_dict(data: dict, extra_fields: tuple = ()) -> Optional[dict]:
+    body: dict[str, Any] = {}
+    keys = LEAD_KEYS + tuple(k for k in extra_fields if k not in LEAD_KEYS + TEXT_KEYS) + TEXT_KEYS
+    gemini = _contents_as_messages(data)
+    for key in keys:
+        value = data.get(key)
+        if key == "messages" and gemini:
+            value = (value if isinstance(value, list) else ([] if value is None else [value])) + gemini
+        if value is None:
+            continue
+        c = _clean(value)
+        if c is not _DROP:
+            body[key] = c
+    return body if _has_text(body) else None
+
+
+# JSON string tokens in compact JSON bytes
+_STRING_RE = re.compile(rb'"[^"\\]*(?:\\.[^"\\]*)*"', re.S)
+_HEX = frozenset(b"0123456789abcdefABCDEF")
+
+
+def _odd_backslashes_before(raw: bytes, i: int) -> bool:
+    n = 0
+    while i - 1 - n >= 0 and raw[i - 1 - n] == 0x5C:
+        n += 1
+    return n % 2 == 1
+
+
+def _head_cut(raw: bytes, h: int) -> int:
+    """`h` moved back to a UTF-8 character boundary that splits no JSON escape."""
+    while h > 0 and 0x80 <= raw[h] < 0xC0:
+        h -= 1
+    j = h - 1
+    while j >= max(0, h - 4) and raw[j] in _HEX:
+        j -= 1
+    if j >= 1 and raw[j] == ord("u") and h < j + 5 and _odd_backslashes_before(raw, j):
+        return j - 1  # inside \uXXXX: cut before its backslash
+    if _odd_backslashes_before(raw, h):
+        return h - 1  # right after an escape's backslash
+    return h
+
+
+def _tail_cut(raw: bytes, t: int) -> int:
+    """`t` moved forward to a UTF-8 character boundary that splits no JSON escape."""
+    n = len(raw)
+    j = t - 1
+    while j >= max(0, t - 4) and raw[j] in _HEX:
+        j -= 1
+    if j >= 1 and raw[j] == ord("u") and t < j + 5 and _odd_backslashes_before(raw, j):
+        t = j + 5  # inside \uXXXX: start after it
+    elif t < n and _odd_backslashes_before(raw, t):
+        t += 5 if raw[t] == ord("u") else 1  # the escaped character itself
+    while t < n and 0x80 <= raw[t] < 0xC0:
+        t += 1
+    return min(t, n)
+
+
+MAX_KEY_PREFIX = 64  # a longer key is sent as "text"
+
+
+def bounded(raw: bytes, limit: int) -> bytes:
+    """At most `limit` bytes of the compact JSON body `raw`, as jev-edge scans
+    a body past its max_body_bytes: the head and the last TAIL_BYTES (the
+    newest content), sent with X-Jev-Body-Partial. jev-edge's partial scanner
+    reads the string values that follow a `"key":` it can see, so the join
+    keeps that true on both sides of each cut: a string the head cuts is
+    closed, and a value the tail starts inside, at, or just before (on its
+    key or colon) is given its key again ("text" when it has none)."""
+    tail_len = min(TAIL_BYTES, limit // 2)
+    h = _head_cut(raw, limit - tail_len - (2 + MAX_KEY_PREFIX + 4))
+    t = _tail_cut(raw, len(raw) - tail_len)
+    in_head = False
+    prev = cur = None  # the first string token that ends after t, and the one before it
+    for m in _STRING_RE.finditer(raw):
+        s, e = m.span()
+        if s < h < e:
+            in_head = True
+        if e > t:
+            cur = (s, e)
+            break
+        prev = (s, e)
+    prefix = b""
+    if cur is not None:
+        s, e = cur
+        is_key = raw[e:e + 1] == b":"
+        keyed = prev is not None and prev[1] == s - 1 and raw[s - 1:s] == b":"
+        key = raw[prev[0]:prev[1]] if keyed and prev[1] - prev[0] <= MAX_KEY_PREFIX + 2 else b'"text"'
+        if s < t < e and is_key:  # inside a key: start after it, send it whole
+            t, prefix = e, (raw[s:e] if e - s <= MAX_KEY_PREFIX + 2 else b'"text"')
+        elif s < t < e:           # inside a value
+            prefix = key + b':"'
+        elif t == s and keyed:    # at a value's opening quote
+            prefix = key + b":"
+        elif t == s - 1 and keyed:  # at the colon before a value
+            prefix = key
+    return raw[:h] + (b'"' if in_head else b"0,") + prefix + raw[t:]
+
+
+def _setting(value: Any, env: str, default: Any) -> Any:
+    if value is not None:
+        return value
+    raw = os.environ.get(env)
+    if raw is not None and raw.strip() != "":
+        return raw.strip()
+    return default
+
+
+def _bool(name: str, value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    s = str(value).strip().lower()
+    if s in ("1", "true", "yes", "on"):
+        return True
+    if s in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"jev-edge guardrail: {name} must be true or false, got {value!r}")
+
+
+def _number(name: str, value: Any, cast: Callable[[Any], Any], minimum: float) -> Any:
+    try:
+        n = cast(value)
+    except (TypeError, ValueError):
+        n = None
+    if n is None or not math.isfinite(n) or not n >= minimum:
+        raise ValueError(f"jev-edge guardrail: {name} must be a number >= {minimum}, got {value!r}")
+    return n
+
 
 class JevEdgeBlocked(Exception):
     """Raised on a block when FastAPI is not installed (tests)."""
@@ -72,74 +388,112 @@ class JevEdgeGuardrail(CustomGuardrail):
     def __init__(
         self,
         jev_edge_url: Optional[str] = None,
-        enforce: bool = True,
-        timeout: float = 2.0,
-        path: str = "/v1/chat/completions",
+        enforce: Optional[Union[bool, str]] = None,
+        timeout: Optional[Union[float, str]] = None,
+        path: Optional[str] = None,
+        max_body_bytes: Optional[Union[int, str]] = None,
+        extra_fields: Optional[Union[str, list]] = None,
+        unjudged: Optional[str] = None,
         transport: Optional[httpx.AsyncBaseTransport] = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
-        url = jev_edge_url or os.environ.get("JEV_EDGE_URL", "")
+        url = str(_setting(jev_edge_url, "JEV_EDGE_URL", ""))
         if not url:
-            raise ValueError("jev-edge guardrail: set jev_edge_url or JEV_EDGE_URL")
+            raise ValueError("jev-edge guardrail: set JEV_EDGE_URL (or jev_edge_url)")
         self.base = url.rstrip("/")
-        self.enforce = bool(enforce)
-        self.timeout = float(timeout)
-        self.path = path if path.startswith("/") else "/" + path
+        self.enforce = _bool("JEV_EDGE_ENFORCE", _setting(enforce, "JEV_EDGE_ENFORCE", True))
+        self.timeout = _number("JEV_EDGE_TIMEOUT", _setting(timeout, "JEV_EDGE_TIMEOUT", 2.0), float, 0.001)
+        p = str(_setting(path, "JEV_EDGE_PATH", "/v1/chat/completions"))
+        self.path = p if p.startswith("/") else "/" + p
+        self.max_body_bytes = _number("JEV_EDGE_MAX_BODY_BYTES",
+                                      _setting(max_body_bytes, "JEV_EDGE_MAX_BODY_BYTES", MAX_BODY_BYTES), int, 1024)
+        self.extra_fields = _parse_fields(_setting(extra_fields, "JEV_EDGE_EXTRA_FIELDS", None))
+        self.unjudged = str(_setting(unjudged, "JEV_EDGE_UNJUDGED", "pass")).lower()
+        if self.unjudged not in ("pass", "block"):
+            raise ValueError(f"jev-edge guardrail: JEV_EDGE_UNJUDGED must be pass or block, got {self.unjudged!r}")
         self._client = httpx.AsyncClient(timeout=self.timeout, transport=transport)
+        log.info("jev-edge guardrail: url=%s enforce=%s timeout=%s path=%s max_body_bytes=%d extra_fields=%s unjudged=%s",
+                 self.base, self.enforce, self.timeout, self.path, self.max_body_bytes,
+                 ",".join(self.extra_fields) or "-", self.unjudged)
 
     # ------------------------------------------------------------------
     # request -> the body jev-edge judges
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _collect(node: Any, out: list, depth: int = 1) -> None:
-        """Every string under a content value, the way core's extractor reads
-        it (core/normalize.lua `collect`): plain strings, each part's `text`
-        (chat `text`, Responses `input_text`), and `content` nested once more
-        (Anthropic `tool_result`), to a bounded depth. Images and numbers add
-        nothing, so the body stays small and under jev-edge's size cap."""
-        if isinstance(node, str):
-            out.append(node)
-            return
-        if depth > 4:
-            return
-        if isinstance(node, list):
-            for item in node:
-                JevEdgeGuardrail._collect(item, out, depth + 1)
-        elif isinstance(node, dict):
-            if isinstance(node.get("text"), str):
-                out.append(node["text"])
-            if node.get("content") is not None:
-                JevEdgeGuardrail._collect(node["content"], out, depth + 1)
+    def body_for(data: dict, extra_fields: Any = ()) -> Optional[str]:
+        """The request's text as the compact JSON body jev-edge judges, in its
+        original structure: `system`, `instructions`, the `extra_fields`,
+        `query`, `text`, `prompt`, `input` and `messages` (Gemini `contents`
+        joins `messages`), with media payloads removed. None when no value
+        holds any text."""
+        body = _body_dict(data, _parse_fields(extra_fields) if extra_fields else ())
+        return None if body is None else json.dumps(body, ensure_ascii=False, separators=(",", ":"))
+
+    def plan(self, data: dict, call_type: Any) -> tuple:
+        """What to do with a call, by call type: ("judge", body or None),
+        ("skip", reason) or ("unjudged", reason)."""
+        name = str(getattr(call_type, "value", call_type) or "")
+        if name in SKIP_CALLS:
+            return "skip", f"call type {name} not judged"
+        if name in NOT_VISIBLE_CALLS:
+            return "unjudged", f"unjudgeable: call type {name}: prompts not visible to the guardrail"
+        if name in ("add_message", "a_add_message"):
+            data = _thread_message(data)
+        elif name in ("run_thread", "arun_thread", "run_thread_stream", "arun_thread_stream"):
+            data = _run(data)
+        elif name in ("create_assistants", "acreate_assistants"):
+            data = _assistant(data)
+        elif name in ("create_file", "acreate_file"):
+            purpose = str(data.get("purpose") or "unknown")
+            if purpose != "batch":
+                return "unjudged", f"unjudgeable: call type {name}: file purpose {purpose} not judged"
+            text = _file_text(data.get("file"))
+            if text is None:
+                return "unjudged", f"unjudgeable: call type {name}: batch file not readable"
+            data = self._batch(text)
+            if data is None:
+                return "unjudged", f"unjudgeable: call type {name}: batch file is not JSONL"
+            if not data:
+                return "skip", f"call type {name}: no generation requests in the batch file"
+        return "judge", _body_dict(data, self.extra_fields)
 
     @staticmethod
-    def body_for(data: dict) -> Optional[str]:
-        """The text of the request as a small JSON body jev-edge judges:
-        chat `messages` (string or content-part contents), and `prompt` /
-        `input` (a string, a list of strings, or Responses API input items).
-        None when there is no text at all."""
-        body: dict[str, Any] = {}
-        msgs = data.get("messages")
-        if isinstance(msgs, list):
-            out = []
-            for m in msgs:
-                if not isinstance(m, dict):
-                    continue
-                parts: list = []
-                JevEdgeGuardrail._collect(m.get("content"), parts)
-                text = "\n".join(p for p in parts if p)
-                if text:
-                    out.append({"role": m.get("role", "user"), "content": text})
-            if out:
-                body["messages"] = out
-        for key in ("prompt", "input"):
-            parts = []
-            JevEdgeGuardrail._collect(data.get(key), parts)
-            text = "\n".join(p for p in parts if p)
-            if text:
-                body[key] = text
-        return json.dumps(body) if body else None
+    def _batch(text: str) -> Optional[dict]:
+        """The generation requests of a Batch input file, merged into one body."""
+        merged: dict[str, list] = {}
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                return None
+            if not isinstance(obj, dict):
+                return None
+            body, url = obj.get("body"), obj.get("url")
+            if not isinstance(body, dict) or (isinstance(url, str) and not _is_generation_url(url)):
+                continue
+            for key in LEAD_KEYS + TEXT_KEYS:
+                v = body.get(key)
+                if v is not None:
+                    merged.setdefault(key, []).extend(v if isinstance(v, list) else [v])
+        return merged
+
+    @staticmethod
+    def _metadata(data: dict) -> dict:
+        """Where LiteLLM keeps its own metadata for this route: routes whose
+        API has a `metadata` parameter (Responses, Anthropic messages,
+        batches, files, assistants) use `litellm_metadata`."""
+        md = data.get("litellm_metadata")
+        if isinstance(md, dict):
+            return md
+        md = data.get("metadata")
+        if not isinstance(md, dict):
+            md = data["metadata"] = {}
+        return md
 
     @staticmethod
     def client_ip(data: dict) -> Optional[str]:
@@ -155,8 +509,8 @@ class JevEdgeGuardrail(CustomGuardrail):
         chain = ", ".join(p.strip() for p in str(xff).split(",") if p.strip()) if xff else ""
         if chain:
             return chain
-        md = data.get("metadata") or {}
-        ip = md.get("requester_ip_address")
+        md = data.get("litellm_metadata") or data.get("metadata") or {}
+        ip = md.get("requester_ip_address") if isinstance(md, dict) else None
         return str(ip) if ip else None
 
     # ------------------------------------------------------------------
@@ -168,16 +522,20 @@ class JevEdgeGuardrail(CustomGuardrail):
         user_api_key_dict: Any,
         cache: Any,
         data: dict,
-        call_type: str,
+        call_type: Any,
     ) -> Optional[Union[Exception, str, dict]]:
-        body = self.body_for(data)
+        kind, arg = self.plan(data, call_type)
         verdict: dict[str, Any]
-        if body is None:
-            verdict = {"verdict": "skipped", "score": "0.00", "source": "l1", "reason": "no text"}
+        if kind == "skip":
+            verdict = self._adapter("skipped", arg)
+        elif kind == "unjudged":
+            verdict = self._unjudged(arg)
+        elif arg is None:
+            verdict = self._adapter("skipped", "no text")
         else:
-            verdict = await self.judge(body, self.client_ip(data))
+            verdict = await self.judge(arg, self.client_ip(data))
 
-        data.setdefault("metadata", {})["jev_verdict"] = verdict
+        self._metadata(data)["jev_verdict"] = verdict
 
         if verdict.get("action") == "block" and self.enforce:
             status = int(verdict.get("status") or 403)
@@ -187,19 +545,59 @@ class JevEdgeGuardrail(CustomGuardrail):
             raise JevEdgeBlocked(status, detail)
         return data
 
-    async def judge(self, body: str, client_ip: Optional[str]) -> dict[str, Any]:
+    @staticmethod
+    def _adapter(verdict: str, reason: str) -> dict[str, Any]:
+        return {"verdict": verdict, "score": "0.00", "source": "adapter", "reason": reason, "action": "pass"}
+
+    def _unjudged(self, reason: str) -> dict[str, Any]:
+        """Nobody judged the request: skipped, passed or blocked as `unjudged`
+        says (keep it equal to jev-edge's policy.unjudgeable)."""
+        log.warning("jev-edge: %s (unjudged: %s)", reason, self.unjudged)
+        v = self._adapter("skipped", reason)
+        if self.unjudged == "block":
+            v["action"] = "block"
+            v["status"] = 403
+        return v
+
+    def encode(self, body: dict) -> tuple:
+        """The UTF-8 compact JSON body and whether it had to be cut."""
+        raw = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8", "replace")
+        if len(raw) <= self.max_body_bytes:
+            return raw, False
+        log.info("jev-edge: body of %d bytes sent as head and tail (%d max)", len(raw), self.max_body_bytes)
+        return bounded(raw, self.max_body_bytes), True
+
+    async def judge(self, body: Union[dict, str, bytes], client_ip: Optional[str]) -> dict[str, Any]:
         headers = {"Content-Type": "application/json"}
+        if isinstance(body, dict):
+            content, partial = self.encode(body)
+        else:
+            content = body.encode("utf-8", "replace") if isinstance(body, str) else body
+            partial = len(content) > self.max_body_bytes
+            if partial:
+                content = bounded(content, self.max_body_bytes)
+        if partial:
+            # jev-edge scans it as the head of a larger body, as it does for
+            # Envoy's allow_partial_message; the reason ends in "(window)"
+            headers["X-Jev-Body-Partial"] = "1"
         if client_ip:
             headers["X-Forwarded-For"] = client_ip
         try:
-            res = await self._client.post(self.base + "/_jev/authz" + self.path, content=body, headers=headers)
+            res = await self._client.post(self.base + "/_jev/authz" + self.path, content=content, headers=headers)
         except httpx.HTTPError as e:  # connection refused, timeout, ...
             log.warning("jev-edge unreachable, failing open: %s", e)
             return {"verdict": "error", "score": "0.00", "source": "adapter", "reason": str(e), "action": "pass"}
 
-        if "x-jev-verdict" not in res.headers or res.status_code not in (200, *range(400, 600)):
-            log.warning("jev-edge answered %s%s, failing open", res.status_code,
-                        "" if "x-jev-verdict" in res.headers else " without X-Jev-Verdict")
+        if "x-jev-verdict" not in res.headers:
+            if res.status_code >= 500:  # the server, or a proxy in front of it, failing
+                log.warning("jev-edge answered %s without X-Jev-Verdict, failing open", res.status_code)
+                return {"verdict": "error", "score": "0.00", "source": "adapter",
+                        "reason": f"http {res.status_code}", "action": "pass"}
+            # refused before jev-edge ran (413 past client_max_body_size, 400
+            # or 431 for headers, 414, a 404 from something else)
+            return self._unjudged(f"unjudgeable: authz answered {res.status_code}")
+        if res.status_code != 200 and res.status_code < 400:
+            log.warning("jev-edge answered %s, failing open", res.status_code)
             return {"verdict": "error", "score": "0.00", "source": "adapter", "reason": f"http {res.status_code}", "action": "pass"}
 
         v = {k[6:].replace("-", "_"): res.headers.get(k, "") for k in HEADER_NAMES if res.headers.get(k) is not None}

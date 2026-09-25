@@ -977,17 +977,31 @@ def test_logged_status_follows_the_verdict():
         assert g.logged["guardrail_status"] == expected
 
 
-def test_a_client_cannot_switch_the_guardrail_off_on_old_litellm():
-    # LiteLLM 1.80 read disable_global_guardrail from the request body and the
-    # client's metadata; only the key's or team's setting counts
-    g = guard(httpx.MockTransport(lambda r: httpx.Response(200)))
-    if hasattr(jg.CustomGuardrail, "_get_admin_metadata"):
-        pytest.skip("this LiteLLM reads key and team settings only")
-    assert g.get_disable_global_guardrail({"disable_global_guardrail": True, "metadata": {"disable_global_guardrail": True,
-                                                                                         "disable_global_guardrails": True},
-                                           "proxy_server_request": psr("/v1/chat/completions")}) is False
-    assert g.get_disable_global_guardrail({"metadata": {"user_api_key_metadata": {"disable_global_guardrails": True}},
-                                           "proxy_server_request": psr("/v1/chat/completions")}) is True
-    assert g.get_disable_global_guardrail({"litellm_metadata": {"user_api_key_team_metadata": {"disable_global_guardrails": True}},
-                                           "metadata": {}, "proxy_server_request": psr("/v1/responses")}) is True
+# Every way a request, or metadata a client or key holder can write, has had
+# to switch a default_on guardrail off: in the body, in the client's metadata
+# under the names LiteLLM 1.80 reads (and never overwrites), and in the other
+# metadata bag.
+OPT_OUTS = [
+    {"disable_global_guardrail": True},
+    {"metadata": {"disable_global_guardrail": True, "disable_global_guardrails": True}},
+    {"metadata": {"user_api_key_team_metadata": {"disable_global_guardrails": True}}},
+    {"metadata": {"user_api_key_metadata": {"disable_global_guardrails": True}}},
+    {"metadata": {}, "litellm_metadata": {"user_api_key_metadata": {"disable_global_guardrails": True},
+                                          "user_api_key_team_metadata": {"disable_global_guardrails": True}}},
+    {"metadata": {"opted_out_global_guardrails": ["jev-edge"],
+                  "user_api_key_team_metadata": {"opted_out_global_guardrails": ["jev-edge"]},
+                  "user_api_key_metadata": {"opted_out_global_guardrails": ["jev-edge"]}}},
+]
 
+
+@pytest.mark.parametrize("route", ["/v1/chat/completions", "/v1/responses"])
+@pytest.mark.parametrize("extra", OPT_OUTS)
+def test_nothing_in_a_request_or_its_key_switches_the_guardrail_off(route, extra):
+    g = JevEdgeGuardrail(jev_edge_url=URL, guardrail_name="jev-edge", event_hook="pre_call", default_on=True,
+                         transport=httpx.MockTransport(lambda r: httpx.Response(200)))
+    data = dict({"messages": [{"role": "user", "content": ATTACK}], "proxy_server_request": psr(route)}, **extra)
+    assert g.get_disable_global_guardrail(data) is False
+    assert g.get_opted_out_global_guardrails_from_metadata(data) == []
+    if hasattr(jg.CustomGuardrail, "should_run_guardrail"):  # the LiteLLM installed decides with them
+        from litellm.types.guardrails import GuardrailEventHooks
+        assert g.should_run_guardrail(data, GuardrailEventHooks.pre_call) is True

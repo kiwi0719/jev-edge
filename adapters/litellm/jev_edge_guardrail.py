@@ -17,7 +17,9 @@ the config's directory)::
           default_on: true
 
 Without ``default_on: true`` LiteLLM runs the hook only for requests and keys
-that name the guardrail; a warning is logged at startup.
+that name the guardrail; a warning is logged at startup. With it, nothing a
+request, a key or a team sets (``disable_global_guardrail(s)``,
+``opted_out_global_guardrails``) switches it off.
 
 Every setting has an environment variable. LiteLLM 1.81.0 and later also
 pass the keys under ``litellm_params`` to the class as keyword arguments,
@@ -550,23 +552,24 @@ class JevEdgeGuardrail(_ApplyGuardrailBase):
         # the test endpoint); every proxy hook stays async_pre_call_hook
         return False
 
+    # A default_on jev-edge guardrail runs for every request: LiteLLM's
+    # per-request switches are all ignored. What LiteLLM reads them from is
+    # not the proxy's alone: 1.80 takes `disable_global_guardrail` from the
+    # request body and metadata, and the key and team settings from metadata
+    # names it never overwrites (`user_api_key_team_metadata`, a bag's
+    # `disable_global_guardrails`), which a client can send; and a key's own
+    # metadata is often set by whoever holds the key.
+
     def get_disable_global_guardrail(self, data: dict) -> Optional[bool]:
-        """Whether a default_on guardrail is switched off for this request.
-        Newer LiteLLM reads that from the key's and team's settings only.
-        Older versions (1.80) read `disable_global_guardrail` from the request
-        body and the client's metadata, so any client could switch this
-        guardrail off; there only the key's or team's
-        `disable_global_guardrails`, which the proxy itself records, counts."""
-        if hasattr(CustomGuardrail, "_get_admin_metadata"):
-            return super().get_disable_global_guardrail(data)  # type: ignore[misc]
-        md = data.get(_metadata_key(data)) if isinstance(data, dict) else None
-        if not isinstance(md, dict):
-            return False
-        for key in ("user_api_key_metadata", "user_api_key_team_metadata"):
-            admin = md.get(key)
-            if isinstance(admin, dict) and admin.get("disable_global_guardrails") is True:
-                return True
+        """Never switched off for a request, whatever its body, its metadata,
+        its key or its team says."""
         return False
+
+    def get_opted_out_global_guardrails_from_metadata(self, data: dict) -> list:
+        """No request, key or team opts out of it (recent LiteLLM, 1.102.1
+        among them, reads `opted_out_global_guardrails` from key and team
+        metadata)."""
+        return []
 
     # ------------------------------------------------------------------
     # request -> the body jev-edge judges

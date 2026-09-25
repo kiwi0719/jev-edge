@@ -26,7 +26,7 @@ LiteLLM proxy is where a lot of LLM traffic actually flows, and it has a guardra
          default_on: true
    ```
 
-   Without `default_on: true` LiteLLM runs the hook only for requests that name the guardrail (`guardrails: ["jev-edge"]`) and keys whose metadata names it, so a client that leaves it out is never judged; the guardrail logs a warning at startup when it is built that way. To judge only some keys, keep `default_on: true` and switch it off for the others with the key's or team's `disable_global_guardrails` (or, on recent LiteLLM, `opted_out_global_guardrails`), which a client cannot set.
+   Without `default_on: true` LiteLLM runs the hook only for requests that name the guardrail (`guardrails: ["jev-edge"]`) and keys whose metadata names it, so a client that leaves it out is never judged; the guardrail logs a warning at startup when it is built that way. With it, nothing switches the guardrail off for a request: it ignores `disable_global_guardrail`, `disable_global_guardrails` and `opted_out_global_guardrails` wherever they are set, in the request, its key or its team, since none of them is the operator's alone. LiteLLM 1.80 reads the first from the request itself; a client can write the key and team settings into its own metadata under names 1.80 never overwrites (`user_api_key_team_metadata`); and a key's metadata is often written by whoever holds the key. Traffic that should not be judged belongs on a LiteLLM without the guardrail.
 
 4. Configure it with environment variables in LiteLLM's environment. From LiteLLM 1.81.0 the same settings can go under `litellm_params` instead (`jev_edge_url`, `enforce`, `timeout`, `path`, `max_body_bytes`, `extra_fields`, `unjudged`); they reach the class as keyword arguments and win over the environment. Earlier versions (1.80.11 was checked) build a custom guardrail with `guardrail_name`, `event_hook` and `default_on` only, so there settings under `litellm_params` are ignored and the environment is the only way.
 
@@ -47,7 +47,7 @@ LiteLLM proxy is where a lot of LLM traffic actually flows, and it has a guardra
 Checked against LiteLLM 1.80.11 and 1.102.1, each running the guardrail as a proxy with a stub jev-edge and a stub provider.
 
 - **1.81.0 and later** pass the `litellm_params` settings to the class; before, only the environment variables work.
-- **1.80.11** lets a request switch every `default_on` guardrail off with `"disable_global_guardrail": true` in its body or `metadata`. The guardrail ignores that and honours only a key's or team's `disable_global_guardrails`; 1.102.1 does the same itself.
+- **1.80.11** lets a request switch every `default_on` guardrail off with `"disable_global_guardrail": true` in its body or `metadata`, and never writes a team's settings into the request (`user_api_key_team_metadata`), so a copy the client sends stands. The guardrail ignores every such switch, on every version (step 3).
 - **Batch files** are judged line by line only where LiteLLM scans them (1.99 and later, see below). 1.80.11 runs no guardrail on `/v1/files` at all.
 - **Realtime text** is judged where LiteLLM's realtime bridge calls `apply_guardrail` for typed messages and tool outputs (1.102.1 does; 1.80.11 does not).
 

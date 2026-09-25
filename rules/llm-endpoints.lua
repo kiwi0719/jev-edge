@@ -44,35 +44,36 @@ return {
   -- cheapest; raise it (4 covers 128 KiB) to judge long text in full, and
   -- policy.unjudgeable then decides what still does not fit. See README.
   max_judge_chunks = 1,
-  -- Oldest first: the judging window keeps the last ones first.
+  -- Oldest first: the judging window keeps the last ones first. The paths
+  -- are walked together, in document order: each message's content, tool
+  -- calls and parts together, so the newest turn is kept whole.
   -- system: Anthropic Messages and Ollama /api/generate; template: Ollama.
   -- Tool-call arguments, which chat templates render for the model and a
   -- client can write into the history: OpenAI and Ollama tool_calls, legacy
   -- function_call, Anthropic tool_use input, Responses function_call and
   -- mcp_call arguments (".**": every key and string below, a string of JSON
-  -- read decoded), and the free-text input of custom tool calls. Before the
-  -- messages, so the window keeps the newest turn first.
+  -- read decoded), and the free-text input of custom tool calls.
   -- messages[*].parts: AI SDK 5 UIMessages, which carry no content.
   -- input[*].output: a Responses API function_call_output (a tool result).
   -- suffix: OpenAI completions and Ollama; input_prefix, input_suffix,
   -- input_extra: llama.cpp /infill.
   text_fields = { "system", "template",
-                  "messages[*].tool_calls[*].function.arguments.**", "messages[*].tool_calls[*].custom.input",
-                  "messages[*].function_call.arguments.**", "messages[*].content[*].input.**",
-                  "input[*].arguments.**", "input[*].input",
-                  "messages[*].content", "messages[*].parts", "prompt", "input",
-                  "input[*].output", "query", "text", "suffix", "input_prefix", "input_suffix",
-                  "input_extra[*].text" },
+                  "messages[*].content", "messages[*].tool_calls[*].function.arguments.**",
+                  "messages[*].tool_calls[*].custom.input", "messages[*].function_call.arguments.**",
+                  "messages[*].content[*].input.**", "messages[*].parts", "prompt",
+                  "input", "input[*].arguments.**", "input[*].input", "input[*].output",
+                  "query", "text", "suffix", "input_prefix", "input_suffix", "input_extra[*].text" },
   -- Tool definitions and output schemas, judged as a part of their own with
   -- the rule's templates and their own verdict-cache entry, so an unchanged
   -- tool set costs one judge call per cache lifetime: OpenAI chat, Ollama,
   -- Responses and Anthropic tools, legacy functions,
   -- response_format.json_schema and the Responses text.format. Read from
-  -- each: name, description, title, enum, const, default and examples values
-  -- and property names, at any depth (JSON Schema included); other strings
-  -- (type, format, URLs, headers) are not. Up to 4 x max_judge_bytes of it is
-  -- scanned by always_suspect and one max_judge_bytes window judged, beside
-  -- the text's own window. {} turns it off for a rule.
+  -- each: every key and string at any depth (JSON Schema included), but a
+  -- `type` whose value is a JSON Schema type name: vLLM, llama.cpp and SGLang
+  -- render the whole definition for the model. All of it is scanned by
+  -- always_suspect and one max_judge_bytes window judged, beside the text's
+  -- own window; past max_body_bytes the head and tail are scanned for them.
+  -- {} turns it off for a rule.
   tool_fields = { "tools", "functions", "response_format.json_schema", "text.format" },
   min_text_chars = 20,
   always_suspect = {

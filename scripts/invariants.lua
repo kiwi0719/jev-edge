@@ -273,6 +273,24 @@ rule("rule-parity", function(r)
       fail(r, "resolve() default " .. k .. " differ from llm-endpoints (core/rules.lua, src/rules/index.ts)")
     end
   end
+  -- the walk over tool-call arguments and tool definitions: the same bounds
+  -- (a cut is "(window)" or unjudgeable in one core only otherwise) and the
+  -- same JSON Schema type names left out of a tool definition
+  local nlua, nts = code("core/normalize.lua"), code("adapters/js/src/core/normalize.ts")
+  local depth, nodes = nts:match("export const DEEP = { depth: (%d+), nodes: (%d+) }")
+  if not depth or nlua:match("\n_M%.DEEP_DEPTH = (%d+)") ~= depth
+     or nlua:match("\n_M%.DEEP_NODES = (%d+)") ~= nodes then
+    fail(r, "DEEP_DEPTH / DEEP_NODES differ between core/normalize.lua and src/core/normalize.ts")
+  end
+  local function sorted_words(s)
+    local out = {}
+    for w in (s or ""):gmatch("[%a_]+") do out[#out + 1] = w end
+    table.sort(out)
+    return table.concat(out, ",")
+  end
+  local lt = sorted_words((nlua:match("\n_M%.SCHEMA_TYPES = (%b{})") or ""):gsub("= true", ""))
+  local tt = sorted_words(nts:match("SCHEMA_TYPES: ReadonlySet<string> = new Set%((%b[])%)"))
+  if lt == "" or lt ~= tt then fail(r, "SCHEMA_TYPES differ between core/normalize.lua and src/core/normalize.ts") end
   local tspats = {}
   for p in (tsrule:match("always_suspect:%s*%[(.-)\n%s*%],") or ""):gmatch("String%.raw`([^`]*)`") do
     tspats[#tspats + 1] = p

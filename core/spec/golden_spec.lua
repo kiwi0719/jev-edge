@@ -56,8 +56,7 @@ describe("golden: extract", function()
         H.body_decode)
       local tools
       if c.input.tool_fields then
-        local ttext, _, capped = normalize.extract_tools(decoded, c.input.tool_fields, c.input.tool_max_bytes,
-          H.body_decode)
+        local ttext, _, capped = normalize.extract_tools(decoded, c.input.tool_fields, H.body_decode)
         tools = { text = ttext, capped = capped or nil }
       end
       same(c.expect, { text = text, kind = kind, cut = cut or nil, tools = tools })

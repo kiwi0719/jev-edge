@@ -22,17 +22,17 @@ export const llmEndpoints: Rule = {
   max_body_bytes: 1048576,
   max_judge_bytes: 32768,
   max_judge_chunks: 1,
-  // oldest first: the judging window keeps the last ones first. Tool-call
-  // arguments (".**": every key and string below, a string of JSON read
-  // decoded) come before the messages, so the newest turn is kept first.
+  // oldest first: the judging window keeps the last ones first. The paths
+  // are walked together, in document order (each message's content and tool
+  // calls together); ".**": every key and string below, a string of JSON
+  // read decoded.
   text_fields: [
     "system", "template",
-    "messages[*].tool_calls[*].function.arguments.**", "messages[*].tool_calls[*].custom.input",
-    "messages[*].function_call.arguments.**", "messages[*].content[*].input.**",
-    "input[*].arguments.**", "input[*].input",
-    "messages[*].content", "messages[*].parts", "prompt", "input",
-    "input[*].output", "query", "text", "suffix", "input_prefix", "input_suffix",
-    "input_extra[*].text",
+    "messages[*].content", "messages[*].tool_calls[*].function.arguments.**",
+    "messages[*].tool_calls[*].custom.input", "messages[*].function_call.arguments.**",
+    "messages[*].content[*].input.**", "messages[*].parts", "prompt",
+    "input", "input[*].arguments.**", "input[*].input", "input[*].output",
+    "query", "text", "suffix", "input_prefix", "input_suffix", "input_extra[*].text",
   ],
   // tool definitions and output schemas, judged as a part of their own with
   // their own verdict-cache entry (see rules/llm-endpoints.lua)
@@ -100,12 +100,11 @@ export function resolve(spec: RuleSpec): Rule {
   if (!uok) throw new Error(uerr);
   out.text_fields ??= [
     "system", "template",
-    "messages[*].tool_calls[*].function.arguments.**", "messages[*].tool_calls[*].custom.input",
-    "messages[*].function_call.arguments.**", "messages[*].content[*].input.**",
-    "input[*].arguments.**", "input[*].input",
-    "messages[*].content", "messages[*].parts", "prompt", "input",
-    "input[*].output", "query", "text", "suffix", "input_prefix", "input_suffix",
-    "input_extra[*].text",
+    "messages[*].content", "messages[*].tool_calls[*].function.arguments.**",
+    "messages[*].tool_calls[*].custom.input", "messages[*].function_call.arguments.**",
+    "messages[*].content[*].input.**", "messages[*].parts", "prompt",
+    "input", "input[*].arguments.**", "input[*].input", "input[*].output",
+    "query", "text", "suffix", "input_prefix", "input_suffix", "input_extra[*].text",
   ];
   out.tool_fields ??= ["tools", "functions", "response_format.json_schema", "text.format"];
   for (const k of ["text_fields", "tool_fields"] as const) {

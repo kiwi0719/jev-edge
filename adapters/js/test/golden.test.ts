@@ -45,7 +45,7 @@ describe("golden: extract", () => {
       // only when the case names tool_fields
       let tools: { text: string; capped?: true } | undefined;
       if (c.input.tool_fields) {
-        const [values, capped] = core.normalize.extractTools(decoded, c.input.tool_fields, c.input.tool_max_bytes ?? undefined, jsonDecode);
+        const [values, capped] = core.normalize.extractTools(decoded, c.input.tool_fields, jsonDecode);
         tools = { text: values.join("\n"), ...(capped ? { capped } : {}) };
       }
       expect({ text, kind, ...(cut ? { cut } : {}), ...(tools ? { tools } : {}) }).toEqual(c.expect);

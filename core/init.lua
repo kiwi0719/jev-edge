@@ -311,7 +311,7 @@ function _M.evaluate(req, ctx)
     end
     local suffix = ""
     if chunks and #chunks > 1 then
-      suffix = capped and " (window)" or (" (" .. #chunks .. " chunks)")
+      suffix = capped and " (window)" or (" (" .. #chunks .. " chunks" .. (windowed and ", window" or "") .. ")")
     elseif windowed or (untrusted and untrusted.windowed) or (tools and tools.windowed) then
       suffix = " (window)"
     end

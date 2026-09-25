@@ -306,7 +306,7 @@ export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
       for (const c of chunks && chunks.length > 1 ? chunks : [text]) parts.push({ text: c, templates: rule!.templates, context });
     }
     let suffix = "";
-    if (chunks && chunks.length > 1) suffix = capped ? " (window)" : ` (${chunks.length} chunks)`;
+    if (chunks && chunks.length > 1) suffix = capped ? " (window)" : ` (${chunks.length} chunks${windowed ? ", window" : ""})`;
     else if (windowed || untrusted?.windowed || tools?.windowed) suffix = " (window)";
     if (untrusted && uspec) {
       // asked without the deployment context, the way the question was measured

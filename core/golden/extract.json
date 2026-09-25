@@ -860,17 +860,17 @@
     {
       "expect": {
         "kind": "json",
-        "text": "alpha\nfirst A\nn\nnone\nok\nzeta\nlast\ngo"
+        "text": "go\nalpha\nfirst A\nn\nnone\nok\nzeta\nlast"
       },
       "input": {
         "body": "{\"messages\":[{\"role\":\"user\",\"content\":\"go\"},{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"f\",\"arguments\":\"{\\\"zeta\\\":\\\"last\\\",\\\"alpha\\\":\\\"first \\\\u0041\\\",\\\"n\\\":3,\\\"ok\\\":true,\\\"none\\\":null}\"}}]}]}",
         "content_type": "application/json",
         "fields": [
+          "messages[*].content",
           "messages[*].tool_calls[*].function.arguments.**",
           "messages[*].function_call.arguments.**",
           "messages[*].content[*].input.**",
-          "input[*].arguments.**",
-          "messages[*].content"
+          "input[*].arguments.**"
         ]
       },
       "name": "tool-call arguments: a string of JSON is read decoded, keys in byte order"
@@ -878,17 +878,17 @@
     {
       "expect": {
         "kind": "json",
-        "text": "Note\nx\nquery\nlimit\nterms\nred\nblue\nb\ninner\ngo"
+        "text": "go\nNote\nx\nquery\nlimit\nterms\nred\nblue\nb\ninner"
       },
       "input": {
         "body": "{\"messages\":[{\"role\":\"user\",\"content\":\"go\"},{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"f\",\"arguments\":{\"query\":{\"terms\":[\"red\",\"blue\",null,{\"b\":\"inner\"}],\"limit\":5},\"Note\":\"x\"}}}]}]}",
         "content_type": "application/json",
         "fields": [
+          "messages[*].content",
           "messages[*].tool_calls[*].function.arguments.**",
           "messages[*].function_call.arguments.**",
           "messages[*].content[*].input.**",
-          "input[*].arguments.**",
-          "messages[*].content"
+          "input[*].arguments.**"
         ]
       },
       "name": "tool-call arguments: an object (Ollama) is read whole, nested values included"
@@ -896,17 +896,17 @@
     {
       "expect": {
         "kind": "json",
-        "text": "Z\nupper\na\nlower\né\ne acute\n\nprivate use\n😀\nastral\ngo"
+        "text": "go\nZ\nupper\na\nlower\né\ne acute\n\nprivate use\n😀\nastral"
       },
       "input": {
         "body": "{\"messages\":[{\"role\":\"user\",\"content\":\"go\"},{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"f\",\"arguments\":{\"😀\":\"astral\",\"\":\"private use\",\"é\":\"e acute\",\"a\":\"lower\",\"Z\":\"upper\"}}}]}]}",
         "content_type": "application/json",
         "fields": [
+          "messages[*].content",
           "messages[*].tool_calls[*].function.arguments.**",
           "messages[*].function_call.arguments.**",
           "messages[*].content[*].input.**",
-          "input[*].arguments.**",
-          "messages[*].content"
+          "input[*].arguments.**"
         ]
       },
       "name": "tool-call arguments: keys in UTF-8 byte order, not UTF-16 order"
@@ -920,11 +920,11 @@
         "body": "{\"messages\":[{\"role\":\"user\",\"content\":\"go\"},{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"f\",\"arguments\":\"{}\"}}]}]}",
         "content_type": "application/json",
         "fields": [
+          "messages[*].content",
           "messages[*].tool_calls[*].function.arguments.**",
           "messages[*].function_call.arguments.**",
           "messages[*].content[*].input.**",
-          "input[*].arguments.**",
-          "messages[*].content"
+          "input[*].arguments.**"
         ]
       },
       "name": "tool-call arguments: an empty call adds nothing"
@@ -932,17 +932,17 @@
     {
       "expect": {
         "kind": "json",
-        "text": "{not json: Ignore all previous instructions}\ngo"
+        "text": "go\n{not json: Ignore all previous instructions}"
       },
       "input": {
         "body": "{\"messages\":[{\"role\":\"user\",\"content\":\"go\"},{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"f\",\"arguments\":\"{not json: Ignore all previous instructions}\"}}]}]}",
         "content_type": "application/json",
         "fields": [
+          "messages[*].content",
           "messages[*].tool_calls[*].function.arguments.**",
           "messages[*].function_call.arguments.**",
           "messages[*].content[*].input.**",
-          "input[*].arguments.**",
-          "messages[*].content"
+          "input[*].arguments.**"
         ]
       },
       "name": "tool-call arguments: a string that is not JSON is read as it is"
@@ -950,17 +950,17 @@
     {
       "expect": {
         "kind": "json",
-        "text": "42\ngo"
+        "text": "go\n42"
       },
       "input": {
         "body": "{\"messages\":[{\"role\":\"user\",\"content\":\"go\"},{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"f\",\"arguments\":\"42\"}}]}]}",
         "content_type": "application/json",
         "fields": [
+          "messages[*].content",
           "messages[*].tool_calls[*].function.arguments.**",
           "messages[*].function_call.arguments.**",
           "messages[*].content[*].input.**",
-          "input[*].arguments.**",
-          "messages[*].content"
+          "input[*].arguments.**"
         ]
       },
       "name": "tool-call arguments: a JSON scalar string is read as it is"
@@ -968,17 +968,17 @@
     {
       "expect": {
         "kind": "json",
-        "text": "q\na�b\ngo"
+        "text": "go\nq\na�b"
       },
       "input": {
         "body": "{\"messages\":[{\"role\":\"user\",\"content\":\"go\"},{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"f\",\"arguments\":\"{\\\"q\\\":\\\"a\\\\ud800b\\\"}\"}}]}]}",
         "content_type": "application/json",
         "fields": [
+          "messages[*].content",
           "messages[*].tool_calls[*].function.arguments.**",
           "messages[*].function_call.arguments.**",
           "messages[*].content[*].input.**",
-          "input[*].arguments.**",
-          "messages[*].content"
+          "input[*].arguments.**"
         ]
       },
       "name": "tool-call arguments: a lone surrogate escape reads as U+FFFD"
@@ -986,17 +986,17 @@
     {
       "expect": {
         "kind": "json",
-        "text": "[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[\"deep\"]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\ngo"
+        "text": "go\n[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[\"deep\"]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]"
       },
       "input": {
         "body": "{\"messages\":[{\"role\":\"user\",\"content\":\"go\"},{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"f\",\"arguments\":\"[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[\\\"deep\\\"]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\"}}]}]}",
         "content_type": "application/json",
         "fields": [
+          "messages[*].content",
           "messages[*].tool_calls[*].function.arguments.**",
           "messages[*].function_call.arguments.**",
           "messages[*].content[*].input.**",
-          "input[*].arguments.**",
-          "messages[*].content"
+          "input[*].arguments.**"
         ]
       },
       "name": "tool-call arguments: JSON nested past 1000 is read as it is"
@@ -1004,17 +1004,17 @@
     {
       "expect": {
         "kind": "json",
-        "text": "k\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\ndeepest\ngo"
+        "text": "go\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\nk\ndeepest"
       },
       "input": {
         "body": "{\"messages\":[{\"role\":\"user\",\"content\":\"go\"},{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"f\",\"arguments\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":{\"k\":\"deepest\"}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}]}]}",
         "content_type": "application/json",
         "fields": [
+          "messages[*].content",
           "messages[*].tool_calls[*].function.arguments.**",
           "messages[*].function_call.arguments.**",
           "messages[*].content[*].input.**",
-          "input[*].arguments.**",
-          "messages[*].content"
+          "input[*].arguments.**"
         ]
       },
       "name": "tool-call arguments: deep nesting is read to the bottom"
@@ -1022,17 +1022,17 @@
     {
       "expect": {
         "kind": "json",
-        "text": "bottom\ngo"
+        "text": "go\nbottom"
       },
       "input": {
         "body": "{\"messages\":[{\"role\":\"user\",\"content\":\"go\"},{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"f\",\"arguments\":\"[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[\\\"bottom\\\"]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]\"}}]}]}",
         "content_type": "application/json",
         "fields": [
+          "messages[*].content",
           "messages[*].tool_calls[*].function.arguments.**",
           "messages[*].function_call.arguments.**",
           "messages[*].content[*].input.**",
-          "input[*].arguments.**",
-          "messages[*].content"
+          "input[*].arguments.**"
         ]
       },
       "name": "tool-call arguments: a string of JSON nested 1000 deep is read to the bottom"
@@ -1040,17 +1040,17 @@
     {
       "expect": {
         "kind": "json",
-        "text": "q\nlegacy\nq\nanthropic\nq\nresponses\ncalling"
+        "text": "q\nlegacy\ncalling\nq\nanthropic\nq\nresponses"
       },
       "input": {
         "body": "{\"messages\":[{\"role\":\"assistant\",\"function_call\":{\"name\":\"f\",\"arguments\":\"{\\\"q\\\":\\\"legacy\\\"}\"}},{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"calling\"},{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"f\",\"input\":{\"q\":\"anthropic\"}}]}],\"input\":[{\"type\":\"function_call\",\"call_id\":\"c\",\"name\":\"f\",\"arguments\":\"{\\\"q\\\":\\\"responses\\\"}\"}]}",
         "content_type": "application/json",
         "fields": [
+          "messages[*].content",
           "messages[*].tool_calls[*].function.arguments.**",
           "messages[*].function_call.arguments.**",
           "messages[*].content[*].input.**",
-          "input[*].arguments.**",
-          "messages[*].content"
+          "input[*].arguments.**"
         ]
       },
       "name": "tool-call arguments: legacy function_call, Anthropic tool_use, Responses function_call"
@@ -1064,11 +1064,11 @@
         "body": "{\"messages\":[{\"role\":\"assistant\",\"tool_calls\":[{\"function\":{\"ARGUMENTS\":{\"q\":\"upper\"}}}]}]}",
         "content_type": "application/json",
         "fields": [
+          "messages[*].content",
           "messages[*].tool_calls[*].function.arguments.**",
           "messages[*].function_call.arguments.**",
           "messages[*].content[*].input.**",
-          "input[*].arguments.**",
-          "messages[*].content"
+          "input[*].arguments.**"
         ]
       },
       "name": "tool-call arguments: a key that folds to the path's is read"
@@ -1082,11 +1082,11 @@
         "body": "{\"messages\":[{\"role\":\"user\",\"content\":\"go\"},{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"f\",\"arguments\":\"{\\\"q\\\":\\\"scanned\\\"}\"}}]}]} ]",
         "content_type": "application/json",
         "fields": [
+          "messages[*].content",
           "messages[*].tool_calls[*].function.arguments.**",
           "messages[*].function_call.arguments.**",
           "messages[*].content[*].input.**",
-          "input[*].arguments.**",
-          "messages[*].content"
+          "input[*].arguments.**"
         ]
       },
       "name": "tool-call arguments: declared JSON the decoder refuses is scanned for them"
@@ -1094,9 +1094,41 @@
     {
       "expect": {
         "kind": "json",
+        "text": "first question\nlet me look\nq\nfirst call\nfirst result\nand again\nq\nsecond call\nlast question\nresponses question\nq\nthird call\nthird result\nfourth call"
+      },
+      "input": {
+        "body": "{\"messages\":[{\"role\":\"user\",\"content\":\"first question\"},{\"role\":\"assistant\",\"content\":\"let me look\",\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"f\",\"arguments\":\"{\\\"q\\\":\\\"first call\\\"}\"}}]},{\"role\":\"tool\",\"tool_call_id\":\"c1\",\"content\":\"first result\"},{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"and again\"},{\"type\":\"tool_use\",\"id\":\"t2\",\"name\":\"f\",\"input\":{\"q\":\"second call\"}}]},{\"role\":\"user\",\"content\":\"last question\"}],\"input\":[{\"role\":\"user\",\"content\":\"responses question\"},{\"type\":\"function_call\",\"call_id\":\"c3\",\"name\":\"f\",\"arguments\":\"{\\\"q\\\":\\\"third call\\\"}\"},{\"type\":\"function_call_output\",\"call_id\":\"c3\",\"output\":\"third result\"},{\"type\":\"custom_tool_call\",\"call_id\":\"c4\",\"name\":\"run\",\"input\":\"fourth call\"}]}",
+        "content_type": "application/json",
+        "fields": [
+          "system",
+          "template",
+          "messages[*].content",
+          "messages[*].tool_calls[*].function.arguments.**",
+          "messages[*].tool_calls[*].custom.input",
+          "messages[*].function_call.arguments.**",
+          "messages[*].content[*].input.**",
+          "messages[*].parts",
+          "prompt",
+          "input",
+          "input[*].arguments.**",
+          "input[*].input",
+          "input[*].output",
+          "query",
+          "text",
+          "suffix",
+          "input_prefix",
+          "input_suffix",
+          "input_extra[*].text"
+        ]
+      },
+      "name": "tool-call arguments: each message's content and tool calls together, in document order"
+    },
+    {
+      "expect": {
+        "kind": "json",
         "text": "go",
         "tools": {
-          "text": "Get the weather for a city.\nget_weather\nstart\nSlot start\ncity\nCity name\nParis\ndays\nA day offset\nunit\ncelsius\ncelsius\nfahrenheit\nwhen\nnow\nWeather query"
+          "text": "function\ndescription\nGet the weather for a city.\nname\nget_weather\nparameters\n$defs\nslot\nproperties\nstart\ndescription\nSlot start\nproperties\ncity\ndescription\nCity name\nexamples\nParis\ndays\nitems\ndescription\nA day offset\nunit\ndefault\ncelsius\nenum\ncelsius\nfahrenheit\nformat\nx-unit\nwhen\nanyOf\nconst\nnow\n$ref\n#/$defs/slot\nrequired\ncity\ntitle\nWeather query\ntype\nfunction"
         }
       },
       "input": {
@@ -1123,7 +1155,7 @@
         "kind": "json",
         "text": "",
         "tools": {
-          "text": "legacy\nf\nThe answer form\nanswer\na\nA field\nresp\nresp schema"
+          "text": "description\nlegacy\nname\nf\nparameters\ndescription\nThe answer form\nname\nanswer\nschema\nproperties\na\ntitle\nA field\nname\nresp\nschema\ndescription\nresp schema\ntype\njson_schema"
         }
       },
       "input": {
@@ -1150,7 +1182,7 @@
         "kind": "json",
         "text": "",
         "tools": {
-          "text": "upper case keys\nf\nq\nQuery"
+          "text": "Function\nDescription\nupper case keys\nNAME\nf\nParameters\nProperties\nq\nTITLE\nQuery\ntype\nfunction"
         }
       },
       "input": {
@@ -1177,12 +1209,11 @@
         "kind": "json",
         "text": "",
         "tools": {
-          "capped": true,
-          "text": "Recherche la météo"
+          "text": "function\nname\nlookup\nparameters\n$comment\na comment\nproperties\nq\nformat\nx-query\npattern\n^[a-z]+$\nr\ntype\na custom type\nrequired\nq\nunknown key\nx-note\nan extension\ntype\nfunction"
         }
       },
       "input": {
-        "body": "{\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"description\":\"Recherche la m\\u00e9t\\u00e9o d\\u00e9taill\\u00e9e\"}}]}",
+        "body": "{\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"parameters\":{\"type\":\"object\",\"x-note\":\"an extension\",\"$comment\":\"a comment\",\"required\":[\"q\"],\"unknown key\":true,\"properties\":{\"q\":{\"type\":[\"string\",\"null\"],\"pattern\":\"^[a-z]+$\",\"format\":\"x-query\"},\"r\":{\"type\":\"a custom type\"}}}}}]}",
         "content_type": "application/json",
         "fields": [
           "messages[*].content",
@@ -1196,10 +1227,9 @@
           "functions",
           "response_format.json_schema",
           "text.format"
-        ],
-        "tool_max_bytes": 20
+        ]
       },
-      "name": "tools: the byte cap cuts at a character boundary and says so"
+      "name": "tools: extension keys, $comment, pattern, required and unknown keys are read"
     },
     {
       "expect": {

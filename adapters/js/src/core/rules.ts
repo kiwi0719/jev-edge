@@ -1,5 +1,5 @@
 // Port of core/rules.lua: L1, cheap and short-circuiting.
-import { extract, extractTools, extractUntrustedValues, isText, byteLength, head, tail, fieldKeys, scanStrings, window, chunks as splitChunks, utf8Bytes, type JsonValue } from "./normalize.js";
+import { extract, extractTools, extractUntrustedValues, isText, byteLength, head, tail, fieldKeys, scanStrings, scanTools, window, chunks as splitChunks, utf8Bytes, type JsonValue } from "./normalize.js";
 import { untrustedSpec, type UntrustedConfig } from "./defaults.js";
 import { repBlocked, type SubjectCtx, type ReputationConfig } from "./subject.js";
 
@@ -13,8 +13,6 @@ export const UNJUDGEABLE: RuleResult = "unjudgeable";
 export const MAX_BODY_BYTES = 1048576;
 export const MAX_JUDGE_BYTES = 32768;
 export const TAIL_BYTES = 65536;
-/** Tool definitions read per request: this many judging windows for the always_suspect scan, one window judged. */
-export const TOOL_WINDOWS = 4;
 export const SKIP_CONTENT_TYPES = [
   "image/", "audio/", "video/", "font/", "application/pdf", "application/zip", "application/gzip",
 ];
@@ -376,24 +374,23 @@ function untrustedPart(decoded: JsonValue | undefined, rule: Rule, ctx: RulesCtx
 }
 
 // Port of tools_part() in core/rules.lua: the tool definitions the model
-// reads, judged as their own part: scanned by always_suspect over up to
-// TOOL_WINDOWS windows of them, cut to one window of their own. Only from a
-// body parsed whole.
-function toolsPart(decoded: JsonValue | undefined, rule: Rule, ctx: RulesCtx | undefined): ToolsPart | undefined {
-  const fields = rule.tool_fields;
-  if (!Array.isArray(fields) || fields.length === 0 || decoded === undefined || decoded === null || typeof decoded !== "object") return undefined;
-  const budget = rule.max_judge_bytes ?? MAX_JUDGE_BYTES;
-  const [values, capped] = extractTools(decoded, fields, budget * TOOL_WINDOWS, ctx?.json_decode);
+// reads, judged as their own part: all of them scanned by always_suspect, cut
+// to one window of their own. `cut`: a bound, or the body's size, left some out.
+function toolsPart(values: string[], cut: boolean, rule: Rule, ctx: RulesCtx | undefined): ToolsPart | undefined {
   const ttext = values.join("\n");
   if (ttext === "") return undefined;
   const hit = textMatches(ttext, rule.always_suspect, ctx);
-  const [w, cut] = window(ttext, values, budget, hit?.[1], hit?.[2]);
-  return { text: w, windowed: cut || capped, hit: hit?.[0] };
+  const [w, windowed] = window(ttext, values, rule.max_judge_bytes ?? MAX_JUDGE_BYTES, hit?.[1], hit?.[2]);
+  return { text: w, windowed: windowed || cut, hit: hit?.[0] };
 }
+
+const hasToolFields = (rule: Rule) => Array.isArray(rule.tool_fields) && rule.tool_fields.length > 0;
 
 type Judged = {
   text: string; unj?: string; hit?: string; windowed?: boolean; chunks?: string[]; capped?: boolean;
   untrusted?: UntrustedPart; tools?: ToolsPart;
+  /** a walk bound left text fields or tool definitions unread */
+  bound?: boolean;
 };
 
 // Port of judged() in core/rules.lua.
@@ -407,6 +404,7 @@ async function judged(
   let values: string[];
   let text: string;
   let partial = false;
+  let bound = false;
   let untrusted: UntrustedPart | undefined;
   let tools: ToolsPart | undefined;
   if (size > max) {
@@ -425,6 +423,12 @@ async function judged(
     if (values.length === 0) return { text: "", unj: "unjudgeable: body too large" };
     text = values.join("\n");
     partial = true;
+    if (hasToolFields(rule)) {
+      const tkeys = fieldKeys(rule.tool_fields);
+      const tvalues = scanTools(hd, tkeys, []);
+      if (tl !== undefined) scanTools(tl, tkeys, tvalues);
+      tools = toolsPart(tvalues, true, rule, ctx);
+    }
   } else {
     let kind: string;
     let decoded: JsonValue | undefined;
@@ -435,18 +439,22 @@ async function judged(
     // declared JSON the decoder refused, with no text-field value to scan
     if (kind === "invalid") return { text: "", unj: "unjudgeable: invalid json" };
     // a "**" field hit its bound: the text is not all there
-    if (cut) partial = true;
+    if (cut) partial = bound = true;
     untrusted = untrustedPart(decoded, rule, ctx);
-    tools = toolsPart(decoded, rule, ctx);
+    if (hasToolFields(rule) && decoded !== undefined && decoded !== null && typeof decoded === "object") {
+      const [tvalues, tcut] = extractTools(decoded, rule.tool_fields, ctx?.json_decode);
+      tools = toolsPart(tvalues, tcut, rule, ctx);
+      if (tcut) bound = true;
+    }
   }
-  if (text === "") return { text: "", untrusted, tools };
+  if (text === "") return { text: "", untrusted, tools, bound };
   const hit = textMatches(text, rule.always_suspect, ctx);
   const budget = rule.max_judge_bytes ?? MAX_JUDGE_BYTES;
   const maxc = Math.floor(Number(rule.max_judge_chunks ?? 1)) || 1;
   if (maxc > 1 && byteLength(text) > budget) {
     // port of the chunked branch of judged() in core/rules.lua
     const [pieces, starts] = splitChunks(text, budget);
-    if (pieces.length <= maxc) return { text: pieces.join("\n"), hit: hit?.[0], windowed: partial, chunks: pieces, capped: false, untrusted, tools };
+    if (pieces.length <= maxc) return { text: pieces.join("\n"), hit: hit?.[0], windowed: partial, chunks: pieces, capped: false, untrusted, tools, bound };
     const firstKept = pieces.length - (maxc - 1); // 0-based
     const tb = utf8Bytes(text);
     let older = new TextDecoder().decode(tb.subarray(0, starts[firstKept] - 1));
@@ -455,11 +463,15 @@ async function judged(
     const inside = hit?.[1] !== undefined && hit?.[2] !== undefined && hit[2] <= olderLen;
     const [win] = window(older, [older], budget, inside ? hit![1] : undefined, inside ? hit![2] : undefined);
     const out = [win, ...pieces.slice(firstKept)];
-    return { text: out.join("\n"), hit: hit?.[0], windowed: true, chunks: out, capped: true, untrusted, tools };
+    return { text: out.join("\n"), hit: hit?.[0], windowed: true, chunks: out, capped: true, untrusted, tools, bound };
   }
   const [w, cut] = window(text, values, budget, hit?.[1], hit?.[2]);
-  return { text: w, hit: hit?.[0], windowed: cut || partial, untrusted, tools };
+  return { text: w, hit: hit?.[0], windowed: cut || partial, untrusted, tools, bound };
 }
+
+// Port of BOUND_REASON: a request the walk bounds cut and that would
+// otherwise pass unjudged for lack of text.
+const BOUND_REASON = "unjudgeable: json over the walk bounds";
 
 /** Port of rules.judged_text: the text evaluate() judges under `rule` ("" when none). */
 export async function judgedText(req: Req, rule: Rule | undefined, ctx?: RulesCtx): Promise<string> {
@@ -522,24 +534,26 @@ export async function evaluate(
   // so are the tool definitions, and short ones an always_suspect pattern hit
   let t = j.tools;
   if (t && !t.hit && byteLength(t.text) < minChars) t = undefined;
-  if (j.text === "" && !u && !t) return [PASS, "", "no text"];
+  if (j.text === "" && !u && !t) return j.bound ? [UNJUDGEABLE, "", BOUND_REASON] : [PASS, "", "no text"];
   const judgedToo = !!j.hit || byteLength(j.text) >= minChars;
   if (!judgedToo) {
-    if (!u && !t) return [PASS, "", "text too short"];
+    if (!u && !t) return j.bound ? [UNJUDGEABLE, "", BOUND_REASON] : [PASS, "", "text too short"];
     // the text alone would have passed: only the retrieved content and the
     // tool definitions are judged
     if (u) u.only = true;
     if (t) t.only = true;
   }
-  let tag = j.windowed ? " (window)" : "";
-  if (j.chunks && !j.capped) tag = ` (${j.chunks.length} chunks)`;
+  // a walk bound cut what is judged: the reason says so, as for any window
+  const windowed = j.windowed || j.bound;
+  let tag = windowed ? " (window)" : "";
+  if (j.chunks && !j.capped) tag = ` (${j.chunks.length} chunks${windowed ? ", window" : ""})`;
   let why: string;
   if (j.hit) why = "pattern: " + j.hit + tag;
   else if (t?.hit) why = "pattern: " + t.hit + " (tools" + (t.windowed ? ", window" : "") + ")";
   else if (judgedToo) why = "natural language" + tag;
   else if (u) why = "retrieved content" + (u.windowed ? " (window)" : "");
   else why = "tool definitions" + (t!.windowed ? " (window)" : "");
-  return [SUSPECT, j.text, why, j.windowed, j.chunks, j.capped, u, t];
+  return [SUSPECT, j.text, why, windowed, j.chunks, j.capped, u, t];
 }
 
 /** Port of rules.rule_for: the first rule whose path, method and content type all match. */

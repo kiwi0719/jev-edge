@@ -5,6 +5,10 @@ return {
     endpoint    = "https://api.typesafe.ai/v1/systemone",
     model       = "jev-latest",
     api_key_env = "TYPESAFE_API_KEY",    -- needs `env TYPESAFE_API_KEY;` in nginx.conf
+    -- A judge you serve yourself (vLLM, Ollama, llama.cpp) instead of Jev, with
+    -- api_key_env naming that server's key or removed, and the rule's
+    -- max_judge_bytes sized to the model's context (see `rules` below):
+    --   provider = "openai-compat", endpoint = "http://127.0.0.1:8000/v1", model = "<served model>",
     -- L2 timeout: starts at timeout_ms and adapts to observed latency
     -- (headroom x (mean + 2 sd)), never below timeout_ms, never above
     -- timeout_max_ms. Measured from a laptop: jev-latest p50 ~270 ms, p95 ~315 ms.
@@ -22,6 +26,17 @@ return {
   --       deployment_context = "A support assistant for Acme's billing product. ..." },
   --     "llm-endpoints",
   --   },
+  -- With openai-compat, max_judge_bytes must fit the judge model's context: the
+  -- text goes in one call next to a ~2 KB system prompt and max_tokens = 200.
+  -- A longer prompt is refused (vLLM: HTTP 400, an L2 error, which passes the
+  -- request) or cut silently (Ollama: the model does not see all of the text
+  -- the gateway believes it judged). Keep max_judge_bytes <= context tokens - 1024
+  -- (the 1024 hold the prompt around the text and the answer; more if
+  -- jev.questions is longer), counting the text at one byte per token, the worst
+  -- case: 7168 for an 8192-token model, 3072 for 4096, 1024 for 2048 (Ollama's
+  -- default context is one of the last two, by version). Longer text is cut to
+  -- one window of that size; max_judge_chunks judges more of it, one call per window:
+  --   rules = { { id = "llm", extends = "llm-endpoints", max_judge_bytes = 7168, max_judge_chunks = 4 } },
   rules  = { "llm-endpoints" },
   policy = {
     mode = "monitor",                    -- switch to "enforce" after reviewing a week of logs

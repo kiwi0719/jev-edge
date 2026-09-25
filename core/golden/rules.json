@@ -947,6 +947,28 @@
     },
     {
       "expect": {
+        "reason": "content-type not watched",
+        "result": "pass",
+        "text": ""
+      },
+      "input": {
+        "cache": {},
+        "clock": 1000,
+        "req": {
+          "body_size": 108,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "image/png"
+          },
+          "method": "POST",
+          "path": "/v1/chat/completions"
+        },
+        "rule": "llm-endpoints"
+      },
+      "name": "a media body the adapter kept nothing of is not watched"
+    },
+    {
+      "expect": {
         "reason": "natural language",
         "result": "suspect",
         "text": "Please write a detailed summary of the attached quarterly report."

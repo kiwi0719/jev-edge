@@ -332,6 +332,9 @@ do
   local r = req(LONG, { body_size = 2000000, headers = { ["content-type"] = "video/mp4" } })
   r.body = nil   -- a gateway that forwards headers only
   rules_case("an oversized media body the adapter kept nothing of is not watched", r)
+  r = req(LONG, { headers = { ["content-type"] = "image/png" } })
+  r.body = nil   -- forward-auth without the body: only the header to go on
+  rules_case("a media body the adapter kept nothing of is not watched", r)
 end
 rules_case("Content-Type header casing", req(LONG, { headers = { ["Content-Type"] = "application/json" } }))
 rules_case("repeated Content-Type header is watched",

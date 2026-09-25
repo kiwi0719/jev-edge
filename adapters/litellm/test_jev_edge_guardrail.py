@@ -234,13 +234,16 @@ def test_unreachable_fails_open_even_with_unjudged_block():
         assert v["verdict"] == "error" and v["action"] == "pass"
 
 
-def test_5xx_without_verdict_fails_open_even_with_unjudged_block():
+@pytest.mark.parametrize("status", [502, 503, 429])
+def test_unavailable_judge_fails_open_even_with_unjudged_block(status):
+    # a 5xx, or a 429 from a rate limiter in front of jev-edge, without the
+    # header: the judge is not available, as for a timeout
     for unjudged in ("pass", "block"):
-        transport, _ = fake_authz(status=502, with_verdict=False)
+        transport, _ = fake_authz(status=status, with_verdict=False)
         g = guard(transport, unjudged=unjudged)
         out = run(g.async_pre_call_hook({}, None, dict(CHAT), "completion"))
         v = out["metadata"]["jev_verdict"]
-        assert v["verdict"] == "error" and v["action"] == "pass" and v["source"] == "adapter"
+        assert v == {"verdict": "error", "score": "0.00", "source": "adapter", "reason": f"http {status}", "action": "pass"}
 
 
 def test_answer_without_verdict_below_500_is_unjudgeable():

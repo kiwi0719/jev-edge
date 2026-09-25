@@ -33,14 +33,15 @@ keyword argument (for code that builds the class itself) wins over it:
 
 Contract: only an answer carrying ``X-Jev-Verdict`` is trusted. 200 with the
 header is a decision; any status >= 400 with the header is a block (whatever
-``policy.block_status`` is). An answer without the header below 500 (nginx
-refusing the request before jev-edge ran: 400, 413, 414, a 404 from something
-that is not jev-edge) means nobody judged it: ``verdict: skipped``,
-``source: adapter``, reason ``unjudgeable: authz answered <status>``, passed or
-blocked as ``unjudged`` says. Any error reaching jev-edge (connection refused,
-timeout, a 5xx without the header) fails open with
-``metadata.jev_verdict == {"verdict": "error", ...}``, whatever ``unjudged``
-says. Requires ``httpx``, which LiteLLM already depends on.
+``policy.block_status`` is). An answer without the header below 500 other
+than 429 (nginx refusing the request before jev-edge ran: 400, 413, 414, a
+404 from something that is not jev-edge) means nobody judged it:
+``verdict: skipped``, ``source: adapter``, reason ``unjudgeable: authz
+answered <status>``, passed or blocked as ``unjudged`` says. A judge that is
+not available (connection refused, timeout, a 5xx or a 429 without the
+header) fails open with ``jev_verdict == {"verdict": "error", ...}``,
+whatever ``unjudged`` says. Requires ``httpx``, which LiteLLM already
+depends on.
 """
 
 from __future__ import annotations
@@ -710,7 +711,9 @@ class JevEdgeGuardrail(_ApplyGuardrailBase):
             return {"verdict": "error", "score": "0.00", "source": "adapter", "reason": str(e), "action": "pass"}
 
         if "x-jev-verdict" not in res.headers:
-            if res.status_code >= 500:  # the server, or a proxy in front of it, failing
+            if res.status_code >= 500 or res.status_code == 429:
+                # the judge is not available: the server, or a proxy or rate
+                # limiter in front of it, failing or shedding load
                 log.warning("jev-edge answered %s without X-Jev-Verdict, failing open", res.status_code)
                 return {"verdict": "error", "score": "0.00", "source": "adapter",
                         "reason": f"http {res.status_code}", "action": "pass"}

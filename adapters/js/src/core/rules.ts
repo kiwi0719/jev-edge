@@ -1,5 +1,5 @@
 // Port of core/rules.lua: L1, cheap and short-circuiting.
-import { extract, extractUntrustedValues, byteLength, head, tail, fieldKeys, scanStrings, window, chunks as splitChunks, utf8Bytes, type JsonValue } from "./normalize.js";
+import { extract, extractUntrustedValues, isText, byteLength, head, tail, fieldKeys, scanStrings, window, chunks as splitChunks, utf8Bytes, type JsonValue } from "./normalize.js";
 import { untrustedSpec, type UntrustedConfig } from "./defaults.js";
 import { repBlocked, type SubjectCtx, type ReputationConfig } from "./subject.js";
 
@@ -21,6 +21,8 @@ export interface Rule {
   id: string;
   /** Lua patterns in the rule files; the subset used (anchors, literals, %-escapes) converts 1:1. */
   watch_paths: string[];
+  /** Match watch_paths without folding ASCII case (default: folded, see pathMatches). */
+  paths_case_sensitive?: boolean;
   methods?: Record<string, boolean>;
   /** Allow list (the pre-0.4 behaviour); without it, skip_content_types applies. */
   content_types?: string[];
@@ -207,9 +209,55 @@ export function luaPatternToRegExp(p: string): RegExp {
   return re;
 }
 
-export function pathMatches(s: string, patterns: string[] | undefined): string | null {
-  for (const p of patterns ?? []) {
-    if (luaPatternToRegExp(p).test(s)) return p;
+// Port of canonical_path() in core/rules.lua: watch paths match the path the
+// backend routes on. `;` parameters leave every segment (Tomcat, Jetty and
+// Spring route /v1;a=b/chat/completions as /v1/chat/completions), then empty
+// and `.` segments go and `..` is resolved; ASCII letters are folded unless
+// the rule matches case-sensitively (Express, Koa, ASP.NET Core and Fiber
+// route /V1/Chat/Completions to /v1/chat/completions). ASCII only, as in Lua:
+// toLowerCase() would fold other letters too.
+const asciiLower = (s: string): string => s.replace(/[A-Z]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 32));
+
+export function canonicalPath(path: string, caseSensitive = false): string {
+  let p = path.replace(/;[^/]*/g, "");
+  if (p.includes("//") || p.includes("/.")) {
+    const out: string[] = [];
+    for (const seg of p.split("/")) {
+      if (seg === "" || seg === ".") continue;
+      if (seg === "..") out.pop();
+      else out.push(seg);
+    }
+    let q = "/" + out.join("/");
+    if (p.endsWith("/") && q !== "/") q += "/";
+    p = q;
+  }
+  return caseSensitive ? p : asciiLower(p);
+}
+
+// the pattern folded the same way; a letter after `%` names a class (%S, %W)
+// and keeps its case
+const foldedPatterns = new Map<string, string>();
+function foldPattern(p: string): string {
+  let f = foldedPatterns.get(p);
+  if (f === undefined) {
+    f = p.replace(/%?[\s\S]/g, (t) => (t.length === 1 ? asciiLower(t) : t));
+    foldedPatterns.set(p, f);
+  }
+  return f;
+}
+
+/**
+ * Port of rules.path_matches: the first of `patterns` (a rule's watch_paths)
+ * that matches `path`, or null. Every place that decides whether a rule
+ * watches a path uses this one, so reading the body and judging it agree.
+ * `caseSensitive` is the rule's paths_case_sensitive.
+ */
+export function pathMatches(path: string, patterns: string[] | undefined, caseSensitive?: boolean): string | null {
+  if (!patterns || patterns.length === 0) return null;
+  const cs = caseSensitive === true;
+  const s = canonicalPath(path ?? "", cs);
+  for (const p of patterns) {
+    if (luaPatternToRegExp(cs ? p : foldPattern(p)).test(s)) return p;
   }
   return null;
 }
@@ -265,7 +313,12 @@ export function contentEncoding(headers: Req["headers"]): string {
   return (ce.toLowerCase().match(/[^,\s]+/g) ?? []).filter((t) => t !== "identity").join(", ");
 }
 
-function ctWatched(ct: string, rule: Rule): boolean {
+// Port of ct_watched() in core/rules.lua: true when the rule reads this
+// content type, false when its allow list leaves it out, "media" when every
+// value is a skip_content_types entry. The client picks the header and Ollama
+// and llama.cpp parse JSON whatever it says, so the body is still read and
+// only one that really is binary is skipped (judged()).
+function ctWatched(ct: string, rule: Rule): boolean | "media" {
   const c = ct.toLowerCase();
   const allowed = rule.content_types;
   if (allowed && allowed.length > 0) {
@@ -281,8 +334,10 @@ function ctWatched(ct: string, rule: Rule): boolean {
     any = true;
     if (!skip.some((sk) => v.startsWith(sk))) return true;
   }
-  return !any;
+  return !any || "media";
 }
+
+const CT_NOT_WATCHED = "content-type not watched";
 
 /**
  * Case-insensitive regex search with the same contract the OpenResty adapter
@@ -318,6 +373,9 @@ async function judged(
   req: Req, rule: Rule, ctx: RulesCtx | undefined, ct: string, size: number,
 ): Promise<{ text: string; unj?: string; hit?: string; windowed?: boolean; chunks?: string[]; capped?: boolean; untrusted?: UntrustedPart }> {
   const max = rule.max_body_bytes ?? MAX_BODY_BYTES;
+  // a media type is taken at its word only when the bytes agree (or there
+  // are none to look at): anything that reads as JSON or text is judged
+  const media = ctWatched(ct, rule) === "media";
   let values: string[];
   let text: string;
   let partial = false;
@@ -330,6 +388,7 @@ async function judged(
       const rest = req.body.slice(hd.length);
       if (rest !== "") tl = tail(rest, TAIL_BYTES);
     }
+    if (media && !(hd !== undefined && isText(hd))) return { text: "", unj: CT_NOT_WATCHED };
     if (hd === undefined) return { text: "", unj: "unjudgeable: body too large" };
     const keys = fieldKeys(rule.text_fields);
     values = scanStrings(hd, keys, []);
@@ -341,6 +400,7 @@ async function judged(
     let kind: string;
     let decoded: JsonValue | undefined;
     [text, kind, values, decoded] = extract(req.body, ct, rule.text_fields, ctx?.json_decode);
+    if (media && (kind === "binary" || kind === "none")) return { text: "", unj: CT_NOT_WATCHED };
     if (kind === "binary") return { text: "", unj: "unjudgeable: binary body" };
     untrusted = untrustedPart(decoded, rule, ctx);
   }
@@ -380,7 +440,7 @@ export async function evaluate(
   req: Req, rule: Rule, ctx?: RulesCtx,
 ): Promise<[RuleResult, string, string, boolean?, string[]?, boolean?, UntrustedPart?]> {
   // 1. path watch list
-  if (!pathMatches(req.path ?? "", rule.watch_paths)) return [PASS, "", "path not watched"];
+  if (!pathMatches(req.path ?? "", rule.watch_paths, rule.paths_case_sensitive)) return [PASS, "", "path not watched"];
 
   // 2. reputation, before anything that needs a body. It only ever blocks:
   //    safe verdicts earn an IP nothing (see core/rules.lua)
@@ -394,10 +454,12 @@ export async function evaluate(
   // the same for the subject (core/subject.lua), when reputation is on
   if (ctx?.subject && (await repBlocked(ctx))) return [BLOCK, "", "subject reputation"];
 
-  // 3. method + content type (deny list of media types unless content_types allows)
+  // 3. method + content type (an allow list when the rule lists
+  //    content_types; the deny list of media types is only settled once the
+  //    body shows it is binary, in step 6)
   if (rule.methods && !rule.methods[(req.method ?? "").toUpperCase()]) return [PASS, "", "method not watched"];
   const ct = contentType(req.headers);
-  if (!ctWatched(ct, rule)) return [PASS, "", "content-type not watched"];
+  if (!ctWatched(ct, rule)) return [PASS, "", CT_NOT_WATCHED];
 
   // 4. body size: the larger of what the adapter declared and what it handed
   //    over, so a wrong or missing Content-Length cannot shrink the body
@@ -415,6 +477,7 @@ export async function evaluate(
 
   // 6+7. extract, prefilter over all of it, judging window, length
   const j = await judged(req, rule, ctx, ct, size);
+  if (j.unj === CT_NOT_WATCHED) return [PASS, "", j.unj];
   if (j.unj) return [UNJUDGEABLE, "", j.unj];
   const minChars = rule.min_text_chars ?? 20;
   // retrieved content is judged on its own when there is enough of it, even
@@ -438,7 +501,7 @@ export async function evaluate(
 export function ruleFor(req: Req, rules: Rule[] | undefined): Rule | undefined {
   const ct = contentType(req.headers);
   for (const r of rules ?? []) {
-    if (pathMatches(req.path ?? "", r.watch_paths)
+    if (pathMatches(req.path ?? "", r.watch_paths, r.paths_case_sensitive)
       && !(r.methods && !r.methods[(req.method ?? "").toUpperCase()])
       && ctWatched(ct, r)) return r;
   }

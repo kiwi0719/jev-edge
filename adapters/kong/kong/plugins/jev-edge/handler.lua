@@ -180,8 +180,8 @@ local function build_req(rt)
   -- disk; resty.jev.body reads the file too.
   local max = 0
   for _, r in ipairs(rt.rules) do
-    for _, p in ipairs(r.watch_paths or {}) do
-      if req.path:find(p) then max = math.max(max, r.max_body_bytes or rules_mod.MAX_BODY_BYTES) break end
+    if rules_mod.path_matches(req.path, r.watch_paths, r.paths_case_sensitive) then
+      max = math.max(max, r.max_body_bytes or rules_mod.MAX_BODY_BYTES)
     end
   end
   if max > 0 then body_m.fill(req, max) end

@@ -67,8 +67,17 @@ describe("Content-Type is a hint", () => {
     });
   }
 
-  it("skips media types", async () => {
-    const res = await handle(post(ATTACK, { "content-type": "image/png" }), rt(), seen);
+  it("judges a JSON prompt labelled with a media type (the client picks the header)", async () => {
+    for (const ct of ["image/png", "application/pdf", "image/png, image/jpeg"]) {
+      const res = await handle(post(ATTACK, { "content-type": ct }), rt(), seen);
+      expect(res.status, ct).toBe(403);
+    }
+  });
+
+  it("skips a media type whose body really is binary", async () => {
+    const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52, 0, 0, 1, 0]);
+    const req = new Request("https://edge.example/v1/chat/completions", { method: "POST", headers: { "content-type": "image/png" }, body: png });
+    const res = await handle(req, rt(), seen);
     expect(((await res.json()) as Record<string, string>).reason).toBe("content-type+not+watched");
   });
 

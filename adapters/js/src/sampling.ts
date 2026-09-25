@@ -26,7 +26,7 @@ export function shouldSample(cfg: Config, v: Verdict, rand: () => number = Math.
 }
 
 export function buildSample(cfg: Config, v: Verdict, req: Req, rules: Rule[], rid: string, ts = Date.now() / 1000): Sample {
-  const rule = rules.find((r) => pathMatches(req.path ?? "", r.watch_paths) !== null); // watch_paths are Lua patterns
+  const rule = rules.find((r) => pathMatches(req.path ?? "", r.watch_paths, r.paths_case_sensitive) !== null); // watch_paths are Lua patterns
   let text = "";
   if (rule && typeof req.body === "string") {
     const ct = contentType(req.headers);

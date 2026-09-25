@@ -27,4 +27,7 @@ export const middleware = nextMiddleware(
   NextResponse,
 );
 
-export const config = { matcher: ["/api/chat/:path*", "/v1/:path*"] };
+// The AI SDK's useChat posts to /api/chat and useCompletion to /api/completion
+// by default. Next runs the middleware only on these paths: list every route
+// of the app that takes a prompt.
+export const config = { matcher: ["/api/chat/:path*", "/api/completion/:path*", "/api/completions/:path*", "/v1/:path*"] };

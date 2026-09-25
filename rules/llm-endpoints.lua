@@ -1,11 +1,29 @@
 -- rules/llm-endpoints.lua
 -- L1 rule set for LLM application entry points.
--- watch_paths are Lua patterns (anchored prefixes). always_suspect are PCRE,
--- matched case-insensitively via ctx.re_find (ngx.re in OpenResty), so the
--- same rule file is portable to the Envoy and Cloudflare adapters.
+-- watch_paths are Lua patterns, matched on the path the backend routes on
+-- (ASCII case folded, ';' parameters dropped: core/rules.lua path_matches).
+-- always_suspect are PCRE, matched case-insensitively via ctx.re_find
+-- (ngx.re in OpenResty), so the same rule file is portable to the Envoy and
+-- Cloudflare adapters.
 return {
   id = "llm-endpoints",
-  watch_paths = { "^/v1/chat", "^/v1/completions", "^/api/chat", "^/api/completions" },
+  -- The generation routes of the servers jev-edge fronts, and the aliases
+  -- they serve for the same handler: a route left out is one a client can
+  -- switch to. OpenAI and compatible servers (/v1/..., Responses and
+  -- Anthropic Messages included), Ollama (/api/chat, /api/generate), the
+  -- Vercel AI SDK's useChat and useCompletion (/api/chat, /api/completion),
+  -- LiteLLM and llama.cpp without the /v1 prefix, LiteLLM /engines/<model>/,
+  -- Azure OpenAI and LiteLLM /openai/deployments/<name>/ and /openai/v1/,
+  -- llama.cpp /completion and /infill. Short generic names are anchored at
+  -- both ends so an application's own routes do not match.
+  watch_paths = {
+    "^/v1/chat", "^/v1/completions", "^/v1/responses", "^/v1/messages",
+    "^/api/chat", "^/api/completions?", "^/api/generate/?$",
+    "^/chat/completions", "^/completions?/?$", "^/infill/?$",
+    "^/engines/[^/]+/chat/completions", "^/engines/[^/]+/completions",
+    "^/openai/deployments/[^/]+/chat/completions", "^/openai/deployments/[^/]+/completions",
+    "^/openai/v1/chat", "^/openai/v1/completions", "^/openai/v1/responses",
+  },
   methods = { POST = true, PUT = true, PATCH = true },
   -- Media types that are never a prompt. Any other Content-Type (or none) is
   -- read and the body decides the format: backends parse JSON whatever the
@@ -26,8 +44,15 @@ return {
   -- cheapest; raise it (4 covers 128 KiB) to judge long text in full, and
   -- policy.unjudgeable then decides what still does not fit. See README.
   max_judge_chunks = 1,
-  -- input[*].output: a Responses API function_call_output (a tool result)
-  text_fields = { "messages[*].content", "prompt", "input", "input[*].output", "query", "text" },
+  -- Oldest first: the judging window keeps the last ones first.
+  -- system: Anthropic Messages and Ollama /api/generate; template: Ollama.
+  -- messages[*].parts: AI SDK 5 UIMessages, which carry no content.
+  -- input[*].output: a Responses API function_call_output (a tool result).
+  -- suffix: OpenAI completions and Ollama; input_prefix, input_suffix,
+  -- input_extra: llama.cpp /infill.
+  text_fields = { "system", "template", "messages[*].content", "messages[*].parts", "prompt", "input",
+                  "input[*].output", "query", "text", "suffix", "input_prefix", "input_suffix",
+                  "input_extra[*].text" },
   min_text_chars = 20,
   always_suspect = {
     [[\b(ignore|disregard|forget)\b.{0,20}\b(previous|prior|above|earlier|all)\b]]

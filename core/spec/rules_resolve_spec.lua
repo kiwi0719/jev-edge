@@ -26,7 +26,8 @@ describe("rules.resolve", function()
   it("fills defaults for a complete inline rule", function()
     local r = rules.resolve({ id = "x", watch_paths = { "^/x" } }, load)
     assert.same({ "injection" }, r.templates)
-    assert.equals("messages[*].content", r.text_fields[1])
+    -- the shipped rule's text fields: AI SDK 5 parts, Anthropic / Ollama system, llama.cpp infill
+    assert.same(require("jev.rules.llm-endpoints").text_fields, r.text_fields)
   end)
 
   it("copies a rule set loaded by id so callers cannot mutate the module", function()

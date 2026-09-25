@@ -248,7 +248,27 @@ rule("rule-parity", function(r)
   -- always_suspect: the same patterns, in the same order (the golden rules
   -- cases name the first pattern that fires)
   local chunk = loadfile("rules/llm-endpoints.lua")
-  local luapats = chunk and chunk().always_suspect or {}
+  local luarule = chunk and chunk() or {}
+  local luapats = luarule.always_suspect or {}
+  -- watch_paths and text_fields: the same entries in the same order (a route
+  -- left out of one copy is "path not watched" on that runtime only; the
+  -- order of text_fields is the order of the judged text). resolve() fills
+  -- in the same text_fields for an inline rule that lists none.
+  local function strings(s)
+    local out = {}
+    for v in (s or ""):gmatch('"([^"]*)"') do out[#out + 1] = v end
+    return out
+  end
+  local want = table.concat(luarule.text_fields or {}, ",")
+  for _, k in ipairs({ "watch_paths", "text_fields" }) do
+    if table.concat(luarule[k] or {}, ",") ~= table.concat(strings(tsrule:match(k .. ":%s*(%b[])")), ",") then
+      fail(r, k .. " differ between rules/llm-endpoints.lua and src/rules/index.ts")
+    end
+  end
+  if table.concat(strings((read("core/rules.lua") or ""):match("out%.text_fields = (%b{})")), ",") ~= want
+     or table.concat(strings(ts:match("out%.text_fields %?%?= (%b[])")), ",") ~= want then
+    fail(r, "resolve() default text_fields differ from llm-endpoints (core/rules.lua, src/rules/index.ts)")
+  end
   local tspats = {}
   for p in (tsrule:match("always_suspect:%s*%[(.-)\n%s*%],") or ""):gmatch("String%.raw`([^`]*)`") do
     tspats[#tspats + 1] = p

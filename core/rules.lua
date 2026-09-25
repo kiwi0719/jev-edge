@@ -27,13 +27,62 @@ _M.SKIP_CONTENT_TYPES = {
   "image/", "audio/", "video/", "font/", "application/pdf", "application/zip", "application/gzip",
 }
 
--- Path patterns are Lua patterns (cheap, anchored, no alternation needed).
-local function path_matches(s, patterns)
-  for _, p in ipairs(patterns or {}) do
-    if s:find(p) then return p end
+-- Path patterns are Lua patterns (cheap, anchored, no alternation needed),
+-- matched against the path the backend routes on, not the one the gateway
+-- reports. Every segment loses its `;` parameters (Tomcat, Jetty and Spring
+-- route /v1;a=b/chat/completions as /v1/chat/completions), then empty and
+-- `.` segments go and `..` is resolved, as the backend does once they are
+-- gone (/v1/x/..;/chat). Unless the rule sets paths_case_sensitive = true,
+-- ASCII letters are folded in the path and in the patterns alike: Express,
+-- Koa, ASP.NET Core and Fiber route /V1/Chat/Completions to the
+-- /v1/chat/completions handler. A letter after `%` names a class (%S, %W)
+-- and keeps its case.
+local LOWER = {}
+for c = 65, 90 do LOWER[string.char(c)] = string.char(c + 32) end
+
+local function canonical_path(path, case_sensitive)
+  local p = path:gsub(";[^/]*", "")
+  if p:find("//", 1, true) or p:find("/.", 1, true) then
+    local out = {}
+    for seg in p:gmatch("[^/]+") do
+      if seg == ".." then
+        out[#out] = nil
+      elseif seg ~= "." then
+        out[#out + 1] = seg
+      end
+    end
+    local q = "/" .. table.concat(out, "/")
+    if p:sub(-1) == "/" and q ~= "/" then q = q .. "/" end
+    p = q
+  end
+  if case_sensitive then return p end
+  return (p:gsub("[A-Z]", LOWER))
+end
+
+local folded = {}
+local function fold_pattern(p)
+  local f = folded[p]
+  if not f then
+    f = p:gsub("%%?.", function(t) if #t == 1 then return LOWER[t] end end)
+    folded[p] = f
+  end
+  return f
+end
+
+--- The first of `patterns` (a rule's watch_paths) that matches `path`, or
+-- nil. Every place that decides whether a rule watches a path uses this one,
+-- core and adapters alike, so reading the body and judging it agree.
+-- @param case_sensitive the rule's paths_case_sensitive
+function _M.path_matches(path, patterns, case_sensitive)
+  if not patterns or #patterns == 0 then return nil end
+  local cs = case_sensitive == true
+  local s = canonical_path(path or "", cs)
+  for _, p in ipairs(patterns) do
+    if s:find(cs and p or fold_pattern(p)) then return p end
   end
   return nil
 end
+local path_matches = _M.path_matches
 
 -- always_suspect patterns are PCRE, matched through ctx.re_find so the same
 -- rule files work under ngx.re (OpenResty), lrexlib (tests) or JS RegExp.
@@ -95,6 +144,11 @@ function _M.content_encoding(headers)
   return table.concat(out, ", ")
 end
 
+-- true when the rule reads this content type; false when its allow list
+-- (content_types) leaves it out; "media" when every value of the header is a
+-- skip_content_types entry. The client picks the header and Ollama and
+-- llama.cpp parse JSON whatever it says, so the body is still read and only
+-- one that really is binary is skipped (judged()).
 local function ct_watched(ct, rule)
   ct = (ct or ""):lower()
   local allowed = rule.content_types
@@ -118,8 +172,10 @@ local function ct_watched(ct, rule)
       if not skipped then return true end
     end
   end
-  return not any
+  return not any or "media"
 end
+
+local CT_NOT_WATCHED = "content-type not watched"
 
 -- Retrieved content (tool results, untrusted.fields) when untrusted judging is
 -- on for `rule`, cut to its own judging window. Only from a body parsed whole:
@@ -143,6 +199,9 @@ end
 --         body carries retrieved content)
 local function judged(req, rule, ctx, ct, size)
   local max = rule.max_body_bytes or _M.MAX_BODY_BYTES
+  -- a media type is taken at its word only when the bytes agree (or there
+  -- are none to look at): anything that reads as JSON or text is judged
+  local media = ct_watched(ct, rule) == "media"
   local values, text
   local partial = false
   local untrusted
@@ -156,6 +215,7 @@ local function judged(req, rule, ctx, ct, size)
         tail = normalize.tail(req.body:sub(#head + 1), _M.TAIL_BYTES)
       end
     end
+    if media and not (head and normalize.is_text(head)) then return nil, CT_NOT_WATCHED end
     if not head then return nil, "unjudgeable: body too large" end
     local keys = normalize.field_keys(rule.text_fields)
     values = normalize.scan_strings(head, keys, {})
@@ -165,6 +225,7 @@ local function judged(req, rule, ctx, ct, size)
   else
     local kind, decoded
     text, kind, values, decoded = normalize.extract(req.body, ct, rule.text_fields, ctx and ctx.json_decode)
+    if media and (kind == "binary" or kind == "none") then return nil, CT_NOT_WATCHED end
     if kind == "binary" then return nil, "unjudgeable: binary body" end
     untrusted = untrusted_part(decoded, rule, ctx)
   end
@@ -202,7 +263,7 @@ end
 --         windowed } of retrieved content to judge on its own, or nil)
 function _M.evaluate(req, rule, ctx)
   -- 1. path watch list
-  if not path_matches(req.path or "", rule.watch_paths) then
+  if not path_matches(req.path, rule.watch_paths, rule.paths_case_sensitive) then
     return _M.PASS, "", "path not watched"
   end
 
@@ -224,14 +285,15 @@ function _M.evaluate(req, rule, ctx)
     return _M.BLOCK, "", "subject reputation"
   end
 
-  -- 3. method + content type (a deny list of media types, unless the rule
-  --    lists content_types to allow)
+  -- 3. method + content type (an allow list when the rule lists
+  --    content_types; the deny list of media types is only settled once the
+  --    body shows it is binary, in step 6)
   if rule.methods and not rule.methods[(req.method or ""):upper()] then
     return _M.PASS, "", "method not watched"
   end
   local ct = _M.content_type(req.headers)
   if not ct_watched(ct, rule) then
-    return _M.PASS, "", "content-type not watched"
+    return _M.PASS, "", CT_NOT_WATCHED
   end
 
   -- 4. body size: the larger of what the adapter declared and what it handed
@@ -253,6 +315,7 @@ function _M.evaluate(req, rule, ctx)
   -- 6+7. extract text (whole body, or head + tail past max_body_bytes), regex
   --      prefilter over all of it, judging window, natural-language length
   local text, unj, hit, windowed, chunks, capped, untrusted = judged(req, rule, ctx, ct, size)
+  if unj == CT_NOT_WATCHED then return _M.PASS, "", unj end
   if unj then return _M.UNJUDGEABLE, "", unj end
   local min_chars = rule.min_text_chars or 20
   -- retrieved content is judged on its own when there is enough of it, even
@@ -396,7 +459,9 @@ function _M.resolve(spec, load)
   local uok, uerr = defaults.validate_untrusted(out.untrusted, "rule " .. out.id .. ": untrusted")
   if not uok then return nil, uerr end
   if not out.text_fields then
-    out.text_fields = { "messages[*].content", "prompt", "input", "input[*].output", "query", "text" }
+    out.text_fields = { "system", "template", "messages[*].content", "messages[*].parts", "prompt", "input",
+                        "input[*].output", "query", "text", "suffix", "input_prefix", "input_suffix",
+                        "input_extra[*].text" }
   end
   if not out.templates then out.templates = { "injection" } end
   return out
@@ -421,7 +486,7 @@ end
 function _M.rule_for(req, rules)
   local ct = _M.content_type(req.headers)
   for _, r in ipairs(rules or {}) do
-    if path_matches(req.path or "", r.watch_paths)
+    if path_matches(req.path, r.watch_paths, r.paths_case_sensitive)
       and not (r.methods and not r.methods[(req.method or ""):upper()])
       and ct_watched(ct, r) then
       return r

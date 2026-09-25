@@ -6,14 +6,27 @@ import { validateUntrusted } from "../core/defaults.js";
 
 export const llmEndpoints: Rule = {
   id: "llm-endpoints",
-  watch_paths: ["^/v1/chat", "^/v1/completions", "^/api/chat", "^/api/completions"],
+  // generation routes and the aliases servers accept for them (see rules/llm-endpoints.lua)
+  watch_paths: [
+    "^/v1/chat", "^/v1/completions", "^/v1/responses", "^/v1/messages",
+    "^/api/chat", "^/api/completions?", "^/api/generate/?$",
+    "^/chat/completions", "^/completions?/?$", "^/infill/?$",
+    "^/engines/[^/]+/chat/completions", "^/engines/[^/]+/completions",
+    "^/openai/deployments/[^/]+/chat/completions", "^/openai/deployments/[^/]+/completions",
+    "^/openai/v1/chat", "^/openai/v1/completions", "^/openai/v1/responses",
+  ],
   methods: { POST: true, PUT: true, PATCH: true },
   skip_content_types: ["image/", "audio/", "video/", "font/", "application/pdf", "application/zip", "application/gzip"],
   min_body_bytes: 8,
   max_body_bytes: 1048576,
   max_judge_bytes: 32768,
   max_judge_chunks: 1,
-  text_fields: ["messages[*].content", "prompt", "input", "input[*].output", "query", "text"],
+  // oldest first: the judging window keeps the last ones first
+  text_fields: [
+    "system", "template", "messages[*].content", "messages[*].parts", "prompt", "input",
+    "input[*].output", "query", "text", "suffix", "input_prefix", "input_suffix",
+    "input_extra[*].text",
+  ],
   min_text_chars: 20,
   always_suspect: [
     String.raw`\b(ignore|disregard|forget)\b.{0,20}\b(previous|prior|above|earlier|all)\b.{0,20}\b(instructions?|rules?|prompts?)\b`,
@@ -74,7 +87,11 @@ export function resolve(spec: RuleSpec): Rule {
   });
   const [uok, uerr] = validateUntrusted(out.untrusted, `rule ${out.id}: untrusted`);
   if (!uok) throw new Error(uerr);
-  out.text_fields ??= ["messages[*].content", "prompt", "input", "input[*].output", "query", "text"];
+  out.text_fields ??= [
+    "system", "template", "messages[*].content", "messages[*].parts", "prompt", "input",
+    "input[*].output", "query", "text", "suffix", "input_prefix", "input_suffix",
+    "input_extra[*].text",
+  ];
   out.templates ??= ["injection"];
   return out;
 }

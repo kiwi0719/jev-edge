@@ -154,6 +154,8 @@ NOT_VISIBLE_CALLS = {
     # where LiteLLM calls it (see _ApplyGuardrailBase)
     "_arealtime": "realtime audio and session instructions are not visible to the guardrail",
     "arealtime_calls": "realtime (WebRTC) audio is not visible to the guardrail",
+    # the Responses API's WebSocket mode: the hook runs once, as the socket
+    # opens; no frame is judged
     "_aresponses_websocket": "the socket's messages are not visible to the guardrail",
 }
 
@@ -741,13 +743,18 @@ class JevEdgeGuardrail(_ApplyGuardrailBase):
 
     @staticmethod
     def client_ip(data: dict) -> Optional[str]:
-        """What jev-edge gets as X-Forwarded-For, from what LiteLLM's proxy
-        itself recorded (the client can set neither): the request's whole
-        X-Forwarded-For chain when it has one, else the proxy's own
-        ``requester_ip_address``. The chain wins because with LiteLLM's
-        ``use_x_forwarded_for`` on, requester_ip_address is the chain's
-        leftmost entry, which is whatever the client sent; jev-edge's
-        ``client_ip.trusted_hops`` picks the real hop from the whole chain."""
+        """What jev-edge gets as X-Forwarded-For: the request's whole
+        X-Forwarded-For chain as LiteLLM's proxy received it (from the
+        proxy_server_request the proxy builds; never a field of the body or
+        of the client's metadata) when it has one, else the proxy's own
+        ``requester_ip_address`` (the peer's address on 1.102; empty on 1.80
+        without a premium licence). The chain is only as trustworthy as what
+        is in front of LiteLLM: a proxy there that appends the address it saw
+        makes the rightmost entry real, and jev-edge's
+        ``client_ip.trusted_hops`` picks it; a client that reaches LiteLLM
+        directly writes the whole chain itself. It wins over
+        requester_ip_address because with ``use_x_forwarded_for`` on, that is
+        the client's own header too."""
         psr = data.get("proxy_server_request")
         if not isinstance(psr, dict):
             return None

@@ -191,3 +191,14 @@ describe("tool definitions", function()
     assert.equals("text too short", reason)
   end)
 end)
+
+describe("the specs' JSON decoder", function()
+  it("refuses what cjson and JSON.parse refuse: a trailing or a missing comma", function()
+    for _, s in ipairs({ "[1,2,]", '{"a":1,}', "[1 2]", '{"a":1 "b":2}', "[,]", '{"a"}', "[1]x" }) do
+      assert.is_nil(H.body_decode(s), s)
+    end
+    for _, s in ipairs({ "[]", "{}", ' { "a" : [ 1 , {"b":null} , "x,]" ] } ', '"s"', "-1.5e+3" }) do
+      assert.is_not_nil(H.body_decode(s), s)
+    end
+  end)
+end)

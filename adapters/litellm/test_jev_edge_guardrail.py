@@ -16,7 +16,7 @@ from jev_edge_guardrail import JevEdgeBlocked, JevEdgeGuardrail
 
 URL = "http://jev-edge:8080"
 ENV = ("JEV_EDGE_URL", "JEV_EDGE_ENFORCE", "JEV_EDGE_TIMEOUT", "JEV_EDGE_PATH", "JEV_EDGE_MAX_BODY_BYTES",
-       "JEV_EDGE_EXTRA_FIELDS", "JEV_EDGE_UNJUDGED")
+       "JEV_EDGE_EXTRA_FIELDS", "JEV_EDGE_UNJUDGED", "JEV_EDGE_TEST_ENDPOINT")
 
 
 @pytest.fixture(autouse=True)
@@ -993,17 +993,19 @@ def test_keyword_arguments_win_over_the_environment(monkeypatch):
     monkeypatch.setenv("JEV_EDGE_URL", "http://env-host:8080")
     monkeypatch.setenv("JEV_EDGE_ENFORCE", "false")
     monkeypatch.setenv("JEV_EDGE_TIMEOUT", "9")
+    monkeypatch.setenv("JEV_EDGE_TEST_ENDPOINT", "judge")
     g = JevEdgeGuardrail(jev_edge_url="http://kw:1", enforce="true", timeout=1, path="/v1/completions",
-                         max_body_bytes="4096", unjudged="BLOCK", transport=httpx.MockTransport(lambda r: httpx.Response(200)))
-    assert (g.base, g.enforce, g.timeout, g.path, g.max_body_bytes, g.unjudged) == \
-        ("http://kw:1", True, 1.0, "/v1/completions", 4096, "block")
+                         max_body_bytes="4096", unjudged="BLOCK", test_endpoint="Refuse",
+                         transport=httpx.MockTransport(lambda r: httpx.Response(200)))
+    assert (g.base, g.enforce, g.timeout, g.path, g.max_body_bytes, g.unjudged, g.test_endpoint) == \
+        ("http://kw:1", True, 1.0, "/v1/completions", 4096, "block", "refuse")
 
 
 def test_defaults(monkeypatch):
     monkeypatch.setenv("JEV_EDGE_URL", URL)
     g = JevEdgeGuardrail(transport=httpx.MockTransport(lambda r: httpx.Response(200)))
-    assert (g.enforce, g.timeout, g.path, g.max_body_bytes, g.extra_fields, g.unjudged) == \
-        (True, 2.0, "/v1/chat/completions", 1048576, (), "pass")
+    assert (g.enforce, g.timeout, g.path, g.max_body_bytes, g.extra_fields, g.unjudged, g.test_endpoint) == \
+        (True, 2.0, "/v1/chat/completions", 1048576, (), "pass", "judge")
 
 
 def test_url_is_required(monkeypatch):
@@ -1017,7 +1019,7 @@ def test_url_is_required(monkeypatch):
 @pytest.mark.parametrize("name,value", [("JEV_EDGE_ENFORCE", "maybe"), ("JEV_EDGE_TIMEOUT", "soon"), ("JEV_EDGE_TIMEOUT", "0"),
                                         ("JEV_EDGE_TIMEOUT", "inf"),
                                         ("JEV_EDGE_MAX_BODY_BYTES", "10"), ("JEV_EDGE_MAX_BODY_BYTES", "1.5"),
-                                        ("JEV_EDGE_UNJUDGED", "drop")])
+                                        ("JEV_EDGE_UNJUDGED", "drop"), ("JEV_EDGE_TEST_ENDPOINT", "maybe")])
 def test_bad_settings_fail_at_startup_not_silently(monkeypatch, name, value):
     monkeypatch.setenv("JEV_EDGE_URL", URL)
     monkeypatch.setenv(name, value)
@@ -1094,7 +1096,8 @@ def test_realtime_text_carries_the_sessions_client_address():
     async def session():
         await g.async_pre_call_hook({}, None, {"model": "rt", "metadata": {"requester_ip_address": "203.0.113.4"},
                                                "proxy_server_request": psr("/v1/realtime?model=rt")}, "_arealtime")
-        await g.apply_guardrail(inputs={"texts": ["hello there, realtime"]}, request_data={}, input_type="request")
+        await g.apply_guardrail(inputs={"texts": ["hello there, realtime"]}, request_data={"user_api_key_dict": Auth()},
+                                input_type="request")
 
     run(session())
     assert seen["xff"] == "203.0.113.4"
@@ -1173,3 +1176,71 @@ def test_nothing_in_a_request_or_its_key_switches_the_guardrail_off(route, extra
     if hasattr(jg.CustomGuardrail, "should_run_guardrail"):  # the LiteLLM installed decides with them
         from litellm.types.guardrails import GuardrailEventHooks
         assert g.should_run_guardrail(data, GuardrailEventHooks.pre_call) is True
+
+
+# ---------------------------------------------------------------------------
+# /guardrails/apply_guardrail, LiteLLM's test endpoint
+# ---------------------------------------------------------------------------
+
+def test_the_test_endpoint_is_judged_by_default_without_an_address():
+    # LiteLLM 1.80 calls apply_guardrail alone, with request_data {}: any key
+    # gets jev-edge's verdict on any text, and jev-edge sees no client
+    transport, seen = fake_authz(status=403, verdict="malicious", score="0.95")
+    with pytest.raises(Exception) as ei:
+        run(guard(transport).apply_guardrail(inputs={"texts": [ATTACK]}, request_data={}, input_type="request"))
+    assert ei.value.status_code == 403 and ei.value.detail["jev"]["score"] == "0.95"
+    assert seen["calls"] == 1 and seen["xff"] is None
+
+
+@pytest.mark.parametrize("request_data", [{}, {"metadata": {"user_api_key_dict": {"user_id": "admin"}}},
+                                          {"messages": [{"role": "user", "content": "x"}], "user_api_key_dict": {"a": 1}}])
+@pytest.mark.parametrize("enforce", [True, False])
+def test_the_test_endpoint_can_be_refused(request_data, enforce):
+    # 1.80 passes {}, 1.102 the request's messages and metadata: neither can
+    # hold the realtime bridge's UserAPIKeyAuth object. A refusal is a
+    # setting, not a verdict: monitor mode does not lift it.
+    transport, seen = fake_authz()
+    g = guard(transport, test_endpoint="refuse", enforce=enforce)
+    for input_type in ("request", "response"):
+        with pytest.raises(Exception) as ei:
+            run(g.apply_guardrail(inputs={"texts": ["hello"]}, request_data=request_data, input_type=input_type))
+        assert ei.value.status_code == 403
+        assert ei.value.detail["jev"]["reason"] == "refused: /guardrails/apply_guardrail is off (JEV_EDGE_TEST_ENDPOINT=refuse)"
+    assert seen["calls"] == 0
+    # the realtime bridge is still judged
+    run(g.apply_guardrail(inputs={"texts": ["hello realtime"]}, request_data={"user_api_key_dict": Auth()}, input_type="request"))
+    assert seen["calls"] == 1
+
+
+def endpoint_call(xff="198.51.100.77"):
+    """What LiteLLM 1.102's /guardrails/apply_guardrail hands the pre-call
+    hook (call type apply_guardrail) before it calls apply_guardrail."""
+    return {"guardrail_name": "jev-edge", "input": [ATTACK], "messages": [], "model": None,
+            "metadata": {"route": "/apply_guardrail", "user_api_key_auth": Auth(), "requester_ip_address": "127.0.0.1"},
+            "proxy_server_request": psr("/guardrails/apply_guardrail", **{"x-forwarded-for": xff}),
+            "litellm_logging_obj": object()}
+
+
+def test_the_test_endpoint_on_1_102_is_judged_once_with_the_callers_address():
+    transport, seen = fake_authz()
+    g = guard(transport)
+
+    async def request():
+        await g.async_pre_call_hook({}, None, endpoint_call(), "apply_guardrail")
+        return await g.apply_guardrail(inputs={"texts": [ATTACK]}, request_data={"metadata": {"k": "v"}}, input_type="request")
+
+    assert run(request()) == {"texts": [ATTACK]}
+    assert seen["calls"] == 1
+    assert (seen["body"], seen["xff"]) == ({"input": [ATTACK], "messages": []}, "198.51.100.77")
+    # a request that did not come through that hook is judged on its own
+    run(g.apply_guardrail(inputs={"texts": [ATTACK]}, request_data={}, input_type="request"))
+    assert seen["calls"] == 2
+
+
+def test_the_test_endpoint_on_1_102_is_refused_in_the_pre_call_hook():
+    transport, seen = fake_authz()
+    with pytest.raises(Exception) as ei:
+        run(guard(transport, test_endpoint="refuse", enforce=False).async_pre_call_hook({}, None, endpoint_call(),
+                                                                                       "apply_guardrail"))
+    assert ei.value.status_code == 403 and seen["calls"] == 0
+    assert ei.value.detail["jev"]["action"] == "block" and ei.value.detail["jev"]["source"] == "adapter"

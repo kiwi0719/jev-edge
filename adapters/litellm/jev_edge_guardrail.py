@@ -36,6 +36,8 @@ which win over the environment; older versions pass only ``guardrail_name``,
                              paths jev-edge's untrusted.fields names
     JEV_EDGE_UNJUDGED        pass (default) | block: what a request nobody
                              could judge gets
+    JEV_EDGE_TEST_ENDPOINT   judge (default) | refuse: what a call from
+                             LiteLLM's /guardrails/apply_guardrail gets
 
 Contract: only an answer carrying ``X-Jev-Verdict`` is trusted. 200 with the
 header is a decision; any status >= 400 with the header is a block (whatever
@@ -168,6 +170,11 @@ PASSTHROUGH_CALL = "pass_through_endpoint"
 # taken out before the body is sent on).
 LITELLM_OWN_KEYS = frozenset({"litellm_logging_obj", "litellm_call_id", "proxy_server_request", "secret_fields",
                               "metadata", "litellm_metadata"})
+
+# LiteLLM 1.102's /guardrails/apply_guardrail runs the pre-call hooks first,
+# with this call type, then calls apply_guardrail (1.80 calls apply_guardrail
+# alone).
+TEST_ENDPOINT_CALL = "apply_guardrail"
 
 # The routes whose proxy metadata LiteLLM keeps in `litellm_metadata` (their
 # API has a `metadata` parameter of its own, which is the client's), from
@@ -552,6 +559,10 @@ def _metadata_key(data: dict) -> str:
 # does on its behalf without the request's data: a batch file's lines,
 # realtime messages. Context-local, so it never crosses requests.
 _CLIENT_IP: contextvars.ContextVar = contextvars.ContextVar("jev_edge_client_ip", default=None)
+# Set when the pre-call hook has judged a /guardrails/apply_guardrail call
+# (LiteLLM 1.102), so the apply_guardrail call that follows it in the same
+# request does not ask jev-edge a second time.
+_TEST_CALL_JUDGED: contextvars.ContextVar = contextvars.ContextVar("jev_edge_test_call_judged", default=False)
 
 
 class JevEdgeBlocked(Exception):
@@ -576,7 +587,7 @@ class _ApplyGuardrailBase(CustomGuardrail):
 
     async def apply_guardrail(self, inputs: Any, request_data: dict, input_type: Any,
                               logging_obj: Optional[Any] = None) -> Any:
-        return await self._judge_texts(inputs, input_type)  # type: ignore[attr-defined]
+        return await self._judge_texts(inputs, request_data, input_type)  # type: ignore[attr-defined]
 
 
 class JevEdgeGuardrail(_ApplyGuardrailBase):
@@ -589,6 +600,7 @@ class JevEdgeGuardrail(_ApplyGuardrailBase):
         max_body_bytes: Optional[Union[int, str]] = None,
         extra_fields: Optional[Union[str, list]] = None,
         unjudged: Optional[str] = None,
+        test_endpoint: Optional[str] = None,
         transport: Optional[httpx.AsyncBaseTransport] = None,
         **kwargs: Any,
     ) -> None:
@@ -607,10 +619,14 @@ class JevEdgeGuardrail(_ApplyGuardrailBase):
         self.unjudged = str(_setting(unjudged, "JEV_EDGE_UNJUDGED", "pass")).lower()
         if self.unjudged not in ("pass", "block"):
             raise ValueError(f"jev-edge guardrail: JEV_EDGE_UNJUDGED must be pass or block, got {self.unjudged!r}")
+        self.test_endpoint = str(_setting(test_endpoint, "JEV_EDGE_TEST_ENDPOINT", "judge")).lower()
+        if self.test_endpoint not in ("judge", "refuse"):
+            raise ValueError("jev-edge guardrail: JEV_EDGE_TEST_ENDPOINT must be judge or refuse, "
+                             f"got {self.test_endpoint!r}")
         self._client = httpx.AsyncClient(timeout=self.timeout, transport=transport)
-        log.info("jev-edge guardrail: url=%s enforce=%s timeout=%s path=%s max_body_bytes=%d extra_fields=%s unjudged=%s",
-                 self.base, self.enforce, self.timeout, self.path, self.max_body_bytes,
-                 ",".join(self.extra_fields) or "-", self.unjudged)
+        log.info("jev-edge guardrail: url=%s enforce=%s timeout=%s path=%s max_body_bytes=%d extra_fields=%s unjudged=%s "
+                 "test_endpoint=%s", self.base, self.enforce, self.timeout, self.path, self.max_body_bytes,
+                 ",".join(self.extra_fields) or "-", self.unjudged, self.test_endpoint)
         if "guardrail_name" in kwargs and kwargs.get("default_on") is not True:
             # LiteLLM built it from config.yaml without default_on: true
             log.warning("jev-edge guardrail %s: default_on is not true, so LiteLLM runs it only for requests and keys "
@@ -660,12 +676,14 @@ class JevEdgeGuardrail(_ApplyGuardrailBase):
 
     def plan(self, data: dict, call_type: Any) -> tuple:
         """What to do with a call, by call type: ("judge", body or None),
-        ("skip", reason) or ("unjudged", reason)."""
+        ("skip", reason), ("unjudged", reason) or ("refuse", reason)."""
         name = str(getattr(call_type, "value", call_type) or "")
         if name in SKIP_CALLS:
             return "skip", f"call type {name} not judged"
         if name in NOT_VISIBLE_CALLS:
             return "unjudged", f"unjudgeable: call type {name}: {NOT_VISIBLE_CALLS[name]}"
+        if name == TEST_ENDPOINT_CALL and self.test_endpoint == "refuse":
+            return "refuse", None
         if name in NESTED_PASSTHROUGH_CALLS:
             inner = data.get("data")
             if isinstance(inner, dict):
@@ -715,6 +733,12 @@ class JevEdgeGuardrail(_ApplyGuardrailBase):
             return "unjudged", f"unjudgeable: call type {name}: no field the guardrail reads in the {what}"
         return "judge", None
 
+    @classmethod
+    def _refused(cls) -> dict[str, Any]:
+        """A call from /guardrails/apply_guardrail with the endpoint refused."""
+        return dict(cls._adapter("skipped", "refused: /guardrails/apply_guardrail is off (JEV_EDGE_TEST_ENDPOINT=refuse)"),
+                    action="block", status=403)
+
     @staticmethod
     def client_ip(data: dict) -> Optional[str]:
         """What jev-edge gets as X-Forwarded-For, from what LiteLLM's proxy
@@ -761,7 +785,9 @@ class JevEdgeGuardrail(_ApplyGuardrailBase):
             ip = _CLIENT_IP.get()
         kind, arg = self.plan(data, call_type)
         verdict: dict[str, Any]
-        if kind == "skip":
+        if kind == "refuse":
+            verdict = self._refused()
+        elif kind == "skip":
             verdict = self._adapter("skipped", arg)
         elif kind == "unjudged":
             verdict = self._unjudged(arg)
@@ -769,21 +795,35 @@ class JevEdgeGuardrail(_ApplyGuardrailBase):
             verdict = self._adapter("skipped", "no text")
         else:
             verdict = await self.judge(arg, ip)
+        if name == TEST_ENDPOINT_CALL:
+            _TEST_CALL_JUDGED.set(True)
 
         key = _metadata_key(data)
         md = data.get(key)
         if not isinstance(md, dict):
             md = data[key] = {}
         md["jev_verdict"] = verdict
-        blocks = verdict.get("action") == "block" and self.enforce
+        # a refusal is the operator's setting, not a verdict: monitor mode
+        # does not lift it
+        blocks = verdict.get("action") == "block" and (self.enforce or kind == "refuse")
         self._log_verdict(key, md, data, verdict, started, blocks)
         if blocks:
             self._raise(verdict)
         return data
 
-    async def _judge_texts(self, inputs: Any, input_type: Any) -> Any:
+    async def _judge_texts(self, inputs: Any, request_data: Any, input_type: Any) -> Any:
         """apply_guardrail: each text judged as a user message; only requests,
-        jev-edge judges input."""
+        jev-edge judges input. A call that is not LiteLLM's realtime bridge
+        (which passes the session's UserAPIKeyAuth object, something no
+        request body can hold) comes from the /guardrails/apply_guardrail
+        test endpoint: refused with JEV_EDGE_TEST_ENDPOINT=refuse, and not
+        judged twice when LiteLLM's pre-call hook judged it already."""
+        realtime = isinstance(request_data, dict) and _is_object(request_data.get("user_api_key_dict"))
+        if not realtime:
+            if self.test_endpoint == "refuse":
+                self._raise(self._refused())
+            if _TEST_CALL_JUDGED.get():
+                return inputs
         if str(getattr(input_type, "value", input_type)) != "request" or not isinstance(inputs, dict):
             return inputs
         texts = [t for t in (inputs.get("texts") or []) if isinstance(t, str) and t]

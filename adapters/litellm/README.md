@@ -28,7 +28,7 @@ LiteLLM proxy is where a lot of LLM traffic actually flows, and it has a guardra
 
    Without `default_on: true` LiteLLM runs the hook only for requests that name the guardrail (`guardrails: ["jev-edge"]`) and keys whose metadata names it, so a client that leaves it out is never judged; the guardrail logs a warning at startup when it is built that way. With it, nothing switches the guardrail off for a request: it ignores `disable_global_guardrail`, `disable_global_guardrails` and `opted_out_global_guardrails` wherever they are set, in the request, its key or its team, since none of them is the operator's alone. LiteLLM 1.80 reads the first from the request itself; a client can write the key and team settings into its own metadata under names 1.80 never overwrites (`user_api_key_team_metadata`); and a key's metadata is often written by whoever holds the key. Traffic that should not be judged belongs on a LiteLLM without the guardrail.
 
-4. Configure it with environment variables in LiteLLM's environment. From LiteLLM 1.81.0 the same settings can go under `litellm_params` instead (`jev_edge_url`, `enforce`, `timeout`, `path`, `max_body_bytes`, `extra_fields`, `unjudged`); they reach the class as keyword arguments and win over the environment. Earlier versions (1.80.11 was checked) build a custom guardrail with `guardrail_name`, `event_hook` and `default_on` only, so there settings under `litellm_params` are ignored and the environment is the only way.
+4. Configure it with environment variables in LiteLLM's environment. From LiteLLM 1.81.0 the same settings can go under `litellm_params` instead (`jev_edge_url`, `enforce`, `timeout`, `path`, `max_body_bytes`, `extra_fields`, `unjudged`, `test_endpoint`); they reach the class as keyword arguments and win over the environment. Earlier versions (1.80.11 was checked) build a custom guardrail with `guardrail_name`, `event_hook` and `default_on` only, so there settings under `litellm_params` are ignored and the environment is the only way.
 
    | Variable | Default | Meaning |
    | --- | --- | --- |
@@ -39,6 +39,7 @@ LiteLLM proxy is where a lot of LLM traffic actually flows, and it has a guardra
    | `JEV_EDGE_MAX_BODY_BYTES` | `1048576` | the largest body sent; keep it equal to jev-edge's `max_body_bytes` and at most `client_max_body_size` |
    | `JEV_EDGE_EXTRA_FIELDS` | none | comma list of top-level keys also sent: those of jev-edge's `untrusted.fields` (`documents[*].text` sends `documents`) |
    | `JEV_EDGE_UNJUDGED` | `pass` | `pass` or `block`: what a request nobody could judge gets; keep it equal to jev-edge's `policy.unjudgeable` |
+   | `JEV_EDGE_TEST_ENDPOINT` | `judge` | `judge` or `refuse`: what a call from LiteLLM's `/guardrails/apply_guardrail` gets ([below](#the-test-endpoint)) |
 
    A bad value (`JEV_EDGE_ENFORCE=maybe`, a timeout of 0) stops LiteLLM at startup with a `ValueError` instead of being ignored, and the settings in effect are logged once at INFO.
 
@@ -51,6 +52,7 @@ Checked against LiteLLM 1.80.11 and 1.102.1, each running the guardrail as a pro
 - **Batch files** are judged line by line only where LiteLLM scans them (1.99 and later, see below). 1.80.11 runs no guardrail on `/v1/files` at all.
 - **Realtime text** is judged where LiteLLM's realtime bridge calls `apply_guardrail` for typed messages and tool outputs (1.102.1 does; 1.80.11 does not).
 - **The Bedrock pass-through** keeps LiteLLM's metadata in `metadata` on 1.80.11 and in `litellm_metadata` on 1.102.1. The guardrail takes the proxy's own metadata to be the one holding LiteLLM's key object (`user_api_key_auth`, which no request body can hold), on every route, and falls back to the route only without one.
+- **`/guardrails/apply_guardrail`** calls `apply_guardrail` alone on 1.80.11; 1.102.1 runs the pre-call hooks first, with call type `apply_guardrail` ([below](#the-test-endpoint)).
 
 ## What it sends
 
@@ -73,6 +75,7 @@ LiteLLM passes each route's call type to the hook (sync and async names are trea
 | `create_file` with purpose `batch`, on LiteLLM 1.99 and later | the upload's hook sees only the file's name, type and size: `skipped`, reason `call type acreate_file: batch file lines are judged one by one as LiteLLM scans them`. LiteLLM then runs the hook over every line as a request of its own (chat, completion, responses and messages lines judged, embeddings lines skipped), and drops a line jev-edge blocks from the file, reporting it in the response's `litellm_batch_guardrail`. That needs jev-edge's block status to be 400, 403 or 422: LiteLLM treats any other status as a failure and refuses the whole upload. |
 | `create_file` with any other purpose (or `batch` on a LiteLLM that does not scan batch files), `create_batch`, `_arealtime` and `arealtime_calls` (realtime over WebSocket and WebRTC), `_aresponses_websocket` (the Responses API's WebSocket mode) | **unjudgeable**: the prompts are not in the request the hook sees. `skipped`, source `adapter`, reason `unjudgeable: call type <name>: ...`, passed or blocked with 403 as `JEV_EDGE_UNJUDGED` says. A batch's prompts are in its input file, judged only when it was uploaded through this proxy with the guardrail on, on LiteLLM 1.99 and later. |
 | realtime messages (`apply_guardrail`) | a realtime session's typed user messages and `function_call_output` items, one text at a time, each judged as a user message; on a block LiteLLM keeps the item from the model (a tool output is replaced by an error marker) and sends the client a `guardrail_violation` error. Audio, its transcripts and the session's `instructions` are not judged. |
+| `/guardrails/apply_guardrail`: call type `apply_guardrail` (1.102.1), then an `apply_guardrail` call | judged, or refused with `JEV_EDGE_TEST_ENDPOINT=refuse`: [the test endpoint](#the-test-endpoint) |
 
 ### Not covered
 
@@ -91,6 +94,12 @@ Where the guardrail is your control, leave `assistant_settings` off, or keep `/v
 - With `JEV_EDGE_ENFORCE=true`, a block from jev-edge (status >= 400 with `X-Jev-Verdict`, 403 by default) raises `HTTPException(<that status>, {"error": "request rejected", "jev": {...}})` and the call never reaches the model. With `false` the request continues annotated; use this for the monitor week and read the scores from the logs.
 - **Unjudgeable**: an answer without `X-Jev-Verdict` below 500, other than 429, means the server in front of jev-edge refused the request before jev-edge ran (413 past `client_max_body_size`, 400 or 431 for headers, 414, a 404 from something that is not jev-edge). It is annotated `skipped`, source `adapter`, reason `unjudgeable: authz answered <status>`, and passed or blocked with 403 as `JEV_EDGE_UNJUDGED` says. `JEV_EDGE_UNJUDGED` is the counterpart of the `-unjudged` flag of the [Envoy gRPC shim](../envoy/README.md) and the [HAProxy agent](../haproxy/README.md): the same values and default.
 - **Fail-open**: connection errors, timeouts, and a 5xx or a 429 without the header (the judge, or a proxy or rate limiter in front of it, unavailable) annotate `verdict: error` and let the call through, whatever `JEV_EDGE_UNJUDGED` says. Requests without text are `skipped`, source `adapter`, reason `no text`, without a round trip.
+
+## The test endpoint
+
+LiteLLM's `/guardrails/apply_guardrail` is one of its LLM API routes: any key that may call a model may also ask for a guardrail's verdict on any text, and a block answers with jev-edge's verdict, score and reason. With this guardrail that is a free oracle for tuning an attack against jev-edge: nothing reaches a model, and on 1.80.11 the call carries no client address, so jev-edge counts it against LiteLLM's own. On 1.102.1 the endpoint first runs the pre-call hooks (call type `apply_guardrail`, the text in `input`), which judge the text with the caller's address, and the `apply_guardrail` call that follows is not judged a second time.
+
+With `JEV_EDGE_TEST_ENDPOINT=refuse` every call from the endpoint is refused with 403 (`skipped`, source `adapter`, reason `refused: /guardrails/apply_guardrail is off (JEV_EDGE_TEST_ENDPOINT=refuse)`) before jev-edge is asked, in monitor mode too; LiteLLM's realtime bridge, which passes the session's key object with each text, is still judged. The endpoint's calls are told apart by that object, which no request can send: 1.80.11 passes nothing with them, 1.102.1 the caller's `messages` and `metadata`. Refuse it wherever keys belong to people you would not show jev-edge's scores to.
 
 ## Thresholds
 

@@ -141,3 +141,49 @@ X-Jev-Reason: injection+0.97+%28window%29
 judged text utf8=ok
 --- no_error_log
 judged text utf8=bad
+
+
+
+=== TEST 6: a 200 answer names every X-Jev-* header jev-edge does not set, for Envoy to remove
+--- http_config eval: $::HttpConfig
+--- user_files eval: ::conf()
+--- config
+location /_jev/authz/ { content_by_lua_block { require("resty.jev.edge").authz() } }
+--- request
+POST /_jev/authz/v1/chat/completions
+{"messages":[{"role":"user","content":"Please summarise the attached quarterly report for me."}]}
+--- more_headers
+Content-Type: application/json
+X-Jev-Mock-Score: 0.2
+X-Envoy-External-Address: 198.51.100.9
+X-Jev-Verdict: safe
+X-Jev-Score: 0.00
+X-Jev-Subject: forged
+X-Jev-Tenant: forged
+--- error_code: 200
+--- response_headers
+X-Jev-Verdict: safe
+x-envoy-auth-headers-to-remove: x-jev-body-partial,x-jev-subject,x-jev-mock-score,x-jev-tenant
+--- no_error_log
+[error]
+
+
+
+=== TEST 7: the subject header the config reads is not removed; the fixed names are, on an unwatched path too
+--- http_config eval: $::HttpConfig
+--- user_files eval: ::conf('subject = { enabled = true, from = "header", name = "X-Jev-Subject", hashed = true },')
+--- config
+location /_jev/authz/ { content_by_lua_block { require("resty.jev.edge").authz() } }
+--- request eval
+["GET /_jev/authz/healthz", "GET /_jev/authz/healthz"]
+--- more_headers eval
+["X-Envoy-External-Address: 198.51.100.9\nX-Jev-Subject: ip:abc",
+ "X-Envoy-External-Address: 198.51.100.9\nX-Jev-Body-Partial: 1"]
+--- error_code eval
+[200, 200]
+--- response_headers eval
+["X-Jev-Verdict: skipped\nx-envoy-auth-headers-to-remove: x-jev-body-partial",
+ "X-Jev-Verdict: skipped\nx-envoy-auth-headers-to-remove: x-jev-body-partial"]
+
+
+

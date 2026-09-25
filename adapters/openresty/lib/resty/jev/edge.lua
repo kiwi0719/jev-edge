@@ -499,6 +499,36 @@ local function client_ip_from(h, cfg, envoy)
   return ip or ngx.var.remote_addr
 end
 
+-- What Envoy removes from the request it lets through: on a 200 answer,
+-- ext_authz removes the headers named in x-envoy-auth-headers-to-remove (and
+-- never forwards that header itself, on any answer). Every X-Jev-* header
+-- jev-edge does not set: X-Jev-Subject (unless it is the subject header the
+-- config reads), X-Jev-Body-Partial, and any other X-Jev-* the gateway
+-- showed us. The ones jev-edge sets replace the client's copies through
+-- allowed_upstream_headers; naming them here would remove jev-edge's own.
+local function headers_to_remove(h, cfg)
+  local keep = {}
+  for _, n in ipairs(HEADER_NAMES) do keep[n:lower()] = true end
+  local s = cfg.subject
+  if type(s) == "table" and s.from == "header" and type(s.name) == "string" then keep[s.name:lower()] = true end
+  local out, seen = {}, {}
+  local function add(n)
+    if not keep[n] and not seen[n] then seen[n], out[#out + 1] = true, n end
+  end
+  add("x-jev-body-partial")
+  add("x-jev-subject")
+  local extra = {}
+  for k in pairs(h) do
+    if type(k) == "string" then
+      local n = k:lower()
+      if n:sub(1, 6) == "x-jev-" and not n:find("[,%s]") then extra[#extra + 1] = n end
+    end
+  end
+  table.sort(extra)
+  for _, n in ipairs(extra) do add(n) end
+  return table.concat(out, ",")
+end
+
 -- Path normalisation for headers that carry the original URI: decode %XX,
 -- collapse duplicate slashes and resolve `.` / `..` the way nginx does for
 -- $uri, so a watch pattern anchored at `^/v1/` sees the path the backend will
@@ -543,12 +573,13 @@ local function respond_authz(cfg, rules, over, who)
 end
 
 --- content_by_lua for Envoy HTTP ext_authz. Configure Envoy with
---   path_prefix: "/_jev/authz"   with_request_body: {max_request_bytes: 65536}
+--   path_prefix: "/_jev/authz"   with_request_body: {max_request_bytes: 1048576}
 --   allowed_upstream_headers: X-Jev-*
 -- and nginx with `location /_jev/authz/ { content_by_lua_block { ...authz() } }`.
 -- Envoy forwards the original method, path (after the prefix), headers and
 -- body. 200 = allow, verdict headers go upstream; 403 = deny with the block
--- body. Any adapter error is 200 + X-Jev-Verdict: error (fail-open).
+-- body. Any adapter error is 200 + X-Jev-Verdict: error (fail-open). Every
+-- answer names the other X-Jev-* headers in x-envoy-auth-headers-to-remove.
 function _M.authz(prefix)
   prefix = prefix or "/_jev/authz"
   local cfg = config.current()
@@ -563,6 +594,8 @@ function _M.authz(prefix)
   -- set by Envoy (with_request_body.allow_partial_message) and the HAProxy
   -- SPOA agent, which both strip client copies
   local partial = h["x-envoy-auth-partial-body"] == "true" or h["x-jev-body-partial"] == "1"
+  local okr, remove = pcall(headers_to_remove, h, cfg)
+  if okr then ngx.header["x-envoy-auth-headers-to-remove"] = remove end
 
   return respond_authz(cfg, rules, { path = path, client_ip = client_ip, partial = partial }, "authz")
 end

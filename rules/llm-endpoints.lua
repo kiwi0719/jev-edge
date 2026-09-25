@@ -12,14 +12,15 @@ return {
   -- switch to. OpenAI and compatible servers (/v1/..., Responses and
   -- Anthropic Messages included), Ollama (/api/chat, /api/generate), the
   -- Vercel AI SDK's useChat and useCompletion (/api/chat, /api/completion),
-  -- LiteLLM and llama.cpp without the /v1 prefix, LiteLLM /engines/<model>/,
-  -- Azure OpenAI and LiteLLM /openai/deployments/<name>/ and /openai/v1/,
-  -- llama.cpp /completion and /infill. Short generic names are anchored at
-  -- both ends so an application's own routes do not match.
+  -- LiteLLM and llama.cpp without the /v1 prefix (/responses included),
+  -- LiteLLM /engines/<model>/, Azure OpenAI and LiteLLM
+  -- /openai/deployments/<name>/ and /openai/v1/, llama.cpp /completion and
+  -- /infill. Short generic names are anchored at both ends so an
+  -- application's own routes do not match.
   watch_paths = {
     "^/v1/chat", "^/v1/completions", "^/v1/responses", "^/v1/messages",
     "^/api/chat", "^/api/completions?", "^/api/generate/?$",
-    "^/chat/completions", "^/completions?/?$", "^/infill/?$",
+    "^/chat/completions", "^/completions?/?$", "^/responses/?$", "^/infill/?$",
     "^/engines/[^/]+/chat/completions", "^/engines/[^/]+/completions",
     "^/openai/deployments/[^/]+/chat/completions", "^/openai/deployments/[^/]+/completions",
     "^/openai/v1/chat", "^/openai/v1/completions", "^/openai/v1/responses",
@@ -45,14 +46,18 @@ return {
   -- policy.unjudgeable then decides what still does not fit. See README.
   max_judge_chunks = 1,
   -- Oldest first: the judging window keeps the last ones first.
-  -- system: Anthropic Messages and Ollama /api/generate; template: Ollama.
-  -- messages[*].parts: AI SDK 5 UIMessages, which carry no content.
+  -- The system text each API puts before the conversation: system (a string
+  -- or text blocks): Anthropic Messages and Ollama /api/generate;
+  -- instructions: the Responses API.
+  -- template: Ollama. messages[*].parts: AI SDK 5 UIMessages, which carry no
+  -- content.
+  -- prompt.prompt_string: llama.cpp's prompt object, alone or in a list.
   -- input[*].output: a Responses API function_call_output (a tool result).
   -- suffix: OpenAI completions and Ollama; input_prefix, input_suffix,
   -- input_extra: llama.cpp /infill.
-  text_fields = { "system", "template", "messages[*].content", "messages[*].parts", "prompt", "input",
-                  "input[*].output", "query", "text", "suffix", "input_prefix", "input_suffix",
-                  "input_extra[*].text" },
+  text_fields = { "system", "instructions", "template", "messages[*].content", "messages[*].parts", "prompt",
+                  "prompt.prompt_string", "prompt[*].prompt_string", "input", "input[*].output", "query", "text",
+                  "suffix", "input_prefix", "input_suffix", "input_extra[*].text" },
   min_text_chars = 20,
   always_suspect = {
     [[\b(ignore|disregard|forget)\b.{0,20}\b(previous|prior|above|earlier|all)\b]]

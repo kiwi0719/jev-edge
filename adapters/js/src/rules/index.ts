@@ -10,7 +10,7 @@ export const llmEndpoints: Rule = {
   watch_paths: [
     "^/v1/chat", "^/v1/completions", "^/v1/responses", "^/v1/messages",
     "^/api/chat", "^/api/completions?", "^/api/generate/?$",
-    "^/chat/completions", "^/completions?/?$", "^/infill/?$",
+    "^/chat/completions", "^/completions?/?$", "^/responses/?$", "^/infill/?$",
     "^/engines/[^/]+/chat/completions", "^/engines/[^/]+/completions",
     "^/openai/deployments/[^/]+/chat/completions", "^/openai/deployments/[^/]+/completions",
     "^/openai/v1/chat", "^/openai/v1/completions", "^/openai/v1/responses",
@@ -23,9 +23,9 @@ export const llmEndpoints: Rule = {
   max_judge_chunks: 1,
   // oldest first: the judging window keeps the last ones first
   text_fields: [
-    "system", "template", "messages[*].content", "messages[*].parts", "prompt", "input",
-    "input[*].output", "query", "text", "suffix", "input_prefix", "input_suffix",
-    "input_extra[*].text",
+    "system", "instructions", "template", "messages[*].content", "messages[*].parts",
+    "prompt", "prompt.prompt_string", "prompt[*].prompt_string", "input", "input[*].output",
+    "query", "text", "suffix", "input_prefix", "input_suffix", "input_extra[*].text",
   ],
   min_text_chars: 20,
   always_suspect: [
@@ -53,7 +53,7 @@ export const defaultRule: Rule = {
   id: "default",
   watch_paths: [],
   methods: { POST: true },
-  text_fields: ["prompt", "input", "input[*].output", "text"],
+  text_fields: ["prompt", "instructions", "input", "input[*].output", "text"],
   templates: ["injection"],
 };
 
@@ -88,9 +88,9 @@ export function resolve(spec: RuleSpec): Rule {
   const [uok, uerr] = validateUntrusted(out.untrusted, `rule ${out.id}: untrusted`);
   if (!uok) throw new Error(uerr);
   out.text_fields ??= [
-    "system", "template", "messages[*].content", "messages[*].parts", "prompt", "input",
-    "input[*].output", "query", "text", "suffix", "input_prefix", "input_suffix",
-    "input_extra[*].text",
+    "system", "instructions", "template", "messages[*].content", "messages[*].parts",
+    "prompt", "prompt.prompt_string", "prompt[*].prompt_string", "input", "input[*].output",
+    "query", "text", "suffix", "input_prefix", "input_suffix", "input_extra[*].text",
   ];
   out.templates ??= ["injection"];
   return out;

@@ -19,6 +19,14 @@ export const llmEndpoints: Rule = {
     "^/v1beta/openai/chat/completions",
     // inference servers' native routes: SGLang, TGI (root POST included), vLLM and SageMaker-style /invocations
     "^/$", "^/generate/?$", "^/generate_stream/?$", "^/vertex/?$", "^/invocations/?$",
+    // Open WebUI: /api/v1 aliases, Anthropic Messages routes, Ollama and OpenAI proxies
+    "^/api/v1/chat/completions", "^/api/v1/messages/?$", "^/api/message/?$",
+    "^/ollama/api/chat", "^/ollama/api/generate", "^/ollama/v1/chat", "^/ollama/v1/completions",
+    "^/ollama/v1/messages", "^/ollama/v1/responses",
+    "^/openai/chat/completions", "^/openai/completions", "^/openai/responses", "^/openai/messages",
+    // LM Studio REST API; Cohere v2 chat and v1 generate
+    "^/api/v0/chat/completions", "^/api/v0/completions", "^/api/v1/chat/?$",
+    "^/v2/chat", "^/v1/generate/?$",
   ],
   methods: { POST: true, PUT: true, PATCH: true },
   skip_content_types: ["image/", "audio/", "video/", "font/", "application/pdf", "application/zip", "application/gzip"],
@@ -28,8 +36,9 @@ export const llmEndpoints: Rule = {
   max_judge_chunks: 1,
   // oldest first: the judging window keeps the last ones first
   text_fields: [
-    "system", "instructions", "systemInstruction.parts", "system_instruction.parts", "template",
-    "messages[*].content", "messages[*].parts", "contents[*].parts", "contents.parts", "prompt",
+    "system", "instructions", "preamble", "system_prompt", "systemInstruction.parts",
+    "system_instruction.parts", "template", "messages[*].content", "messages[*].parts",
+    "contents[*].parts", "contents.parts", "chat_history[*].message", "message", "prompt",
     "prompt.prompt_string", "prompt[*].prompt_string", "input", "input[*].output", "inputs",
     "instances[*].inputs", "instances[*].messages[*].content", "query", "text", "suffix",
     "input_prefix", "input_suffix", "input_extra[*].text",
@@ -95,8 +104,9 @@ export function resolve(spec: RuleSpec): Rule {
   const [uok, uerr] = validateUntrusted(out.untrusted, `rule ${out.id}: untrusted`);
   if (!uok) throw new Error(uerr);
   out.text_fields ??= [
-    "system", "instructions", "systemInstruction.parts", "system_instruction.parts", "template",
-    "messages[*].content", "messages[*].parts", "contents[*].parts", "contents.parts", "prompt",
+    "system", "instructions", "preamble", "system_prompt", "systemInstruction.parts",
+    "system_instruction.parts", "template", "messages[*].content", "messages[*].parts",
+    "contents[*].parts", "contents.parts", "chat_history[*].message", "message", "prompt",
     "prompt.prompt_string", "prompt[*].prompt_string", "input", "input[*].output", "inputs",
     "instances[*].inputs", "instances[*].messages[*].content", "query", "text", "suffix",
     "input_prefix", "input_suffix", "input_extra[*].text",

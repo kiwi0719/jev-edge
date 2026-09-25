@@ -35,6 +35,16 @@ return {
     -- /generate; TGI / (POST), /generate, /generate_stream, /vertex and
     -- /invocations; vLLM and SageMaker-style /invocations.
     "^/$", "^/generate/?$", "^/generate_stream/?$", "^/vertex/?$", "^/invocations/?$",
+    -- Open WebUI: /api/v1/chat/completions (the /api/chat/completions
+    -- handler), its Anthropic Messages routes, and its Ollama and OpenAI
+    -- proxies (a /<url_idx> suffix included).
+    "^/api/v1/chat/completions", "^/api/v1/messages/?$", "^/api/message/?$",
+    "^/ollama/api/chat", "^/ollama/api/generate", "^/ollama/v1/chat", "^/ollama/v1/completions",
+    "^/ollama/v1/messages", "^/ollama/v1/responses",
+    "^/openai/chat/completions", "^/openai/completions", "^/openai/responses", "^/openai/messages",
+    -- LM Studio's REST API; Cohere /v2/chat and /v1/generate (/v1/chat is above).
+    "^/api/v0/chat/completions", "^/api/v0/completions", "^/api/v1/chat/?$",
+    "^/v2/chat", "^/v1/generate/?$",
   },
   methods = { POST = true, PUT = true, PATCH = true },
   -- Media types that are never a prompt. Any other Content-Type (or none) is
@@ -59,17 +69,19 @@ return {
   -- Oldest first: the judging window keeps the last ones first.
   -- The system text each API puts before the conversation: system (a string
   -- or text blocks): Anthropic Messages and Ollama /api/generate;
-  -- instructions: the Responses API; systemInstruction or
-  -- system_instruction: Gemini.
+  -- instructions: the Responses API; preamble: Cohere v1; system_prompt: LM
+  -- Studio /api/v1/chat; systemInstruction or system_instruction: Gemini.
   -- template: Ollama. messages[*].parts: AI SDK 5 UIMessages, which carry no
   -- content. contents: Gemini (a list, or one content as LiteLLM takes it).
+  -- chat_history[*].message, message: Cohere v1 /v1/chat.
   -- prompt.prompt_string: llama.cpp's prompt object, alone or in a list.
   -- input[*].output: a Responses API function_call_output (a tool result).
   -- inputs, instances: TGI /generate, / and /vertex.
   -- suffix: OpenAI completions and Ollama; input_prefix, input_suffix,
   -- input_extra: llama.cpp /infill.
-  text_fields = { "system", "instructions", "systemInstruction.parts", "system_instruction.parts", "template",
-                  "messages[*].content", "messages[*].parts", "contents[*].parts", "contents.parts", "prompt",
+  text_fields = { "system", "instructions", "preamble", "system_prompt", "systemInstruction.parts",
+                  "system_instruction.parts", "template", "messages[*].content", "messages[*].parts",
+                  "contents[*].parts", "contents.parts", "chat_history[*].message", "message", "prompt",
                   "prompt.prompt_string", "prompt[*].prompt_string", "input", "input[*].output", "inputs",
                   "instances[*].inputs", "instances[*].messages[*].content", "query", "text", "suffix",
                   "input_prefix", "input_suffix", "input_extra[*].text" },

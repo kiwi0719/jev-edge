@@ -462,11 +462,12 @@ function _M.resolve(spec, load)
   local uok, uerr = defaults.validate_untrusted(out.untrusted, "rule " .. out.id .. ": untrusted")
   if not uok then return nil, uerr end
   if not out.text_fields then
-    out.text_fields = { "system", "instructions", "systemInstruction.parts", "system_instruction.parts",
-                        "template", "messages[*].content", "messages[*].parts", "contents[*].parts",
-                        "contents.parts", "prompt", "prompt.prompt_string", "prompt[*].prompt_string", "input",
-                        "input[*].output", "inputs", "instances[*].inputs", "instances[*].messages[*].content",
-                        "query", "text", "suffix", "input_prefix", "input_suffix", "input_extra[*].text" }
+    out.text_fields = { "system", "instructions", "preamble", "system_prompt", "systemInstruction.parts",
+                        "system_instruction.parts", "template", "messages[*].content", "messages[*].parts",
+                        "contents[*].parts", "contents.parts", "chat_history[*].message", "message", "prompt",
+                        "prompt.prompt_string", "prompt[*].prompt_string", "input", "input[*].output", "inputs",
+                        "instances[*].inputs", "instances[*].messages[*].content", "query", "text", "suffix",
+                        "input_prefix", "input_suffix", "input_extra[*].text" }
   end
   if not out.templates then out.templates = { "injection" } end
   return out

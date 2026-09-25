@@ -426,6 +426,40 @@ rules_case("route: /generate_stream is anchored at both ends", raw("/generate_st
 rules_case("route: /vertex is anchored at both ends", raw("/vertex/datasets", '{"inputs":' .. ASK .. '}'))
 rules_case("route: /invocations is anchored at both ends", raw("/invocations/export", '{"inputs":' .. ASK .. '}'))
 rules_case("route: the root pattern watches / only", raw("/index.html", '{"inputs":' .. ASK .. '}'))
+-- Open WebUI's aliases and proxies
+rules_case("route: Open WebUI /api/v1/chat/completions", req(LONG, { path = "/api/v1/chat/completions" }))
+rules_case("route: Open WebUI /api/v1/messages", raw("/api/v1/messages",
+  '{"model":"m","system":' .. SYS .. ',"messages":[{"role":"user","content":' .. HI .. '}]}'))
+rules_case("route: Open WebUI /api/message", req(LONG, { path = "/api/message" }))
+rules_case("route: Open WebUI /ollama/api/chat/<url_idx>", req(LONG, { path = "/ollama/api/chat/0" }))
+rules_case("route: Open WebUI /ollama/api/generate",
+  raw("/ollama/api/generate", '{"model":"llama3","prompt":' .. ASK .. '}'))
+rules_case("route: Open WebUI /ollama/v1/chat/completions", req(LONG, { path = "/ollama/v1/chat/completions" }))
+rules_case("route: Open WebUI /ollama/v1/completions", raw("/ollama/v1/completions", '{"prompt":' .. ASK .. '}'))
+rules_case("route: Open WebUI /ollama/v1/messages", req(LONG, { path = "/ollama/v1/messages" }))
+rules_case("route: Open WebUI /ollama/v1/responses", raw("/ollama/v1/responses", '{"input":' .. ASK .. '}'))
+rules_case("route: Open WebUI /openai/chat/completions", req(LONG, { path = "/openai/chat/completions" }))
+rules_case("route: Open WebUI /openai/completions", raw("/openai/completions", '{"prompt":' .. ASK .. '}'))
+rules_case("route: Open WebUI /openai/responses", raw("/openai/responses", '{"input":' .. ASK .. '}'))
+rules_case("route: Open WebUI /openai/messages", req(LONG, { path = "/openai/messages" }))
+rules_case("route: Open WebUI embeddings are not watched", raw("/ollama/v1/embeddings", '{"input":' .. ASK .. '}'))
+rules_case("route: Open WebUI chat records are not watched", req(LONG, { path = "/api/v1/chats/new" }))
+-- LM Studio's REST API
+rules_case("route: LM Studio /api/v0/chat/completions", req(LONG, { path = "/api/v0/chat/completions" }))
+rules_case("route: LM Studio /api/v0/completions", raw("/api/v0/completions", '{"model":"m","prompt":' .. ASK .. '}'))
+rules_case("route: LM Studio /api/v1/chat input parts", raw("/api/v1/chat",
+  '{"model":"m","input":[{"type":"text","content":' .. ASK .. '}]}'))
+rules_case("field: LM Studio system_prompt", raw("/api/v1/chat",
+  '{"model":"m","system_prompt":' .. SYS .. ',"input":' .. HI .. '}'))
+rules_case("route: LM Studio /api/v1/chat is anchored at both ends", req(LONG, { path = "/api/v1/chats" }))
+-- Cohere
+rules_case("field: Cohere v1 preamble, chat history and message, oldest first", raw("/v1/chat",
+  '{"model":"command-r-plus","preamble":"You answer billing questions.","chat_history":[{"role":"USER",'
+  .. '"message":"Hello there."},{"role":"CHATBOT","message":"Hi, how can I help?"}],"message":' .. ASK .. '}'))
+rules_case("field: Cohere v1 preamble",
+  raw("/v1/chat", '{"model":"command-r-plus","preamble":' .. SYS .. ',"message":' .. HI .. '}'))
+rules_case("route: Cohere /v2/chat", req(LONG, { path = "/v2/chat" }))
+rules_case("route: Cohere /v1/generate", raw("/v1/generate", '{"model":"command","prompt":' .. ASK .. '}'))
 
 -- a media Content-Type is the client's word, not the body's: Ollama and
 -- llama.cpp parse JSON whatever the header says. The body is still read, and
@@ -876,6 +910,11 @@ do
     { "TGI root POST inputs", "/", '{"inputs":' .. A .. ',"parameters":{"max_new_tokens":64}}' },
     { "TGI /vertex instances", "/vertex", '{"instances":[{"inputs":' .. A .. '}]}' },
     { "vLLM /invocations chat", "/invocations", '{"messages":[{"role":"user","content":' .. A .. '}]}' },
+    { "Open WebUI /api/v1/chat/completions", "/api/v1/chat/completions",
+      '{"messages":[{"role":"user","content":' .. A .. '}]}' },
+    { "Open WebUI /ollama/api/chat", "/ollama/api/chat", '{"messages":[{"role":"user","content":' .. A .. '}]}' },
+    { "LM Studio system_prompt", "/api/v1/chat", '{"system_prompt":' .. A .. ',"input":' .. SHORT .. '}' },
+    { "Cohere v1 preamble", "/v1/chat", '{"preamble":' .. A .. ',"message":' .. SHORT .. '}' },
   }) do
     eval_case(c[1] .. " is judged and blocked", { req = raw(c[2], c[3]),
       config = { policy = { mode = "enforce" } }, judge = { answers = { injection = 0.95 } } })

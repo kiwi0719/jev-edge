@@ -14,6 +14,11 @@ export const llmEndpoints: Rule = {
     "^/engines/[^/]+/chat/completions", "^/engines/[^/]+/completions",
     "^/openai/deployments/[^/]+/chat/completions", "^/openai/deployments/[^/]+/completions",
     "^/openai/v1/chat", "^/openai/v1/completions", "^/openai/v1/responses",
+    // Gemini generateContent and streamGenerateContent (the Gemini API, Vertex AI, LiteLLM), Gemini's OpenAI route
+    "^/v1%w*/.+:%a*generatecontent/?$", "^/models/.+:%a*generatecontent/?$",
+    "^/v1beta/openai/chat/completions",
+    // inference servers' native routes: SGLang, TGI (root POST included), vLLM and SageMaker-style /invocations
+    "^/$", "^/generate/?$", "^/generate_stream/?$", "^/vertex/?$", "^/invocations/?$",
   ],
   methods: { POST: true, PUT: true, PATCH: true },
   skip_content_types: ["image/", "audio/", "video/", "font/", "application/pdf", "application/zip", "application/gzip"],
@@ -23,9 +28,11 @@ export const llmEndpoints: Rule = {
   max_judge_chunks: 1,
   // oldest first: the judging window keeps the last ones first
   text_fields: [
-    "system", "instructions", "template", "messages[*].content", "messages[*].parts",
-    "prompt", "prompt.prompt_string", "prompt[*].prompt_string", "input", "input[*].output",
-    "query", "text", "suffix", "input_prefix", "input_suffix", "input_extra[*].text",
+    "system", "instructions", "systemInstruction.parts", "system_instruction.parts", "template",
+    "messages[*].content", "messages[*].parts", "contents[*].parts", "contents.parts", "prompt",
+    "prompt.prompt_string", "prompt[*].prompt_string", "input", "input[*].output", "inputs",
+    "instances[*].inputs", "instances[*].messages[*].content", "query", "text", "suffix",
+    "input_prefix", "input_suffix", "input_extra[*].text",
   ],
   min_text_chars: 20,
   always_suspect: [
@@ -88,9 +95,11 @@ export function resolve(spec: RuleSpec): Rule {
   const [uok, uerr] = validateUntrusted(out.untrusted, `rule ${out.id}: untrusted`);
   if (!uok) throw new Error(uerr);
   out.text_fields ??= [
-    "system", "instructions", "template", "messages[*].content", "messages[*].parts",
-    "prompt", "prompt.prompt_string", "prompt[*].prompt_string", "input", "input[*].output",
-    "query", "text", "suffix", "input_prefix", "input_suffix", "input_extra[*].text",
+    "system", "instructions", "systemInstruction.parts", "system_instruction.parts", "template",
+    "messages[*].content", "messages[*].parts", "contents[*].parts", "contents.parts", "prompt",
+    "prompt.prompt_string", "prompt[*].prompt_string", "input", "input[*].output", "inputs",
+    "instances[*].inputs", "instances[*].messages[*].content", "query", "text", "suffix",
+    "input_prefix", "input_suffix", "input_extra[*].text",
   ];
   out.templates ??= ["injection"];
   return out;

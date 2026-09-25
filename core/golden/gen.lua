@@ -378,6 +378,54 @@ rules_case("field: Anthropic system as text blocks", raw("/v1/messages",
 rules_case("field: llama.cpp prompt object", raw("/v1/completions", '{"prompt":{"prompt_string":' .. ASK .. '}}'))
 rules_case("field: llama.cpp prompt objects in a list", raw("/completion",
   '{"prompt":[{"prompt_string":' .. ASK .. ',"multimodal_data":[]}],"n_predict":16}'))
+-- Gemini generateContent and streamGenerateContent, on the Gemini API,
+-- Vertex AI and LiteLLM (which serves them for every model)
+local GEM = '{"contents":[{"role":"user","parts":[{"text":' .. ASK .. '}]}]}'
+rules_case("route: Gemini /v1beta/models/<m>:generateContent, system instruction first", raw(
+  "/v1beta/models/gemini-2.0-flash:generateContent", '{"systemInstruction":{"parts":[{"text":"You answer billing '
+  .. 'questions."}]},"contents":[{"role":"user","parts":[{"text":"Hello there."}]},{"role":"model","parts":'
+  .. '[{"text":"Hi, how can I help?"}]},{"role":"user","parts":[{"text":' .. ASK .. '}]}],'
+  .. '"generationConfig":{"temperature":0.2}}'))
+rules_case("route: Gemini :streamGenerateContent", raw("/v1beta/models/gemini-2.0-flash:streamGenerateContent", GEM))
+rules_case("route: Gemini /v1/models/<m>:generateContent", raw("/v1/models/gemini-2.0-flash:generateContent", GEM))
+rules_case("route: Gemini tuned model", raw("/v1beta/tunedModels/my-model:generateContent", GEM))
+rules_case("route: Vertex AI /v1/projects/.../models/<m>:generateContent", raw(
+  "/v1/projects/p1/locations/us-central1/publishers/google/models/gemini-2.0-flash:generateContent", GEM))
+rules_case("route: LiteLLM /models/<m>:generateContent", raw("/models/gpt-4o:generateContent", GEM))
+rules_case("route: LiteLLM /models/<m>:streamGenerateContent", raw("/models/gpt-4o:streamGenerateContent", GEM))
+rules_case("route: LiteLLM model name with a slash", raw("/v1beta/models/openai/gpt-4o:generateContent", GEM))
+rules_case("route: Gemini OpenAI-compatible chat", req(LONG, { path = "/v1beta/openai/chat/completions" }))
+rules_case("field: Gemini systemInstruction", raw("/v1beta/models/gemini-2.0-flash:generateContent",
+  '{"systemInstruction":{"parts":[{"text":' .. SYS .. '}]},"contents":[{"parts":[{"text":' .. HI .. '}]}]}'))
+rules_case("field: Gemini system_instruction", raw("/v1beta/models/gemini-2.0-flash:generateContent",
+  '{"system_instruction":{"parts":[{"text":' .. SYS .. '}]},"contents":[{"parts":[{"text":' .. HI .. '}]}]}'))
+rules_case("field: Gemini contents as one content, parts as one part", raw("/models/gpt-4o:generateContent",
+  '{"system_instruction":{"parts":{"text":"You answer billing questions."}},"contents":{"role":"user",'
+  .. '"parts":{"text":' .. ASK .. '}}}'))
+rules_case("route: Gemini countTokens is not watched", raw("/v1beta/models/gemini-2.0-flash:countTokens", GEM))
+rules_case("route: a path that only contains generateContent is not watched",
+  raw("/proxy/v1beta/models/gemini-2.0-flash:generateContent", GEM))
+-- inference servers' native routes: SGLang, TGI, vLLM and SageMaker-style
+rules_case("route: SGLang /generate text",
+  raw("/generate", '{"text":' .. ASK .. ',"sampling_params":{"max_new_tokens":64}}'))
+rules_case("route: TGI /generate inputs",
+  raw("/generate", '{"inputs":' .. ASK .. ',"parameters":{"max_new_tokens":64}}'))
+rules_case("route: TGI /generate_stream inputs", raw("/generate_stream", '{"inputs":' .. ASK .. '}'))
+rules_case("route: TGI root POST /",
+  raw("/", '{"inputs":' .. ASK .. ',"parameters":{"max_new_tokens":64},"stream":false}'))
+rules_case("route: TGI /vertex instances inputs", raw("/vertex",
+  '{"instances":[{"inputs":' .. ASK .. ',"parameters":{"max_new_tokens":64}}]}'))
+rules_case("route: TGI /vertex instances messages", raw("/vertex",
+  '{"instances":[{"messages":[{"role":"system","content":"Answer briefly."},'
+  .. '{"role":"user","content":' .. ASK .. '}]}]}'))
+rules_case("route: TGI /invocations inputs", raw("/invocations", '{"inputs":' .. ASK .. '}'))
+rules_case("route: vLLM /invocations chat", req(LONG, { path = "/invocations" }))
+rules_case("route: vLLM /invocations completion", raw("/invocations", '{"model":"m","prompt":' .. ASK .. '}'))
+rules_case("route: /generate is anchored at both ends", raw("/generate/images", '{"inputs":' .. ASK .. '}'))
+rules_case("route: /generate_stream is anchored at both ends", raw("/generate_streaming", '{"inputs":' .. ASK .. '}'))
+rules_case("route: /vertex is anchored at both ends", raw("/vertex/datasets", '{"inputs":' .. ASK .. '}'))
+rules_case("route: /invocations is anchored at both ends", raw("/invocations/export", '{"inputs":' .. ASK .. '}'))
+rules_case("route: the root pattern watches / only", raw("/index.html", '{"inputs":' .. ASK .. '}'))
 
 -- a media Content-Type is the client's word, not the body's: Ollama and
 -- llama.cpp parse JSON whatever the header says. The body is still read, and
@@ -820,6 +868,14 @@ do
     { "Responses instructions", "/v1/responses", '{"instructions":' .. A .. ',"input":' .. SHORT .. '}' },
     { "Anthropic system text blocks", "/v1/messages",
       '{"system":[{"type":"text","text":' .. A .. '}],"messages":[{"role":"user","content":' .. SHORT .. '}]}' },
+    { "Gemini generateContent contents", "/v1beta/models/gemini-2.0-flash:generateContent",
+      '{"contents":[{"role":"user","parts":[{"text":' .. A .. '}]}]}' },
+    { "Gemini systemInstruction", "/models/gpt-4o:streamGenerateContent",
+      '{"systemInstruction":{"parts":[{"text":' .. A .. '}]},"contents":[{"parts":[{"text":' .. SHORT .. '}]}]}' },
+    { "SGLang /generate text", "/generate", '{"text":' .. A .. '}' },
+    { "TGI root POST inputs", "/", '{"inputs":' .. A .. ',"parameters":{"max_new_tokens":64}}' },
+    { "TGI /vertex instances", "/vertex", '{"instances":[{"inputs":' .. A .. '}]}' },
+    { "vLLM /invocations chat", "/invocations", '{"messages":[{"role":"user","content":' .. A .. '}]}' },
   }) do
     eval_case(c[1] .. " is judged and blocked", { req = raw(c[2], c[3]),
       config = { policy = { mode = "enforce" } }, judge = { answers = { injection = 0.95 } } })

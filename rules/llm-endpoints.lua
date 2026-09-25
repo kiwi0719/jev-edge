@@ -24,6 +24,17 @@ return {
     "^/engines/[^/]+/chat/completions", "^/engines/[^/]+/completions",
     "^/openai/deployments/[^/]+/chat/completions", "^/openai/deployments/[^/]+/completions",
     "^/openai/v1/chat", "^/openai/v1/completions", "^/openai/v1/responses",
+    -- Gemini generateContent and streamGenerateContent: the Gemini API
+    -- (/v1beta/models/<m>:..., /v1/..., tunedModels, Vertex AI's
+    -- /v1/projects/.../models/<m>:...), and LiteLLM, which serves them for
+    -- every model, also as /models/<m>:... (<m> may hold a slash). Gemini's
+    -- OpenAI-compatible route.
+    "^/v1%w*/.+:%a*generatecontent/?$", "^/models/.+:%a*generatecontent/?$",
+    "^/v1beta/openai/chat/completions",
+    -- Inference servers' native routes, beside their /v1 ones: SGLang
+    -- /generate; TGI / (POST), /generate, /generate_stream, /vertex and
+    -- /invocations; vLLM and SageMaker-style /invocations.
+    "^/$", "^/generate/?$", "^/generate_stream/?$", "^/vertex/?$", "^/invocations/?$",
   },
   methods = { POST = true, PUT = true, PATCH = true },
   -- Media types that are never a prompt. Any other Content-Type (or none) is
@@ -48,16 +59,20 @@ return {
   -- Oldest first: the judging window keeps the last ones first.
   -- The system text each API puts before the conversation: system (a string
   -- or text blocks): Anthropic Messages and Ollama /api/generate;
-  -- instructions: the Responses API.
+  -- instructions: the Responses API; systemInstruction or
+  -- system_instruction: Gemini.
   -- template: Ollama. messages[*].parts: AI SDK 5 UIMessages, which carry no
-  -- content.
+  -- content. contents: Gemini (a list, or one content as LiteLLM takes it).
   -- prompt.prompt_string: llama.cpp's prompt object, alone or in a list.
   -- input[*].output: a Responses API function_call_output (a tool result).
+  -- inputs, instances: TGI /generate, / and /vertex.
   -- suffix: OpenAI completions and Ollama; input_prefix, input_suffix,
   -- input_extra: llama.cpp /infill.
-  text_fields = { "system", "instructions", "template", "messages[*].content", "messages[*].parts", "prompt",
-                  "prompt.prompt_string", "prompt[*].prompt_string", "input", "input[*].output", "query", "text",
-                  "suffix", "input_prefix", "input_suffix", "input_extra[*].text" },
+  text_fields = { "system", "instructions", "systemInstruction.parts", "system_instruction.parts", "template",
+                  "messages[*].content", "messages[*].parts", "contents[*].parts", "contents.parts", "prompt",
+                  "prompt.prompt_string", "prompt[*].prompt_string", "input", "input[*].output", "inputs",
+                  "instances[*].inputs", "instances[*].messages[*].content", "query", "text", "suffix",
+                  "input_prefix", "input_suffix", "input_extra[*].text" },
   min_text_chars = 20,
   always_suspect = {
     [[\b(ignore|disregard|forget)\b.{0,20}\b(previous|prior|above|earlier|all)\b]]

@@ -350,7 +350,8 @@ rule("breaker-failures", function(r)
     if not s:find("judge%.counts%(") then fail(r, f .. ": failed calls are not classified with judge.counts") end
   end
   local own = { ["core/breaker.lua"] = true, ["adapters/js/src/core/breaker.ts"] = true,
-                ["adapters/js/src/cf/stores.ts"] = true }  -- the breaker and its Durable Object proxy
+                ["adapters/js/src/cf/stores.ts"] = true,   -- the breaker and its Durable Object proxy
+                ["adapters/js/src/besteffort.ts"] = true } -- the runtime's forwarding wrapper around them
   local files = tracked("adapters/openresty/lib", "%.lua$")
   for _, f in ipairs(tracked("adapters/js/src", "%.ts$")) do files[#files + 1] = f end
   files[#files + 1] = "adapters/apisix/apisix/plugins/jev-edge.lua"

@@ -12,8 +12,9 @@ _M.PASS    = "pass"
 _M.BLOCK   = "block"
 _M.SUSPECT = "suspect"
 -- A watched request L1 cannot read: compressed with an encoding the adapter
--- could not decode, binary, or over max_body_bytes with no text in the part
--- the adapter could hand over. policy.unjudgeable decides what happens.
+-- could not decode, binary, declared JSON the decoder refused with no text in
+-- it, or over max_body_bytes with no text in the part the adapter could hand
+-- over. policy.unjudgeable decides what happens.
 _M.UNJUDGEABLE = "unjudgeable"
 
 _M.MAX_BODY_BYTES  = 1048576   -- parsed whole up to here (nginx's default client_max_body_size)
@@ -166,6 +167,8 @@ local function judged(req, rule, ctx, ct, size)
     local kind, decoded
     text, kind, values, decoded = normalize.extract(req.body, ct, rule.text_fields, ctx and ctx.json_decode)
     if kind == "binary" then return nil, "unjudgeable: binary body" end
+    -- declared JSON the decoder refused, with no text-field value to scan
+    if kind == "invalid" then return nil, "unjudgeable: invalid json" end
     untrusted = untrusted_part(decoded, rule, ctx)
   end
   if text == "" then return "", nil, nil, nil, nil, nil, untrusted end

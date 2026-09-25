@@ -162,7 +162,7 @@ export function extractUntrustedValues(decoded: JsonValue | undefined, spec: { t
   return out;
 }
 
-export type ExtractKind = "json" | "text" | "form" | "multipart" | "binary" | "none";
+export type ExtractKind = "json" | "scan" | "invalid" | "text" | "form" | "multipart" | "binary" | "none";
 
 /** Lua's tonumber(h, 16) + string.char: bytes, so %C3%BC is two bytes not one char. */
 function formDecode(v: string): string {
@@ -243,6 +243,62 @@ function multipartValues(body: string, contentType: string, out: string[]): void
 }
 
 /**
+ * Port of lone_surrogates(): `s` with every \uD800-\uDFFF escape that is not
+ * half of a valid pair written as \uFFFD, before decoding. cjson refuses a
+ * lone surrogate and JSON.parse keeps it; both cores read U+FFFD, as Go does.
+ */
+export function loneSurrogates(s: string): string {
+  if (!/\\u[dD][89a-fA-F]/.test(s)) return s;
+  let out = "";
+  let last = 0;
+  let i = 0;
+  for (;;) {
+    const j = s.indexOf("\\", i);
+    if (j === -1) break;
+    i = j + 2; // any other escape is two characters
+    if (s[j + 1] !== "u") continue;
+    const hex = /^[0-9a-fA-F]{4}/.exec(s.slice(j + 2, j + 6))?.[0];
+    if (!hex) continue;
+    const cp = parseInt(hex, 16);
+    i = j + 6;
+    if (cp < 0xd800 || cp > 0xdfff) continue;
+    const lo = cp <= 0xdbff ? /^\\u([0-9a-fA-F]{4})/.exec(s.slice(i, i + 6))?.[1] : undefined;
+    const lcp = lo ? parseInt(lo, 16) : NaN;
+    if (lcp >= 0xdc00 && lcp <= 0xdfff) {
+      i += 6;
+      continue;
+    }
+    out += s.slice(last, j) + "\\ufffd";
+    last = i;
+  }
+  return last === 0 ? s : out + s.slice(last);
+}
+
+// cjson, the Lua adapters' decoder, refuses JSON nested deeper than 1000;
+// JSON.parse does not. A body that deep is read by the scanner in both cores.
+const MAX_JSON_DEPTH = 1000;
+function tooDeep(s: string): boolean {
+  if (s.length < 2 * (MAX_JSON_DEPTH + 1)) return false;
+  let depth = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c === 0x22) {
+      // to the closing quote, past escapes
+      for (i++; i < s.length; i++) {
+        const d = s.charCodeAt(i);
+        if (d === 0x5c) i++;
+        else if (d === 0x22) break;
+      }
+    } else if (c === 0x5b || c === 0x7b) {
+      if (++depth > MAX_JSON_DEPTH) return true;
+    } else if (c === 0x5d || c === 0x7d) {
+      depth--;
+    }
+  }
+  return false;
+}
+
+/**
  * Extract text from a raw body. Returns the text (values joined with "\n"),
  * the kind, the values in order (newest last) for window(), and the decoded
  * JSON value when the kind is "json".
@@ -259,22 +315,36 @@ export function extract(
   // A UTF-8 BOM is not JSON, but Python's json.loads on bytes and Express's
   // body-parser skip it: judge what the backend reads.
   if (body.startsWith("﻿")) body = body.slice(1);
-  const declaredJson = ct.includes("json");
+  // declared JSON: a JSON media type (application/json, text/json,
+  // application/*+json), not "json" in a parameter such as a multipart
+  // boundary or "text/plain; profile=json"
+  const declaredJson = ct.split(";")[0].includes("json");
   const first = /^[ \t\n\v\f\r]*([\s\S])/.exec(body)?.[1];
   if (first === "{" || first === "[" || declaredJson) {
     let decoded: JsonValue | undefined;
     let ok = true;
     try {
-      decoded = jsonDecode(body);
+      decoded = jsonDecode(loneSurrogates(body));
     } catch {
       ok = false;
     }
+    if (ok && isObj(decoded) && tooDeep(body)) ok = false;
     if (ok && isObj(decoded)) {
       const values = extractJsonValues(decoded as JsonValue, fields);
       return [values.join("\n"), "json", values, decoded as JsonValue];
     }
-    // declared JSON that is not: the backend rejects it too
-    if (declaredJson) return ["", "none", []];
+    if (declaredJson) {
+      // a JSON scalar has no text fields
+      if (ok && decoded !== undefined) return ["", "none", []];
+      // The decoder refused it; the backend's parser may not (cjson refuses
+      // nesting past 1000 and bytes after the value, Go and Node do not).
+      // The text fields' string values, read by the tolerant scanner past
+      // max_body_bytes uses, are judged; a body with none is unjudgeable,
+      // never "no text".
+      const out = scanStrings(body, fieldKeys(fields), []);
+      if (out.length === 0) return ["", "invalid", []];
+      return [out.join("\n"), "scan", out];
+    }
   }
   const out: string[] = [];
   if (ct.includes("application/x-www-form-urlencoded") || (ct === "" && /^[A-Za-z0-9._~%+[\]-]+=[^ \t\n\v\f\r]*$/.test(body))) {
@@ -318,6 +388,8 @@ function readString(s: string, i: number): [string, number] {
           i += 6;
         }
       }
+      // a lone surrogate is U+FFFD, as in loneSurrogates()
+      if (cp >= 0xd800 && cp <= 0xdfff) cp = 0xfffd;
       buf += String.fromCodePoint(cp);
     } else if (e === undefined) {
       return [buf, n];

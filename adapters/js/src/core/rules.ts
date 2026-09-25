@@ -342,6 +342,8 @@ async function judged(
     let decoded: JsonValue | undefined;
     [text, kind, values, decoded] = extract(req.body, ct, rule.text_fields, ctx?.json_decode);
     if (kind === "binary") return { text: "", unj: "unjudgeable: binary body" };
+    // declared JSON the decoder refused, with no text-field value to scan
+    if (kind === "invalid") return { text: "", unj: "unjudgeable: invalid json" };
     untrusted = untrustedPart(decoded, rule, ctx);
   }
   if (text === "") return { text: "", untrusted };

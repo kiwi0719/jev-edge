@@ -191,13 +191,43 @@ local function multipart_values(body, content_type, out)
   end
 end
 
+--- `s` with every \uD800-\uDFFF escape that is not half of a valid pair
+-- written as \uFFFD. cjson refuses a lone surrogate; Python, Node and Go
+-- accept it (Go reads U+FFFD), so the rest of the body reaches the model.
+function _M.lone_surrogates(s)
+  if not s:find("\\u[dD][89a-fA-F]") then return s end
+  local out, last, i = {}, 1, 1
+  while true do
+    local j = s:find("\\", i, true)
+    if not j then break end
+    i = j + 2   -- any other escape is two bytes
+    local cp = s:sub(j + 1, j + 1) == "u" and tonumber(s:match("^%x%x%x%x", j + 2) or "", 16)
+    if cp then
+      i = j + 6
+      if cp >= 0xD800 and cp <= 0xDFFF then
+        local lo = cp <= 0xDBFF and tonumber(s:match("^\\u(%x%x%x%x)", i) or "", 16)
+        if lo and lo >= 0xDC00 and lo <= 0xDFFF then
+          i = i + 6
+        else
+          out[#out + 1] = s:sub(last, j - 1)
+          out[#out + 1] = "\\ufffd"
+          last = i
+        end
+      end
+    end
+  end
+  if last == 1 then return s end
+  out[#out + 1] = s:sub(last)
+  return table.concat(out)
+end
+
 --- Extract text from a raw body.
 -- @param body         string
 -- @param content_type string (may be nil)
 -- @param fields       list of JSON paths
 -- @param json_decode  function(string) -> table|nil
 -- @return text string (the values joined with "\n"),
---         kind ("json"|"form"|"multipart"|"text"|"binary"|"none"),
+--         kind ("json"|"scan"|"invalid"|"form"|"multipart"|"text"|"binary"|"none"),
 --         list of the values found (newest last), for window(),
 --         and the decoded JSON value when kind is "json"
 function _M.extract(body, content_type, fields, json_decode)
@@ -207,17 +237,30 @@ function _M.extract(body, content_type, fields, json_decode)
   -- A UTF-8 BOM is not JSON (cjson rejects it) but Python's json.loads on
   -- bytes and Express's body-parser skip it: judge what the backend reads.
   if body:sub(1, 3) == BOM then body = body:sub(4) end
-  local declared_json = ct:find("json", 1, true) ~= nil
+  -- declared JSON: a JSON media type (application/json, text/json,
+  -- application/*+json), not "json" in a parameter such as a multipart
+  -- boundary or "text/plain; profile=json"
+  local declared_json = ct:match("^[^;]*"):find("json", 1, true) ~= nil
   local first = body:match("^%s*(.)")
   if first == "{" or first == "[" or declared_json then
     if not json_decode then return "", "none", {} end
-    local ok, decoded = pcall(json_decode, body)
+    local ok, decoded = pcall(json_decode, _M.lone_surrogates(body))
     if ok and type(decoded) == "table" then
       local text, out = _M.extract_json(decoded, fields)
       return text, "json", out, decoded
     end
-    -- declared JSON that is not: the backend rejects it too
-    if declared_json then return "", "none", {} end
+    if declared_json then
+      -- a JSON scalar has no text fields
+      if ok and decoded ~= nil then return "", "none", {} end
+      -- The decoder refused it; the backend's parser may not (cjson refuses
+      -- nesting past 1000 and bytes after the value, Go and Node do not).
+      -- The text fields' string values, read by the tolerant scanner past
+      -- max_body_bytes uses, are judged; a body with none is unjudgeable,
+      -- never "no text".
+      local out = _M.scan_strings(body, _M.field_keys(fields), {})
+      if #out == 0 then return "", "invalid", {} end
+      return table.concat(out, "\n"), "scan", out
+    end
   end
   local out = {}
   if ct:find("application/x-www-form-urlencoded", 1, true)
@@ -275,6 +318,8 @@ local function read_string(s, i)
           i = i + 6
         end
       end
+      -- a lone surrogate is U+FFFD, as in lone_surrogates()
+      if cp >= 0xD800 and cp <= 0xDFFF then cp = 0xFFFD end
       buf[#buf + 1] = utf8_char(cp)
     elseif e == "" then
       return table.concat(buf), n + 1

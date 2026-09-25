@@ -194,6 +194,16 @@ jobs:
           for i in $(seq 1 30); do curl -fs http://127.0.0.1:8080/healthz >/dev/null && break; sleep 1; done
           make conformance ENDPOINT=http://127.0.0.1:8080/v1/systemone STRICT=1 MOCK=1
           docker stop laya
+      # the image's HEALTHCHECK probes the port the server listens on
+      - name: healthcheck follows LAYA_PORT
+        run: |
+          docker run -d --rm --name laya-port -e LAYA_BACKEND=mock -e LAYA_PORT=9000 -e LAYA_ACCESS_LOG=0 laya-server
+          for i in $(seq 1 30); do
+            [ "$(docker inspect -f '{{.State.Health.Status}}' laya-port)" = healthy ] && break; sleep 2
+          done
+          status=$(docker inspect -f '{{.State.Health.Status}}' laya-port)
+          docker stop laya-port
+          echo "health: $status"; test "$status" = healthy
 
   # The one check the main ruleset requires: green only when every job above
   # succeeded. Adding, removing or renaming a job or matrix entry needs no

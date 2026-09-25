@@ -29,6 +29,8 @@ docker run --rm -p 8080:8080 -v /path/to/finetuned:/model:ro \
 | `LAYA_MAX_BODY_BYTES` | `262144` | request body limit |
 | `LAYA_API_KEY` | unset | when set, `Authorization: Bearer <key>` is required |
 | `LAYA_ACCESS_LOG` | `1` | `0` drops the per-request line on stderr |
+| `LAYA_ORT_PROVIDERS` | `CPUExecutionProvider` | onnx: execution providers, comma-separated, in order of preference, e.g. `CUDAExecutionProvider,CPUExecutionProvider` with `onnxruntime-gpu` installed. A provider missing from the installed build stops the server at start |
+| `LAYA_ORT_THREADS` | `0` | onnx: intra-op threads per session; `0` leaves onnxruntime's default |
 | `LAYA_WORKERS` | CPU count | requests scored at once. `python` defaults to `1`, because your scorer may not be thread-safe |
 | `LAYA_QUEUE_MS` | `1000` | how long a request waits for a free worker before `503 overloaded` |
 | `LAYA_BACKLOG` | `1024` | listen backlog: at least the sum of `jev.max_inflight` over the gateways that call this server. The kernel caps it (`net.core.somaxconn` on Linux, logged at start when lower) |
@@ -44,6 +46,12 @@ docker run --rm -p 8080:8080 -v /path/to/finetuned:/model:ro \
 
 An L2 error lets the request through (fail open). The profile's `max_judge_bytes = 4096` is sized so the gateway never sends a text that needs the 413. See the comment in [`jev-laya.conf.lua`](jev-laya.conf.lua).
 
+## Latency grows with windows
+
+On CPU, a text split into N windows costs about N model calls. The windows go to the model in one batch, and that saves the per-call overhead but not the compute. A hostile text can be built to tokenize at about one token per byte (punctuation, rare letters). At `max_judge_bytes = 4096` with the deployment-context wording, that is about 6 windows, where a short prompt is one. Measured on CPU with a synthetic BERT-shaped model, the worst case took 30 to 50 times as long as a short prompt.
+
+Under steady traffic the gateway's adaptive timeout sits at its floor, `timeout_ms`. A request that takes longer passes unjudged and counts toward the breaker, so the floor has to cover the worst case, not the typical request. The profile sets 500 / 800 ms: about 2.5 times 6 windows at the ~33 ms per window Laya is reported at on CPU. Measure your own build (below). If the worst case does not fit the latency you can add, lower `max_judge_bytes`, or use a GPU (`LAYA_ORT_PROVIDERS`), where the windows of a batch run in parallel.
+
 ## Before you enforce
 
 1. **Fine-tune on the gateway's input.** Each model input is a pair. The first segment is the question's `instructions`, then `Yes if:` / `No if:` criteria, then `assistant: …` when a deployment context is set. The second segment is a slice of the text. `question_segment()` in `laya_server.py` builds it. The exact wording the gateway sends is in [`conformance/questions.json`](../../conformance/questions.json), in both its plain and its `ctx` form. Fine-tune on that wording, or put the wording you trained on under `jev.questions` in the gateway config. That wording was validated against Jev, not Laya. The `ctx` form in particular needs its own evaluation on your data.
@@ -55,9 +63,9 @@ An L2 error lets the request through (fail open). The profile's `max_judge_bytes
    It prints the log loss and calibration error before and after, and the `LAYA_TEMPERATURE=` line to use. Rankings do not change, only how far the scores spread.
 3. **Check the protocol and the latency** on the hardware you will run:
    ```bash
-   make conformance ENDPOINT=http://laya-server:8080/v1/systemone API_KEY=change-me STRICT=1 BUDGET_MS=300
+   make conformance ENDPOINT=http://laya-server:8080/v1/systemone API_KEY=change-me STRICT=1 BUDGET_MS=500
    ```
-   Then set `timeout_ms` / `timeout_max_ms` in the profile from the p50 / p99 it prints.
+   `BUDGET_MS` is the `timeout_ms` you plan to run. The suite times a short text and the worst case: `max_judge_bytes` of text at one token per byte, in the deployment-context wording. It also opens 64 connections at once, like the gateway at `max_inflight`. It ends with a `timeout_ms:` line, which is 2 to 3 times the worst-case p99. Set the profile's `timeout_ms` from that line, never from the short-text p99. For a profile with a different `max_judge_bytes`, `max_inflight` or `deployment_context`, run `python3 conformance/run.py` with `--judge-bytes`, `--concurrency` and `--assistant`.
 4. **Calibrate thresholds** from a monitor period. The access log carries `provider` and `model`:
    ```bash
    make calibrate LOG=/var/log/nginx/jev.log LABELS=labels.csv PROVIDER=laya MODEL=laya
@@ -70,4 +78,4 @@ An L2 error lets the request through (fail open). The profile's `max_judge_bytes
 make test-laya          # unit tests + the conformance suite against the mock backend
 ```
 
-The suite includes negative tests. `conformance` must fail for a server that silently judges only the first window, and for one whose listen backlog drops a burst of connections.
+The suite includes negative tests. `conformance` must fail for a server that silently judges only the first window, for one whose listen backlog drops a burst of connections, and for one that is fast on a short text but whose worst case is over the budget.

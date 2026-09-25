@@ -31,6 +31,12 @@ Guarantees the gateway relies on, checked by conformance/ (make conformance):
   * errors are JSON with a non-200 status (400, 401, 404, 405, 411, 413,
     500, 503).
 
+Cost: on CPU a text split in N windows costs about N model calls. Batching
+the windows saves the per-call overhead, not the per-window compute, so a
+hostile text that tokenizes to one token per byte costs many times a short
+one. Size the gateway's timeout floor from the worst-case line that
+`make conformance` prints, not from the short-text p99 (README.md).
+
 Standard library only, apart from the backend: `onnx` needs onnxruntime,
 tokenizers and numpy; `python` loads your own scoring function; `mock` needs
 nothing and exists for tests and conformance runs.
@@ -49,6 +55,11 @@ Configuration (environment):
   LAYA_API_KEY       when set, requests need "Authorization: Bearer <key>"
   LAYA_ACCESS_LOG    0 turns off the per-request line on stderr     (1)
   LAYA_HOST, LAYA_PORT                                            (0.0.0.0, 8080)
+  LAYA_ORT_PROVIDERS onnx: execution providers, comma-separated, in order of
+                     preference; each must be in this onnxruntime build
+                                                   (CPUExecutionProvider)
+  LAYA_ORT_THREADS   onnx: intra-op threads per session, 0 = onnxruntime's
+                     default                                      (0)
   LAYA_WORKERS       requests scored at once       (CPU count; python: 1)
   LAYA_QUEUE_MS      wait for a free worker before 503            (1000)
   LAYA_BACKLOG       listen backlog: at least the sum of jev.max_inflight of
@@ -135,10 +146,23 @@ def split_state(state) -> tuple[str | None, str]:
 # plain strings; it applies the temperature itself.
 
 
+def ort_providers(spec: str | None, available: list[str]) -> list[str]:
+    """LAYA_ORT_PROVIDERS as a list. A provider this onnxruntime build lacks
+    stops the server: onnxruntime would fall back to CPU with a warning, and
+    a timeout sized for a GPU would then fail open on every long text."""
+    names = [p.strip() for p in (spec or "CPUExecutionProvider").split(",") if p.strip()]
+    missing = [p for p in names if p not in available]
+    if not names or missing:
+        raise SystemExit(f"LAYA_ORT_PROVIDERS: {', '.join(missing) or 'empty'} not in this "
+                         f"onnxruntime build (it has {', '.join(available)})")
+    return names
+
+
 class OnnxBackend:
     """A sequence-pair classifier exported to ONNX with a tokenizers tokenizer."""
 
-    def __init__(self, model_dir: str, positive: int = 1):
+    def __init__(self, model_dir: str, positive: int = 1, providers: str | None = None,
+                 threads: int = 0):
         import numpy as np
         import onnxruntime as ort
         from tokenizers import Tokenizer
@@ -147,8 +171,12 @@ class OnnxBackend:
         self.tok = Tokenizer.from_file(os.path.join(model_dir, "tokenizer.json"))
         self.tok.no_truncation()
         self.tok.no_padding()
-        self.sess = ort.InferenceSession(os.path.join(model_dir, "model.onnx"),
-                                         providers=["CPUExecutionProvider"])
+        opts = ort.SessionOptions()
+        if threads:
+            opts.intra_op_num_threads = threads
+        self.sess = ort.InferenceSession(os.path.join(model_dir, "model.onnx"), sess_options=opts,
+                                         providers=ort_providers(providers, ort.get_available_providers()))
+        self.providers = self.sess.get_providers()
         self.inputs = {i.name for i in self.sess.get_inputs()}
         self.positive = positive
         pp = self.tok.post_processor
@@ -166,9 +194,12 @@ class OnnxBackend:
         return self.logits(first, [second])[0]
 
     def logits(self, first: str, seconds: list[str]) -> list[float]:
-        # every window of a long text in one batch: a text split in N windows
-        # costs about one model call, not N in a row, so the gateway's timeout
-        # does not become a lever for a text built to split badly
+        # every window of a long text in one batch. On CPU that saves the
+        # per-call overhead only: N windows still cost about N times one, so
+        # a text built to split into many windows costs that much more, and
+        # the gateway's timeout floor must be sized from that worst case
+        # (conformance/run.py measures it). A GPU provider
+        # (LAYA_ORT_PROVIDERS) runs the batch in parallel.
         np = self.np
         encs = [self.tok.encode(first, s) for s in seconds]
         width = max(len(e.ids) for e in encs)
@@ -238,7 +269,9 @@ class MockBackend:
 def load_backend(env=os.environ):
     kind = env.get("LAYA_BACKEND", "onnx")
     if kind == "onnx":
-        return OnnxBackend(env.get("LAYA_MODEL_DIR", "/model"), int(env.get("LAYA_POSITIVE", "1")))
+        return OnnxBackend(env.get("LAYA_MODEL_DIR", "/model"), int(env.get("LAYA_POSITIVE", "1")),
+                           providers=env.get("LAYA_ORT_PROVIDERS"),
+                           threads=int(env.get("LAYA_ORT_THREADS") or "0"))
     if kind == "python":
         return PythonBackend(env["LAYA_SCORER"])
     if kind == "mock":
@@ -614,8 +647,10 @@ def main() -> None:
     srv = make_server()
     host, port = srv.server_address[:2]
     h = srv.RequestHandlerClass
+    providers = getattr(h.scorer.b, "providers", None)
     sys.stderr.write(f"laya-server on {host}:{port}{PATH}: {h.workers.n} workers, "
-                     f"backlog {srv.request_queue_size}, at most {srv.max_connections} connections\n")
+                     f"backlog {srv.request_queue_size}, at most {srv.max_connections} connections"
+                     + (f", providers {','.join(providers)}" if providers else "") + "\n")
     cap = somaxconn()
     if cap is not None and cap < srv.request_queue_size:
         sys.stderr.write(f"laya-server: the kernel caps the listen backlog at {cap} "

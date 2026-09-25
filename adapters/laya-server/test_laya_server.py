@@ -14,6 +14,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
@@ -39,6 +40,18 @@ def serve(env=None, backend=None, start_after=0.0):
     run.daemon = True
     run.start()
     return srv, f"http://127.0.0.1:{srv.server_address[1]}/v1/systemone"
+
+
+class Hostile(L.MockBackend):
+    """The mock, except that a run of over 32 characters without whitespace
+    is one token per character: what a hostile text built of punctuation
+    costs a real tokenizer (conformance/run.py's worst case)."""
+
+    def spans(self, text):
+        out = []
+        for a, b in super().spans(text):
+            out.extend([(i, i + 1) for i in range(a, b)] if b - a > 32 else [(a, b)])
+        return out
 
 
 def stop(srv):
@@ -144,13 +157,16 @@ class Temperature(unittest.TestCase):
 
 class Http(unittest.TestCase):
     def test_passes_conformance_strict_with_auth(self):
-        srv, url = serve({"LAYA_API_KEY": "k"})
+        # Hostile: the worst case is judged in several windows, and --mock
+        # checks the attack at its tail is seen
+        srv, url = serve({"LAYA_API_KEY": "k"}, backend=Hostile())
         try:
             rc, out = conformance_run(url, "--strict", "--mock", "--api-key", "k")
         finally:
             srv.shutdown()
             srv.server_close()
         self.assertEqual(rc, 0, out)
+        self.assertRegex(out, r"ok    worst case .*, [2-8] windows\)")
         self.assertRegex(out, r"ok    burst: 64 new connections at once")
 
     def test_conformance_catches_silent_truncation(self):
@@ -225,6 +241,46 @@ class Http(unittest.TestCase):
             srv.shutdown()
             srv.server_close()
         self.assertEqual(status, 413)
+
+    def test_conformance_catches_per_window_cost(self):
+        # On CPU a text split in N windows costs about N model calls. A server
+        # that answers a short text well inside the budget can still time out
+        # on the longest text the gateway sends, and a timeout passes the
+        # request: the worst-case check must fail where the short one passes.
+        class PerWindow(Hostile):
+            def logit(self, first, second):
+                time.sleep(0.03)
+                return super().logit(first, second)
+
+        srv, url = serve(backend=PerWindow())
+        try:
+            rc, out = conformance_run(url, "--budget-ms", "100", "--concurrency", "4")
+        finally:
+            stop(srv)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("ok    latency within 100 ms at p99", out)
+        self.assertRegex(out, r"FAIL  worst case within 100 ms at p99: 4096 bytes .* windows\)")
+        self.assertRegex(out, r"timeout_ms: \d+-\d+, 2-3x the worst-case p99")
+
+    def test_worst_case_refused_is_a_failure(self):
+        # a 413 for a text inside max_judge_bytes is an L2 error: a bypass
+        srv, url = serve({"LAYA_MAX_WINDOWS": "2"}, backend=Hostile())
+        try:
+            t = conformance.Target(url, None, "laya", 5)
+            with open(os.path.join(ROOT, "conformance", "questions.json")) as f:
+                ctx = json.load(f)["ctx"]
+            body = conformance.worst_body(t, 4096, conformance.DEFAULT_ASSISTANT, ctx)
+            err, _, _ = conformance.check_worst(t, body, 4096, 2, 1000, mock=False)
+        finally:
+            stop(srv)
+        self.assertRegex(err, r"^status 413 for 4096 bytes")
+
+    def test_worst_text_is_fixed_ascii_of_the_asked_size(self):
+        a, b = conformance.worst_text(4096), conformance.worst_text(4096)
+        self.assertEqual(a, b)
+        self.assertEqual(len(a.encode()), 4096)
+        self.assertTrue(a.endswith(" ATTACK"))
+        self.assertNotIn(" ", a[:-7])
 
 
 class Load(unittest.TestCase):
@@ -327,6 +383,24 @@ class Load(unittest.TestCase):
                 self.assertEqual(srv.RequestHandlerClass.workers.n, want)
             finally:
                 stop(srv)
+
+
+class OrtOptions(unittest.TestCase):
+    def test_providers(self):
+        have = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        self.assertEqual(L.ort_providers(None, have), ["CPUExecutionProvider"])
+        self.assertEqual(L.ort_providers(" CUDAExecutionProvider,CPUExecutionProvider ", have), have)
+        # a provider missing from the build stops the server rather than
+        # falling back to CPU under a timeout sized for a GPU
+        with self.assertRaises(SystemExit) as cm:
+            L.ort_providers("CUDAExecutionProvider", ["CPUExecutionProvider"])
+        self.assertIn("CUDAExecutionProvider", str(cm.exception))
+
+    def test_env_reaches_the_backend(self):
+        with mock.patch.object(L, "OnnxBackend") as onnx:
+            L.load_backend({"LAYA_BACKEND": "onnx", "LAYA_ORT_PROVIDERS": "CUDAExecutionProvider",
+                            "LAYA_ORT_THREADS": "2"})
+        onnx.assert_called_once_with("/model", 1, providers="CUDAExecutionProvider", threads=2)
 
 
 if __name__ == "__main__":

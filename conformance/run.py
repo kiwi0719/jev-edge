@@ -2,7 +2,7 @@
 
     python3 conformance/run.py --endpoint http://127.0.0.1:8080/v1/systemone \\
         [--api-key KEY] [--model laya] [--strict] [--mock] [--budget-ms 250] \\
-        [--concurrency 64]
+        [--judge-bytes 4096] [--concurrency 64] [--assistant TEXT]
 
 Replays conformance/vectors.json (generated from the gateway's own provider
 and templates by conformance/gen.lua), then checks transport behaviour the
@@ -18,8 +18,20 @@ gateway depends on:
                 connect budget (30% of --budget-ms) and is answered 200
                 within --budget-ms. A listen backlog smaller than the burst
                 drops connections, and the gateway sees each as a timeout
-  latency       --samples sequential requests; p99 must fit --budget-ms,
-                the timeout_max_ms the gateway will run with
+  latency       --samples sequential short requests; p99 must fit
+                --budget-ms
+  worst case    --samples requests with the longest text the gateway sends
+                (--judge-bytes, the profile's max_judge_bytes), built to
+                tokenize at about one token per byte, in the deployment
+                context wording: answered 200 (a 413 here is a bypass), and
+                p99 within --budget-ms
+
+--budget-ms is the L2 timeout floor the gateway runs with (jev.timeout_ms).
+Under steady traffic the adaptive timeout sits at the floor, so a hostile
+text that forces the worst case must fit it too. The run ends with the
+timeout_ms to set: 2-3x the worst-case p99. On CPU that can be tens of times
+the short-text p99, because a text split in N windows costs about N model
+calls.
 
 --strict requires the exact status codes this suite chose (400, 404, 405,
 413); without it any 4xx passes where a 4xx is expected. --mock also checks
@@ -318,25 +330,92 @@ def check_burst(t: Target, vectors, n: int, budget_ms: float) -> tuple[str | Non
     return None, info
 
 
-def check_latency(t: Target, vectors, samples: int, budget_ms: float) -> tuple[str | None, str]:
+def timed(t: Target, body: bytes, samples: int) -> tuple[str | None, list, bytes]:
+    """samples sequential requests of body on one connection, after one that
+    warms the connection and the model. Returns (error, sorted ms, last body)."""
     c = t.conn()
-    lat = []
+    lat, data = [], b""
     try:
-        body = short_body(t, vectors)
-        t.request("POST", "/v1/systemone", body, conn=c)  # warm the connection and the model
+        t.request("POST", "/v1/systemone", body, conn=c)
         for _ in range(samples):
-            s, _, ms = t.request("POST", "/v1/systemone", body, conn=c)
+            s, data, ms = t.request("POST", "/v1/systemone", body, conn=c)
             if s != 200:
-                return f"status {s} during the latency run", ""
+                return f"status {s}", lat, data
             lat.append(ms)
     finally:
         c.close()
     lat.sort()
-    q = lambda f: lat[min(len(lat) - 1, int(math.ceil(f * len(lat))) - 1)]  # noqa: E731
-    info = f"p50 {q(0.5):.1f} ms, p99 {q(0.99):.1f} ms over {samples}"
-    if q(0.99) > budget_ms:
-        return f"p99 {q(0.99):.1f} ms is over the {budget_ms:.0f} ms budget ({info})", info
-    return None, info
+    return None, lat, data
+
+
+def pct(lat: list, f: float) -> float:
+    return lat[min(len(lat) - 1, int(math.ceil(f * len(lat))) - 1)]
+
+
+def check_latency(t: Target, vectors, samples: int, budget_ms: float) -> tuple[str | None, str, float]:
+    err, lat, _ = timed(t, short_body(t, vectors), samples)
+    if err:
+        return f"{err} during the latency run", "", 0.0
+    p99 = pct(lat, 0.99)
+    info = f"p50 {pct(lat, 0.5):.1f} ms, p99 {p99:.1f} ms over {samples}"
+    if p99 > budget_ms:
+        return f"p99 {p99:.1f} ms is over the {budget_ms:.0f} ms budget ({info})", info, p99
+    return None, info, p99
+
+
+# Punctuation and rare letters, no whitespace. Most tokenizers give each of
+# these characters a token of its own (WordPiece splits off every
+# punctuation mark; byte-level BPE and SentencePiece have few merges for
+# these pairs), so the text costs about one token per byte: the most windows
+# a text of that size can force.
+WORST_ALPHABET = "!#$%&()*+,-./:;<=>?@[]^_`{|}~'\"\\QXZJqxzjKVkv"
+DEFAULT_ASSISTANT = "A support assistant for Acme's billing product: invoices, payment methods and refunds."
+
+
+def worst_text(nbytes: int) -> str:
+    """nbytes of ASCII from WORST_ALPHABET, the same on every run (a fixed
+    LCG). It ends in " ATTACK", so --mock also shows the tail was judged."""
+    tail = " ATTACK"
+    x, out = 20240607, []
+    for _ in range(max(0, nbytes - len(tail))):
+        x = (x * 1103515245 + 12345) & 0x7FFFFFFF
+        out.append(WORST_ALPHABET[(x >> 16) % len(WORST_ALPHABET)])
+    return "".join(out) + tail
+
+
+def worst_body(t: Target, nbytes: int, assistant: str, ctx_questions: dict) -> bytes:
+    """The request the gateway sends for that text under a deployment
+    context: object state, the _ctx wording (longer, so less room per
+    window) and the llm-endpoints rule's one question."""
+    state = {"assistant": assistant, "user_message": worst_text(nbytes)}
+    return json.dumps({"model": t.model, "state": state,
+                       "questions": {"injection": ctx_questions["injection"]}}).encode()
+
+
+def check_worst(t: Target, body: bytes, nbytes: int, samples: int, budget_ms: float,
+                mock: bool) -> tuple[str | None, str, float]:
+    err, lat, data = timed(t, body, samples)
+    if err:
+        return (f"{err} for {nbytes} bytes, a text the gateway sends as is (max_judge_bytes). An L2 "
+                f"error passes the request unjudged: lower max_judge_bytes, or let the server judge "
+                f"more (laya-server: LAYA_MAX_WINDOWS)"), "", 0.0
+    aerr, scores = check_answers(data, ["injection"])
+    if aerr:
+        return aerr, "", 0.0
+    if mock and scores["injection"] <= 0.5:
+        return f"mock: injection = {scores['injection']:.3f} with ATTACK at the tail, want high", "", 0.0
+    windows = ""
+    try:
+        w = json.loads(data).get("usage", {}).get("windows")
+        windows = f", {w} window{'' if w == 1 else 's'}" if isinstance(w, int) else ""
+    except (ValueError, AttributeError):
+        pass
+    p99 = pct(lat, 0.99)
+    info = f"p50 {pct(lat, 0.5):.1f} ms, p99 {p99:.1f} ms over {samples}{windows}"
+    if p99 > budget_ms:
+        return (f"p99 {p99:.1f} ms is over the {budget_ms:.0f} ms budget ({info}): raise timeout_ms "
+                f"or lower max_judge_bytes"), info, p99
+    return None, info, p99
 
 
 # ---------------------------------------------------------------------------
@@ -350,16 +429,24 @@ def main(argv=None) -> int:
     ap.add_argument("--vectors", default=os.path.join(HERE, "vectors.json"))
     ap.add_argument("--strict", action="store_true")
     ap.add_argument("--mock", action="store_true")
-    ap.add_argument("--budget-ms", type=float, default=250.0)
+    ap.add_argument("--budget-ms", type=float, default=250.0,
+                    help="the gateway's L2 timeout floor, jev.timeout_ms")
     ap.add_argument("--samples", type=int, default=50)
     ap.add_argument("--timeout", type=float, default=30.0, help="seconds per request")
+    ap.add_argument("--judge-bytes", type=int, default=4096,
+                    help="the longest text the gateway sends: the profile's max_judge_bytes")
     ap.add_argument("--concurrency", type=int, default=64,
                     help="connections at once in the burst check: the gateway's jev.max_inflight")
+    ap.add_argument("--assistant", default=DEFAULT_ASSISTANT,
+                    help="deployment context for the worst case: your jev.deployment_context")
+    ap.add_argument("--questions", default=os.path.join(HERE, "questions.json"))
     args = ap.parse_args(argv)
 
     t = Target(args.endpoint, args.api_key, args.model, args.timeout)
     with open(args.vectors) as f:
         vectors = json.load(f)["cases"]
+    with open(args.questions) as f:
+        ctx_questions = json.load(f)["ctx"]
 
     failed = 0
 
@@ -391,20 +478,35 @@ def main(argv=None) -> int:
         except (http.client.HTTPException, OSError) as e:
             report(name, f"transport error: {e!r}")
 
-    try:
-        err, info = check_burst(t, vectors, args.concurrency, args.budget_ms)
-        report(f"burst: {args.concurrency} new connections at once, each answered within "
-               f"{args.budget_ms:.0f} ms", err, info)
-    except (http.client.HTTPException, OSError) as e:
-        report("burst", f"transport error: {e!r}")
-    try:
-        err, info = check_latency(t, vectors, args.samples, args.budget_ms)
-        report(f"latency within {args.budget_ms:.0f} ms at p99", err, info)
-    except (http.client.HTTPException, OSError) as e:
-        report("latency", f"transport error: {e!r}")
+    budget = f"{args.budget_ms:.0f} ms"
+    worst = worst_body(t, args.judge_bytes, args.assistant, ctx_questions)
+    timing = [
+        (f"burst: {args.concurrency} new connections at once, each answered within {budget}",
+         lambda: check_burst(t, vectors, args.concurrency, args.budget_ms) + (0.0,)),
+        (f"latency within {budget} at p99",
+         lambda: check_latency(t, vectors, args.samples, args.budget_ms)),
+        (f"worst case within {budget} at p99: {args.judge_bytes} bytes at ~1 token per byte, "
+         f"deployment context wording",
+         lambda: check_worst(t, worst, args.judge_bytes, args.samples, args.budget_ms, args.mock)),
+    ]
+    p99 = []
+    for name, fn in timing:
+        try:
+            err, info, ms = fn()
+        except (http.client.HTTPException, OSError) as e:
+            err, info, ms = f"transport error: {e!r}", "", 0.0
+        report(name, err, info)
+        p99.append(ms)
 
-    total = len(vectors) + len(checks) + 2
+    total = len(vectors) + len(checks) + len(timing)
     print(f"\n{total - failed}/{total} passed" + ("" if args.strict else "  (not --strict: exact error codes not checked)"))
+    short, longest = p99[1], p99[2]
+    if longest:
+        lo, hi = (math.ceil(k * longest) for k in (2, 3))
+        print(f"timeout_ms: {lo}-{hi}" if hi > lo else f"timeout_ms: {hi}",
+              f"2-3x the worst-case p99 of {longest:.1f} ms"
+              + (f" (short text: {short:.1f} ms)" if short else "")
+              + ". Size the gateway's floor from the worst case: the client chooses the text.", sep=", ")
     return 1 if failed else 0
 
 

@@ -13,17 +13,27 @@ return {
                                          -- cache is keyed by it, and calibrate splits on it
     api_key_env = "LAYA_API_KEY",        -- needs `env LAYA_API_KEY;` in nginx.conf; drop if unset
 
-    -- L2 timeout. jev's 400 ms floor / 1000 ms ceiling are sized for a
-    -- ~300 ms remote API. Laya is reported at ~33 ms per window; with that
-    -- floor a Laya server ten times slower than normal would never time out,
-    -- and the slowdown would show up late. Measure yours with
-    --   make conformance ENDPOINT=... BUDGET_MS=...
-    -- (p50 / p99 over 50 requests) and set the floor to ~2-3x p99, the
-    -- ceiling to what one request may add to your latency. laya-server
-    -- scores all windows of a long text in one batch, so a long text costs
-    -- about one model call, not one per window.
-    timeout_ms       = 100,
-    timeout_max_ms   = 300,
+    -- L2 timeout. Under steady traffic the adaptive timeout sits at its
+    -- floor (timeout_ms), so the floor must cover the slowest text a client
+    -- can send, not the typical one: a timeout passes the request unjudged
+    -- and counts toward the breaker. On CPU a text split in N windows costs
+    -- about N model calls (laya-server batches the windows, which saves the
+    -- per-call overhead, not the compute). At max_judge_bytes = 4096 a text
+    -- of punctuation and rare letters, about one token per byte, needs ~6
+    -- windows with the deployment-context wording: ~200 ms at the ~33 ms per
+    -- window Laya is reported at on CPU, and 500 ms is 2.5x that. Measure
+    -- yours with
+    --   make conformance ENDPOINT=... BUDGET_MS=<timeout_ms>
+    -- It times a short text and that worst case, and prints the timeout_ms
+    -- to set: 2-3x the worst-case p99. Size the floor from that line, never
+    -- from the short-text p99, which can be 30x smaller. If the result is
+    -- more than one request may add to your latency, lower max_judge_bytes
+    -- (below) and measure again, or run the model on a GPU
+    -- (LAYA_ORT_PROVIDERS), which runs the windows of a batch in parallel.
+    -- The ceiling is what one request may add when the server as a whole
+    -- slows down.
+    timeout_ms       = 500,
+    timeout_max_ms   = 800,
     timeout_headroom = 1.5,
     timeout_adaptive = true,
     -- laya-server's listen backlog (LAYA_BACKLOG, default 1024) must be at
@@ -57,8 +67,9 @@ return {
   -- deployment_context, 8 windows cover ~4300 tokens. Longer deployment
   -- contexts leave less room per window: lower max_judge_bytes, or raise
   -- LAYA_MAX_WINDOWS, until `make conformance` and your own longest texts
-  -- pass. Text past max_judge_bytes is handled by the gateway as for jev
-  -- (window around the suspicious part, or max_judge_chunks), and that
+  -- pass. It also sets the worst-case latency above: fewer bytes, fewer
+  -- windows. Text past max_judge_bytes is handled by the gateway as for
+  -- jev (window around the suspicious part, or max_judge_chunks), and that
   -- shows up in the verdict reason, never silently.
   rules = {
     { extends = "llm-endpoints", max_judge_bytes = 4096 },

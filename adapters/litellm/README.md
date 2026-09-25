@@ -15,7 +15,7 @@ LiteLLM proxy is where a lot of LLM traffic actually flows, and it has a guardra
 
 2. Put `jev_edge_guardrail.py` next to LiteLLM's `config.yaml`: LiteLLM loads `guardrail: <file>.<Class>` from the config file's directory. It needs only `httpx`, which LiteLLM already depends on.
 
-3. Add it to `config.yaml`:
+3. Add it to `config.yaml`, with `default_on: true`:
 
    ```yaml
    guardrails:
@@ -26,9 +26,9 @@ LiteLLM proxy is where a lot of LLM traffic actually flows, and it has a guardra
          default_on: true
    ```
 
-   Per-key or per-request guardrail selection works as for any LiteLLM guardrail (`guardrails: ["jev-edge"]` in the request or the key's metadata).
+   Without `default_on: true` LiteLLM runs the hook only for requests that name the guardrail (`guardrails: ["jev-edge"]`) and keys whose metadata names it, so a client that leaves it out is never judged; the guardrail logs a warning at startup when it is built that way. To judge only some keys, keep `default_on: true` and switch it off for the others with the key's or team's `disable_global_guardrails` (or, on recent LiteLLM, `opted_out_global_guardrails`), which a client cannot set.
 
-4. Configure it with environment variables in LiteLLM's environment. LiteLLM builds a custom guardrail with `guardrail_name`, `event_hook` and `default_on` only, so settings written under `litellm_params` never reach it.
+4. Configure it with environment variables in LiteLLM's environment. From LiteLLM 1.81.0 the same settings can go under `litellm_params` instead (`jev_edge_url`, `enforce`, `timeout`, `path`, `max_body_bytes`, `extra_fields`, `unjudged`); they reach the class as keyword arguments and win over the environment. Earlier versions (1.80.11 was checked) build a custom guardrail with `guardrail_name`, `event_hook` and `default_on` only, so there settings under `litellm_params` are ignored and the environment is the only way.
 
    | Variable | Default | Meaning |
    | --- | --- | --- |
@@ -40,14 +40,23 @@ LiteLLM proxy is where a lot of LLM traffic actually flows, and it has a guardra
    | `JEV_EDGE_EXTRA_FIELDS` | none | comma list of top-level keys also sent: those of jev-edge's `untrusted.fields` (`documents[*].text` sends `documents`) |
    | `JEV_EDGE_UNJUDGED` | `pass` | `pass` or `block`: what a request nobody could judge gets; keep it equal to jev-edge's `policy.unjudgeable` |
 
-   A bad value (`JEV_EDGE_ENFORCE=maybe`, a timeout of 0) stops LiteLLM at startup with a `ValueError` instead of being ignored, and the settings in effect are logged once at INFO. Code that builds the class itself can pass the same settings as keyword arguments (`jev_edge_url`, `enforce`, `timeout`, `path`, `max_body_bytes`, `extra_fields`, `unjudged`); they win over the environment.
+   A bad value (`JEV_EDGE_ENFORCE=maybe`, a timeout of 0) stops LiteLLM at startup with a `ValueError` instead of being ignored, and the settings in effect are logged once at INFO.
+
+### LiteLLM versions
+
+Checked against LiteLLM 1.80.11 and 1.102.1, each running the guardrail as a proxy with a stub jev-edge and a stub provider.
+
+- **1.81.0 and later** pass the `litellm_params` settings to the class; before, only the environment variables work.
+- **1.80.11** lets a request switch every `default_on` guardrail off with `"disable_global_guardrail": true` in its body or `metadata`. The guardrail ignores that and honours only a key's or team's `disable_global_guardrails`; 1.102.1 does the same itself.
+- **Batch files** are judged line by line only where LiteLLM scans them (1.99 and later, see below). 1.80.11 runs no guardrail on `/v1/files` at all.
+- **Realtime text** is judged where LiteLLM's realtime bridge calls `apply_guardrail` for typed messages and tool outputs (1.102.1 does; 1.80.11 does not).
 
 ## What it sends
 
-- **The body** is the request's text keys with their structure: `system`, `instructions`, the `JEV_EDGE_EXTRA_FIELDS` keys, `query`, `text`, `prompt`, `input` and `messages`, in that order (the conversation last). Roles, content parts, Anthropic `tool_use` / `tool_result` blocks, `role: tool` messages and Responses API `function_call` / `function_call_output` items are sent as they are, so jev-edge judges tool results and retrieved content (`untrusted.enabled`) exactly as it does in-line. Gemini `contents` and `systemInstruction` are sent as `messages`. Media is left out: image, audio and file parts keep only their `type` (and any `text`), and base64 sources and inline data are removed. The model, tool definitions, sampling parameters and LiteLLM's metadata are not sent.
+- **The body** is the request's text with its structure. First the tool definitions, `tools`, `functions` and `response_format`, unchanged: jev-edge judges them on their own. Then the `JEV_EDGE_EXTRA_FIELDS` keys, `query`, `text`, `prompt`, `input` and `messages`, the conversation last. A system prompt (Anthropic's top-level `system`, a string or text blocks, the Responses API's `instructions`, Gemini's `systemInstruction`) is sent as the first entry of `messages`, with role `system`, since every jev-edge version reads `messages[*].content`, none reads a top-level `instructions` and not every version reads `system`. Roles, content parts, Anthropic `tool_use` / `tool_result` blocks, `role: tool` messages and Responses API `function_call` / `function_call_output` items are sent as they are, so jev-edge judges tool results and retrieved content (`untrusted.enabled`) exactly as it does in-line. Gemini `contents` are sent as `messages`. Media is left out of the conversation: image, audio and file parts keep only their `type` (and any `text`), and base64 sources and inline data are removed. The model, sampling parameters and LiteLLM's metadata are not sent.
 - **Encoding**: compact UTF-8 JSON; non-ASCII text is not escaped, so CJK text and emoji cost their UTF-8 size.
-- **Size**: a body past `JEV_EDGE_MAX_BODY_BYTES` is sent as its head and its last 64 KiB (the newest turn) with `X-Jev-Body-Partial: 1`. jev-edge scans it the way it scans an oversized body in-line (the reason ends in `(window)`); text in the middle is not judged, and tool results in such a body are judged as text, without the retrieved-content question.
-- **`X-Forwarded-For`** carries the request's whole `X-Forwarded-For` chain, so jev-edge's `client_ip.trusted_hops` picks the hop instead of the client-forgeable first entry (LiteLLM's `requester_ip_address` is only used when there is no `X-Forwarded-For`: with `use_x_forwarded_for` on it is that forgeable first entry), so jev-edge's reputation and L3 work per client, not per proxy.
+- **Size**: a body past `JEV_EDGE_MAX_BODY_BYTES` is sent as its head and its last 64 KiB (the newest turn) with `X-Jev-Body-Partial: 1`. jev-edge scans it the way it scans an oversized body in-line (the reason ends in `(window)`): only string values that follow a key, so the value the tail starts in or just before, an array element too, is given its key again. Text in the middle is not judged, and tool results in such a body are judged as text, without the retrieved-content question.
+- **`X-Forwarded-For`** is built from what LiteLLM's proxy recorded for the request, never from body or metadata fields a client sends: the request's whole `X-Forwarded-For` chain, so jev-edge's `client_ip.trusted_hops` picks the hop instead of the client-forgeable first entry, or, without one, the proxy's own `requester_ip_address` (read from `litellm_metadata` on the routes where LiteLLM keeps its metadata there, where `metadata` is the client's). With `use_x_forwarded_for` on, `requester_ip_address` is that forgeable first entry, which is why the chain wins. A batch file's lines and a realtime session's messages carry the address of the upload or the session. jev-edge's reputation and L3 work per client, not per proxy.
 
 ## Call types
 
@@ -56,22 +65,27 @@ LiteLLM passes each route's call type to the hook (sync and async names are trea
 | Call type | What the guardrail does |
 | --- | --- |
 | `completion`, `text_completion`, `anthropic_messages`, `responses`, `generate_content`, pass-through routes, and any call type not listed below | judged: the body above |
-| embeddings, `moderation`, `transcription`, `speech`, `rerank`, image generation, edit and variation, video generation | skipped without a round trip: `skipped`, source `adapter`, reason `call type <name> not judged`. In-line jev-edge does not watch these routes either. |
-| `add_message` (a thread message) | its `role` and `content`, judged as a message |
-| `run_thread` | `instructions` and `additional_instructions` as system messages, then `additional_messages` |
-| `create_thread` | its `messages` |
-| `create_assistants` | its `instructions`, as a system message |
-| `create_file` with purpose `batch` | the generation requests in the JSONL file (lines for chat completions, completions, responses and messages; embeddings lines are left out), judged as one body |
-| `create_file` with any other purpose or a batch file that is not UTF-8 JSONL, `create_batch`, `realtime` | **unjudgeable**: the prompts are not in the request the hook sees. `skipped`, source `adapter`, reason `unjudgeable: call type <name>: ...`, passed or blocked with 403 as `JEV_EDGE_UNJUDGED` says |
+| embeddings, `moderation`, `transcription`, `speech`, `rerank`, image generation, edit and variation, video generation, remix, edit and extension, `vector_store_search`, `search` | skipped without a round trip: `skipped`, source `adapter`, reason `call type <name> not judged`. In-line jev-edge does not watch these routes either; what a search returns reaches a model only in a later request, which is judged. |
+| `create_file` with purpose `batch`, on LiteLLM 1.99 and later | the upload's hook sees only the file's name, type and size: `skipped`, reason `call type acreate_file: batch file lines are judged one by one as LiteLLM scans them`. LiteLLM then runs the hook over every line as a request of its own (chat, completion, responses and messages lines judged, embeddings lines skipped), and drops a line jev-edge blocks from the file, reporting it in the response's `litellm_batch_guardrail`. That needs jev-edge's block status to be 400, 403 or 422: LiteLLM treats any other status as a failure and refuses the whole upload. |
+| `create_file` with any other purpose (or `batch` on a LiteLLM that does not scan batch files), `create_batch`, `_arealtime` and `arealtime_calls` (realtime over WebSocket and WebRTC), `_aresponses_websocket` (the Responses API's WebSocket mode) | **unjudgeable**: the prompts are not in the request the hook sees. `skipped`, source `adapter`, reason `unjudgeable: call type <name>: ...`, passed or blocked with 403 as `JEV_EDGE_UNJUDGED` says. A batch's prompts are in its input file, judged only when it was uploaded through this proxy with the guardrail on, on LiteLLM 1.99 and later. |
+| realtime messages (`apply_guardrail`) | a realtime session's typed user messages and `function_call_output` items, one text at a time, each judged as a user message; on a block LiteLLM keeps the item from the model (a tool output is replaced by an error marker) and sends the client a `guardrail_violation` error. Audio, its transcripts and the session's `instructions` are not judged. |
 
-LiteLLM, not this file, decides which routes run pre-call guardrails at all. In the LiteLLM source this was written against (not run here), the Assistants and Threads handlers do not appear to call them, and a Batch's prompts run at the provider without passing through LiteLLM. Where the guardrail is your control, leave `assistant_settings` and `files_settings` off, or keep `/v1/threads`, `/v1/assistants`, `/v1/files` and `/v1/batches` away from keys that should be judged.
+### Not covered
+
+LiteLLM, not this file, decides which routes run pre-call guardrails at all, and on these the hook never runs, so nothing is judged or recorded (checked on 1.80.11 and 1.102.1):
+
+- `/v1/assistants`, `/v1/threads` and a thread's messages and runs: an assistant's instructions and a thread's messages reach the model unjudged.
+- `/v1/files` on LiteLLM 1.80: no hook, no batch scan.
+- The Responses API's WebSocket mode after its first frame, and realtime audio.
+
+Where the guardrail is your control, leave `assistant_settings` off, or keep `/v1/assistants` and `/v1/threads` (and on older LiteLLM `/v1/files` and `/v1/batches`) away from keys that should be judged.
 
 ## What it does with the answer
 
-- Every request gets `jev_verdict` with `verdict`, `score`, `source`, `reason`, `action` and, from jev-edge, `request_id`, in `metadata`, or in `litellm_metadata` on the routes where LiteLLM keeps its own metadata there (Responses, Anthropic messages, batches, files, assistants). It shows up in LiteLLM's spend logs and callbacks.
+- Every request gets `jev_verdict` with `verdict`, `score`, `source`, `reason`, `action` and, from jev-edge, `request_id`, in the metadata LiteLLM keeps for itself: `metadata`, or `litellm_metadata` on the routes where the API has a `metadata` parameter of its own (Responses, Anthropic messages, batches, files, assistants); the client's `metadata` there is sent on to the provider and never written. The same verdict is recorded as LiteLLM's standard guardrail information (status `success`, `guardrail_intervened` for a block, `guardrail_failed_to_respond` when jev-edge could not be asked), which is what logging callbacks and the spend logs' `guardrail_information` show; `jev_verdict` itself is not a spend-log field.
 - With `JEV_EDGE_ENFORCE=true`, a block from jev-edge (status >= 400 with `X-Jev-Verdict`, 403 by default) raises `HTTPException(<that status>, {"error": "request rejected", "jev": {...}})` and the call never reaches the model. With `false` the request continues annotated; use this for the monitor week and read the scores from the logs.
-- **Unjudgeable**: an answer without `X-Jev-Verdict` below 500 means the server in front of jev-edge refused the request before jev-edge ran (413 past `client_max_body_size`, 400 or 431 for headers, 414, a 404 from something that is not jev-edge). It is annotated `skipped`, source `adapter`, reason `unjudgeable: authz answered <status>`, and passed or blocked with 403 as `JEV_EDGE_UNJUDGED` says. This matches the Envoy shim's and the HAProxy agent's `-unjudged`.
-- **Fail-open**: connection errors, timeouts and a 5xx without the header annotate `verdict: error` and let the call through, whatever `JEV_EDGE_UNJUDGED` says. Requests without text are `skipped`, source `adapter`, reason `no text`, without a round trip.
+- **Unjudgeable**: an answer without `X-Jev-Verdict` below 500, other than 429, means the server in front of jev-edge refused the request before jev-edge ran (413 past `client_max_body_size`, 400 or 431 for headers, 414, a 404 from something that is not jev-edge). It is annotated `skipped`, source `adapter`, reason `unjudgeable: authz answered <status>`, and passed or blocked with 403 as `JEV_EDGE_UNJUDGED` says. `JEV_EDGE_UNJUDGED` is the counterpart of the `-unjudged` flag of the [Envoy gRPC shim](../envoy/README.md) and the [HAProxy agent](../haproxy/README.md): the same values and default.
+- **Fail-open**: connection errors, timeouts, and a 5xx or a 429 without the header (the judge, or a proxy or rate limiter in front of it, unavailable) annotate `verdict: error` and let the call through, whatever `JEV_EDGE_UNJUDGED` says. Requests without text are `skipped`, source `adapter`, reason `no text`, without a round trip.
 
 ## Thresholds
 
@@ -83,4 +97,4 @@ Set them in jev-edge, not here. `make calibrate` in the repo root works on jev-e
 make test-litellm
 ```
 
-Pytest cases against a fake `/_jev/authz` (httpx `MockTransport`): pass with annotation, block, monitor mode, unreachable, 5xx, unjudgeable answers with `JEV_EDGE_UNJUDGED` pass and block, the forwarded structure (tool results, media dropped, extra fields, Gemini contents), UTF-8 and the head-and-tail cut (checked with a port of jev-edge's partial-body scanner, with every cut position around a key, colon and value), each call-type group, and settings from the environment as LiteLLM builds the class. LiteLLM itself is not required; when it is installed, one more case checks the hook's signature against LiteLLM's `CustomGuardrail`.
+Pytest cases against a fake `/_jev/authz` (httpx `MockTransport`): pass with annotation, block, monitor mode, unreachable, 5xx and 429, unjudgeable answers with `JEV_EDGE_UNJUDGED` pass and block, the forwarded structure (tool results, system prompts, tool definitions, media dropped, extra fields, Gemini contents), UTF-8 and the head-and-tail cut (checked with a port of jev-edge's partial-body scanner, with every cut position around a key, colon, value and array element), each call-type group as LiteLLM passes it (batch uploads and their per-line scan, realtime text), where the verdict and the client address are read and written, and settings from the environment and from `litellm_params` as LiteLLM builds the class. LiteLLM itself is not required; when it is installed, two more cases check the hooks' signatures against LiteLLM's `CustomGuardrail`.

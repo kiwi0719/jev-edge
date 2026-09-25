@@ -262,3 +262,43 @@ Content-Type: application/json
 ["verdict=safe score=0.10 source=l2 reason=injection\\+0.10\\+%28window%29", "request rejected"]
 --- no_error_log
 [error]
+
+
+
+=== TEST 11: a refused config names the empty variable that fills the failing key, not the others
+--- http_config eval: $::HttpConfig
+--- user_files eval
+::conf('subject = { enabled = true, from = "ip", salt = os.getenv("JEV_T_UNSET_SALT") },'
+     . 'feedback = { enabled = false, token = os.getenv("JEV_T_UNSET_TOKEN") },')
+--- config
+location = /t { content_by_lua_block { ngx.say("subject.enabled=", tostring(require("resty.jev.config").current().subject.enabled)) } }
+--- request
+GET /t
+--- response_body
+subject.enabled=false
+--- error_log
+config invalid, keeping previous: subject.enabled needs subject.salt
+the config file sets subject.salt from JEV_T_UNSET_SALT, unset when it ran
+add `env JEV_T_UNSET_SALT;` to nginx.conf
+--- no_error_log
+JEV_T_UNSET_TOKEN
+
+
+
+=== TEST 12: a config refused for a key no variable fills blames no variable
+--- http_config eval: $::HttpConfig
+--- user_files eval
+::conf('sampling = { rate = 5 },'
+     . 'subject = { enabled = false, salt = os.getenv("JEV_T_UNSET_SALT") },'
+     . 'feedback = { enabled = false, token = os.getenv("JEV_T_UNSET_TOKEN") },')
+--- config
+location = /t { content_by_lua_block { ngx.say("rate=", tostring(require("resty.jev.config").current().sampling.rate)) } }
+--- request
+GET /t
+--- response_body
+rate=0.05
+--- error_log
+config invalid, keeping previous: sampling.rate must be in [0,1]
+--- no_error_log
+JEV_T_UNSET
+unset when it ran

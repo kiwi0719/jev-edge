@@ -12,6 +12,7 @@ local state = {
   path = nil,
   file_cfg = {},
   file_mtime = 0,
+  file_env = nil,
   override_version = 0,
   current = defaults.merge(defaults.config),
   rules = {},
@@ -52,6 +53,83 @@ local function read_api_key(cfg)
   end
 end
 
+-- A hint for the error line when validation fails on a key the config file
+-- fills from a variable it read with os.getenv and got nothing for. A worker
+-- only has the variables nginx.conf declares with `env NAME;`, and the file
+-- runs again in every worker on each reload, so a salt or token that was there
+-- at startup can read as empty after the first edit and the reload is refused.
+-- The stock file always reads optional variables (the feedback token even with
+-- feedback off), so an empty variable alone says nothing: the hint names one
+-- only when the error names a key its value would have filled.
+--
+-- Which keys those are is found by running the file once more with each empty
+-- variable returning a marker string and looking for the markers in the table
+-- it returns: on the first error that needs it, once per loaded file, never
+-- for a file that validates.
+local function env_feeds(probe)
+  if probe.feeds then return probe.feeds end
+  local marks = {}
+  for _, name in ipairs(probe.unset) do marks[name] = "\1jev-env-probe:" .. name .. "\1" end
+  local getenv = os.getenv
+  os.getenv = function(name)  -- luacheck: ignore 122
+    local v = getenv(name)
+    if v == nil then return marks[name] end
+    return v
+  end
+  local ok, cfg = pcall(probe.chunk)
+  os.getenv = getenv  -- luacheck: ignore 122
+  local feeds, seen = {}, {}
+  local function walk(t, prefix)
+    if seen[t] then return end
+    seen[t] = true
+    for k, v in pairs(t) do
+      local path = prefix .. tostring(k)
+      if type(v) == "string" then
+        for _, name in ipairs(probe.unset) do
+          if v:find(marks[name], 1, true) then feeds[#feeds + 1] = { path = path, name = name } end
+        end
+      elseif type(v) == "table" then
+        walk(v, path .. ".")
+      end
+    end
+  end
+  if ok and type(cfg) == "table" then walk(cfg, "") end
+  probe.feeds, probe.chunk = feeds, nil
+  return feeds
+end
+
+-- `path` appears in `err` as a whole key: "subject.salt" in "subject.enabled
+-- needs subject.salt", not "jev.timeout_ms" in "jev.timeout_ms_x".
+local function names_key(err, path)
+  local init = 1
+  while true do
+    local s, e = err:find(path, init, true)
+    if not s then return false end
+    local before, after = err:sub(s - 1, s - 1), err:sub(e + 1, e + 1)
+    if not before:find("^[%w_.]") and not after:find("^[%w_]") then return true end
+    init = s + 1
+  end
+end
+
+local function env_hint(err)
+  local probe = state.file_env
+  if not probe or type(err) ~= "string" then return "" end
+  local fills, decl, named = {}, {}, {}
+  for _, f in ipairs(env_feeds(probe)) do
+    if names_key(err, f.path) then
+      fills[#fills + 1] = f.path .. " from " .. f.name
+      if not named[f.name] then
+        named[f.name] = true
+        decl[#decl + 1] = "`env " .. f.name .. ";`"
+      end
+    end
+  end
+  if #fills == 0 then return "" end
+  return "; the config file sets " .. table.concat(fills, ", ") .. ", unset when it ran:"
+    .. " if that is set for nginx, add " .. table.concat(decl, " ") .. " to nginx.conf"
+    .. " (workers only see the variables nginx.conf declares)"
+end
+
 local function rebuild()
   local override = {}
   local dict = ngx.shared[state.dict_name]
@@ -62,7 +140,7 @@ local function rebuild()
   local merged = defaults.merge(defaults.merge(defaults.config, state.file_cfg), override)
   local ok, err = defaults.validate(merged)
   if not ok then
-    ngx.log(ngx.ERR, "jev-edge: config invalid, keeping previous: ", err)
+    ngx.log(ngx.ERR, "jev-edge: config invalid, keeping previous: ", err, env_hint(err))
     return false
   end
   read_api_key(merged)
@@ -88,9 +166,23 @@ end
 local function load_file(path)
   local chunk, err = loadfile(path)
   if not chunk then return nil, err end
+  -- os.getenv is wrapped while the file runs to note what came back empty
+  -- (env_hint), and put back even when the file fails. A config file has no
+  -- reason to yield, so no request runs while the wrapper is in place.
+  local getenv, unset, seen = os.getenv, {}, {}
+  os.getenv = function(name)  -- luacheck: ignore 122
+    local v = getenv(name)
+    if v == nil and not seen[name] then
+      seen[name] = true
+      unset[#unset + 1] = name
+    end
+    return v
+  end
   local ok, cfg = pcall(chunk)
+  os.getenv = getenv  -- luacheck: ignore 122
   if not ok then return nil, cfg end
   if type(cfg) ~= "table" then return nil, "config must return a table" end
+  state.file_env = #unset > 0 and { chunk = chunk, unset = unset } or nil
   return cfg
 end
 

@@ -1226,6 +1226,101 @@
     },
     {
       "expect": {
+        "reason": "natural language (window)",
+        "result": "suspect",
+        "text": "Please write a detailed summary of the attached quarterly report."
+      },
+      "input": {
+        "cache": {},
+        "clock": 1000,
+        "req": {
+          "body": "{\"messages\":[{\"role\":\"user\",\"content\":\"Please write a detailed summary of the attached quarterly report.\"",
+          "body_partial": true,
+          "body_size": 105,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/v1/chat/completions"
+        },
+        "rule": "llm-endpoints"
+      },
+      "name": "a body the gateway cut is scanned as a head"
+    },
+    {
+      "expect": {
+        "reason": "natural language",
+        "result": "suspect",
+        "text": "Please write a detailed summary of the attached quarterly report."
+      },
+      "input": {
+        "cache": {},
+        "clock": 1000,
+        "req": {
+          "body": "{\"messages\":[{\"role\":\"user\",\"content\":\"Please write a detailed summary of the attached quarterly report.\"",
+          "body_size": 105,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/v1/chat/completions"
+        },
+        "rule": "llm-endpoints"
+      },
+      "name": "a body the gateway cut without the flag is parsed as a whole"
+    },
+    {
+      "expect": {
+        "reason": "natural language (window)",
+        "result": "suspect",
+        "text": "Please write a detailed summary of the attached quarterly report."
+      },
+      "input": {
+        "cache": {},
+        "clock": 1000,
+        "req": {
+          "body_head": "{\"messages\":[{\"role\":\"user\",\"content\":\"Please write a detailed summary of the attached quarterly report.\"",
+          "body_partial": true,
+          "body_size": 1048577,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/v1/chat/completions"
+        },
+        "rule": "llm-endpoints"
+      },
+      "name": "a body the gateway cut, head handed over, is scanned as a head"
+    },
+    {
+      "expect": {
+        "reason": "content-type not watched",
+        "result": "pass",
+        "text": ""
+      },
+      "input": {
+        "cache": {},
+        "clock": 1000,
+        "req": {
+          "body": "\u0000\u0000\u0000\rIHDR\u0000\u0000\u0001\u0000 binary image payload",
+          "body_partial": true,
+          "body_size": 43,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "image/png"
+          },
+          "method": "POST",
+          "path": "/v1/chat/completions"
+        },
+        "rule": "llm-endpoints"
+      },
+      "name": "a binary media body the gateway cut is not watched"
+    },
+    {
+      "expect": {
         "reason": "natural language",
         "result": "suspect",
         "text": "Please write a detailed summary of the attached quarterly report."

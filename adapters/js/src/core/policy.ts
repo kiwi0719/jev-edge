@@ -9,6 +9,8 @@ export interface Policy {
   block_body?: string;
   /** What happens to a watched request L1 cannot read (see core/defaults.lua). */
   unjudgeable?: "pass" | "block" | string;
+  /** A body the gateway in front cut: judged on its head, or reported unjudgeable (see core/defaults.lua). */
+  partial?: "judge" | "unjudgeable" | string;
 }
 
 export const DEFAULTS: Required<Policy> = {
@@ -18,6 +20,7 @@ export const DEFAULTS: Required<Policy> = {
   block_status: 403,
   block_body: '{"error":"request rejected"}',
   unjudgeable: "pass",
+  partial: "judge",
 };
 
 export type Decision = [Action, Label, boolean];

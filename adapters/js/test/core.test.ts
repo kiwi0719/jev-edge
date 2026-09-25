@@ -201,12 +201,16 @@ describe("defaults.validate", () => {
       { async: { max_async: -1 } },
       { client_ip: { trusted_hops: 0 } },
       { client_ip: { trusted_hops: 1.5 } },
+      { policy: { partial: "block" } },
+      { policy: { partial: true } },
     ]) {
       const [ok] = core.defaults.validate(core.defaults.merge(core.defaults.config, over));
       expect(ok, JSON.stringify(over)).toBeNull();
     }
     expect(core.defaults.config.client_ip.trusted_hops).toBe(1);
     expect(core.defaults.validate(core.defaults.merge(core.defaults.config, { policy: { block_status: 429 }, client_ip: { trusted_hops: 2 } }))[0]).toBe(true);
+    expect(core.defaults.config.policy.partial).toBe("judge");
+    expect(core.defaults.validate(core.defaults.merge(core.defaults.config, { policy: { partial: "unjudgeable" } }))[0]).toBe(true);
   });
 });
 

@@ -36,6 +36,12 @@ _M.config = {
     -- "unjudgeable: ...", "block" rejects it in enforce mode. Normal SDKs
     -- send none of these; "block" is the stricter choice once you are sure.
     unjudgeable       = "pass",
+    -- A body the gateway in front cut before handing it over (Envoy's
+    -- allow_partial_message, HAProxy past tune.bufsize; the request's
+    -- `body_partial`): "judge" scans the part it has as the head of a larger
+    -- body, and what was cut off is never read; "unjudgeable" reports the
+    -- request unjudgeable instead, so policy.unjudgeable decides.
+    partial           = "judge",
   },
   cache = {
     fp_ttl          = 300,
@@ -199,6 +205,9 @@ function _M.validate(c)
   end
   if p.unjudgeable ~= nil and p.unjudgeable ~= "pass" and p.unjudgeable ~= "block" then
     return nil, "policy.unjudgeable must be pass|block"
+  end
+  if p.partial ~= nil and p.partial ~= "judge" and p.partial ~= "unjudgeable" then
+    return nil, "policy.partial must be judge|unjudgeable"
   end
   if p.block_status ~= nil and (type(p.block_status) ~= "number"
      or p.block_status < 200 or p.block_status > 599 or p.block_status % 1 ~= 0) then

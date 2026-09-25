@@ -85,6 +85,7 @@ export const config: Config = {
     block_status: 403,
     block_body: '{"error":"request rejected"}',
     unjudgeable: "pass",
+    partial: "judge",
   },
   cache: { fp_ttl: 300, rep_ttl: 600, fp_prefix_bytes: 2048 }, // fp_prefix_bytes: sampled/logged text only since 0.3.1
   async: { enabled: true, max_async: 32, rep_block_after: 0, rep_block_ttl: 600 },
@@ -120,6 +121,9 @@ export function validate(c: Config): [true, null] | [null, string] {
   if (p.mode !== "monitor" && p.mode !== "enforce") return [null, "policy.mode must be monitor|enforce"];
   if (p.unjudgeable !== undefined && p.unjudgeable !== "pass" && p.unjudgeable !== "block") {
     return [null, "policy.unjudgeable must be pass|block"];
+  }
+  if (p.partial !== undefined && p.partial !== "judge" && p.partial !== "unjudgeable") {
+    return [null, "policy.partial must be judge|unjudgeable"];
   }
   if (typeof p.block_threshold !== "number" || typeof p.suspect_threshold !== "number") return [null, "policy thresholds must be numbers"];
   if (p.suspect_threshold > p.block_threshold) return [null, "policy.suspect_threshold must be <= block_threshold"];

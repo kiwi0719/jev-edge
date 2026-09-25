@@ -226,6 +226,126 @@ describe("nodeMiddleware", () => {
     expect(h["x-jev-score"]).toBe("0.00");
     expect(h["x-jev-subject"]).toBeUndefined();
   });
+
+  // Express / Connect under a mount path: req.url has the prefix cut off,
+  // req.originalUrl keeps the whole target.
+  function mounted(prefix: string, path: string, body: string | null, headers: Record<string, string> = {}) {
+    const req = nodeReq(body, headers, path);
+    req.originalUrl = path;
+    req.url = path.slice(prefix.length) || "/";
+    return req;
+  }
+
+  it("judges the whole path when mounted under a prefix: app.use('/v1', ...)", async () => {
+    const mw = nodeMiddleware(opts());
+    const req = mounted("/v1", "/v1/chat/completions", ATTACK, { "x-jev-mock-score": "0.95" });
+    const res = nodeRes();
+    await mw(req as never, res, () => {});
+    expect(res.statusCode).toBe(403);
+    expect(res.headers["x-jev-source"]).toBe("l2");
+  });
+
+  it("judges the whole path under a Router mounted deeper: /v1/chat", async () => {
+    const mw = nodeMiddleware(opts("monitor"));
+    const req = mounted("/v1/chat", "/v1/chat/completions?stream=1", ATTACK, { "x-jev-mock-score": "0.95" });
+    await mw(req as never, nodeRes(), () => {});
+    const h = req.headers as Record<string, string>;
+    expect(h["x-jev-verdict"]).toBe("malicious");
+    expect(h["x-jev-reason"]).toBe("injection+0.95");
+  });
+
+  it("serves /_jev/health under its own mount path", async () => {
+    const mw = nodeMiddleware(opts());
+    const res = nodeRes();
+    await mw(mounted("/v1", "/v1/_jev/health", null) as never, res, () => {});
+    expect(res.ended).toBe(true);
+    expect(JSON.parse(res.body)).toMatchObject({ ok: true, provider: "mock" });
+  });
+
+  it("judges an absolute-form target on its path", async () => {
+    const mw = nodeMiddleware(opts());
+    const res = nodeRes();
+    await mw(nodeReq(ATTACK, { "x-jev-mock-score": "0.95" }, "http://app.example/v1/chat/completions") as never, res, () => {});
+    expect(res.statusCode).toBe(403);
+  });
+});
+
+// Raw bytes to a real node:http server, the way a client can write them: the
+// Host header and the request-target are whatever the client sent.
+describe("nodeMiddleware on node:http, crafted requests", () => {
+  async function serve(prefix?: string) {
+    const http = await import("node:http");
+    const mw = nodeMiddleware(opts());
+    const srv = http.createServer((req, res) => {
+      const done = () => {
+        res.setHeader("content-type", "application/json");
+        res.end(JSON.stringify({ reached: true, verdict: req.headers["x-jev-verdict"] ?? null, reason: req.headers["x-jev-reason"] ?? null }));
+      };
+      const r = req as typeof req & { originalUrl?: string };
+      // Connect's mount: strip the prefix from req.url, keep originalUrl
+      if (prefix) {
+        if (!r.url!.startsWith(prefix)) return done();
+        r.originalUrl = r.url;
+        r.url = r.url!.slice(prefix.length) || "/";
+      }
+      void mw(r as never, res as never, done);
+    });
+    await new Promise<void>((ok) => srv.listen(0, "127.0.0.1", ok));
+    return { srv, port: (srv.address() as { port: number }).port };
+  }
+
+  async function raw(port: number, target: string, host: string, body = ATTACK): Promise<{ status: number; body: string }> {
+    const net = await import("node:net");
+    const msg = `POST ${target} HTTP/1.1\r\nHost: ${host}\r\ncontent-type: application/json\r\nx-jev-mock-score: 0.95\r\n` +
+      `content-length: ${Buffer.byteLength(body)}\r\nconnection: close\r\n\r\n${body}`;
+    const out = await new Promise<string>((ok, fail) => {
+      const s = net.connect(port, "127.0.0.1", () => s.end(msg));
+      let buf = "";
+      s.on("data", (d) => (buf += d.toString()));
+      s.on("end", () => ok(buf));
+      s.on("error", fail);
+    });
+    return { status: Number(out.split(" ")[1]), body: out.slice(out.indexOf("\r\n\r\n") + 4) };
+  }
+
+  it("a Host the URL parser rejects is judged, not a fail-open error", async () => {
+    const { srv, port } = await serve();
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      for (const host of ["app.example", "a b", "x:99999", "[::1", "a%zz", ""]) {
+        const r = await raw(port, "/v1/chat/completions", host);
+        expect({ host, status: r.status }).toEqual({ host, status: 403 });
+      }
+      expect(err).not.toHaveBeenCalled();
+    } finally {
+      err.mockRestore();
+      srv.close();
+    }
+  });
+
+  it("a //v1/... target is judged as /v1/..., never resolved with v1 as the host", async () => {
+    const { srv, port } = await serve();
+    try {
+      for (const target of ["//v1/chat/completions", "///v1/chat/completions", "/v1//chat/completions", "http://x/v1/chat/completions"]) {
+        const r = await raw(port, target, "app.example");
+        expect({ target, status: r.status }).toEqual({ target, status: 403 });
+      }
+    } finally {
+      srv.close();
+    }
+  });
+
+  it("the same under a mount path", async () => {
+    const { srv, port } = await serve("/v1");
+    try {
+      expect((await raw(port, "/v1/chat/completions", "a b")).status).toBe(403);
+      const unwatched = await raw(port, "/v1/models", "a b");
+      expect(unwatched.status).toBe(200);
+      expect(JSON.parse(unwatched.body)).toMatchObject({ reached: true, verdict: "skipped", reason: "path+not+watched" });
+    } finally {
+      srv.close();
+    }
+  });
 });
 
 describe("honoMiddleware", () => {

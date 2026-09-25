@@ -16,9 +16,13 @@ the config's directory)::
           mode: pre_call
           default_on: true
 
-LiteLLM builds a custom guardrail with ``guardrail_name``, ``event_hook`` and
-``default_on`` only, so every setting has an environment variable, and a
-keyword argument (for code that builds the class itself) wins over it:
+Without ``default_on: true`` LiteLLM runs the hook only for requests and keys
+that name the guardrail; a warning is logged at startup.
+
+Every setting has an environment variable. LiteLLM 1.81.0 and later also
+pass the keys under ``litellm_params`` to the class as keyword arguments,
+which win over the environment; older versions pass only ``guardrail_name``,
+``event_hook`` and ``default_on``, so there the environment is the only way:
 
     JEV_EDGE_URL             jev-edge's base URL (required)
     JEV_EDGE_ENFORCE         true (default) | false = monitor: never block
@@ -534,6 +538,11 @@ class JevEdgeGuardrail(_ApplyGuardrailBase):
         log.info("jev-edge guardrail: url=%s enforce=%s timeout=%s path=%s max_body_bytes=%d extra_fields=%s unjudged=%s",
                  self.base, self.enforce, self.timeout, self.path, self.max_body_bytes,
                  ",".join(self.extra_fields) or "-", self.unjudged)
+        if "guardrail_name" in kwargs and kwargs.get("default_on") is not True:
+            # LiteLLM built it from config.yaml without default_on: true
+            log.warning("jev-edge guardrail %s: default_on is not true, so LiteLLM runs it only for requests and keys "
+                        "that name it, and a request that leaves it out is never judged; set default_on: true "
+                        "under litellm_params to judge every request", kwargs.get("guardrail_name"))
 
     def uses_apply_guardrail_interface(self) -> bool:
         # apply_guardrail only answers LiteLLM's direct calls (realtime text,

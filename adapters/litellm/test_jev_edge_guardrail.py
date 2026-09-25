@@ -782,6 +782,45 @@ def test_built_the_way_litellm_builds_it_reads_the_environment(monkeypatch):
     assert out["metadata"]["jev_verdict"]["action"] == "block"
 
 
+# What LiteLLM 1.102 passes besides guardrail_name, event_hook and default_on:
+# every litellm_params field that is not None (model_dump(exclude_none=True)).
+LITELLM_1_102_EXTRA = {
+    "version": 2, "action": "block", "confidence_threshold": 0.5, "detect_execution_intent": True, "on_flagged": "block",
+    "is_detector_server": True, "verify_ssl": True, "block_on_violation": True,
+    "experimental_use_latest_role_message_only": False, "only_scan_new_messages": False, "fail_on_error": True,
+    "skip_unscannable_attachments": False, "sanitize_error_detail": True, "unreachable_fallback": "fail_closed",
+    "sticky_session_routing": True, "api_version": "v1", "send_user_api_key_alias": False,
+    "send_user_api_key_user_id": False, "send_user_api_key_team_id": False, "default_action": "deny",
+    "on_disallowed_action": "block", "use_v2": False, "on_flagged_action": "monitor", "include_scanners": True,
+    "include_evidence": True, "mask": False, "ccr_retrieval": True, "payload": True, "breakdown": True, "dev_info": True,
+    "disable_exception_on_block": False, "content_filter_threshold": 0.5, "prompt_attack_threshold": 0.5,
+    "pii_confidence_threshold": 0.5, "chunk_budget_chars": 25000, "presidio_language": "en",
+}
+
+
+def test_litellm_params_reach_the_class_from_litellm_1_81(monkeypatch):
+    # 1.81.0 and later pass litellm_params as keyword arguments: they win
+    # over the environment, and LiteLLM's own fields are accepted
+    monkeypatch.setenv("JEV_EDGE_URL", "http://env-host:8080")
+    monkeypatch.setenv("JEV_EDGE_ENFORCE", "true")
+    g = JevEdgeGuardrail(guardrail_name="jev-edge", event_hook="pre_call", default_on=True, jev_edge_url="http://yaml:8080",
+                         enforce=False, timeout=1.5, unjudged="block", transport=httpx.MockTransport(lambda r: httpx.Response(200)),
+                         **LITELLM_1_102_EXTRA)
+    assert (g.base, g.enforce, g.timeout, g.unjudged) == ("http://yaml:8080", False, 1.5, "block")
+
+
+@pytest.mark.parametrize("default_on,warns", [(True, False), (False, True), (None, True)])
+def test_default_on_off_is_warned_at_startup(monkeypatch, caplog, default_on, warns):
+    monkeypatch.setenv("JEV_EDGE_URL", URL)
+    caplog.set_level("WARNING", logger="jev_edge")
+    JevEdgeGuardrail(guardrail_name="jev-edge", event_hook="pre_call", default_on=default_on)
+    msgs = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert any("default_on is not true" in m for m in msgs) is warns
+    caplog.clear()
+    JevEdgeGuardrail()  # built by code, not from config.yaml: nothing to warn about
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+
 def test_keyword_arguments_win_over_the_environment(monkeypatch):
     monkeypatch.setenv("JEV_EDGE_URL", "http://env-host:8080")
     monkeypatch.setenv("JEV_EDGE_ENFORCE", "false")

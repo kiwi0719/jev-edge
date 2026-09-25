@@ -40,9 +40,15 @@ describe("golden: normalize", () => {
 describe("golden: extract", () => {
   for (const c of load("extract").cases) {
     it(c.name, () => {
-      const [text, kind, , , cut] = core.normalize.extract(c.input.body, c.input.content_type, c.input.fields, jsonDecode);
-      // expect.cut is there only when a "**" walk hit a bound
-      expect({ text, kind, ...(cut ? { cut } : {}) }).toEqual(c.expect);
+      const [text, kind, , decoded, cut] = core.normalize.extract(c.input.body, c.input.content_type, c.input.fields, jsonDecode);
+      // expect.cut is there only when a "**" walk hit a bound; expect.tools
+      // only when the case names tool_fields
+      let tools: { text: string; capped?: true } | undefined;
+      if (c.input.tool_fields) {
+        const [values, capped] = core.normalize.extractTools(decoded, c.input.tool_fields, c.input.tool_max_bytes ?? undefined, jsonDecode);
+        tools = { text: values.join("\n"), ...(capped ? { capped } : {}) };
+      }
+      expect({ text, kind, ...(cut ? { cut } : {}), ...(tools ? { tools } : {}) }).toEqual(c.expect);
     });
   }
 });
@@ -51,8 +57,11 @@ describe("golden: rules", () => {
   for (const c of load("rules").cases) {
     it(c.name, async () => {
       const ctx = { cache: storeFrom(c.input.cache), clock: () => c.input.clock, json_decode: jsonDecode, re_find: reFind };
-      const [result, text, reason] = await core.rules.evaluate(c.input.req, loadRule(c.input.rule), ctx);
-      expect({ result, text, reason }).toEqual(c.expect);
+      // a rule set id, or an inline spec resolved the way a config's `rules` list is
+      const rule = typeof c.input.rule === "string" ? loadRule(c.input.rule) : resolveRule(c.input.rule);
+      const [result, text, reason, , , , , t] = await core.rules.evaluate(c.input.req, rule, ctx);
+      const tools = t && { text: t.text, windowed: t.windowed, ...(t.hit ? { hit: t.hit } : {}), ...(t.only ? { only: t.only } : {}) };
+      expect({ result, text, reason, ...(tools ? { tools } : {}) }).toEqual(c.expect);
     });
   }
 });

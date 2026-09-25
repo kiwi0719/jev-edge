@@ -58,7 +58,7 @@ function splitPath(path: string): Seg[] {
   return segs;
 }
 
-/** Port of normalize.path_error: why `path` (a text_fields entry, or any path in that syntax) is not one, or null. */
+/** Port of normalize.path_error: why `path` (a text_fields or tool_fields entry) is not one, or null. */
 export function pathError(path: unknown): string | null {
   if (typeof path !== "string" || path === "") return "must be a non-empty string";
   const segs = splitPath(path);
@@ -139,13 +139,14 @@ function variants(node: { [k: string]: JsonValue }, key: string): string[] | und
 
 // ---------------------------------------------------------------------------
 // Bounded walks over JSON of any shape (port of the Lua ones): tool-call
-// arguments ("**"). The client picks the shape, so the walk is bounded:
-// DEEP.nodes object keys and array items per extraction, and DEEP.depth
-// levels below the path's value (cjson's nesting limit, which tooDeep()
-// applies here: JSON either core decodes is never cut by depth). Object keys
-// are read in UTF-8 byte order, as Lua's table.sort orders them. Past a
-// bound the rest is left out and `capped` says so. An empty object or array
-// (and null) adds nothing and is not counted. Tests lower the bounds.
+// arguments ("**") and tool definitions (rule.tool_fields). The client picks
+// the shape, so the walk is bounded: DEEP.nodes object keys and array items
+// per extraction, and DEEP.depth levels below the path's value (cjson's
+// nesting limit, which tooDeep() applies here: JSON either core decodes is
+// never cut by depth). Object keys are read in UTF-8 byte order, as Lua's
+// table.sort orders them. Past a bound the rest is left out and `capped`
+// says so. An empty object or array (and null) adds nothing and is not
+// counted. Tests lower the bounds.
 // ---------------------------------------------------------------------------
 
 export const DEEP = { depth: 1000, nodes: 50000 };
@@ -154,6 +155,8 @@ type Decode = (s: string) => JsonValue;
 
 interface WalkState {
   out: string[];
+  /** reads the value a path ends at (tool_fields); collect() otherwise */
+  leaf?: (node: JsonValue, st: WalkState) => void;
   nodes: number;
   bytes: number;
   /** cap on the UTF-8 bytes of the strings taken (undefined: none) */
@@ -250,6 +253,55 @@ function everyString(node: JsonValue | undefined, st: WalkState, depth: number):
   }
 }
 
+/** Port of TOOL_TEXT_KEYS: keys of a tool definition or JSON Schema whose values the model reads as text (matched folded). */
+export const TOOL_TEXT_KEYS: ReadonlySet<string> = new Set(["name", "description", "title", "enum", "const", "default", "examples"]);
+
+// Port of tool_walk: a tool definition, a JSON Schema, or a list of them; the
+// TOOL_TEXT_KEYS values and the property names under `properties`, at any
+// depth. Other strings (type, format, $ref, a server URL, headers) are left out.
+function toolWalk(node: JsonValue | undefined, st: WalkState, depth: number): void {
+  if (!isObj(node) || st.full || isEmpty(node)) return;
+  if (depth > DEEP.depth) {
+    st.capped = true;
+    return;
+  }
+  if (Array.isArray(node)) {
+    for (const v of node) {
+      if (!countItem(st)) return;
+      toolWalk(v, st, depth + 1);
+      if (st.full) return;
+    }
+    return;
+  }
+  const keys = keysOf(node, st);
+  if (!keys) return;
+  for (const k of keys) {
+    const v = node[k];
+    const f = fold(k);
+    if (TOOL_TEXT_KEYS.has(f)) {
+      everyString(v, st, depth + 1);
+    } else if (f === "properties" && isObj(v) && !Array.isArray(v)) {
+      // property names are text too; each value is a schema
+      const names = keysOf(v, st);
+      if (!names) return;
+      for (const name of names) {
+        take(st, name);
+        toolWalk(v[name], st, depth + 2);
+        if (st.full) return;
+      }
+    } else {
+      toolWalk(v, st, depth + 1);
+    }
+    if (st.full) return;
+  }
+}
+
+// Port of tool_leaf: a string whole, anything else walked as tool definitions.
+function toolLeaf(node: JsonValue, st: WalkState): void {
+  if (typeof node === "string") return take(st, node);
+  toolWalk(node, st, 1);
+}
+
 // Port of deep_value: the value a "**" path ends at; a string holding a JSON
 // object or array is read decoded, anything else (and JSON the decoder
 // refuses, cjson's depth limit included) as it is.
@@ -285,6 +337,7 @@ function descend(child: JsonValue | undefined, segs: Seg[], i: number, st: WalkS
 function walk(node: JsonValue | undefined, segs: Seg[], i: number, st: WalkState): void {
   if (node === undefined || node === null || st.full) return;
   if (i >= segs.length) {
+    if (st.leaf) return st.leaf(node, st);
     collect(node, st.out, 1);
     return;
   }
@@ -309,6 +362,26 @@ function extractJsonState(decoded: JsonValue, fields: string[], jsonDecode?: Dec
   const st = newState(undefined, jsonDecode);
   for (const f of fields ?? []) walk(decoded, splitPath(f), 0, st);
   return st;
+}
+
+/**
+ * Port of extract_tools: tool definitions in a decoded JSON body
+ * (rule.tool_fields), what the model reads of the tools it may call and of
+ * the schema its answer must follow. Returns the strings (in order), and true
+ * when a bound (depth, nodes, `maxBytes` of UTF-8) left something out.
+ */
+export function extractTools(
+  decoded: JsonValue | undefined, fields: string[] | undefined, maxBytes?: number, jsonDecode?: Decode,
+): [string[], boolean] {
+  const st = newState(maxBytes, jsonDecode);
+  st.leaf = toolLeaf;
+  if (isObj(decoded)) {
+    for (const f of fields ?? []) {
+      walk(decoded, splitPath(f), 0, st);
+      if (st.full) break;
+    }
+  }
+  return [st.out, st.capped];
 }
 
 // Port of tool_results() in core/normalize.lua. Tool results in the chat shapes

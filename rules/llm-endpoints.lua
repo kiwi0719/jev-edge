@@ -63,6 +63,17 @@ return {
                   "messages[*].content", "messages[*].parts", "prompt", "input",
                   "input[*].output", "query", "text", "suffix", "input_prefix", "input_suffix",
                   "input_extra[*].text" },
+  -- Tool definitions and output schemas, judged as a part of their own with
+  -- the rule's templates and their own verdict-cache entry, so an unchanged
+  -- tool set costs one judge call per cache lifetime: OpenAI chat, Ollama,
+  -- Responses and Anthropic tools, legacy functions,
+  -- response_format.json_schema and the Responses text.format. Read from
+  -- each: name, description, title, enum, const, default and examples values
+  -- and property names, at any depth (JSON Schema included); other strings
+  -- (type, format, URLs, headers) are not. Up to 4 x max_judge_bytes of it is
+  -- scanned by always_suspect and one max_judge_bytes window judged, beside
+  -- the text's own window. {} turns it off for a rule.
+  tool_fields = { "tools", "functions", "response_format.json_schema", "text.format" },
   min_text_chars = 20,
   always_suspect = {
     [[\b(ignore|disregard|forget)\b.{0,20}\b(previous|prior|above|earlier|all)\b]]

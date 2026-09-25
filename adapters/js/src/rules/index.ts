@@ -34,6 +34,9 @@ export const llmEndpoints: Rule = {
     "input[*].output", "query", "text", "suffix", "input_prefix", "input_suffix",
     "input_extra[*].text",
   ],
+  // tool definitions and output schemas, judged as a part of their own with
+  // their own verdict-cache entry (see rules/llm-endpoints.lua)
+  tool_fields: ["tools", "functions", "response_format.json_schema", "text.format"],
   min_text_chars: 20,
   always_suspect: [
     String.raw`\b(ignore|disregard|forget)\b.{0,20}\b(previous|prior|above|earlier|all)\b.{0,20}\b(instructions?|rules?|prompts?)\b`,
@@ -61,6 +64,7 @@ export const defaultRule: Rule = {
   watch_paths: [],
   methods: { POST: true },
   text_fields: ["prompt", "input", "input[*].output", "text"],
+  tool_fields: [],
   templates: ["injection"],
 };
 
@@ -103,11 +107,15 @@ export function resolve(spec: RuleSpec): Rule {
     "input[*].output", "query", "text", "suffix", "input_prefix", "input_suffix",
     "input_extra[*].text",
   ];
-  if (!Array.isArray(out.text_fields)) throw new Error(`rule ${out.id}: text_fields must be a list of paths`);
-  out.text_fields.forEach((p, i) => {
-    const perr = pathError(p);
-    if (perr) throw new Error(`rule ${out.id}: text_fields[${i + 1}] ${perr}`);
-  });
+  out.tool_fields ??= ["tools", "functions", "response_format.json_schema", "text.format"];
+  for (const k of ["text_fields", "tool_fields"] as const) {
+    const paths = out[k];
+    if (!Array.isArray(paths)) throw new Error(`rule ${out.id}: ${k} must be a list of paths`);
+    paths.forEach((p, i) => {
+      const perr = pathError(p);
+      if (perr) throw new Error(`rule ${out.id}: ${k}[${i + 1}] ${perr}`);
+    });
+  }
   out.templates ??= ["injection"];
   return out;
 }

@@ -96,21 +96,27 @@ export function cacheKey(
   return "fp:" + String(hash(scope)).slice(0, 16) + ":" + fp;
 }
 
-// Port of UNTRUSTED_SEP in core/init.lua: what the request's fingerprint covers
-// when it carries retrieved content.
+// Port of UNTRUSTED_SEP and TOOLS_SEP in core/init.lua: what the request's
+// fingerprint covers when it carries retrieved content or tool definitions.
 const UNTRUSTED_SEP = "\n<untrusted content>\n";
+const TOOLS_SEP = "\n<tool definitions>\n";
+
+// Names the tool-definitions part in the reason when its score decides.
+const TOOLS_LABEL = "tools+";
 
 interface Part {
   text: string;
   templates: string[];
   context: judge.PromptContext;
   over?: { templates?: string[]; deployment?: string };
+  /** put before the template name in the reason when this part's score decides */
+  label?: string;
 }
 
-// Port of judge_parts in core/init.lua: each part (a chunk, or the retrieved
-// content) its own cache entry, the misses judged together, the highest part
-// score wins; a failed part makes the request an error unless another part
-// already blocks.
+// Port of judge_parts in core/init.lua: each part (a chunk, the retrieved
+// content, the tool definitions) its own cache entry, the misses judged
+// together, the highest part score wins; a failed part makes the request an
+// error unless another part already blocks.
 async function judgeParts(
   ctx: Ctx, rule: Rule, parts: Part[], suffix: string, fp: string, ckey: string | undefined, reason: string,
 ): Promise<verdict.Verdict> {
@@ -179,6 +185,7 @@ async function judgeParts(
     if (s !== undefined && (best === undefined || s > best)) {
       best = s;
       top = tops[i];
+      if (top !== "" && parts[i].label) top = parts[i].label + top;
     }
   }
   if (err && !(best !== undefined && best >= (cfg.policy.block_threshold ?? 0.7))) {
@@ -202,7 +209,7 @@ export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
   const cfg = ctx.config;
 
   // L1 --------------------------------------------------------------------
-  const [r, text, reason, rule, windowed, chunks, capped, untrusted] = await rulesMod.evaluateAll(req, ctx.rules, ctx);
+  const [r, text, reason, rule, windowed, chunks, capped, untrusted, tools] = await rulesMod.evaluateAll(req, ctx.rules, ctx);
 
   if (r === rulesMod.PASS) {
     return verdict.newVerdict({ verdict: verdict.SKIPPED, source: verdict.SRC_L1, reason });
@@ -221,9 +228,13 @@ export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
     return finish(ctx, verdict.newVerdict({ action, verdict: verdict.MALICIOUS, score: 1, source: verdict.SRC_L1, reason }));
   }
 
-  const fp = normalize.fingerprint(untrusted ? text + UNTRUSTED_SEP + untrusted.text : text,
-    { prefix_bytes: cfg.cache.fp_prefix_bytes }, ctx.hash);
+  let whole = text;
+  if (untrusted) whole += UNTRUSTED_SEP + untrusted.text;
+  if (tools) whole += TOOLS_SEP + tools.text;
+  const fp = normalize.fingerprint(whole, { prefix_bytes: cfg.cache.fp_prefix_bytes }, ctx.hash);
   const uspec = untrusted ? untrustedSpec(cfg, rule) : undefined;
+  // the text only stands aside when it alone would have passed
+  const only = !!(untrusted?.only || tools?.only);
 
   // trust -----------------------------------------------------------------
   // An operator called this exact text a false positive. Checked before the
@@ -244,9 +255,16 @@ export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
   }
 
   // cache -----------------------------------------------------------------
-  const ckey = fp !== "" ? cacheKey(fp, rule, cfg, ctx.hash, uspec && {
-    templates: [(rule?.templates ?? []).join(","), "+" + uspec.templates.join(",")],
-  }) : undefined;
+  // The whole request's entry. Judged in parts, it names the parts in its
+  // scope, so it never answers for the same text judged in one piece.
+  let over: { templates: string[] } | undefined;
+  if (uspec || tools) {
+    const names = [(rule?.templates ?? []).join(",")];
+    if (uspec) names.push("+" + uspec.templates.join(","));
+    if (tools) names.push("+tools");
+    over = { templates: names };
+  }
+  const ckey = fp !== "" ? cacheKey(fp, rule, cfg, ctx.hash, over) : undefined;
   if (ckey && ctx.cache) {
     const hit = (await ctx.cache.get(ckey)) as { score?: unknown; reason?: string } | undefined;
     if (hit && typeof hit === "object" && typeof hit.score === "number") {
@@ -278,18 +296,18 @@ export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
       }));
     }
   }
-  if ((chunks && chunks.length > 1) || untrusted) {
+  if ((chunks && chunks.length > 1) || untrusted || tools) {
     const context = {
       path: req.path ?? "", method: req.method ?? "",
       deployment: rule!.deployment_context ?? cfg.jev.deployment_context ?? "",
     };
     const parts: Part[] = [];
-    if (!untrusted?.only) {
+    if (!only) {
       for (const c of chunks && chunks.length > 1 ? chunks : [text]) parts.push({ text: c, templates: rule!.templates, context });
     }
     let suffix = "";
     if (chunks && chunks.length > 1) suffix = capped ? " (window)" : ` (${chunks.length} chunks)`;
-    else if (windowed || untrusted?.windowed) suffix = " (window)";
+    else if (windowed || untrusted?.windowed || tools?.windowed) suffix = " (window)";
     if (untrusted && uspec) {
       // asked without the deployment context, the way the question was measured
       parts.push({
@@ -297,6 +315,11 @@ export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
         context: { path: req.path ?? "", method: req.method ?? "", deployment: "" },
         over: { templates: uspec.templates, deployment: "" },
       });
+    }
+    if (tools) {
+      // the client sent them: the same question and scope as its own text,
+      // so the entry is the one any text like it gets
+      parts.push({ text: tools.text, templates: rule!.templates, context, label: TOOLS_LABEL });
     }
     return judgeParts(ctx, rule!, parts, suffix, fp, ckey, reason);
   }
@@ -359,7 +382,7 @@ export { rulesMod as rules, normalize, judge, policy, verdict, trust, subject };
 export { sha256Hex } from "./sha256.js";
 export * as defaults from "./defaults.js";
 export * as breaker from "./breaker.js";
-export type { Req, Rule, CacheLike } from "./rules.js";
+export type { Req, Rule, CacheLike, ToolsPart, UntrustedPart } from "./rules.js";
 export type { Verdict } from "./verdict.js";
 export type { Config } from "./defaults.js";
 export type { Prompt, Answers } from "./judge.js";

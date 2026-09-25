@@ -92,20 +92,28 @@ function _M.cache_key(fp, rule, cfg, hash, over)
   return "fp:" .. tostring(hash(scope)):sub(1, 16) .. ":" .. fp
 end
 
--- Joins the whole text and the retrieved content into what the request's
--- fingerprint covers: trust and the verdict cache must not treat a request
--- with new retrieved content as one already judged.
+-- Joins the whole text, the retrieved content and the tool definitions into
+-- what the request's fingerprint covers: trust and the verdict cache must not
+-- treat a request with new retrieved content or new tools as one already
+-- judged.
 local UNTRUSTED_SEP = "\n<untrusted content>\n"
+local TOOLS_SEP = "\n<tool definitions>\n"
+
+-- Names the tool-definitions part in the reason when its score decides.
+local TOOLS_LABEL = "tools+"
 
 -- Judge a request in parts: text that did not fit one window, chunk by chunk
--- (rule.max_judge_chunks), and retrieved content with its own question
--- (untrusted.enabled). Each part has its own verdict-cache entry, so the
--- unchanged history of a long conversation (earlier tool results included)
--- is not paid for again on every turn; the misses go to the judge together
+-- (rule.max_judge_chunks), retrieved content with its own question
+-- (untrusted.enabled), and the tool definitions (rule.tool_fields). Each part
+-- has its own verdict-cache entry, so the unchanged history of a long
+-- conversation (earlier tool results included) and an unchanged tool set are
+-- not paid for again on every turn; the misses go to the judge together
 -- (ctx.judge.call_many, in parallel, when the adapter has it). The request's
 -- score is the highest part score. A part the judge failed on turns the
 -- request into an error unless another part already blocks.
--- @param parts  list of { text, templates, context, over } (over: cache_key's)
+-- @param parts  list of { text, templates, context, over, label } (over:
+--               cache_key's; label: put before the template name in the
+--               reason when this part's score decides)
 -- @param suffix appended to the reason when a part answered
 local function judge_parts(ctx, rule, parts, suffix, fp, ckey, reason)
   local cfg = ctx.config
@@ -115,6 +123,8 @@ local function judge_parts(ctx, rule, parts, suffix, fp, ckey, reason)
     local ck = cfp ~= "" and _M.cache_key(cfp, rule, cfg, ctx.hash, part.over) or nil
     local hit = ck and ctx.cache and ctx.cache:get(ck)
     if type(hit) == "table" and type(hit.score) == "number" then
+      -- a part's entry holds its own reason, unlabelled: the same text is
+      -- the same entry whichever part it came in
       scores[i], tops[i] = hit.score, tostring(hit.reason or ""):match("^(%S+)") or ""
     else
       local prompt, perr = judge.build(part.templates, part.text, part.context)
@@ -166,7 +176,10 @@ local function judge_parts(ctx, rule, parts, suffix, fp, ckey, reason)
 
   local best, top = nil, ""
   for i = 1, #parts do
-    if scores[i] and (not best or scores[i] > best) then best, top = scores[i], tops[i] end
+    if scores[i] and (not best or scores[i] > best) then
+      best, top = scores[i], tops[i]
+      if top ~= "" and parts[i].label then top = parts[i].label .. top end
+    end
   end
   if err and not (best and best >= cfg.policy.block_threshold) then
     log(ctx, "warn", "jev-edge: L2 failed on a chunk: " .. err)
@@ -191,7 +204,7 @@ function _M.evaluate(req, ctx)
   local cfg = ctx.config
 
   -- L1 ------------------------------------------------------------------
-  local r, text, reason, rule, windowed, chunks, capped, untrusted = rules_mod.evaluate_all(req, ctx.rules, ctx)
+  local r, text, reason, rule, windowed, chunks, capped, untrusted, tools = rules_mod.evaluate_all(req, ctx.rules, ctx)
 
   if r == rules_mod.PASS then
     return verdict.new({ verdict = verdict.SKIPPED, source = verdict.SRC_L1, reason = reason })
@@ -213,9 +226,13 @@ function _M.evaluate(req, ctx)
     }))
   end
 
-  local fp = normalize.fingerprint(untrusted and (text .. UNTRUSTED_SEP .. untrusted.text) or text,
-    { prefix_bytes = cfg.cache.fp_prefix_bytes }, ctx.hash)
+  local whole = text
+  if untrusted then whole = whole .. UNTRUSTED_SEP .. untrusted.text end
+  if tools then whole = whole .. TOOLS_SEP .. tools.text end
+  local fp = normalize.fingerprint(whole, { prefix_bytes = cfg.cache.fp_prefix_bytes }, ctx.hash)
   local uspec = untrusted and defaults.untrusted_spec(cfg, rule)
+  -- the text only stands aside when it alone would have passed
+  local only = (untrusted and untrusted.only) or (tools and tools.only)
 
   -- trust ---------------------------------------------------------------
   -- An operator called this exact text a false positive. Checked before the
@@ -235,9 +252,16 @@ function _M.evaluate(req, ctx)
   end
 
   -- cache ---------------------------------------------------------------
-  local ckey = fp ~= "" and _M.cache_key(fp, rule, cfg, ctx.hash, uspec and {
-    templates = { table.concat(rule.templates or {}, ","), "+" .. table.concat(uspec.templates, ",") },
-  }) or nil
+  -- The whole request's entry. Judged in parts, it names the parts in its
+  -- scope, so it never answers for the same text judged in one piece.
+  local over
+  if uspec or tools then
+    local names = { table.concat(rule.templates or {}, ",") }
+    if uspec then names[#names + 1] = "+" .. table.concat(uspec.templates, ",") end
+    if tools then names[#names + 1] = "+tools" end
+    over = { templates = names }
+  end
+  local ckey = fp ~= "" and _M.cache_key(fp, rule, cfg, ctx.hash, over) or nil
   if ckey and ctx.cache then
     local hit = ctx.cache:get(ckey)
     if type(hit) == "table" and type(hit.score) == "number" then
@@ -274,13 +298,13 @@ function _M.evaluate(req, ctx)
       }))
     end
   end
-  if (chunks and #chunks > 1) or untrusted then
+  if (chunks and #chunks > 1) or untrusted or tools then
     local context = {
       path = req.path or "", method = req.method or "",
       deployment = rule.deployment_context or cfg.jev.deployment_context or "",
     }
     local parts = {}
-    if not (untrusted and untrusted.only) then
+    if not only then
       for _, c in ipairs((chunks and #chunks > 1) and chunks or { text }) do
         parts[#parts + 1] = { text = c, templates = rule.templates, context = context }
       end
@@ -288,7 +312,7 @@ function _M.evaluate(req, ctx)
     local suffix = ""
     if chunks and #chunks > 1 then
       suffix = capped and " (window)" or (" (" .. #chunks .. " chunks)")
-    elseif windowed or (untrusted and untrusted.windowed) then
+    elseif windowed or (untrusted and untrusted.windowed) or (tools and tools.windowed) then
       suffix = " (window)"
     end
     if untrusted then
@@ -296,6 +320,12 @@ function _M.evaluate(req, ctx)
       parts[#parts + 1] = { text = untrusted.text, templates = uspec.templates,
         context = { path = req.path or "", method = req.method or "", deployment = "" },
         over = { templates = uspec.templates, deployment = "" } }
+    end
+    if tools then
+      -- the client sent them: the same question and scope as its own text,
+      -- so the entry is the one any text like it gets
+      parts[#parts + 1] = { text = tools.text, templates = rule.templates, context = context,
+        label = TOOLS_LABEL }
     end
     return judge_parts(ctx, rule, parts, suffix, fp, ckey, reason)
   end

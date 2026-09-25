@@ -26,7 +26,7 @@ local function split_path(path)
   return segs
 end
 
---- Why `path` (a text_fields entry, or any path in that syntax) is not one, or nil.
+--- Why `path` (a text_fields or tool_fields entry) is not one, or nil.
 function _M.path_error(path)
   if type(path) ~= "string" or path == "" then return "must be a non-empty string" end
   local segs = split_path(path)
@@ -111,16 +111,17 @@ local function variants(node, key)
 end
 
 -- ---------------------------------------------------------------------------
--- Bounded walks over JSON of any shape: tool-call arguments ("**"). The
--- client picks the shape, so the walk is bounded: DEEP_NODES object keys
--- and array items per extraction (sorting the keys of one big object is
--- what costs: 150k keys take 45 ms under LuaJIT, 50k about 13), and
--- DEEP_DEPTH levels below the path's value, which is cjson's own nesting
--- limit: JSON either core decodes is never cut by depth, the bound only
--- guards the recursion. Object keys are read in byte order: a Lua table has
--- none, and both cores must produce the same text. Past a bound the rest is
--- left out and `capped` says so. An empty object or array (and a decoder's
--- null, which may be an empty table) adds nothing and is not counted.
+-- Bounded walks over JSON of any shape: tool-call arguments ("**") and tool
+-- definitions (rule.tool_fields). The client picks the shape, so the walk is
+-- bounded: DEEP_NODES object keys and array items per extraction (sorting
+-- the keys of one big object is what costs: 150k keys take 45 ms under
+-- LuaJIT, 50k about 13), and DEEP_DEPTH levels below the path's value, which
+-- is cjson's own nesting limit: JSON either core decodes is never cut by
+-- depth, the bound only guards the recursion. Object keys are read in byte
+-- order: a Lua table has none, and both cores must produce the same text.
+-- Past a bound the rest is left out and `capped` says so. An empty object or
+-- array (and a decoder's null, which may be an empty table) adds nothing and
+-- is not counted.
 -- ---------------------------------------------------------------------------
 
 _M.DEEP_DEPTH = 1000
@@ -202,6 +203,58 @@ local function every_string(node, st, depth)
   end
 end
 
+-- Keys of a tool definition or JSON Schema whose values the model reads as
+-- text: every key and string below them is taken (an enum's values, an
+-- example object). Keys are matched folded, as Go's encoding/json does.
+_M.TOOL_TEXT_KEYS = { name = true, description = true, title = true, enum = true, const = true,
+                      default = true, examples = true }
+
+-- A tool definition, a JSON Schema, or a list of them: the TOOL_TEXT_KEYS
+-- values and the property names under `properties`, at any depth. Other
+-- strings (type, format, $ref, a server URL, headers) are left out.
+local function tool_walk(node, st, depth)
+  if type(node) ~= "table" or st.full or next(node) == nil then return end
+  if depth > _M.DEEP_DEPTH then
+    st.capped = true
+    return
+  end
+  if node[1] ~= nil then
+    for _, v in ipairs(node) do
+      if not count_item(st) then return end
+      tool_walk(v, st, depth + 1)
+      if st.full then return end
+    end
+    return
+  end
+  local keys = keys_of(node, st)
+  if not keys then return end
+  for _, k in ipairs(keys) do
+    local v, f = node[k], fold(k)
+    if _M.TOOL_TEXT_KEYS[f] then
+      every_string(v, st, depth + 1)
+    elseif f == "properties" and type(v) == "table" and v[1] == nil then
+      -- property names are text too; each value is a schema
+      local names = keys_of(v, st)
+      if not names then return end
+      for _, name in ipairs(names) do
+        take(st, name)
+        tool_walk(v[name], st, depth + 2)
+        if st.full then return end
+      end
+    else
+      tool_walk(v, st, depth + 1)
+    end
+    if st.full then return end
+  end
+end
+
+-- The value a tool_fields path ends at: a string whole, anything else walked
+-- as tool definitions.
+local function tool_leaf(node, st)
+  if type(node) == "string" then return take(st, node) end
+  tool_walk(node, st, 1)
+end
+
 -- The value a "**" path ends at. A string that holds a JSON object or array
 -- (OpenAI tool-call arguments) is read decoded, as the chat templates that
 -- render arguments read it: its keys and strings, escapes resolved, and no
@@ -228,10 +281,12 @@ local function descend(child, segs, i, st)
   end
 end
 
--- st.out collects the values
+-- st.out collects the values; st.leaf, when set, reads the value a path
+-- ends at (tool_fields), collect() otherwise
 walk = function(node, segs, i, st)
   if node == nil or st.full then return end
   if i > #segs then
+    if st.leaf then return st.leaf(node, st) end
     collect(node, st.out, 1)
     return
   end
@@ -255,6 +310,28 @@ function _M.extract_json(decoded, fields, json_decode)
   local st = new_state(nil, json_decode)
   for _, f in ipairs(fields or {}) do
     walk(decoded, split_path(f), 1, st)
+  end
+  return table.concat(st.out, "\n"), st.out, st.capped
+end
+
+--- Tool definitions in a decoded JSON body (rule.tool_fields): what the
+-- model reads of the tools it may call and of the schema its answer must
+-- follow. A path ending at a string takes it; one ending at a table is read
+-- with tool_walk. A "**" path reads everything below it.
+-- @param decoded     table (decoded JSON)
+-- @param fields      list of path strings (text_fields syntax)
+-- @param max_bytes   cap on the bytes of the strings taken (nil: none)
+-- @param json_decode optional, as for extract_json
+-- @return string (joined with "\n"), may be ""; the list of strings; and
+--         true when a bound (depth, nodes, bytes) left something out
+function _M.extract_tools(decoded, fields, max_bytes, json_decode)
+  local st = new_state(max_bytes, json_decode)
+  st.leaf = tool_leaf
+  if type(decoded) == "table" then
+    for _, f in ipairs(fields or {}) do
+      walk(decoded, split_path(f), 1, st)
+      if st.full then break end
+    end
   end
   return table.concat(st.out, "\n"), st.out, st.capped
 end

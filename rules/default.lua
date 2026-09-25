@@ -5,5 +5,6 @@ return {
   watch_paths = {},
   methods = { POST = true },
   text_fields = { "prompt", "input", "input[*].output", "text" },
+  tool_fields = {},
   templates = { "injection" },
 }

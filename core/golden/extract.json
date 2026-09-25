@@ -1090,6 +1090,140 @@
         ]
       },
       "name": "tool-call arguments: declared JSON the decoder refuses is scanned for them"
+    },
+    {
+      "expect": {
+        "kind": "json",
+        "text": "go",
+        "tools": {
+          "text": "Get the weather for a city.\nget_weather\nstart\nSlot start\ncity\nCity name\nParis\ndays\nA day offset\nunit\ncelsius\ncelsius\nfahrenheit\nwhen\nnow\nWeather query"
+        }
+      },
+      "input": {
+        "body": "{\"messages\":[{\"role\":\"user\",\"content\":\"go\"}],\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"description\":\"Get the weather for a city.\",\"parameters\":{\"type\":\"object\",\"title\":\"Weather query\",\"required\":[\"city\"],\"properties\":{\"city\":{\"type\":\"string\",\"description\":\"City name\",\"examples\":[\"Paris\"]},\"unit\":{\"type\":\"string\",\"enum\":[\"celsius\",\"fahrenheit\"],\"default\":\"celsius\",\"format\":\"x-unit\"},\"days\":{\"type\":\"array\",\"items\":{\"type\":\"integer\",\"description\":\"A day offset\"}},\"when\":{\"anyOf\":[{\"type\":\"string\",\"const\":\"now\"},{\"$ref\":\"#/$defs/slot\"}]}},\"$defs\":{\"slot\":{\"type\":\"object\",\"properties\":{\"start\":{\"type\":\"string\",\"description\":\"Slot start\"}}}}}}}],\"tool_choice\":\"auto\"}",
+        "content_type": "application/json",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ],
+        "tool_fields": [
+          "tools",
+          "functions",
+          "response_format.json_schema",
+          "text.format"
+        ]
+      },
+      "name": "tools: what a tool definition and its JSON Schema give the judge"
+    },
+    {
+      "expect": {
+        "kind": "json",
+        "text": "",
+        "tools": {
+          "text": "legacy\nf\nThe answer form\nanswer\na\nA field\nresp\nresp schema"
+        }
+      },
+      "input": {
+        "body": "{\"functions\":[{\"name\":\"f\",\"description\":\"legacy\",\"parameters\":{\"type\":\"object\"}}],\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{\"name\":\"answer\",\"description\":\"The answer form\",\"schema\":{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"string\",\"title\":\"A field\"}}}}},\"text\":{\"format\":{\"type\":\"json_schema\",\"name\":\"resp\",\"schema\":{\"type\":\"object\",\"description\":\"resp schema\"}}}}",
+        "content_type": "application/json",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ],
+        "tool_fields": [
+          "tools",
+          "functions",
+          "response_format.json_schema",
+          "text.format"
+        ]
+      },
+      "name": "tools: legacy functions, response_format and the Responses text.format"
+    },
+    {
+      "expect": {
+        "kind": "json",
+        "text": "",
+        "tools": {
+          "text": "upper case keys\nf\nq\nQuery"
+        }
+      },
+      "input": {
+        "body": "{\"TOOLS\":[{\"type\":\"function\",\"Function\":{\"NAME\":\"f\",\"Description\":\"upper case keys\",\"Parameters\":{\"Properties\":{\"q\":{\"TITLE\":\"Query\"}}}}}]}",
+        "content_type": "application/json",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ],
+        "tool_fields": [
+          "tools",
+          "functions",
+          "response_format.json_schema",
+          "text.format"
+        ]
+      },
+      "name": "tools: keys match without regard to case"
+    },
+    {
+      "expect": {
+        "kind": "json",
+        "text": "",
+        "tools": {
+          "capped": true,
+          "text": "Recherche la météo"
+        }
+      },
+      "input": {
+        "body": "{\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"description\":\"Recherche la m\\u00e9t\\u00e9o d\\u00e9taill\\u00e9e\"}}]}",
+        "content_type": "application/json",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ],
+        "tool_fields": [
+          "tools",
+          "functions",
+          "response_format.json_schema",
+          "text.format"
+        ],
+        "tool_max_bytes": 20
+      },
+      "name": "tools: the byte cap cuts at a character boundary and says so"
+    },
+    {
+      "expect": {
+        "kind": "json",
+        "text": "",
+        "tools": {
+          "text": "only this"
+        }
+      },
+      "input": {
+        "body": "{\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"f\",\"description\":\"only this\"}}]}",
+        "content_type": "application/json",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ],
+        "tool_fields": [
+          "tools[*].function.description"
+        ]
+      },
+      "name": "tools: a path that ends at a string takes it"
     }
   ],
   "core_version": "0.6.1",

@@ -102,6 +102,21 @@ describe("denoHandler", () => {
     expect(seen).toHaveLength(0);
   });
 
+  it("answers 400 to a path nginx would refuse and never calls the upstream", async () => {
+    const seen = captureUpstream();
+    const h = denoHandler({ upstream: UPSTREAM, config: mockConfig() });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      for (const path of ["/v1/%u0063ompletions", "/%u0063ompletion", "/v1%u002fchat/completions", "/v1/chat/completions%", "/v1/%zz"]) {
+        const res = await h(chat(ATTACK, {}, path), PEER);
+        expect({ path, status: res.status }).toEqual({ path, status: 400 });
+      }
+    } finally {
+      warn.mockRestore();
+    }
+    expect(seen).toHaveLength(0);
+  });
+
   it("forwards allowed requests to the upstream with X-Jev-* and manual redirects", async () => {
     const seen = captureUpstream();
     const h = denoHandler({ upstream: UPSTREAM + "/ignored/base", config: mockConfig() });

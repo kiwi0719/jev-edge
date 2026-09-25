@@ -127,7 +127,20 @@ function consumesSubjectHeader(cfg: core.Config): boolean {
   return !!(s?.enabled && s.from === "header" && typeof s.name === "string" && s.name.toLowerCase() === SUBJECT_HEADER);
 }
 
-/** Does any rule watch this path and method? Decides whether the body is worth reading at all. */
+/**
+ * Is this a path nginx would take? Every '%' must start a two-digit hex
+ * escape and none may be %00: nginx answers anything else with 400 before
+ * jev-edge runs. The runtime cannot tell what the origin makes of such a
+ * path (cpp-httplib, under llama.cpp, reads the IIS-style %u0063 as 'c', so
+ * /v1/%u0063ompletions is /v1/completions there), so evaluate() refuses it
+ * with 400 as nginx does, never passes it unjudged. An escape of a byte
+ * that is not UTF-8 (%FF, the overlong %C0%AE) is well formed: nginx takes
+ * it, and normalizePath keeps it as sent.
+ */
+export function wellFormedPath(pathname: string): boolean {
+  return !/%(?![0-9A-Fa-f]{2})|%00/.test(pathname);
+}
+
 /**
  * The path the origin will route on, the way nginx builds $uri: %XX decoded,
  * duplicate slashes collapsed, `.` / `..` resolved. Watch patterns anchored at
@@ -138,7 +151,8 @@ export function normalizePath(pathname: string): string {
   try {
     decoded = decodeURIComponent(pathname);
   } catch {
-    // malformed escapes: decode the valid ASCII ones, leave the rest
+    // escapes that are not UTF-8 (or malformed ones, which evaluate()
+    // refuses before this): decode the valid ASCII ones, leave the rest
     decoded = pathname.replace(/%([0-7][0-9a-fA-F])/g, (_, h: string) => String.fromCharCode(parseInt(h, 16)));
   }
   const out: string[] = [];
@@ -152,6 +166,7 @@ export function normalizePath(pathname: string): string {
   return p;
 }
 
+/** Does any rule watch this path and method? Decides whether the body is worth reading at all. */
 function isCandidate(rt: Runtime, path: string, method: string): boolean {
   const m = method.toUpperCase();
   return rt.rules.some((r) => core.rules.pathMatches(path, r.watch_paths, r.paths_case_sensitive) && (!r.methods || r.methods[m]));
@@ -361,8 +376,28 @@ function describe(e: unknown): string {
 }
 
 /**
+ * A path that is not well formed (wellFormedPath): refused with 400 and the
+ * block body, whatever policy.mode and policy.unjudgeable say, as nginx
+ * answers it inline and the Envoy shim and HAProxy agent do. It is the
+ * client's error, not a verdict, so it never fails open. The X-Jev-* headers
+ * say skipped / adapter / "invalid path", as the HAProxy agent sets them.
+ */
+function badPath(rt: Runtime, requestId: string, pathname: string): Evaluation {
+  console.warn("jev-edge: refusing malformed path " + JSON.stringify(pathname.slice(0, 256)) + " with 400");
+  const verdict = core.verdict.newVerdict({
+    action: core.verdict.ACTION_BLOCK, verdict: core.verdict.SKIPPED, source: core.verdict.SRC_ADAPTER, reason: "invalid path",
+  });
+  const response = new Response(rt.config.policy.block_body ?? '{"error":"request rejected"}', {
+    status: 400,
+    headers: { "Content-Type": "application/json", ...core.verdict.headers(verdict), "X-Jev-Request-Id": requestId },
+  });
+  return { verdict, response, requestId };
+}
+
+/**
  * Evaluate one request. Never throws: any failure in the pipeline yields a
  * pass with verdict "error" and source "adapter" (see the header comment).
+ * A path that is not well formed is refused with 400 (badPath), never passed.
  */
 export async function evaluate(request: Request, rt: Runtime, rctx?: RequestCtx): Promise<Evaluation> {
   let requestId: string;
@@ -372,6 +407,8 @@ export async function evaluate(request: Request, rt: Runtime, rctx?: RequestCtx)
     requestId = String(Date.now());
   }
   try {
+    const pathname = new URL(request.url).pathname;
+    if (!wellFormedPath(pathname)) return badPath(rt, requestId, pathname);
     return await evaluateInner(request, rt, requestId, rctx);
   } catch (e) {
     console.error("jev-edge: adapter error, failing open: " + describe(e));

@@ -363,7 +363,13 @@ function _M.chunks(text, budget)
       if text:byte(j) == 10 then e, nexti = j - 1, j + 1 break end
     end
     if not nexti then
-      while e > i and cont(text, e + 1) do e = e - 1 end
+      -- back to a character boundary: at most 3 bytes, the longest run of
+      -- continuation bytes in valid UTF-8. A longer run is invalid UTF-8 and
+      -- is cut where it is; walking it back byte by byte made a 1-byte piece
+      -- per step, O(n x budget) on a body of continuation bytes.
+      local cut, k = e, 0
+      while k < 3 and e > i and cont(text, e + 1) do e, k = e - 1, k + 1 end
+      if e > i and cont(text, e + 1) then e = cut end
       nexti = e + 1
     end
     pieces[#pieces + 1], starts[#starts + 1] = text:sub(i, e), i

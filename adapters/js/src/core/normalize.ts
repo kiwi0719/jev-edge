@@ -418,7 +418,11 @@ export function chunks(text: string, budget: number): [string[], number[]] {
       }
     }
     if (next === undefined) {
-      while (e > i && isCont(b, e)) e--;
+      // back to a character boundary, at most 3 bytes (valid UTF-8); a
+      // longer run of continuation bytes is cut where it is, as in Lua
+      const cut = e;
+      for (let k = 0; k < 3 && e > i && isCont(b, e); k++) e--;
+      if (e > i && isCont(b, e)) e = cut;
       next = e + 1;
     }
     pieces.push(dec.decode(b.subarray(i - 1, e)));

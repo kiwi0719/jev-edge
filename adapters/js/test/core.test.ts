@@ -269,3 +269,10 @@ describe("normalize.extract: form bodies", () => {
     expect(Date.now() - t0).toBeLessThan(2000);
   });
 });
+
+describe("normalize.chunks", () => {
+  it("still cuts valid UTF-8 at a character boundary", () => {
+    const [pieces] = core.normalize.chunks("\u{1F600}".repeat(40), 63);
+    for (const p of pieces) expect(new TextEncoder().encode(p).length % 4).toBe(0);
+  });
+});

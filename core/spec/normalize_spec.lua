@@ -179,3 +179,19 @@ describe("normalize.extract: form bodies", function()
     assert.is_true(os.clock() - t0 < 2, "form_values is not linear")
   end)
 end)
+
+describe("normalize.chunks", function()
+  it("cuts a run of continuation bytes hard instead of walking it back", function()
+    local pieces = N.chunks(string.rep("\128", 5000), 64)
+    assert.equals(79, #pieces)
+    for k = 1, 78 do assert.equals(64, #pieces[k]) end
+    local t0 = os.clock()
+    assert.equals(32, #N.chunks(string.rep("\191", 1024 * 1024), 32768))
+    assert.is_true(os.clock() - t0 < 2)
+  end)
+
+  it("still cuts valid UTF-8 at a character boundary", function()
+    local text = string.rep("\240\159\152\128", 40)   -- 40 x U+1F600, 4 bytes each
+    for _, piece in ipairs((N.chunks(text, 63))) do assert.equals(0, #piece % 4) end
+  end)
+end)

@@ -557,6 +557,16 @@ describe("stores", () => {
     expect(isNamespace(memoryStore())).toBe(false);
     expect(isStub(memoryStore())).toBe(false);
     expect(isNamed(memoryStore())).toBe(false);
+    expect(isNamed({ ...memoryStore(), namespace: "jev" })).toBe(false); // a Store with a key prefix of its own
+  });
+
+  it("a Store with a namespace field of its own is still a Store", async () => {
+    const own = { ...memoryStore(), namespace: "tenant-a" };
+    const rt = createRuntime({ config: ENFORCE95, state: own, subjectStore: own, cache: own });
+    const res = await handle(chat(attack(0)), rt, echo);
+    expect(res.status).toBe(403);
+    expect(res.headers.get("x-jev-source")).toBe("l2");
+    expect(await own.get("adapt")).toMatchObject({ n: 1 });
   });
 
   /** A namespace whose every name is its own JevState object, made on first use. */

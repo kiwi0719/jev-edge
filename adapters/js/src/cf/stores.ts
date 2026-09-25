@@ -234,9 +234,13 @@ export function isNamespace(x: unknown): x is DONamespaceLike {
   return typeof n.idFromName === "function" && typeof n.get === "function";
 }
 
-/** `{ namespace, name }`: a plain object with a `namespace` key (a stub has every key, so not one). */
+/**
+ * `{ namespace, name }`: an object with a `namespace` key and no `get`
+ * method. Not a stub, which has every key, nor a Store, which always has
+ * `get` and may well carry a `namespace` of its own (a key prefix, say).
+ */
 export function isNamed(x: unknown): x is DONamed {
-  return typeof x === "object" && x !== null && !isStub(x) && "namespace" in x;
+  return typeof x === "object" && x !== null && !isStub(x) && "namespace" in x && typeof (x as { get?: unknown }).get !== "function";
 }
 
 /** A namespace, `{ namespace, name }` or a stub: what createRuntime runs through JevState. */

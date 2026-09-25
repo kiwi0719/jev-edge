@@ -44,7 +44,8 @@ export interface Options {
    *  runtime kept across requests with a stub logs that once per stub and isolate, and from then on keeps
    *  breaker and adaptive state in that isolate's memory, one operation at a time (cf/stores.ts). Anything
    *  with a `fetch` method is taken for a stub, idFromName + get without one for a namespace, and an object
-   *  with a `namespace` key for `{ namespace, name }`, so a Store must have none of these. */
+   *  with a `namespace` key and no `get` for `{ namespace, name }`, so a Store must have no `fetch` and not
+   *  both idFromName and get. */
   state?: StateTarget | Store;
   /** Store for per-subject trajectories: KV, the JevState Durable Object (namespace, `{ namespace, name }`
    *  or stub, as for `state`; its incr is atomic) or any Store. Memory (per isolate) if absent. Only used

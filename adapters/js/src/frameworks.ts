@@ -33,7 +33,7 @@ export interface NextFetchEventLike {
  *   import { NextResponse } from "next/server";
  *   import { nextMiddleware } from "@jev-edge/js";
  *   export const middleware = nextMiddleware({ config: { ... } }, NextResponse);
- *   export const config = { matcher: ["/api/chat/:path*", "/v1/:path*"] };
+ *   export const config = { matcher: ["/api/chat/:path*", "/api/completion/:path*", "/api/completions/:path*", "/v1/:path*"] };
  *
  * Allowed requests continue with X-Jev-* on the request headers (read them in
  * the route handler); blocked ones get the 403 from the middleware. Next

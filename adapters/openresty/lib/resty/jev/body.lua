@@ -8,6 +8,7 @@
 --   body_head     past `max`: its first `max` bytes
 --   body_tail     past `max`: its last TAIL_BYTES bytes after the head
 --   body_size     the size core compares against max_body_bytes
+--   body_received the bytes read off the wire, before any decoding
 --   decoded       true when a Content-Encoding was decoded
 -- An encoded body that cannot be decoded (unsupported coding, missing
 -- library, corrupt data, or too large to decode whole) is left out, and core
@@ -62,6 +63,7 @@ function _M.fill(req, max)
     if not size then return req end
   end
   req.body_size = math.max(tonumber(req.body_size) or 0, size)
+  req.body_received = size
 
   local ce = rules_m.content_encoding(req.headers)
   if ce ~= "" then

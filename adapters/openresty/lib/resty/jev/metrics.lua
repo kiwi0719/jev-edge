@@ -50,7 +50,9 @@ function _M.incr_async_dropped() incr("async_dropped") end
 -- cannot be minted by traffic):
 --   no_client_ip  neither x-envoy-external-address nor X-Forwarded-For
 --                 named the client: no IP reputation, no subject = "ip"
-local AUTHZ_EVENTS = { no_client_ip = true }
+--   cut_at_cap    a body at or past max_body_bytes the gateway did not flag
+--                 as cut, taken as cut
+local AUTHZ_EVENTS = { no_client_ip = true, cut_at_cap = true }
 function _M.incr_authz(event)
   if AUTHZ_EVENTS[event] then incr("authz:" .. event) end
 end

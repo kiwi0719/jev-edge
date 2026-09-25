@@ -125,8 +125,25 @@ local function build_req(rules, over)
     body_m.fill(req, max)
     -- The gateway in front sent only part of the body (Envoy's
     -- allow_partial_message, HAProxy past tune.bufsize): scan it as the head
-    -- of a larger body instead of parsing truncated JSON as a whole.
-    if over.partial and req.body then
+    -- of a larger body instead of parsing truncated JSON as a whole, and let
+    -- policy.partial decide whether that is judged (core: body_partial).
+    local cut = over.partial
+    -- authz: a body that reaches max_body_bytes is taken as cut whatever the
+    -- gateway says. Envoy can report a body it cut at max_request_bytes as
+    -- whole (x-envoy-auth-partial-body: false) when the bytes it had so far
+    -- end exactly there, and a client places that point with its own pauses;
+    -- parsed as whole, the head would read as truncated JSON. Past
+    -- max_body_bytes it is still scanned head and tail.
+    if over.cut_at_cap and not cut and (req.body_received or 0) >= max then
+      cut = true
+      metrics.incr_authz("cut_at_cap")
+      local said = tostring(over.partial_flag or "(absent)"):sub(1, 16)
+      ngx.log(req.body_received == max and ngx.WARN or ngx.INFO,
+        "jev-edge: authz body of ", req.body_received, " bytes (max_body_bytes ", max,
+        ") taken as cut; the gateway said x-envoy-auth-partial-body: ", said)
+    end
+    if cut then req.body_partial = true end
+    if cut and req.body then
       -- The gateway cuts at a byte count, so the head can end inside a UTF-8
       -- sequence (a client picks where with its padding). Drop that
       -- incomplete sequence: invalid UTF-8 in the L2 prompt can make the
@@ -606,11 +623,14 @@ function _M.authz(prefix)
   if not client_ip then metrics.incr_authz("no_client_ip") end
   -- set by Envoy (with_request_body.allow_partial_message) and the HAProxy
   -- SPOA agent, which both strip client copies
-  local partial = h["x-envoy-auth-partial-body"] == "true" or h["x-jev-body-partial"] == "1"
+  local flag = h["x-envoy-auth-partial-body"]
+  if type(flag) == "table" then flag = flag[1] end
+  local partial = flag == "true" or h["x-jev-body-partial"] == "1"
   local okr, remove = pcall(headers_to_remove, h, cfg)
   if okr then ngx.header["x-envoy-auth-headers-to-remove"] = remove end
 
-  return respond_authz(cfg, rules, { path = path, client_ip = client_ip or false, partial = partial }, "authz")
+  return respond_authz(cfg, rules, { path = path, client_ip = client_ip or false, partial = partial,
+                                     cut_at_cap = true, partial_flag = flag }, "authz")
 end
 
 --- content_by_lua for generic forward-auth: Traefik ForwardAuth, Caddy

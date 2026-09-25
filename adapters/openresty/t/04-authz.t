@@ -247,3 +247,105 @@ authz subject=nil
 
 
 
+=== TEST 10: a body at max_body_bytes is taken as cut even when Envoy says it is whole
+--- http_config eval: $::HttpConfig
+--- user_files eval: ::conf('rules = { { id = "small", extends = "llm-endpoints", max_body_bytes = 256 } },')
+--- config
+location /_jev/authz/ { content_by_lua_block { require("resty.jev.edge").authz() } }
+location = /m { content_by_lua_block { require("resty.jev.edge").metrics() } }
+--- request eval
+my $p = '{"messages":[{"role":"user","content":"Please summarise the attached quarterly report for me. ';
+my $s = '"}]}';
+my @b = map { $p . ('a' x ($_ - length($p) - length($s))) . $s } (255, 256);
+["POST /_jev/authz/v1/chat/completions\n$b[0]",
+ "POST /_jev/authz/v1/chat/completions\n$b[1]",
+ "GET /m"]
+--- more_headers eval
+["Content-Type: application/json\nX-Jev-Mock-Score: 0.2\nX-Envoy-External-Address: 198.51.100.9\nX-Envoy-Auth-Partial-Body: false",
+ "Content-Type: application/json\nX-Jev-Mock-Score: 0.2\nX-Envoy-External-Address: 198.51.100.9\nX-Envoy-Auth-Partial-Body: false",
+ ""]
+--- error_code eval
+[200, 200, 200]
+--- response_headers eval
+["X-Jev-Verdict: safe\nX-Jev-Reason: injection+0.20",
+ "X-Jev-Verdict: safe\nX-Jev-Reason: injection+0.20+%28window%29",
+ ""]
+--- response_body_like eval
+["^\$", "^\$", qr/jev_authz_events_total\{event="cut_at_cap"\} 1\n/]
+--- no_error_log
+[error]
+
+
+
+=== TEST 11: a body taken as cut at max_body_bytes is logged with what the gateway said
+--- http_config eval: $::HttpConfig
+--- user_files eval: ::conf('rules = { { id = "small", extends = "llm-endpoints", max_body_bytes = 256 } },')
+--- config
+location /_jev/authz/ { content_by_lua_block { require("resty.jev.edge").authz() } }
+--- request eval
+my $p = '{"messages":[{"role":"user","content":"Please summarise the attached quarterly report for me. ';
+my $s = '"}]}';
+"POST /_jev/authz/v1/chat/completions\n" . $p . ('a' x (256 - length($p) - length($s))) . $s
+--- more_headers
+Content-Type: application/json
+X-Jev-Mock-Score: 0.2
+X-Envoy-External-Address: 198.51.100.9
+X-Envoy-Auth-Partial-Body: false
+--- error_code: 200
+--- error_log
+authz body of 256 bytes (max_body_bytes 256) taken as cut; the gateway said x-envoy-auth-partial-body: false
+--- no_error_log
+[error]
+
+
+
+=== TEST 12: policy.partial = unjudgeable: a cut body, flagged or at the cap, is unjudgeable
+--- http_config eval: $::HttpConfig
+--- user_files eval: ::conf('rules = { { id = "small", extends = "llm-endpoints", max_body_bytes = 256 } }, policy = { mode = "monitor", block_threshold = 0.85, suspect_threshold = 0.5, partial = "unjudgeable" },')
+--- config
+location /_jev/authz/ { content_by_lua_block { require("resty.jev.edge").authz() } }
+location = /m { content_by_lua_block { require("resty.jev.edge").metrics() } }
+--- request eval
+my $p = '{"messages":[{"role":"user","content":"Please summarise the attached quarterly report for me. ';
+my $s = '"}]}';
+my @b = map { $p . ('a' x ($_ - length($p) - length($s))) . $s } (256, 255);
+["POST /_jev/authz/v1/chat/completions\n" . substr($b[0], 0, 200),
+ "POST /_jev/authz/v1/chat/completions\n$b[0]",
+ "POST /_jev/authz/v1/chat/completions\n$b[1]",
+ "GET /m"]
+--- more_headers eval
+["Content-Type: application/json\nX-Jev-Mock-Score: 0.2\nX-Envoy-External-Address: 198.51.100.9\nX-Envoy-Auth-Partial-Body: true",
+ "Content-Type: application/json\nX-Jev-Mock-Score: 0.2\nX-Envoy-External-Address: 198.51.100.9\nX-Envoy-Auth-Partial-Body: false",
+ "Content-Type: application/json\nX-Jev-Mock-Score: 0.2\nX-Envoy-External-Address: 198.51.100.9\nX-Envoy-Auth-Partial-Body: false",
+ ""]
+--- error_code eval
+[200, 200, 200, 200]
+--- response_headers eval
+["X-Jev-Verdict: skipped\nX-Jev-Reason: unjudgeable%3A+partial+body",
+ "X-Jev-Verdict: skipped\nX-Jev-Reason: unjudgeable%3A+partial+body",
+ "X-Jev-Verdict: safe\nX-Jev-Reason: injection+0.20",
+ ""]
+--- response_body_like eval
+["^\$", "^\$", "^\$", qr/jev_unjudged_total\{reason="partial"\} 2\n/]
+--- no_error_log
+[error]
+
+
+
+=== TEST 13: policy.partial = unjudgeable with policy.unjudgeable = block denies a cut body in enforce
+--- http_config eval: $::HttpConfig
+--- user_files eval: ::conf('policy = { mode = "enforce", block_threshold = 0.7, suspect_threshold = 0.5, partial = "unjudgeable", unjudgeable = "block" },')
+--- config
+location /_jev/authz/ { content_by_lua_block { require("resty.jev.edge").authz() } }
+--- request eval
+["POST /_jev/authz/v1/chat/completions\n{\"messages\":[{\"role\":\"user\",\"content\":\"Please summarise the attached quarterly report for me, all of it",
+ "POST /_jev/authz/v1/chat/completions\n{\"messages\":[{\"role\":\"user\",\"content\":\"Please summarise the attached quarterly report for me.\"}]}"]
+--- more_headers eval
+["Content-Type: application/json\nX-Jev-Mock-Score: 0.2\nX-Envoy-External-Address: 198.51.100.9\nX-Envoy-Auth-Partial-Body: true",
+ "Content-Type: application/json\nX-Jev-Mock-Score: 0.2\nX-Envoy-External-Address: 198.51.100.9\nX-Envoy-Auth-Partial-Body: false"]
+--- error_code eval
+[403, 200]
+--- response_body eval
+["{\"error\":\"request rejected\"}\n", ""]
+--- no_error_log
+[error]

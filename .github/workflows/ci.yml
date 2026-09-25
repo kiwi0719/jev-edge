@@ -20,10 +20,14 @@ on:
 permissions:
   contents: read
 
-# A newer push to the same PR makes the running one obsolete; main keeps
-# every run so each merge has a result.
+# Pull requests: the newest push wins, and an older run of the same PR is
+# cancelled. Every other run (a push to main, the weekly schedule, a manual
+# run) gets a group of its own and is kept: GitHub keeps one pending run per
+# group and cancels the older one, so a shared group would drop a merge's run
+# or the schedule's. The runs are independent (they share only the Actions
+# cache), so running them in parallel is safe.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || format('{0}-{1}-{2}', github.ref, github.event_name, github.run_id) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:

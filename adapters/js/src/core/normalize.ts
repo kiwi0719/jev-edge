@@ -63,10 +63,14 @@ function isObj(v: unknown): v is { [k: string]: JsonValue } | JsonValue[] {
 // (`[{type:"text", text:"..."}, {type:"image_url", ...}]`), the Responses API's
 // `input_text`, and Anthropic's `tool_result` whose `content` nests once more.
 // Collect every string, every part's `text`, and recurse into `content`, to a
-// bounded depth. Anything else (numbers, images) contributes nothing.
+// bounded depth. Two parts keep their text elsewhere: an Anthropic `document`
+// block under `source.data` (source type "text") or `source.content` (type
+// "content"), and a Responses `file_search_call` under `results[*].text`.
+// The depth leaves room for a content document inside a tool_result.
+// Anything else (numbers, images) contributes nothing.
 // Mirrors collect() in core/normalize.lua, including Lua's "array if [1] is
 // set" test: an empty array is a table with no array part and yields nothing.
-const LEAF_DEPTH = 4;
+const LEAF_DEPTH = 6;
 function collect(node: JsonValue | undefined, out: string[], depth: number): void {
   if (typeof node === "string") {
     out.push(node);
@@ -84,6 +88,12 @@ function collect(node: JsonValue | undefined, out: string[], depth: number): voi
   }
   if (typeof node.text === "string") out.push(node.text);
   if (node.content !== undefined && node.content !== null) collect(node.content, out, depth + 1);
+  const src = node.source;
+  if (isObj(src) && !Array.isArray(src)) {
+    if (src.type === "text" && typeof src.data === "string") out.push(src.data);
+    if (src.type === "content" && src.content !== undefined && src.content !== null) collect(src.content, out, depth + 1);
+  }
+  if (node.type === "file_search_call" && isObj(node.results)) collect(node.results, out, depth + 1);
 }
 
 /**
@@ -157,7 +167,12 @@ export function extractJsonValues(decoded: JsonValue, fields: string[]): string[
 // gateways see:
 //   OpenAI Chat Completions  messages[*] with role "tool" (or legacy "function"): content
 //   Anthropic Messages       messages[*].content[*] with type "tool_result": content
-//   OpenAI Responses         input[*] with type "function_call_output": output
+//   OpenAI Responses         input[*] with a type ending in "_call_output"
+//                            (function_call_output, custom_tool_call_output,
+//                            local_shell_call_output, ...) or "mcp_call": output;
+//                            "file_search_call": results[*].text
+const responsesResult = (t: unknown) => typeof t === "string" && (t.endsWith("_call_output") || t === "mcp_call");
+
 function toolResults(decoded: JsonValue, out: string[]): void {
   if (!isObj(decoded) || Array.isArray(decoded)) return;
   const msgs = decoded.messages;
@@ -176,7 +191,9 @@ function toolResults(decoded: JsonValue, out: string[]): void {
   const input = decoded.input;
   if (Array.isArray(input)) {
     for (const item of input) {
-      if (isObj(item) && !Array.isArray(item) && item.type === "function_call_output") collect(item.output, out, 1);
+      if (!isObj(item) || Array.isArray(item)) continue;
+      if (responsesResult(item.type)) collect(item.output, out, 1);
+      else if (item.type === "file_search_call" && isObj(item.results)) collect(item.results, out, 1);
     }
   }
 }

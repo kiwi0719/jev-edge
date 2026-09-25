@@ -26,10 +26,14 @@ end
 -- (`[{type="text", text="..."}, {type="image_url", ...}]`), the Responses API's
 -- `input_text`, and Anthropic's `tool_result` whose `content` nests once more.
 -- Collect every string, every part's `text`, and recurse into `content`, to a
--- bounded depth. Anything else (numbers, images, JSON null) contributes
--- nothing. A decoder that keeps null as a value (cjson.null) is assumed:
--- `[null, {...}]` goes on past the null, as the backend's parser does.
-local LEAF_DEPTH = 4
+-- bounded depth. Two parts keep their text elsewhere: an Anthropic `document`
+-- block under `source.data` (source type "text") or `source.content` (type
+-- "content"), and a Responses `file_search_call` under `results[*].text`.
+-- The depth leaves room for a content document inside a tool_result. Anything
+-- else (numbers, images, JSON null) contributes nothing. A decoder that keeps
+-- null as a value (cjson.null) is assumed: `[null, {...}]` goes on past the
+-- null, as the backend's parser does.
+local LEAF_DEPTH = 6
 local function collect(node, out, depth)
   if type(node) == "string" then
     out[#out + 1] = node
@@ -42,6 +46,14 @@ local function collect(node, out, depth)
   end
   if type(node.text) == "string" then out[#out + 1] = node.text end
   if node.content ~= nil then collect(node.content, out, depth + 1) end
+  local src = node.source
+  if type(src) == "table" then
+    if src.type == "text" and type(src.data) == "string" then out[#out + 1] = src.data end
+    if src.type == "content" and src.content ~= nil then collect(src.content, out, depth + 1) end
+  end
+  if node.type == "file_search_call" and type(node.results) == "table" then
+    collect(node.results, out, depth + 1)
+  end
 end
 
 -- Go's encoding/json (Ollama's /api/chat, a default watched path) matches an
@@ -126,7 +138,15 @@ end
 -- Tool results in the chat shapes gateways see:
 --   OpenAI Chat Completions  messages[*] with role "tool" (or legacy "function"): content
 --   Anthropic Messages       messages[*].content[*] with type "tool_result": content
---   OpenAI Responses         input[*] with type "function_call_output": output
+--   OpenAI Responses         input[*] with a type ending in "_call_output"
+--                            (function_call_output, custom_tool_call_output,
+--                            local_shell_call_output, ...) or "mcp_call": output;
+--                            "file_search_call": results[*].text
+local function responses_result(item)
+  local t = item.type
+  return type(t) == "string" and (t:sub(-12) == "_call_output" or t == "mcp_call")
+end
+
 local function tool_results(decoded, out)
   local msgs = decoded.messages
   if type(msgs) == "table" then
@@ -145,7 +165,13 @@ local function tool_results(decoded, out)
   local input = decoded.input
   if type(input) == "table" then
     for _, item in ipairs(input) do
-      if type(item) == "table" and item.type == "function_call_output" then collect(item.output, out, 1) end
+      if type(item) == "table" then
+        if responses_result(item) then
+          collect(item.output, out, 1)
+        elseif item.type == "file_search_call" and type(item.results) == "table" then
+          collect(item.results, out, 1)
+        end
+      end
     end
   end
 end

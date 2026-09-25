@@ -258,6 +258,24 @@ describe("normalize: JSON keys match without regard to case", function()
   end)
 end)
 
+describe("normalize: documents and retrieved results", function()
+  it("reads Anthropic document blocks and Responses file_search results", function()
+    local text_doc = { type = "document", source = { type = "text", media_type = "text/plain", data = "doc text" } }
+    local blocks_doc = { type = "document", source = { type = "content",
+      content = { { type = "text", text = "block one" }, { type = "text", text = "block two" } } } }
+    local pdf = { type = "document", source = { type = "base64", media_type = "application/pdf", data = "JVBERi0=" } }
+    local parts = { text_doc, blocks_doc, pdf, { type = "text", text = "sum up" } }
+    local d = { messages = { { role = "user", content = parts } } }
+    assert.equals("doc text\nblock one\nblock two\nsum up", N.extract_json(d, { "messages[*].content" }))
+    -- a content document inside a tool_result
+    d = { messages = { { role = "user", content = { { type = "tool_result", content = { blocks_doc } } } } } }
+    assert.equals("block one\nblock two", N.extract_json(d, { "messages[*].content" }))
+    d = { input = { { type = "file_search_call", queries = { "q" }, results = {
+      { file_id = "f", text = "found one" }, { file_id = "g", text = "found two" } } } } }
+    assert.equals("found one\nfound two", N.extract_json(d, { "input" }))
+  end)
+end)
+
 describe("normalize.chunks", function()
   it("cuts a run of continuation bytes hard instead of walking it back", function()
     local pieces = N.chunks(string.rep("\128", 5000), 64)

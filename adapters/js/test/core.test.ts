@@ -337,6 +337,23 @@ describe("normalize: JSON keys match without regard to case", () => {
   });
 });
 
+describe("normalize: documents and retrieved results", () => {
+  it("reads Anthropic document blocks and Responses file_search results", () => {
+    const textDoc = { type: "document", source: { type: "text", media_type: "text/plain", data: "doc text" } };
+    const blocksDoc = { type: "document", source: { type: "content",
+      content: [{ type: "text", text: "block one" }, { type: "text", text: "block two" }] } };
+    const pdf = { type: "document", source: { type: "base64", media_type: "application/pdf", data: "JVBERi0=" } };
+    const ex = (d: object, f: string) => core.normalize.extractJson(d as never, [f]);
+    expect(ex({ messages: [{ role: "user", content: [textDoc, blocksDoc, pdf, { type: "text", text: "sum up" }] }] },
+      "messages[*].content")).toBe("doc text\nblock one\nblock two\nsum up");
+    // a content document inside a tool_result
+    expect(ex({ messages: [{ role: "user", content: [{ type: "tool_result", content: [blocksDoc] }] }] },
+      "messages[*].content")).toBe("block one\nblock two");
+    expect(ex({ input: [{ type: "file_search_call", queries: ["q"], results: [
+      { file_id: "f", text: "found one" }, { file_id: "g", text: "found two" }] }] }, "input")).toBe("found one\nfound two");
+  });
+});
+
 describe("normalize.chunks", () => {
   it("still cuts valid UTF-8 at a character boundary", () => {
     const [pieces] = core.normalize.chunks("\u{1F600}".repeat(40), 63);

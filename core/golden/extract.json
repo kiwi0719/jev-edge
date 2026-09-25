@@ -802,6 +802,60 @@
         ]
       },
       "name": "scanned keys are folded too"
+    },
+    {
+      "expect": {
+        "kind": "json",
+        "text": "doc text\nblock one\nblock two\nsum up"
+      },
+      "input": {
+        "body": "{\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"document\",\"source\":{\"type\":\"text\",\"media_type\":\"text/plain\",\"data\":\"doc text\"}},{\"type\":\"document\",\"source\":{\"type\":\"content\",\"content\":[{\"type\":\"text\",\"text\":\"block one\"},{\"type\":\"text\",\"text\":\"block two\"}]}},{\"type\":\"document\",\"source\":{\"type\":\"base64\",\"media_type\":\"application/pdf\",\"data\":\"JVBERi0=\"}},{\"type\":\"text\",\"text\":\"sum up\"}]}]}",
+        "content_type": "application/json",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "anthropic document blocks: text and content sources"
+    },
+    {
+      "expect": {
+        "kind": "json",
+        "text": "in a tool result"
+      },
+      "input": {
+        "body": "{\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t1\",\"content\":[{\"type\":\"document\",\"source\":{\"type\":\"content\",\"content\":[{\"type\":\"text\",\"text\":\"in a tool result\"}]}}]}]}]}",
+        "content_type": "application/json",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "anthropic content document inside a tool_result"
+    },
+    {
+      "expect": {
+        "kind": "json",
+        "text": "find it\nfound one\nfound two"
+      },
+      "input": {
+        "body": "{\"input\":[{\"role\":\"user\",\"content\":\"find it\"},{\"type\":\"file_search_call\",\"id\":\"fs1\",\"status\":\"completed\",\"queries\":[\"q\"],\"results\":[{\"file_id\":\"f1\",\"text\":\"found one\"},{\"file_id\":\"f2\",\"text\":\"found two\"}]}]}",
+        "content_type": "application/json",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "responses file_search_call results"
     }
   ],
   "core_version": "0.6.1",

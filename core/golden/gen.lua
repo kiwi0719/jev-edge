@@ -252,6 +252,20 @@ extract_case("a scanned key with another character in it is not a key",
 extract_case("scanned keys are folded too", '{"MESSAGES":[{"Content":"scanned upper"}],"x":' .. string.rep("[", 1001)
   .. string.rep("]", 1001) .. "}", "application/json")
 
+-- documents and retrieved results
+extract_case("anthropic document blocks: text and content sources",
+  '{"messages":[{"role":"user","content":[{"type":"document","source":{"type":"text","media_type":"text/plain",'
+  .. '"data":"doc text"}},{"type":"document","source":{"type":"content","content":[{"type":"text","text":"block one"},'
+  .. '{"type":"text","text":"block two"}]}},{"type":"document","source":{"type":"base64","media_type":'
+  .. '"application/pdf","data":"JVBERi0="}},{"type":"text","text":"sum up"}]}]}', "application/json")
+extract_case("anthropic content document inside a tool_result",
+  '{"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"document",'
+  .. '"source":{"type":"content","content":[{"type":"text","text":"in a tool result"}]}}]}]}]}', "application/json")
+extract_case("responses file_search_call results",
+  '{"input":[{"role":"user","content":"find it"},{"type":"file_search_call","id":"fs1","status":"completed",'
+  .. '"queries":["q"],"results":[{"file_id":"f1","text":"found one"},{"file_id":"f2","text":"found two"}]}]}',
+  "application/json")
+
 -- ---------------------------------------------------------------------------
 -- rules: L1 decisions with the shipped llm-endpoints rule set
 -- ---------------------------------------------------------------------------
@@ -843,6 +857,26 @@ eval_case("untrusted: a rule's own untrusted table turns it on for that rule", {
   rules = { { id = "rag", extends = "llm-endpoints", watch_paths = { "^/rag/" }, untrusted = { enabled = true } },
             "llm-endpoints" },
   judge = U_SCORES })
+
+-- more retrieved-content shapes: every Responses *_call_output, mcp_call and
+-- file_search_call results
+local U_CUSTOM = '{"input":[{"role":"user","content":' .. escape(U_ASK) .. '},'
+  .. '{"type":"custom_tool_call","call_id":"c1","name":"search","input":"budget"},'
+  .. '{"type":"custom_tool_call_output","call_id":"c1","output":' .. escape(U_EMAIL) .. '}]}'
+local U_MCP = '{"input":[{"role":"user","content":' .. escape(U_ASK) .. '},'
+  .. '{"type":"mcp_call","id":"m1","server_label":"mail","name":"search","arguments":"{}","output":'
+  .. escape(U_EMAIL) .. '}]}'
+local U_FILES = '{"input":[{"role":"user","content":' .. escape(U_ASK) .. '},'
+  .. '{"type":"file_search_call","id":"fs1","status":"completed","queries":["budget"],'
+  .. '"results":[{"file_id":"f1","filename":"mail.txt","text":' .. escape(U_EMAIL) .. '}]}]}'
+eval_case("untrusted: a Responses custom_tool_call_output item", {
+  req = raw_req(U_CUSTOM), config = U_ON_ENF, judge = U_SCORES })
+eval_case("untrusted: a Responses mcp_call output", {
+  req = raw_req(U_MCP), config = U_ON_ENF, judge = U_SCORES })
+eval_case("untrusted: Responses file_search_call results", {
+  req = raw_req(U_FILES), config = U_ON_ENF, judge = U_SCORES })
+eval_case("untrusted off: file_search_call results are judged with the whole text", {
+  req = raw_req(U_FILES), config = { policy = { mode = "enforce" } }, judge = U_SCORES })
 
 -- text a strict judge server would refuse is sent well formed
 eval_case("a lone surrogate escape reaches the judge as U+FFFD", {

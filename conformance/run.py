@@ -1,7 +1,8 @@
 """Check a judge server against the System One protocol as jev-edge speaks it.
 
     python3 conformance/run.py --endpoint http://127.0.0.1:8080/v1/systemone \\
-        [--api-key KEY] [--model laya] [--strict] [--mock] [--budget-ms 250]
+        [--api-key KEY] [--model laya] [--strict] [--mock] [--budget-ms 250] \\
+        [--concurrency 64]
 
 Replays conformance/vectors.json (generated from the gateway's own provider
 and templates by conformance/gen.lua), then checks transport behaviour the
@@ -12,6 +13,11 @@ gateway depends on:
   aborted       a client that sends half a body and hangs up does not wedge
                 the server: the next request is answered in budget
   stalled       while one client sits on an open request, others are served
+  burst         --concurrency new connections at once (the gateway's
+                jev.max_inflight): each connects within the gateway's
+                connect budget (30% of --budget-ms) and is answered 200
+                within --budget-ms. A listen backlog smaller than the burst
+                drops connections, and the gateway sees each as a timeout
   latency       --samples sequential requests; p99 must fit --budget-ms,
                 the timeout_max_ms the gateway will run with
 
@@ -35,6 +41,7 @@ import sys
 import threading
 import time
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -202,8 +209,8 @@ def check_auth(t: Target, vectors) -> str | None:
     return None
 
 
-def raw_socket(t: Target):
-    s = socket.create_connection((t.host, t.port), timeout=t.timeout)
+def raw_socket(t: Target, timeout: float | None = None):
+    s = socket.create_connection((t.host, t.port), timeout=timeout or t.timeout)
     if t.https:
         import ssl
         ctx = ssl.create_default_context()
@@ -259,6 +266,58 @@ def check_stalled(t: Target, vectors, budget_ms: float) -> str | None:
     return None
 
 
+def check_burst(t: Target, vectors, n: int, budget_ms: float) -> tuple[str | None, str]:
+    """n fresh connections at once, as the gateway opens them when its
+    keepalive pool is cold or used up: each must connect within the
+    gateway's connect budget and be answered 200 within budget_ms. The
+    client retries a SYN that the server's listen queue dropped only after
+    about a second, far past the connect budget, so the gateway sees a
+    timeout."""
+    body = short_body(t, vectors)
+    connect_s = max(0.01, 0.3 * budget_ms / 1000)  # resty/jev/http.lua: 30% of the L2 timeout
+    start = threading.Barrier(n)
+    cls = http.client.HTTPSConnection if t.https else http.client.HTTPConnection
+
+    def one(_):
+        try:
+            start.wait(timeout=30)
+        except threading.BrokenBarrierError:
+            return "could not start", 0.0
+        t0 = time.perf_counter()
+        try:
+            s = raw_socket(t, connect_s)
+        except OSError as e:
+            return f"connect {type(e).__name__}", (time.perf_counter() - t0) * 1000
+        s.settimeout(t.timeout)
+        c = cls(t.host, t.port, timeout=t.timeout)
+        c.sock = s
+        try:
+            c.request("POST", t.map_path("/v1/systemone"), body=body, headers=t.headers())
+            r = c.getresponse()
+            r.read()
+            return r.status, (time.perf_counter() - t0) * 1000
+        except (http.client.HTTPException, OSError) as e:
+            return f"request {type(e).__name__}", (time.perf_counter() - t0) * 1000
+        finally:
+            c.close()
+
+    with ThreadPoolExecutor(max_workers=n) as ex:
+        results = list(ex.map(one, range(n)))
+    bad = {}
+    for status, _ in results:
+        if status != 200:
+            bad[status] = bad.get(status, 0) + 1
+    slowest = max(ms for _, ms in results)
+    info = f"{n} at once, slowest {slowest:.1f} ms"
+    if bad:
+        what = ", ".join(f"{k}: {v}" for k, v in sorted(bad.items(), key=str))
+        return (f"{sum(bad.values())} of {n} not answered 200 ({what}). A connect failure means a "
+                f"listen backlog under the burst (laya-server: LAYA_BACKLOG)"), info
+    if slowest > budget_ms:
+        return f"slowest answer {slowest:.1f} ms is over the {budget_ms:.0f} ms budget ({info})", info
+    return None, info
+
+
 def check_latency(t: Target, vectors, samples: int, budget_ms: float) -> tuple[str | None, str]:
     c = t.conn()
     lat = []
@@ -294,6 +353,8 @@ def main(argv=None) -> int:
     ap.add_argument("--budget-ms", type=float, default=250.0)
     ap.add_argument("--samples", type=int, default=50)
     ap.add_argument("--timeout", type=float, default=30.0, help="seconds per request")
+    ap.add_argument("--concurrency", type=int, default=64,
+                    help="connections at once in the burst check: the gateway's jev.max_inflight")
     args = ap.parse_args(argv)
 
     t = Target(args.endpoint, args.api_key, args.model, args.timeout)
@@ -329,13 +390,20 @@ def main(argv=None) -> int:
             report(name, fn())
         except (http.client.HTTPException, OSError) as e:
             report(name, f"transport error: {e!r}")
+
+    try:
+        err, info = check_burst(t, vectors, args.concurrency, args.budget_ms)
+        report(f"burst: {args.concurrency} new connections at once, each answered within "
+               f"{args.budget_ms:.0f} ms", err, info)
+    except (http.client.HTTPException, OSError) as e:
+        report("burst", f"transport error: {e!r}")
     try:
         err, info = check_latency(t, vectors, args.samples, args.budget_ms)
         report(f"latency within {args.budget_ms:.0f} ms at p99", err, info)
     except (http.client.HTTPException, OSError) as e:
         report("latency", f"transport error: {e!r}")
 
-    total = len(vectors) + len(checks) + 1
+    total = len(vectors) + len(checks) + 2
     print(f"\n{total - failed}/{total} passed" + ("" if args.strict else "  (not --strict: exact error codes not checked)"))
     return 1 if failed else 0
 

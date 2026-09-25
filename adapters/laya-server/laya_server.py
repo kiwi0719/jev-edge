@@ -23,7 +23,13 @@ Guarantees the gateway relies on, checked by conformance/ (make conformance):
     would need more than LAYA_MAX_WINDOWS windows is refused with 413;
   * text that is not valid Unicode (a lone surrogate escape, invalid UTF-8)
     is judged with U+FFFD in its place, never refused;
-  * errors are JSON with a non-200 status (400, 401, 404, 405, 413, 500).
+  * load past what the server can take is answered, never dropped: the
+    listen backlog is LAYA_BACKLOG, not socketserver's 5; at most
+    LAYA_WORKERS requests are scored at once; a request that waits longer
+    than LAYA_QUEUE_MS for a worker, and a connection past
+    LAYA_MAX_CONNECTIONS, get a 503 `overloaded`;
+  * errors are JSON with a non-200 status (400, 401, 404, 405, 411, 413,
+    500, 503).
 
 Standard library only, apart from the backend: `onnx` needs onnxruntime,
 tokenizers and numpy; `python` loads your own scoring function; `mock` needs
@@ -43,10 +49,20 @@ Configuration (environment):
   LAYA_API_KEY       when set, requests need "Authorization: Bearer <key>"
   LAYA_ACCESS_LOG    0 turns off the per-request line on stderr     (1)
   LAYA_HOST, LAYA_PORT                                            (0.0.0.0, 8080)
+  LAYA_WORKERS       requests scored at once       (CPU count; python: 1)
+  LAYA_QUEUE_MS      wait for a free worker before 503            (1000)
+  LAYA_BACKLOG       listen backlog: at least the sum of jev.max_inflight of
+                     the gateways calling this server; the kernel caps it at
+                     its somaxconn                                (1024)
+  LAYA_MAX_CONNECTIONS open connections; one more gets 503 and is closed (1024)
+  LAYA_IDLE_TIMEOUT_S a connection silent this long is closed, 0 = never;
+                     keep it above the gateway's keepalive idle time (60 s)
+                                                                  (120)
 """
 
 from __future__ import annotations
 
+import contextlib
 import hmac
 import importlib
 import json
@@ -349,28 +365,66 @@ def validate(req) -> None:
 # ---------------------------------------------------------------------------
 
 
+
+class Workers:
+    """The scoring pool: at most `n` requests are scored at once.
+
+    A request that finds every worker busy waits up to `wait_ms` for one,
+    then gets 503 `overloaded`. By then the gateway has given up on it (its
+    L2 timeout is under a second), and scoring it anyway would only push the
+    requests queued behind it past their own timeouts.
+    """
+
+    def __init__(self, n: int, wait_ms: float):
+        if n < 1:
+            raise ValueError("LAYA_WORKERS must be >= 1")
+        if wait_ms < 0:
+            raise ValueError("LAYA_QUEUE_MS must be >= 0")
+        self.n, self.wait_ms = n, wait_ms
+        self.sem = threading.BoundedSemaphore(n)
+
+    @contextlib.contextmanager
+    def slot(self):
+        """Holds a worker for the block; yields the ms spent waiting for it."""
+        t0 = time.perf_counter()
+        if not self.sem.acquire(timeout=self.wait_ms / 1000):
+            raise Refused(503, "overloaded", f"all {self.n} workers busy for {self.wait_ms:g} ms "
+                                             "(LAYA_WORKERS, LAYA_QUEUE_MS)")
+        try:
+            yield (time.perf_counter() - t0) * 1000
+        finally:
+            self.sem.release()
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "laya-server"
     protocol_version = "HTTP/1.1"  # keepalive: the gateway pools connections
 
     # set by make_server
     scorer: Scorer
+    workers: Workers
     model_name = "laya"
     api_key = None
     max_body = 262144
-    lock = None  # a Lock when the backend is not thread-safe
+    timeout = 120  # LAYA_IDLE_TIMEOUT_S, applied to the socket by StreamRequestHandler
 
     access_log = True
+    over_capacity = False  # set on a connection past LAYA_MAX_CONNECTIONS (Server)
 
     def log_message(self, fmt, *args):  # one line per request on stderr
-        if self.access_log or "error" in fmt:
-            sys.stderr.write("%s %s\n" % (self.address_string(), fmt % args))
+        if self.access_log:
+            self.warn(fmt, *args)
+
+    def warn(self, fmt, *args):  # backend faults and overload: written even without the access log
+        sys.stderr.write("%s %s\n" % (self.address_string(), fmt % args))
 
     def _send(self, status: int, obj) -> None:
         body = json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        if self.close_connection:
+            self.send_header("Connection", "close")
         self.end_headers()
         try:
             self.wfile.write(body)
@@ -378,6 +432,8 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True  # the client gave up (its timeout); nothing to tell it
 
     def _error(self, e: Refused) -> None:
+        if e.status == 503:
+            self.warn("overloaded: %s", e.message)
         self._send(e.status, {"error": {"code": e.code, "message": e.message}})
 
     def _drain(self) -> None:
@@ -388,14 +444,31 @@ class Handler(BaseHTTPRequestHandler):
         elif n > self.max_body:
             self.close_connection = True
 
+    def _shed(self) -> bool:
+        """On a connection past LAYA_MAX_CONNECTIONS: answer 503 and close.
+        Refusing it in the kernel instead would reach the gateway only when
+        its connect budget runs out, as a timeout."""
+        if not self.over_capacity:
+            return False
+        self._drain()
+        self.close_connection = True
+        self._error(Refused(503, "overloaded", f"over {self.server.max_connections} open "
+                                               "connections (LAYA_MAX_CONNECTIONS)"))
+        return True
+
     def do_GET(self):
-        if self.path == "/healthz":
+        if self.path == "/healthz":  # busy is not unhealthy: probes are answered even past the cap
+            self.close_connection = self.close_connection or self.over_capacity
             return self._send(200, {"status": "ok", "model": self.model_name})
+        if self._shed():
+            return
         if self.path == PATH:
             return self._error(Refused(405, "method_not_allowed", "use POST"))
         return self._error(Refused(404, "not_found", "no such path"))
 
     def do_PUT(self):
+        if self._shed():
+            return
         self._drain()
         if self.path == PATH:
             return self._error(Refused(405, "method_not_allowed", "use POST"))
@@ -404,6 +477,8 @@ class Handler(BaseHTTPRequestHandler):
     do_DELETE = do_PATCH = do_PUT
 
     def do_POST(self):
+        if self._shed():
+            return
         if self.path != PATH:
             self._drain()
             return self._error(Refused(404, "not_found", "no such path"))
@@ -436,22 +511,78 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 raise Refused(400, "invalid_json", "body is not valid JSON") from None
             validate(req)
-            t0 = time.perf_counter()
-            if self.lock:
-                with self.lock:
-                    answers, usage = self.scorer.score(req["state"], req["questions"])
-            else:
+            with self.workers.slot() as waited:
+                t0 = time.perf_counter()
                 answers, usage = self.scorer.score(req["state"], req["questions"])
-            usage["ms"] = round((time.perf_counter() - t0) * 1000, 2)
+                usage["ms"] = round((time.perf_counter() - t0) * 1000, 2)
+            usage["wait_ms"] = round(waited, 2)
             self._send(200, {"model": self.model_name, "answers": answers, "usage": usage})
         except Refused as e:
             self._error(e)
         except Exception as e:  # a backend fault: never a score
-            self.log_message("backend error: %r", e)
+            self.warn("backend error: %r", e)
             self._error(Refused(500, "backend_error", "the model failed to score this request"))
 
 
-def make_server(env=os.environ, backend=None) -> ThreadingHTTPServer:
+class Server(ThreadingHTTPServer):
+    """ThreadingHTTPServer with a real listen backlog and a connection cap.
+
+    socketserver listens with a backlog of 5. The gateway opens up to
+    jev.max_inflight connections at once (64 in the Laya profile); the kernel
+    drops a connection past the backlog, the gateway's connect budget (30% of
+    its L2 timeout) runs out before the client retries the SYN, and the call
+    is an L2 error that passes the request unjudged. About 20 of those open
+    the breaker, which skips L2 for every tenant. So the backlog is
+    LAYA_BACKLOG, and a connection past LAYA_MAX_CONNECTIONS is still
+    accepted and answered 503: the gateway sees that at once, and this
+    server's log says why.
+    """
+
+    daemon_threads = True
+
+    def __init__(self, address, handler, backlog: int = 1024, max_connections: int = 1024):
+        if backlog < 1:
+            raise ValueError("LAYA_BACKLOG must be >= 1")
+        if max_connections < 1:
+            raise ValueError("LAYA_MAX_CONNECTIONS must be >= 1")
+        self.request_queue_size = backlog  # server_activate listens with it
+        self.max_connections = max_connections
+        self.connections = 0
+        self._count = threading.Lock()
+        self.shed_handler = type(handler.__name__ + "Shed", (handler,), {"over_capacity": True})
+        super().__init__(address, handler)
+
+    def process_request_thread(self, request, client_address):
+        with self._count:
+            self.connections += 1
+            over = self.connections > self.max_connections
+        try:
+            (self.shed_handler if over else self.RequestHandlerClass)(request, client_address, self)
+        except Exception:
+            self.handle_error(request, client_address)
+        finally:
+            with self._count:
+                self.connections -= 1
+            self.shutdown_request(request)
+
+    def handle_error(self, request, client_address):
+        # a client that hung up or went silent (the gateway's timeout, or
+        # LAYA_IDLE_TIMEOUT_S) is not a server fault: no traceback for it
+        if isinstance(sys.exc_info()[1], (ConnectionError, TimeoutError)):
+            return
+        super().handle_error(request, client_address)
+
+
+def somaxconn() -> int | None:
+    """The kernel's cap on a listen backlog, where it can be read (Linux)."""
+    try:
+        with open("/proc/sys/net/core/somaxconn") as f:
+            return int(f.read())
+    except (OSError, ValueError):
+        return None
+
+
+def make_server(env=os.environ, backend=None) -> Server:
     backend = backend or load_backend(env)
     scorer = Scorer(
         backend,
@@ -460,25 +591,35 @@ def make_server(env=os.environ, backend=None) -> ThreadingHTTPServer:
         overlap=int(env.get("LAYA_WINDOW_OVERLAP", "64")),
         max_windows=int(env.get("LAYA_MAX_WINDOWS", "8")),
     )
+    # onnxruntime sessions are thread-safe; a Python scorer may not be, so it
+    # gets one worker unless LAYA_WORKERS says it can take more
+    default_workers = 1 if isinstance(backend, PythonBackend) else (os.cpu_count() or 1)
     attrs = {
         "scorer": scorer,
+        "workers": Workers(int(env.get("LAYA_WORKERS") or default_workers),
+                           float(env.get("LAYA_QUEUE_MS", "1000"))),
         "model_name": env.get("LAYA_MODEL_NAME", "laya"),
         "api_key": env.get("LAYA_API_KEY") or None,
         "max_body": int(env.get("LAYA_MAX_BODY_BYTES", "262144")),
         "access_log": env.get("LAYA_ACCESS_LOG", "1") != "0",
-        # onnxruntime sessions are thread-safe; a Python scorer may not be
-        "lock": threading.Lock() if isinstance(backend, PythonBackend) else None,
+        "timeout": float(env.get("LAYA_IDLE_TIMEOUT_S", "120")) or None,
     }
     handler = type("LayaHandler", (Handler,), attrs)
-    srv = ThreadingHTTPServer((env.get("LAYA_HOST", "0.0.0.0"), int(env.get("LAYA_PORT", "8080"))), handler)
-    srv.daemon_threads = True
-    return srv
+    return Server((env.get("LAYA_HOST", "0.0.0.0"), int(env.get("LAYA_PORT", "8080"))), handler,
+                  backlog=int(env.get("LAYA_BACKLOG", "1024")),
+                  max_connections=int(env.get("LAYA_MAX_CONNECTIONS", "1024")))
 
 
 def main() -> None:
     srv = make_server()
     host, port = srv.server_address[:2]
-    sys.stderr.write(f"laya-server on {host}:{port}{PATH}\n")
+    h = srv.RequestHandlerClass
+    sys.stderr.write(f"laya-server on {host}:{port}{PATH}: {h.workers.n} workers, "
+                     f"backlog {srv.request_queue_size}, at most {srv.max_connections} connections\n")
+    cap = somaxconn()
+    if cap is not None and cap < srv.request_queue_size:
+        sys.stderr.write(f"laya-server: the kernel caps the listen backlog at {cap} "
+                         f"(net.core.somaxconn), under LAYA_BACKLOG={srv.request_queue_size}\n")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

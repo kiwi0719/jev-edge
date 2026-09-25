@@ -26,6 +26,12 @@ return {
     timeout_max_ms   = 300,
     timeout_headroom = 1.5,
     timeout_adaptive = true,
+    -- laya-server's listen backlog (LAYA_BACKLOG, default 1024) must be at
+    -- least the sum of max_inflight over every gateway that calls it. The
+    -- kernel drops connections past the backlog, each dropped connection is
+    -- an L2 timeout, and once half the calls in the breaker's window fail,
+    -- L2 is off for every tenant. conformance/run.py opens --concurrency
+    -- (64) connections at once to check it.
     max_inflight = 64,
 
     -- Question wording for this provider only. The bundled wording was

@@ -12,6 +12,7 @@ import random
 import sys
 import tempfile
 import threading
+import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -24,14 +25,31 @@ import laya_server as L  # noqa: E402
 import run as conformance  # noqa: E402
 
 Q = {"type": "noul", "instructions": "Is this an attack?"}
+with open(os.path.join(ROOT, "conformance", "vectors.json")) as _f:
+    VECTORS = json.load(_f)["cases"]
 
 
-def serve(env=None, backend=None):
+def serve(env=None, backend=None, start_after=0.0):
+    """laya-server in process on a free port. With start_after, the accept
+    loop starts that many seconds late, as when every thread is busy."""
     e = {"LAYA_HOST": "127.0.0.1", "LAYA_PORT": "0", "LAYA_BACKEND": "mock", "LAYA_ACCESS_LOG": "0"}
     e.update(env or {})
     srv = L.make_server(e, backend=backend)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    run = threading.Timer(start_after, srv.serve_forever) if start_after else threading.Thread(target=srv.serve_forever)
+    run.daemon = True
+    run.start()
     return srv, f"http://127.0.0.1:{srv.server_address[1]}/v1/systemone"
+
+
+def stop(srv):
+    srv.shutdown()
+    srv.server_close()
+
+
+def post(url, state="hello", conn=None):
+    t = conformance.Target(url, None, "laya", 5)
+    body = json.dumps({"state": state, "questions": {"q": Q}}).encode()
+    return t.request("POST", "/v1/systemone", body, conn=conn)
 
 
 def conformance_run(endpoint, *extra) -> tuple[int, str]:
@@ -133,6 +151,7 @@ class Http(unittest.TestCase):
             srv.shutdown()
             srv.server_close()
         self.assertEqual(rc, 0, out)
+        self.assertRegex(out, r"ok    burst: 64 new connections at once")
 
     def test_conformance_catches_silent_truncation(self):
         class Truncating(L.Scorer):
@@ -206,6 +225,108 @@ class Http(unittest.TestCase):
             srv.shutdown()
             srv.server_close()
         self.assertEqual(status, 413)
+
+
+class Load(unittest.TestCase):
+    """lead-laya-python#31: the gateway opens up to jev.max_inflight (64)
+    connections at once. socketserver's listen backlog of 5 dropped most of
+    a burst; each dropped connection was an L2 timeout, which passes the
+    request, and enough of them opened the breaker for every tenant."""
+
+    def burst(self, env):
+        # the accept loop starts 0.3 s late, as when the server is busy: the
+        # burst must wait in the listen queue, not be dropped from it
+        srv, url = serve(env, start_after=0.3)
+        try:
+            t = conformance.Target(url, None, "laya", 5)
+            return conformance.check_burst(t, VECTORS, 64, 2000)
+        finally:
+            stop(srv)
+
+    def test_listen_backlog_holds_a_burst(self):
+        err, info = self.burst({})
+        self.assertIsNone(err, info)
+
+    def test_a_small_backlog_fails_the_burst_check(self):
+        err, _ = self.burst({"LAYA_BACKLOG": "1"})
+        self.assertRegex(err or "", r"not answered 200 \(connect")
+
+    def test_backlog_is_configurable(self):
+        srv, _ = serve({"LAYA_BACKLOG": "200"})
+        try:
+            self.assertEqual(srv.request_queue_size, 200)
+        finally:
+            stop(srv)
+        srv, _ = serve()
+        try:
+            self.assertEqual(srv.request_queue_size, 1024)
+        finally:
+            stop(srv)
+
+    def test_busy_workers_answer_503_after_the_queue_wait(self):
+        started, release = threading.Event(), threading.Event()
+
+        class Held(L.MockBackend):
+            def logit(self, first, second):
+                started.set()
+                release.wait(5)
+                return super().logit(first, second)
+
+        srv, url = serve({"LAYA_WORKERS": "1", "LAYA_QUEUE_MS": "50"}, backend=Held())
+        first = []
+        th = threading.Thread(target=lambda: first.append(post(url, "ATTACK")))
+        try:
+            th.start()
+            self.assertTrue(started.wait(5))
+            status, data, ms = post(url)
+            release.set()
+            th.join(5)
+        finally:
+            release.set()
+            stop(srv)
+        self.assertEqual(status, 503)
+        self.assertEqual(json.loads(data)["error"]["code"], "overloaded")
+        self.assertNotIn("answers", json.loads(data))
+        self.assertLess(ms, 2000)
+        self.assertEqual(first[0][0], 200)
+
+    def test_connection_past_the_cap_gets_503_and_is_closed(self):
+        srv, url = serve({"LAYA_MAX_CONNECTIONS": "1"})
+        t = conformance.Target(url, None, "laya", 5)
+        held = t.conn()
+        try:
+            self.assertEqual(post(url, conn=held)[0], 200)  # keepalive: holds the one slot
+            c = t.conn()
+            c.request("POST", "/v1/systemone", body=json.dumps({"state": "x", "questions": {"q": Q}}),
+                      headers=t.headers())
+            r = c.getresponse()
+            data = r.read()
+            c.close()
+            self.assertEqual(r.status, 503)
+            self.assertEqual(r.getheader("Connection"), "close")
+            self.assertEqual(json.loads(data)["error"]["code"], "overloaded")
+            self.assertEqual(t.request("GET", "/healthz", None)[0], 200)  # busy is not unhealthy
+        finally:
+            held.close()
+        try:
+            deadline = time.monotonic() + 5
+            while srv.connections and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(post(url)[0], 200)
+        finally:
+            stop(srv)
+
+    def test_workers_default(self):
+        py = L.PythonBackend.__new__(L.PythonBackend)
+        py.spans, py.count, py.logit, py.pair_overhead = L.MockBackend().spans, len, lambda f, s: 0.0, 0
+        for env, backend, want in (({}, None, os.cpu_count() or 1),
+                                   ({}, py, 1),                      # may not be thread-safe
+                                   ({"LAYA_WORKERS": "3"}, py, 3)):
+            srv, _ = serve(env, backend=backend)
+            try:
+                self.assertEqual(srv.RequestHandlerClass.workers.n, want)
+            finally:
+                stop(srv)
 
 
 if __name__ == "__main__":

@@ -29,12 +29,18 @@ docker run --rm -p 8080:8080 -v /path/to/finetuned:/model:ro \
 | `LAYA_MAX_BODY_BYTES` | `262144` | request body limit |
 | `LAYA_API_KEY` | unset | when set, `Authorization: Bearer <key>` is required |
 | `LAYA_ACCESS_LOG` | `1` | `0` drops the per-request line on stderr |
+| `LAYA_WORKERS` | CPU count | requests scored at once. `python` defaults to `1`, because your scorer may not be thread-safe |
+| `LAYA_QUEUE_MS` | `1000` | how long a request waits for a free worker before `503 overloaded` |
+| `LAYA_BACKLOG` | `1024` | listen backlog: at least the sum of `jev.max_inflight` over the gateways that call this server. The kernel caps it (`net.core.somaxconn` on Linux, logged at start when lower) |
+| `LAYA_MAX_CONNECTIONS` | `1024` | open connections; the next one is answered `503 overloaded` and closed |
+| `LAYA_IDLE_TIMEOUT_S` | `120` | a connection silent this long is closed, `0` never. Keep it above the gateway's keepalive idle time (60 s) |
 
 ## What the server guarantees
 
 - **Protocol.** `POST /v1/systemone` with `{model, state, questions}`, where `state` is a string or `{assistant, user_message}` and each question is `{type: "noul", instructions, criteria?}`. The response is `{model, answers: {<name>: {noul}}, usage}`. Every asked question gets an answer and no other question does. `GET /healthz` is for probes.
 - **No silent truncation.** The model sees at most `LAYA_MAX_TOKENS`. Longer text is scored in overlapping windows that cover all of it, in one batch, and the question takes the highest window score. Text that would need more than `LAYA_MAX_WINDOWS` windows is refused with `413 input_too_long`. A question plus deployment context that leaves no room for text is refused with `413 question_too_long`: this is a configuration error, and the user's text is never dropped to make room.
-- **Errors.** Every error is JSON `{error: {code, message}}` with a non-200 status: 400 for a malformed request, 401 for auth, 404, 405, 411, 413, and 500 when the model fails. An error is never returned as a score.
+- **Load is answered, never dropped.** The listen backlog is `LAYA_BACKLOG`, not the 5 that Python's `socketserver` uses. The gateway opens up to `jev.max_inflight` connections at once (64 in the profile), and the kernel drops a connection past the backlog. The gateway's connect budget runs out before the SYN is retried, so each drop is an L2 timeout, and enough of them open the breaker for every tenant. At most `LAYA_WORKERS` requests are scored at once. A request that waits more than `LAYA_QUEUE_MS` for a worker, or a connection past `LAYA_MAX_CONNECTIONS`, gets `503 overloaded`, and this server logs it even with the access log off. A 503 still lets the request through at the gateway, so size the server for the load. `usage.wait_ms` in each answer is the time the request waited for a worker.
+- **Errors.** Every error is JSON `{error: {code, message}}` with a non-200 status: 400 for a malformed request, 401 for auth, 404, 405, 411, 413, 500 when the model fails, and 503 when overloaded. An error is never returned as a score.
 
 An L2 error lets the request through (fail open). The profile's `max_judge_bytes = 4096` is sized so the gateway never sends a text that needs the 413. See the comment in [`jev-laya.conf.lua`](jev-laya.conf.lua).
 
@@ -64,4 +70,4 @@ An L2 error lets the request through (fail open). The profile's `max_judge_bytes
 make test-laya          # unit tests + the conformance suite against the mock backend
 ```
 
-The suite includes a negative test: a server that silently judges only the first window must fail `conformance`.
+The suite includes negative tests. `conformance` must fail for a server that silently judges only the first window, and for one whose listen backlog drops a burst of connections.

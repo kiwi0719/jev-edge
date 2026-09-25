@@ -8,6 +8,8 @@ make conformance-vectors    regenerate vectors.json and questions.json (after a 
 make conformance-check      fail if the committed files are stale (part of `make check`)
 ```
 
+`run.py` also takes `--concurrency` (default 64, `jev.max_inflight`) for the load check below.
+
 ## Files
 
 | file | |
@@ -24,6 +26,7 @@ make conformance-check      fail if the committed files are stale (part of `make
 - **Errors**: malformed JSON, a wrong top-level type, missing, empty or unknown-type questions, bad state, an unknown path and the wrong method. Each must return a non-200 status and must not return `answers`. By default any 4xx passes where a 4xx is expected. `STRICT=1` requires the exact codes this suite picked (400, 404, 405, 413). laya-server is held to strict.
 - **Long input**: text far beyond one model context must be either judged whole or refused, never cut. `MOCK=1` (laya-server with `LAYA_BACKEND=mock`) proves the "judged whole" part: an attack marker at the head or at the tail of the long text must score high.
 - **Transport**: two requests on one keepalive connection; a missing or wrong key refused (with `API_KEY`); five clients that send half a body and hang up must not wedge the server; one client stalled mid-request must not block others; and p99 latency over 50 sequential requests must fit `BUDGET_MS`, the `timeout_max_ms` the gateway will run with.
+- **Load**: 64 new connections at once, as the gateway opens them at `max_inflight` when its keepalive pool is cold. Each must connect within the gateway's connect budget (30% of `BUDGET_MS`) and get a 200 within `BUDGET_MS`. A server whose listen backlog is smaller than the burst drops connections. The client retries a dropped SYN only after about a second, so the gateway sees a timeout, passes the request, and counts a breaker failure.
 
 ## What is not checked
 

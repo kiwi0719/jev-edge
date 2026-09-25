@@ -168,7 +168,7 @@ The trajectory uses the same ring layout as the Lua core: one counter per subjec
 
 ## What is the same as nginx, and what is not
 
-Same, guaranteed by the golden vectors: text extraction, normalisation and fingerprints, every L1 decision, thresholds and the async flag, verdict headers and reason encoding, the order L1 / cache / breaker / L2. Same by construction: provider request bodies (the `jev` and `openai-compat` providers build the same JSON as the Lua ones), config keys and defaults, `/_jev/health`.
+Same, guaranteed by the golden vectors: text extraction, normalisation and fingerprints, every L1 decision, thresholds and the async flag, verdict headers and reason encoding, the order L1 / cache / breaker / L2, and what core reports to the breaker (only a transport error, a timeout, a 5xx or a 429 is a failure; a 200 with no usable answer and any other 4xx are not, and in half-open hand the probe on). Same by construction: provider request bodies (the `jev` and `openai-compat` providers build the same JSON as the Lua ones) and the error kind each provider gives a failed call, config keys and defaults, `/_jev/health`.
 
 Different, by platform:
 

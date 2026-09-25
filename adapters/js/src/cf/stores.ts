@@ -133,7 +133,7 @@ function storeOver(state: DOStateLike, clock: () => number): Store {
   };
 }
 
-interface BreakerOp { op: "allow" | "state" | "trip" | "success" | "failure"; cfg?: BreakerConfig; now?: number }
+interface BreakerOp { op: "allow" | "state" | "trip" | "success" | "failure" | "release"; cfg?: BreakerConfig; now?: number }
 interface AdaptiveOp { op: "current" | "success" | "timeout"; cfg: JevConfig; ms?: number }
 
 export class JevState {
@@ -172,6 +172,7 @@ export class JevState {
         case "trip": await b.trip(typeof body.now === "number" ? body.now : undefined); return Response.json({ ok: true });
         case "success": await b.success(); return Response.json({ ok: true });
         case "failure": await b.failure(); return Response.json({ ok: true });
+        case "release": await b.release(); return Response.json({ ok: true });
         default: return new Response("bad breaker op", { status: 400 });
       }
     }
@@ -229,6 +230,7 @@ export function durableBreaker(stub: DOStubLike, cfg: BreakerConfig = {}): Break
     trip: async (now?: number) => { await op("trip", now === undefined ? {} : { now }); },
     success: async () => { await op("success"); },
     failure: async () => { await op("failure"); },
+    release: async () => { await op("release"); },
   };
 }
 

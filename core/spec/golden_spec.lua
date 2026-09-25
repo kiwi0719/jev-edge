@@ -16,7 +16,7 @@ local function load(name)
   local f = assert(io.open("core/golden/" .. name .. ".json", "rb"), "missing golden file " .. name)
   local doc = assert(json.decode(f:read("*a")))
   f:close()
-  assert.equals(1, doc.format_version, "unknown golden format version")
+  assert.equals(2, doc.format_version, "unknown golden format version")
   return doc
 end
 
@@ -107,12 +107,16 @@ describe("golden: evaluate", function()
           rules[#rules + 1] = require("jev.rules." .. spec)
         end
       end
-      local breaker
+      local breaker, brk, brk_calls
       if inp.breaker then
         local bstore = H.store()
-        local st = inp.breaker == "open" and breaker_m.OPEN or breaker_m.CLOSED
-        bstore:set("brk:state", { state = st, until_ts = inp.clock + 30 })
-        breaker = breaker_m.new(bstore, function() return inp.clock end, {})
+        local st = inp.breaker == "closed" and breaker_m.CLOSED or breaker_m.OPEN
+        bstore:set("brk:state", { state = st, until_ts = inp.breaker == "half-open" and inp.clock or inp.clock + 30 })
+        brk = breaker_m.new(bstore, function() return inp.clock end, {})
+        brk_calls, breaker = {}, {}
+        for _, m in ipairs({ "allow", "success", "failure", "release" }) do
+          breaker[m] = function() brk_calls[#brk_calls + 1] = m; return brk[m](brk) end
+        end
       end
       local recorded, subject_ctx, swrites
       if inp.subject then
@@ -141,7 +145,7 @@ describe("golden: evaluate", function()
         hash = normalize.djb2, json_decode = H.body_decode, re_find = H.re_find,
         judge = { call = function(prompt)
           calls = calls + 1; seen = prompt
-          if inp.judge.error then return nil, inp.judge.error end
+          if inp.judge.error then return nil, inp.judge.error, inp.judge.kind end
           if inp.judge.by_question then
             local a = {}
             for n in pairs(prompt.questions) do a[n] = inp.judge.by_question[n] end
@@ -160,7 +164,8 @@ describe("golden: evaluate", function()
         prompt = { text = seen.text, context = seen.context, questions = names }
       end
       same(c.expect, { verdict = v, headers = verdict.headers(v), judge_calls = calls,
-        prompt = prompt, cache_writes = writes, subject_record = recorded, subject_store_writes = swrites })
+        prompt = prompt, cache_writes = writes, subject_record = recorded, subject_store_writes = swrites,
+        breaker = brk and { calls = brk_calls, state = brk:state() } })
     end)
   end
 end)

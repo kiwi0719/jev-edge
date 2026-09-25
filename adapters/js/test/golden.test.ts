@@ -15,7 +15,7 @@ interface Doc { format_version: number; suite: string; cases: Case[] }
 
 function load(name: string): Doc {
   const doc = JSON.parse(readFileSync(resolve(GOLDEN, name + ".json"), "utf8")) as Doc;
-  expect(doc.format_version).toBe(1);
+  expect(doc.format_version).toBe(2);
   return doc;
 }
 
@@ -85,11 +85,22 @@ describe("golden: evaluate", () => {
       const writes: Record<string, { value: unknown; ttl: number }> = {};
       let calls = 0;
       let seen: core.Prompt | undefined;
-      let breaker: Breaker | undefined;
+      // every call core makes on the breaker is recorded, with its state after
+      let brk: Breaker | undefined;
+      let breaker: core.Ctx["breaker"];
+      const brkCalls: string[] = [];
       if (inp.breaker) {
         const bstore = memoryStore();
-        bstore.set("brk:state", { state: inp.breaker === "open" ? OPEN : CLOSED, until_ts: inp.clock + 30 }, 0);
-        breaker = new Breaker(bstore, () => inp.clock, {});
+        const until = inp.breaker === "half-open" ? inp.clock : inp.clock + 30;
+        bstore.set("brk:state", { state: inp.breaker === "closed" ? CLOSED : OPEN, until_ts: until }, 0);
+        const b = new Breaker(bstore, () => inp.clock, {});
+        brk = b;
+        const rec = <T>(m: string, f: () => Promise<T>) => () => { brkCalls.push(m); return f(); };
+        breaker = {
+          state: () => b.state(), trip: (now?: number) => b.trip(now),
+          allow: rec("allow", () => b.allow()), success: rec("success", () => b.success()),
+          failure: rec("failure", () => b.failure()), release: rec("release", () => b.release()),
+        };
       }
       let recorded: core.SubjectEntry | null = null;
       const swrites: Record<string, { value: unknown; ttl: number }> | null = inp.subject ? {} : null;
@@ -126,7 +137,7 @@ describe("golden: evaluate", () => {
           call: (prompt) => {
             calls++;
             seen = prompt;
-            if (inp.judge.error) return [null, inp.judge.error];
+            if (inp.judge.error) return [null, inp.judge.error, inp.judge.kind];
             if (inp.judge.by_question) {
               // answers only the questions this prompt asked, as a provider does
               const a: Record<string, unknown> = {};
@@ -145,6 +156,7 @@ describe("golden: evaluate", () => {
       expect({
         verdict: v, headers: core.verdict.headers(v), judge_calls: calls, prompt,
         cache_writes: writes, subject_record: recorded, subject_store_writes: swrites,
+        breaker: brk ? { calls: brkCalls, state: await brk.state() } : null,
       }).toEqual(c.expect);
     });
   }

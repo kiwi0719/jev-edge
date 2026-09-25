@@ -13,6 +13,42 @@ local templates = {}
 -- requests trip the breaker and switch L2 off for everyone for open_s.
 _M.BUSY = "max_inflight exceeded"
 
+--- What a failed call ran into: the third value of a judge call that
+-- returns no answers (`nil, err, kind`). The breaker measures the provider's
+-- health, and the judged text is the client's: a 200 whose answer the text
+-- made unusable (a refusal, other keys), or a 4xx the text provoked (a
+-- provider's content filter, a strict parser), would let a client switch L2
+-- off for every tenant. So only the first three kinds count (counts()).
+_M.TRANSPORT   = "transport"    -- no HTTP answer: connect, DNS, TLS, reset
+_M.TIMEOUT     = "timeout"
+_M.UNAVAILABLE = "unavailable"  -- HTTP 5xx or 429
+_M.REJECTED    = "rejected"     -- any other non-2xx status: this call was refused
+_M.UNUSABLE    = "unusable"     -- 2xx, but no answer core can use
+
+--- The kind of a failed call the provider answered with this HTTP status.
+function _M.status_kind(status)
+  status = tonumber(status) or 0
+  if status >= 500 or status == 429 then return _M.UNAVAILABLE end
+  if status >= 200 and status < 300 then return _M.UNUSABLE end
+  return _M.REJECTED
+end
+
+--- Does a failed call count against the provider (a breaker failure)?
+-- A judge that gives no kind is counted, as every error was before kinds.
+function _M.counts(err, kind)
+  if err == _M.BUSY then return false end
+  if kind == nil then return true end
+  return kind == _M.TRANSPORT or kind == _M.TIMEOUT or kind == _M.UNAVAILABLE
+end
+
+--- The verdict reason for a failed call: the error, led by its kind when
+-- the breaker did not count it, so the reason says why it did not.
+function _M.reason(err, kind)
+  err = tostring(err or "error")
+  if kind == _M.REJECTED or kind == _M.UNUSABLE then return kind .. ": " .. err end
+  return err
+end
+
 --- Register a template. Ships with core/templates/*.lua.
 -- @param name string
 -- @param t { instructions = string, criteria = { [true]=..., [false]=... }|nil }

@@ -104,6 +104,114 @@ describe("core.evaluate end to end", function()
     assert.same({ ok = 1, fail = 0 }, w)
   end)
 
+  describe("which judge errors count against the breaker", function()
+    local J = require "jev.core.judge"
+    -- min_samples 1: a single counted failure trips the breaker
+    local function run(result, n)
+      local ctx = H.ctx({ config = { policy = { mode = "enforce" } },
+        judge = { call = function() return result[1], result[2], result[3] end } })
+      ctx.breaker = B.new(H.store(), ctx.clock, { min_samples = 1, fail_ratio = 0.5 })
+      local v
+      for i = 1, n or 1 do
+        v = core.evaluate(H.chat_req(LONG .. " variant " .. string.rep("x", i)), ctx)
+        assert.equals(V.ERROR, v.verdict)
+        assert.equals(V.ACTION_PASS, v.action, "fails open, as before")
+      end
+      return v, ctx.breaker:state()
+    end
+
+    it("a 200 the judged text made unusable, or a 4xx it provoked, never trips it", function()
+      -- the client decides these: a refusal, keys other than the questions,
+      -- a provider's content filter, a strict parser refusing the bytes
+      for _, r in ipairs({
+        { nil, "openai-compat: no content", J.UNUSABLE },
+        { nil, 'openai-compat: no numeric answers in {"status":"ok"}', J.UNUSABLE },
+        { nil, "openai-compat http 400", J.REJECTED },
+        { nil, "laya http 400", J.REJECTED },
+      }) do
+        local v, st = run(r, 25)
+        assert.equals(B.CLOSED, st, r[2])
+        assert.equals(r[3] .. ": " .. r[2], v.reason)
+        assert.is_true(v.async)
+      end
+      local v, st = run({ {} }, 25)
+      assert.equals(B.CLOSED, st)
+      assert.equals("unusable: no scores in answer", v.reason)
+    end)
+
+    it("transport errors, timeouts, 5xx and 429 still trip it", function()
+      for _, r in ipairs({
+        { nil, "connection refused", J.TRANSPORT },
+        { nil, "timeout", J.TIMEOUT },
+        { nil, "laya http 503", J.UNAVAILABLE },
+        { nil, "openai-compat http 429", J.UNAVAILABLE },
+        { nil, "error from a judge that gives no kind" },
+      }) do
+        local v, st = run(r)
+        assert.equals(B.OPEN, st, r[2])
+        assert.equals(r[2], v.reason)
+      end
+    end)
+
+    it("a half-open probe with a non-counting error hands the probe on", function()
+      local answer = { nil, "openai-compat: no content", J.UNUSABLE }
+      local calls = 0
+      local ctx = H.ctx({ judge = { call = function() calls = calls + 1; return answer[1], answer[2], answer[3] end } })
+      ctx.breaker = B.new(H.store(), ctx.clock, { open_s = 30 })
+      ctx.breaker:trip()
+      ctx._clock.advance(31)
+      local v = core.evaluate(H.chat_req(LONG .. " probe one"), ctx)
+      assert.equals("unusable: openai-compat: no content", v.reason)
+      assert.equals(B.HALF_OPEN, ctx.breaker:state(), "not re-opened, not closed")
+      -- the next request takes the probe instead of being skipped for open_s
+      answer = { { injection = 0.9 } }
+      v = core.evaluate(H.chat_req(LONG .. " probe two"), ctx)
+      assert.equals(V.SRC_L2, v.source)
+      assert.equals(2, calls)
+      assert.equals(B.CLOSED, ctx.breaker:state())
+    end)
+
+    it("a half-open probe that the provider fails re-opens it", function()
+      local ctx = H.ctx({ judge = { call = function() return nil, "laya http 502", J.UNAVAILABLE end } })
+      ctx.breaker = B.new(H.store(), ctx.clock, { open_s = 30 })
+      ctx.breaker:trip()
+      ctx._clock.advance(31)
+      core.evaluate(H.chat_req(LONG), ctx)
+      assert.equals(B.OPEN, ctx.breaker:state())
+    end)
+
+    it("chunks: the kinds carry through call_many; an answered chunk makes it a success", function()
+      local rules = require "jev.core.rules"
+      local rule = assert(rules.resolve({ id = "long", extends = "llm-endpoints", max_judge_bytes = 512,
+        max_judge_chunks = 4 }, function(x) return require("jev.rules." .. x) end))
+      local function ctx_with(results)
+        local ctx = H.ctx({ rules = { rule }, judge = {
+          call = function() error("call_many expected") end,
+          call_many = function(prompts)
+            local out = {}
+            for i = 1, #prompts do out[i] = results[(i - 1) % #results + 1] end
+            return out
+          end,
+        } })
+        ctx.breaker = B.new(H.store(), ctx.clock, { min_samples = 1, fail_ratio = 0.5 })
+        return ctx
+      end
+      local text = string.rep("The quarterly report covers revenue. ", 40)
+      local ctx = ctx_with({ { nil, "laya: malformed response", J.UNUSABLE } })
+      local v = core.evaluate(H.chat_req(text), ctx)
+      assert.equals("unusable: laya: malformed response", v.reason)
+      assert.equals(B.CLOSED, ctx.breaker:state())
+      ctx = ctx_with({ { nil, "laya http 400", J.REJECTED }, { { injection = 0.1 } } })
+      v = core.evaluate(H.chat_req(text), ctx)
+      assert.equals("rejected: laya http 400", v.reason)
+      local w = ctx.breaker.store:get("brk:w:" .. math.floor(ctx.clock() / 60))
+      assert.same({ ok = 1, fail = 0 }, w)
+      ctx = ctx_with({ { nil, "timeout", J.TIMEOUT }, { { injection = 0.1 } } })
+      core.evaluate(H.chat_req(text), ctx)
+      assert.equals(B.OPEN, ctx.breaker:state())
+    end)
+  end)
+
   it("skips L2 while the breaker is open", function()
     local calls = 0
     local ctx = H.ctx({ judge = { call = function() calls = calls + 1; return { injection = 0 } end } })

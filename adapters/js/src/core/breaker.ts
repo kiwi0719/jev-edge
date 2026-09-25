@@ -48,6 +48,10 @@ export interface BreakerLike {
   trip(now?: number): Promise<void>;
   success(): Promise<void>;
   failure(): Promise<void>;
+  /** The admitted request said nothing about the provider's health: count
+   *  nothing, and in half-open give the probe back. Optional for breakers
+   *  written before it; without it the probe claim runs out after open_s. */
+  release?(): Promise<void>;
 }
 
 export class Breaker implements BreakerLike {
@@ -128,6 +132,12 @@ export class Breaker implements BreakerLike {
 
   failure(): Promise<void> {
     return this.record(false);
+  }
+
+  /** Port of breaker.release: in half-open the next request probes instead
+   *  of L2 staying off until the claim expires, and nothing re-trips. */
+  async release(): Promise<void> {
+    if ((await this.state()) === HALF_OPEN) await this.store.set(this.c("key_prefix") + "probe", null, 0);
   }
 }
 

@@ -14,7 +14,10 @@ import type { JsonValue } from "./normalize.js";
 
 export const VERSION = "0.6.1";
 
-export type JudgeResult = [judge.Answers, null] | [null, string];
+/** A failed call may say what it ran into (judge.ErrorKind); only a
+ *  transport error, a timeout, a 5xx or a 429 is a breaker failure, and a
+ *  result with no kind is counted as before. */
+export type JudgeResult = [judge.Answers, null] | [null, string] | [null, string, judge.ErrorKind | undefined];
 
 export interface Judge {
   call(prompt: judge.Prompt, timeoutMs: number): Promise<JudgeResult> | JudgeResult;
@@ -58,6 +61,18 @@ async function finish(ctx: Ctx, v: verdict.Verdict): Promise<verdict.Verdict> {
   subject.record(ctx, v);
   await subject.repRecord(ctx, v);
   return v;
+}
+
+// Port of settle in core/init.lua: tell the breaker how a request it admitted
+// went. Only calls that reached the provider and found it failing count
+// against it (judge.counts); a request that says nothing about its health
+// releases a half-open probe.
+async function settle(ctx: Ctx, failed = false, answered = false): Promise<void> {
+  const b = ctx.breaker;
+  if (!b) return;
+  if (failed) await b.failure();
+  else if (answered) await b.success();
+  else if (b.release) await b.release();
 }
 
 /** Port of core.cache_key: the verdict-cache key for a fingerprint judged under
@@ -115,6 +130,7 @@ async function judgeParts(
       const [prompt, perr] = judge.build(part.templates, part.text, part.context);
       if (!prompt) {
         log(ctx, "error", "jev-edge: " + perr);
+        await settle(ctx);
         const [action, label, async] = policy.onError();
         return finish(ctx, verdict.newVerdict({ action, verdict: label, async, source: verdict.SRC_L2, reason: perr, fingerprint: fp }));
       }
@@ -136,12 +152,16 @@ async function judgeParts(
   let failed = false, answered = false;
   for (let k = 0; k < pending.length; k++) {
     const p = pending[k];
-    const [a, e] = results[k] ?? [null, "error"];
+    const r: JudgeResult = results[k] ?? [null, "error"];
+    const a = r[0];
+    let e: string | null = r[1];
+    let kind = r[2];
     let s = 0, t = "", n = 0;
     if (a) [s, t, n] = judge.reduce(a);
     if (!a || n === 0) {
-      err ??= String(e ?? (a ? "no scores in answer" : "error"));
-      if (e !== judge.BUSY) failed = true;
+      if (a) [e, kind] = ["no scores in answer", judge.UNUSABLE];
+      err ??= judge.reason(e, kind);
+      if (judge.counts(e, kind)) failed = true;
     } else {
       answered = true;
       scores[p.i] = s;
@@ -150,10 +170,7 @@ async function judgeParts(
     }
   }
   // only calls that reached the provider say anything about its health
-  if (ctx.breaker) {
-    if (failed) await ctx.breaker.failure();
-    else if (answered) await ctx.breaker.success();
-  }
+  await settle(ctx, failed, answered);
 
   let best: number | undefined;
   let top = "";
@@ -254,6 +271,7 @@ export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
   if (chunks && chunks.length > 1) {
     // max_judge_chunks > 1: what still did not fit is unjudgeable
     if (capped && cfg.policy.unjudgeable === "block" && cfg.policy.mode === "enforce") {
+      await settle(ctx);
       return finish(ctx, verdict.newVerdict({
         action: verdict.ACTION_BLOCK, verdict: verdict.SKIPPED, source: verdict.SRC_L1,
         reason: "unjudgeable: text over max_judge_chunks", fingerprint: fp,
@@ -289,34 +307,38 @@ export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
   });
   if (!prompt) {
     log(ctx, "error", "jev-edge: " + perr);
+    await settle(ctx);
     const [action, label, async] = policy.onError();
     return finish(ctx, verdict.newVerdict({ action, verdict: label, async, source: verdict.SRC_L2, reason: perr, fingerprint: fp }));
   }
 
   const t0 = nowMs(ctx);
-  const [answers, jerr] = await ctx.judge.call(prompt, cfg.jev.timeout_ms);
+  const [answers, jerr, jkind] = await ctx.judge.call(prompt, cfg.jev.timeout_ms);
   const elapsed = nowMs(ctx) - t0;
 
   if (!answers) {
-    if (ctx.breaker && jerr !== judge.BUSY) await ctx.breaker.failure();
-    log(ctx, "warn", "jev-edge: L2 failed: " + String(jerr));
+    const why = judge.reason(jerr, jkind);
+    await settle(ctx, judge.counts(jerr, jkind));
+    log(ctx, "warn", "jev-edge: L2 failed: " + why);
     const [action, label, async] = policy.onError();
     return finish(ctx, verdict.newVerdict({
       action, verdict: label, async, source: verdict.SRC_L2,
-      reason: String(jerr ?? "error"), fingerprint: fp, l2_ms: elapsed,
+      reason: why, fingerprint: fp, l2_ms: elapsed,
     }));
   }
 
   const [score, top, n] = judge.reduce(answers);
   if (n === 0) {
-    // An answer with no score in it is a provider fault, not a SAFE verdict:
-    // caching score 0 would wave the same text through for fp_ttl.
-    if (ctx.breaker) await ctx.breaker.failure();
+    // An answer with no score in it is an error, not a SAFE verdict: caching
+    // score 0 would wave the same text through for fp_ttl. Nor is it the
+    // provider failing: the judged text can make a judge answer that way.
+    const why = judge.reason("no scores in answer", judge.UNUSABLE);
+    await settle(ctx);
     log(ctx, "warn", "jev-edge: L2 answer has no scores");
     const [action, label, async] = policy.onError();
     return finish(ctx, verdict.newVerdict({
       action, verdict: label, async, source: verdict.SRC_L2,
-      reason: "no scores in answer", fingerprint: fp, l2_ms: elapsed,
+      reason: why, fingerprint: fp, l2_ms: elapsed,
     }));
   }
   if (ctx.breaker) await ctx.breaker.success();

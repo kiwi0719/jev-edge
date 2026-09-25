@@ -317,6 +317,34 @@ rule("ci-ok", function(r)
   end
 end)
 
+-- 13. Only a provider that is failing counts against the breaker: core
+--     reports through settle(), with judge.counts deciding, and the Lua HTTP
+--     client classifies by status (a 200 the judged text made unusable, or a
+--     4xx it provoked, let a client switch L2 off for every tenant)
+rule("breaker-failures", function(r)
+  local core_files = { ["core/init.lua"] = true, ["adapters/js/src/core/index.ts"] = true }
+  for f in pairs(core_files) do
+    local s = code(f)
+    local n = select(2, s:gsub("[:%.]failure%(%)", ""))
+    if n ~= 1 then fail(r, f .. ": " .. n .. " breaker failure() calls; report through settle() only") end
+    if not s:find("judge%.counts%(") then fail(r, f .. ": failed calls are not classified with judge.counts") end
+  end
+  local own = { ["core/breaker.lua"] = true, ["adapters/js/src/core/breaker.ts"] = true,
+                ["adapters/js/src/cf/stores.ts"] = true }  -- the breaker and its Durable Object proxy
+  local files = tracked("adapters/openresty/lib", "%.lua$")
+  for _, f in ipairs(tracked("adapters/js/src", "%.ts$")) do files[#files + 1] = f end
+  files[#files + 1] = "adapters/apisix/apisix/plugins/jev-edge.lua"
+  files[#files + 1] = "adapters/kong/kong/plugins/jev-edge/handler.lua"
+  for _, f in ipairs(files) do
+    if not core_files[f] and not own[f] and code(f):find("[:%.]failure%(%)") then
+      fail(r, f .. ": feeds the breaker outside core")
+    end
+  end
+  if not code("adapters/openresty/lib/resty/jev/http.lua"):find("judge%.status_kind%(res%.status%)") then
+    fail(r, "resty/jev/http.lua: a failed parse is not classified by the provider's status")
+  end
+end)
+
 -- ---------------------------------------------------------------------------
 if #failures > 0 then
   io.stderr:write(("invariants: %d problem(s) across %d rules\n"):format(#failures, checked))

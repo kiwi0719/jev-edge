@@ -193,7 +193,102 @@ export interface DOStubLike {
   fetch(input: string | Request, init?: RequestInit): Promise<Response>;
 }
 
-function caller(stub: DOStubLike) {
+/** The Durable Object namespace binding (env.JEV_STATE), not a stub made from it. */
+export interface DONamespaceLike {
+  idFromName(name: string): unknown;
+  get(id: unknown): DOStubLike;
+}
+
+/** The one JevState object a deployment uses: `idFromName` of this. */
+export const STATE_OBJECT = "jev-edge";
+
+/**
+ * A Durable Object stub, told apart from a Store by the one thing it always
+ * has and a Store never does: a `fetch` method. Not by what it lacks: a
+ * workerd stub answers every property name (each one an RPC method on
+ * compatibility dates from 2024-04-03, the old Fetcher get / put / delete
+ * before that), so `"get" in stub` is true for every real one.
+ */
+export function isStub(x: unknown): x is DOStubLike {
+  return (typeof x === "object" || typeof x === "function") && x !== null && typeof (x as DOStubLike).fetch === "function";
+}
+
+/** A namespace binding: idFromName and get, and no `fetch`, which every stub has. */
+export function isNamespace(x: unknown): x is DONamespaceLike {
+  if (typeof x !== "object" || x === null || isStub(x)) return false;
+  const n = x as DONamespaceLike;
+  return typeof n.idFromName === "function" && typeof n.get === "function";
+}
+
+// A stub is an I/O object of the request that made it: workerd refuses it in
+// any later one. A namespace is not, so a runtime given one (and kept at
+// module scope, or across requests by a preset) makes its stub per call;
+// idFromName is a hash and get() no round trip.
+const CROSS_REQUEST = /Cannot perform I\/O on behalf of a different request/;
+const STALE_STUB =
+  "jev-edge: a Durable Object stub made in one request was used in a later one, which workerd refuses " +
+  '("Cannot perform I/O on behalf of a different request"). Breaker, adaptive timeout and any durableStore on ' +
+  "this stub now use this isolate's memory. Fix: pass the namespace, createRuntime({ state: env.JEV_STATE }) " +
+  "or durableStore(env.JEV_STATE), which makes a stub per call; or build the runtime per request.";
+
+const resolved = new WeakSet<object>();
+const guards = new WeakMap<object, DOStubLike>();
+
+/**
+ * A stub kept past its request answers every call with the cross-request
+ * error, which would fail open every request after the first. Instead the
+ * first such error is logged once, naming the fix, and this stub's calls go to
+ * a JevState over isolate memory: the same state a runtime without a binding
+ * keeps. Any other error is the caller's, as before.
+ */
+function guarded(stub: DOStubLike): DOStubLike {
+  const known = guards.get(stub);
+  if (known) return known;
+  let local: JevState | undefined;
+  const toLocal = (input: string | Request, init?: RequestInit) => local!.fetch(new Request(input, init));
+  const g: DOStubLike = {
+    fetch: async (input, init) => {
+      if (local) return toLocal(input, init);
+      try {
+        return await stub.fetch(input, init);
+      } catch (e) {
+        if (!CROSS_REQUEST.test(e instanceof Error ? e.message : String(e))) throw e;
+        if (!local) {
+          console.error(STALE_STUB);
+          local = new JevState(memoryState());
+        }
+        return toLocal(input, init);
+      }
+    },
+  };
+  guards.set(stub, g);
+  resolved.add(g);
+  return g;
+}
+
+function memoryState(): DOStateLike {
+  const m = new Map<string, unknown>();
+  return { storage: { get: async (k) => m.get(k), put: async (k, v) => { m.set(k, v); }, delete: async (k) => m.delete(k) } };
+}
+
+/**
+ * What the durable* helpers call: for a namespace, a stub made per call
+ * (`idFromName(name)`); for a stub, the stub guarded against use past its
+ * request. Idempotent.
+ */
+export function stateStub(target: DOStubLike | DONamespaceLike, name = STATE_OBJECT): DOStubLike {
+  if (resolved.has(target)) return target as DOStubLike;
+  if (isNamespace(target)) {
+    const ns = target;
+    const s: DOStubLike = { fetch: (input, init) => ns.get(ns.idFromName(name)).fetch(input, init) };
+    resolved.add(s);
+    return s;
+  }
+  return guarded(target);
+}
+
+function caller(target: DOStubLike | DONamespaceLike) {
+  const stub = stateStub(target);
   return async (path: string, payload: unknown): Promise<{ value?: unknown; ok?: boolean }> => {
     const res = await stub.fetch("https://jev-state" + path, {
       method: "POST",
@@ -205,8 +300,8 @@ function caller(stub: DOStubLike) {
   };
 }
 
-/** The plain Store interface over a JevState stub: two hops per read-modify-write, one (atomic) per incr. */
-export function durableStore(stub: DOStubLike): Store {
+/** The plain Store interface over JevState (a namespace, or a stub): two hops per read-modify-write, one (atomic) per incr. */
+export function durableStore(stub: DOStubLike | DONamespaceLike): Store {
   const call = caller(stub);
   return {
     get: async (k) => (await call("/get", { key: k })).value ?? undefined,
@@ -221,7 +316,7 @@ export function durableStore(stub: DOStubLike): Store {
 }
 
 /** A breaker whose every operation is one fetch, executed inside the Durable Object. */
-export function durableBreaker(stub: DOStubLike, cfg: BreakerConfig = {}): BreakerLike {
+export function durableBreaker(stub: DOStubLike | DONamespaceLike, cfg: BreakerConfig = {}): BreakerLike {
   const call = caller(stub);
   const op = (o: BreakerOp["op"], extra: Record<string, unknown> = {}) => call("/breaker", { op: o, cfg, ...extra });
   return {
@@ -235,7 +330,7 @@ export function durableBreaker(stub: DOStubLike, cfg: BreakerConfig = {}): Break
 }
 
 /** Adaptive timeout whose observe() runs inside the Durable Object: one fetch, atomic. */
-export function durableAdaptive(stub: DOStubLike, cfg: JevConfig): AdaptiveLike {
+export function durableAdaptive(stub: DOStubLike | DONamespaceLike, cfg: JevConfig): AdaptiveLike {
   const call = caller(stub);
   const t = tuning(cfg);
   const op = (o: AdaptiveOp["op"], extra: Record<string, unknown> = {}) => call("/adaptive", { op: o, cfg, ...extra });

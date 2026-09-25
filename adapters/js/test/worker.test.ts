@@ -379,6 +379,120 @@ describe("stores", () => {
     }
   });
 
+  /** A namespace shaped like workerd's binding: idFromName and get, no fetch.
+   *  Every stub it hands out is bound to the request current when it was made. */
+  function namespace(target: { fetch(i: string | Request, init?: RequestInit): Promise<Response> }) {
+    const clock = { request: 0, made: 0 };
+    const ns = {
+      idFromName: (n: string) => ({ name: n }),
+      get: (id: unknown) => {
+        clock.made++;
+        expect(id).toEqual({ name: "jev-edge" });
+        const mine = clock.request;
+        return rpcStub(target, () => clock.request === mine);
+      },
+    };
+    return { ns, clock };
+  }
+
+  // a small delay, so each judge call leaves an adaptive sample (ms > 0)
+  const ENFORCE95 = { jev: { provider: "mock", mock_score: 0.95, mock_delay_ms: 2, timeout_ms: 400 }, policy: { mode: "enforce" as const } };
+  // distinct texts, so each request reaches the breaker instead of the cache
+  const attack = (i: number) => ATTACK.replace("prompt.", "prompt, take " + i + ".");
+
+  it("a runtime kept across requests works when given the namespace: a stub per operation", async () => {
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const { stub, calls } = dobj();
+      const { ns, clock } = namespace(stub);
+      const rt = createRuntime({ config: ENFORCE95, state: ns });
+      for (let i = 0; i < 3; i++) {
+        clock.request++;
+        const before = calls();
+        const res = await handle(chat(attack(i)), rt, echo);
+        expect(res.status).toBe(403);
+        expect(res.headers.get("x-jev-source")).toBe("l2");
+        expect(calls()).toBeGreaterThan(before); // the Durable Object answered, not a fallback
+      }
+      expect(clock.made).toBe(calls()); // one stub per operation
+      expect(err).not.toHaveBeenCalled();
+      expect(await rt.state.get("adapt")).toMatchObject({ n: 3 });
+    } finally {
+      err.mockRestore();
+    }
+  });
+
+  it("durableStore takes the namespace too", async () => {
+    const { stub } = dobj();
+    const { ns, clock } = namespace(stub);
+    const store = durableStore(ns);
+    await store.set("a", { x: 1 }, 60);
+    clock.request++;
+    expect(await store.get("a")).toEqual({ x: 1 });
+    clock.request++;
+    expect(await store.incr!("n", 2, 60)).toBe(2);
+  });
+
+  it("a stub kept past its request: logged once with the fix, and judging goes on in isolate memory", async () => {
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const { stub, calls } = dobj();
+      let request = 1;
+      const rt = createRuntime({ config: ENFORCE95, state: rpcStub(stub, () => request === 1) });
+      const first = await handle(chat(attack(0)), rt, echo);
+      expect(first.status).toBe(403);
+      const reached = calls();
+      expect(reached).toBeGreaterThan(0);
+      for (let i = 1; i <= 3; i++) {
+        request++;
+        const res = await handle(chat(attack(i)), rt, echo);
+        expect(res.status).toBe(403);
+        expect(res.headers.get("x-jev-verdict")).toBe("malicious");
+        expect(res.headers.get("x-jev-source")).toBe("l2"); // judged, not failed open by the adapter
+      }
+      expect(calls()).toBe(reached); // the stale stub reached the object no more
+      const msgs = err.mock.calls.map((c) => String(c[0]));
+      expect(msgs).toHaveLength(1);
+      expect(msgs[0]).toMatch(/different request/);
+      expect(msgs[0]).toContain("createRuntime({ state: env.JEV_STATE })");
+      // breaker, adaptive and rt.state share the one fallback
+      expect(await rt.state.get("adapt")).toMatchObject({ n: 3 });
+    } finally {
+      err.mockRestore();
+    }
+  });
+
+  it("any other error from a stub still fails open, with no fallback", async () => {
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const broken = { fetch: async (): Promise<Response> => { throw new Error("network connection lost"); } };
+      const rt = createRuntime({ config: ENFORCE95, state: broken });
+      for (let i = 0; i < 2; i++) {
+        const j = (await (await handle(chat(attack(i)), rt, echo)).json()) as Record<string, string>;
+        expect(j.verdict).toBe("error");
+        expect(j.source).toBe("adapter");
+      }
+      const msgs = err.mock.calls.map((c) => String(c[0]));
+      expect(msgs).toHaveLength(2);
+      expect(msgs.every((m) => m.includes("failing open") && m.includes("network connection lost"))).toBe(true);
+    } finally {
+      err.mockRestore();
+    }
+  });
+
+  it("tells a namespace from a stub and from a Store", async () => {
+    const { isNamespace, isStub } = await import("../src/cf/stores");
+    const { stub } = dobj();
+    const { ns } = namespace(stub);
+    expect(isNamespace(ns)).toBe(true);
+    expect(isStub(ns)).toBe(false);
+    const rpc = rpcStub(stub);
+    expect(isStub(rpc)).toBe(true);
+    expect(isNamespace(rpc)).toBe(false); // answers idFromName and get, but has fetch
+    expect(isNamespace(memoryStore())).toBe(false);
+    expect(isStub(memoryStore())).toBe(false);
+  });
+
   it("the adaptive estimate is one document", async () => {
     const { Adaptive } = await import("../src/cf/adaptive");
     const store = memoryStore();

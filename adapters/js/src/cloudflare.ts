@@ -12,7 +12,7 @@
 //   pagesMiddleware(opts) same as fullWorker, exported as a Pages Functions
 //                         middleware: `export const onRequest = pagesMiddleware({...})`.
 import { createRuntime, handle, type Options, type Runtime, type RequestCtx } from "./runtime.js";
-import { JevState, type KVLike, type DOStubLike } from "./cf/stores.js";
+import { JevState, type KVLike, type DONamespaceLike } from "./cf/stores.js";
 
 export { JevState };
 
@@ -20,7 +20,7 @@ export { JevState };
 
 export interface WorkerEnv {
   JEV_CACHE?: KVLike;
-  JEV_STATE?: { idFromName(name: string): unknown; get(id: unknown): DOStubLike };
+  JEV_STATE?: DONamespaceLike;
   TYPESAFE_API_KEY?: string;
   JEV_ORIGIN?: string;
   [k: string]: unknown;
@@ -33,14 +33,9 @@ function runtimeFor<E extends WorkerEnv>(resolve: Resolve<E>, env: E, cache: Wea
   if (hit) return hit;
   const o: Options = { ...(typeof resolve === "function" ? resolve(env) : resolve), platform: "cloudflare" };
   if (!o.cache && env.JEV_CACHE) o.cache = env.JEV_CACHE;
-  if (!o.state && env.JEV_STATE) {
-    // A stub is an I/O object of the request that made it: workerd refuses
-    // it in any later one ("Cannot perform I/O on behalf of a different
-    // request"), and this runtime lives as long as the isolate. So every
-    // call gets a fresh stub; idFromName is a hash and get() no round trip.
-    const ns = env.JEV_STATE;
-    o.state = { fetch: (input, init) => ns.get(ns.idFromName("jev-edge")).fetch(input, init) };
-  }
+  // the namespace, not a stub: this runtime lives as long as the isolate,
+  // and a stub only as long as the request that made it (cf/stores.ts)
+  if (!o.state && env.JEV_STATE) o.state = env.JEV_STATE;
   if (env.TYPESAFE_API_KEY) o.config = { ...o.config, jev: { api_key: env.TYPESAFE_API_KEY, ...o.config?.jev } };
   const rt = createRuntime(o);
   cache.set(env, rt);

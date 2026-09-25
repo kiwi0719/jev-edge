@@ -124,13 +124,13 @@ func TestDecisionBlockAndFailOpen(t *testing.T) {
 	}
 }
 
-// A path the agent cannot relay as the backend reads it: a '%' without two
-// hex digits after it (IIS-style %u0063, a bare %, %zz, a cut-off %4), a
-// %00, a control character, an overlong UTF-8 form. cpp-httplib (llama.cpp)
-// decodes %u0063 to 'c', so /v1/%u0063ompletions is /v1/completions there.
-// It is blocked with 400 as nginx answers it inline, whatever -unjudged
-// says, and jev-edge is not asked; before, Go could not build the authz URL
-// for most of them and the agent failed open.
+// A path nginx refuses with 400 before jev-edge runs: a '%' without two hex
+// digits after it (IIS-style %u0063, a bare %, %zz, a cut-off %4) or a %00;
+// or a control character, which Go cannot put in a URL. cpp-httplib
+// (llama.cpp) decodes %u0063 to 'c', so /v1/%u0063ompletions is
+// /v1/completions there. It is blocked with 400 as nginx answers it inline,
+// whatever -unjudged says, and jev-edge is not asked; before, Go could not
+// build the authz URL for most of them and the agent failed open.
 func TestMalformedPathIsBlockedWith400(t *testing.T) {
 	called := false
 	authz(t, func(w http.ResponseWriter, r *http.Request) {
@@ -145,7 +145,6 @@ func TestMalformedPathIsBlockedWith400(t *testing.T) {
 			"/v1/%u0063ompletions", "/%u0063ompletion", "/v1%u002fchat/completions", "/v1/chat/%U0063ompletions",
 			"/v1/chat/completions%", "/v1/%zzchat/completions", "/v1/chat/completions%4",
 			"/v1/chat/completions%00", "/v1/comp\x01letions", "/v1/comp\x7fletions",
-			"/v1/%C0%AEchat/completions", "/v1%C0%AFchat/completions", "/v1/%E0%80%AE/completions", "/v1/%FFchat",
 			// refused with 400 even when safePath would also refuse them
 			"/v1//%u0063ompletions", "/v1/../%zz", "/v1/%2e%2e/%u002f", "v1/%u0063ompletions",
 		} {
@@ -159,14 +158,19 @@ func TestMalformedPathIsBlockedWith400(t *testing.T) {
 	}
 }
 
-// Well-formed escapes, UTF-8 included, still reach jev-edge as sent.
+// Well-formed escapes still reach jev-edge as sent: UTF-8, an escaped
+// control character, and escapes of bytes that are not UTF-8 (the overlong
+// %C0%AE, %FF), which nginx and HAProxy take and jev-edge judges as sent.
 func TestWellFormedEscapesAreForwardedAsSent(t *testing.T) {
 	var got string
 	authz(t, func(w http.ResponseWriter, r *http.Request) {
 		got = r.RequestURI
 		w.Header().Set("X-Jev-Verdict", "safe")
 	})
-	for _, p := range []string{"/v1/%63ompletions", "/v1/chat%2Fcompletions", "/v1/models/%E6%A8%A1%E5%9E%8B", "/v1/a%25b", "/v1/%0a"} {
+	for _, p := range []string{
+		"/v1/%63ompletions", "/v1/chat%2Fcompletions", "/v1/models/%E6%A8%A1%E5%9E%8B", "/v1/a%25b", "/v1/%0a", "/v1/%01x",
+		"/v1/%C0%AEchat/completions", "/v1%C0%AFchat/completions", "/v1/%E0%80%AE/completions", "/v1/%FFchat", "/v1/%c0%ae", "/v1/a%2500",
+	} {
 		if v := check(msg(map[string]string{"method": "POST", "path": p, "body": "{}"})); v["verdict"] != "safe" || v["action"] != "pass" {
 			t.Fatalf("%q: vars = %v", p, v)
 		}

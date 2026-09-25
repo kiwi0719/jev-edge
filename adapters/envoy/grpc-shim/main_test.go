@@ -167,15 +167,15 @@ func TestUnsafePathsAreNotForwarded(t *testing.T) {
 	}
 }
 
-// Paths the shim cannot relay as the backend reads them: a '%' without two
-// hex digits after it (IIS-style %u0063, a bare %, %zz, a cut-off %4), a %00,
-// a control character, an overlong UTF-8 form. cpp-httplib (llama.cpp)
-// decodes %u0063 to 'c', so /v1/%u0063ompletions is /v1/completions there.
+// Paths nginx refuses with 400 before jev-edge runs: a '%' without two hex
+// digits after it (IIS-style %u0063, a bare %, %zz, a cut-off %4) and a %00;
+// and a control character, which Go cannot put in a URL. cpp-httplib
+// (llama.cpp) decodes %u0063 to 'c', so /v1/%u0063ompletions is
+// /v1/completions there.
 var malformedPaths = []string{
 	"/v1/%u0063ompletions", "/%u0063ompletion", "/v1%u002fchat/completions", "/v1/chat/%U0063ompletions",
 	"/v1/chat/completions%", "/v1/%zzchat/completions", "/v1/chat/completions%4", "/v1/%u0063ompletions?stream=true",
 	"/v1/chat/completions%00", "/v1/comp\x01letions", "/v1/comp\x7fletions",
-	"/v1/%C0%AEchat/completions", "/v1%C0%AFchat/completions", "/v1/%E0%80%AE/completions", "/v1/%FFchat",
 	// refused with 400 even when safePath would also refuse them
 	"/v1//%u0063ompletions", "/v1/../%zz", "/v1/%2e%2e/%u002f", "v1/%u0063ompletions",
 }
@@ -210,15 +210,20 @@ func TestMalformedPathIsDeniedWith400(t *testing.T) {
 	}
 }
 
-// Well-formed escapes, UTF-8 included, still reach the adapter as sent; the
-// query string is not the path and is not checked.
+// Well-formed escapes still reach the adapter as sent: UTF-8, an escaped
+// control character, and escapes of bytes that are not UTF-8 (the overlong
+// %C0%AE, %FF), which nginx, Envoy and HAProxy take and jev-edge judges as
+// sent. The query string is not the path and is not checked.
 func TestWellFormedEscapesAreForwardedAsSent(t *testing.T) {
 	var got string
 	s, _ := newServer(t, func(w http.ResponseWriter, r *http.Request) {
 		got = r.RequestURI
 		w.Header().Set("X-Jev-Verdict", "safe")
 	})
-	for _, p := range []string{"/v1/%63ompletions", "/v1/chat%2Fcompletions", "/v1/models/%E6%A8%A1%E5%9E%8B", "/v1/a%25b", "/v1/%0a"} {
+	for _, p := range []string{
+		"/v1/%63ompletions", "/v1/chat%2Fcompletions", "/v1/models/%E6%A8%A1%E5%9E%8B", "/v1/a%25b", "/v1/%0a", "/v1/%01x",
+		"/v1/%C0%AEchat/completions", "/v1%C0%AFchat/completions", "/v1/%E0%80%AE/completions", "/v1/%FFchat", "/v1/%c0%ae", "/v1/a%2500",
+	} {
 		res, _ := s.Check(context.Background(), checkReq(p+"?x=%zz", nil))
 		if res.GetOkResponse() == nil {
 			t.Fatalf("%q: expected OK, got %v", p, res)

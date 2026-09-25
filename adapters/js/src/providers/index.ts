@@ -5,11 +5,13 @@
 //   backend        an existing jev-edge (OpenResty/Envoy) reached at /_jev/authz:
 //                  the "thin Worker" mode, one set of thresholds for edge and origin
 //   mock           fixed score, no network
-import type { Prompt, Answers } from "../core/judge.js";
+import { TRANSPORT, TIMEOUT, UNUSABLE, statusKind, type Prompt, type Answers, type ErrorKind } from "../core/judge.js";
 import type { JevConfig, QuestionWording } from "../core/defaults.js";
 import type { Template } from "../core/templates.js";
 
-export type JudgeResult = [Answers, null] | [null, string];
+/** A failure carries its kind (core/judge.ts): a provider that answered 200
+ *  with nothing usable, or a 4xx, is not a breaker failure. */
+export type JudgeResult = [Answers, null] | [null, string] | [null, string, ErrorKind | undefined];
 
 export interface Provider {
   name: string;
@@ -75,6 +77,13 @@ function errorString(e: unknown, timeoutMs: number): string {
   return e instanceof Error ? e.message : String(e);
 }
 
+/** A call that got no HTTP answer: past the deadline, or fetch itself failed
+ *  (connect, DNS, TLS, reset). Both count against the provider. */
+function noAnswer(e: unknown, timeoutMs: number): JudgeResult {
+  const timedOut = e instanceof TimeoutError || (e instanceof Error && e.name === "AbortError");
+  return [null, errorString(e, timeoutMs), timedOut ? TIMEOUT : TRANSPORT];
+}
+
 // ---------------------------------------------------------------------------
 
 /**
@@ -114,11 +123,11 @@ function systemOne(name: string, defaults: { model: string; url: string }): Prov
           }
         });
       } catch (e) {
-        if (e instanceof HttpStatus) return [null, `${name} http ${e.status}`];
-        if (e instanceof Error && e.message === "malformed response") return [null, `${name}: malformed response`];
-        return [null, errorString(e, timeoutMs)];
+        if (e instanceof HttpStatus) return [null, `${name} http ${e.status}`, statusKind(e.status)];
+        if (e instanceof Error && e.message === "malformed response") return [null, `${name}: malformed response`, UNUSABLE];
+        return noAnswer(e, timeoutMs);
       }
-      if (!decoded || typeof decoded.answers !== "object" || decoded.answers === null) return [null, `${name}: malformed response`];
+      if (!decoded || typeof decoded.answers !== "object" || decoded.answers === null) return [null, `${name}: malformed response`, UNUSABLE];
       const answers: Answers = {};
       for (const [qname, a] of Object.entries(decoded.answers)) {
         if (a && typeof a === "object" && typeof a.noul === "number") answers[qname] = a.noul;
@@ -357,11 +366,11 @@ export const openaiCompat: Provider = {
         }
       });
     } catch (e) {
-      if (e instanceof HttpStatus) return [null, "openai-compat http " + e.status];
-      if (e instanceof Error && e.message === "malformed response") return [null, "openai-compat: malformed response"];
-      return [null, errorString(e, timeoutMs)];
+      if (e instanceof HttpStatus) return [null, "openai-compat http " + e.status, statusKind(e.status)];
+      if (e instanceof Error && e.message === "malformed response") return [null, "openai-compat: malformed response", UNUSABLE];
+      return noAnswer(e, timeoutMs);
     }
-    if (typeof content !== "string") return [null, "openai-compat: no content"];
+    if (typeof content !== "string") return [null, "openai-compat: no content", UNUSABLE];
     const wanted = Object.keys(prompt.questions);
     // a reply that copies an answer planted in the input: the judge was
     // steered, so every asked question scores 1 (an error would fail open,
@@ -370,7 +379,10 @@ export const openaiCompat: Provider = {
       console.warn("jev-edge: openai-compat judge echoed an answer planted in the input");
       return [Object.fromEntries(wanted.map((n) => [n, 1])), null];
     }
-    return parseOpenaiContent(content, wanted);
+    // a 200 whose reply answers nothing usable: the judged text can cause
+    // that, so it is not the provider failing
+    const r = parseOpenaiContent(content, wanted);
+    return r[0] ? r : [null, r[1], UNUSABLE];
   },
 };
 
@@ -411,7 +423,7 @@ export const backend: Provider = {
         return r;
       });
     } catch (e) {
-      return [null, errorString(e, timeoutMs)];
+      return noAnswer(e, timeoutMs);
     }
     const verdict = res.headers.get("x-jev-verdict") ?? "";
     const score = Number(res.headers.get("x-jev-score"));
@@ -419,9 +431,11 @@ export const backend: Provider = {
       const name = (res.headers.get("x-jev-reason") ?? "backend").split("+")[0] || "backend";
       return [{ [name]: Number.isFinite(score) && score > 0 ? score : 1 }, null];
     }
-    if (res.status !== 200) return [null, "backend http " + res.status];
-    if (verdict === "error") return [null, "backend: " + decodeURIComponent((res.headers.get("x-jev-reason") ?? "error").replace(/\+/g, " "))];
-    if (!Number.isFinite(score)) return [null, "backend: no X-Jev-Score"];
+    if (res.status !== 200) return [null, "backend http " + res.status, statusKind(res.status)];
+    // The origin answered but had no score: its own L2 failed, and its own
+    // breaker counts that when it should. The origin itself is healthy.
+    if (verdict === "error") return [null, "backend: " + decodeURIComponent((res.headers.get("x-jev-reason") ?? "error").replace(/\+/g, " ")), UNUSABLE];
+    if (!Number.isFinite(score)) return [null, "backend: no X-Jev-Score", UNUSABLE];
     const name = (res.headers.get("x-jev-reason") ?? "backend").split("+")[0] || "backend";
     return [{ [name]: score }, null];
   },

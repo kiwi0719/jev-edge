@@ -41,9 +41,9 @@ An implementation replays a case by constructing its IO from `input` exactly as 
 - **`subject.store`**: preloads the subject store (reputation counters); every write to it is recorded as `{ value, ttl }` in `expect.subject_store_writes` (`null` without a subject).
 - **judge calls**: text judged in chunks makes one `judge.call` per chunk that missed the cache, in chunk order (`expect.judge_calls`); `expect.prompt` is the last prompt the core built. An adapter may run them in parallel through `judge.call_many`; the vectors pin the sequential order.
 - **`config`**: deep-merged over `core/defaults.lua`.
-- **`judge`**: `{ answers }` returns that map from the judge call; `{ error }` returns `nil, error`. `expect.judge_calls` counts calls and `expect.prompt` records the prompt the core built: `text`, `context` and the sorted question names.
+- **`judge`**: `{ answers }` returns that map from the judge call; `{ error, kind }` returns `nil, error, kind` (`kind` may be absent: a judge that does not classify its errors). `expect.judge_calls` counts calls and `expect.prompt` records the prompt the core built: `text`, `context` and the sorted question names.
 - **`subject`**: `null` means no subject context injected at all. Otherwise `{ id, history }` is passed as `ctx.subject` together with a `record` sink that captures the single entry the core hands over; that entry (or `null`) is `expect.subject_record`. **`history` must change nothing**: several cases pass a non-empty one and expect the same verdict as their subject-less twin. This version records trajectories, it does not score on them.
-- **`breaker`**: `null` means no breaker injected. `"open"` is a breaker whose open period has not elapsed at `clock`; `"closed"` is a healthy one.
+- **`breaker`**: `null` means no breaker injected. `"open"` is a breaker whose open period has not elapsed at `clock`; `"half-open"` one whose open period ends at `clock`; `"closed"` is a healthy one, all over an empty store with the default breaker settings. The double records every call core makes on it (`allow`, `success`, `failure`, `release`), in order, as `expect.breaker.calls`, and its state after the request (`0` closed, `1` open, `2` half-open) as `expect.breaker.state` (`null` without a breaker).
 - **`hash`** is the reference djb2 (`normalize.djb2`), **`json_decode`** is any RFC 8259 parser, **`re_find`** is a case-insensitive regex search that returns the match's 1-based inclusive **byte** span `from, to` (UTF-8 bytes, not UTF-16 indices), or nothing. A bare truthy value still decides L1, but the judging window can then not place the hit, and the cases over `max_judge_bytes` will not match.
 
 ## What parity covers and what it does not
@@ -55,12 +55,13 @@ An implementation replays a case by constructing its IO from `input` exactly as 
 - policy: thresholds, mode, the async flag, error and skipped events; an `unjudgeable` L1 result is `skipped` with action `pass`, or `block` only when `policy.unjudgeable = "block"` and the mode is `enforce`
 - verdict structure, header names and values, reason encoding and truncation
 - the order in which the pipeline consults L1, cache, breaker and L2, and what it writes to the cache
+- what core reports to the breaker: a failure only for a judge error of kind `transport`, `timeout` or `unavailable` (or with no kind), a success for an answer, and a release for anything else (`rejected`, `unusable`, an answer with no scores, `max_inflight exceeded`, no call at all); the reason of a `rejected` or `unusable` error starts with its kind
 - the subject trajectory entry: its fields, which exits produce one (every exit that made a decision; not L1 pass), and that a supplied `history` is ignored
 
 **Not covered** (platform semantics; each adapter documents its own):
 
 - cache TTL precision and eviction (a shared dict, KV and the Cache API expire differently)
-- breaker window statistics across workers or isolates; only "open skips L2, closed calls L2" is pinned
+- breaker window statistics across workers or isolates; only "open skips L2, closed calls L2", what core reports and the state one report leaves are pinned
 - the adaptive timeout's numeric value; only that `jev.timeout_ms` is what the judge receives
 - the production hash (OpenResty and APISIX use SHA-256; a port may use any function that is collision-resistant, because the fingerprint keys the verdict cache and the trust store); the vectors use djb2 so the *normalised text* is what is compared
 - HTTP transport: provider request bodies, retries, header casing on the wire

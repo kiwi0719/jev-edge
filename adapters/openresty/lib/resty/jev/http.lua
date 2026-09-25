@@ -54,13 +54,14 @@ function _M.new(cfg, inflight, metrics)
 
     if provider.local_only then
       local t0 = now_ms()
-      local answers, err = provider.call(prompt, cfg, timeout_ms)
+      local answers, err, kind = provider.call(prompt, cfg, timeout_ms)
       ngx.update_time()
       if is_l2 then
         if answers then adaptive:success(now_ms() - t0)
         elseif tostring(err):find("timeout", 1, true) then adaptive:timeout(timeout_ms) end
       end
-      return answers, err
+      if not answers then return nil, err, kind end
+      return answers
     end
     if not http_ok then
       return nil, "lua-resty-http not installed"
@@ -89,14 +90,19 @@ function _M.new(cfg, inflight, metrics)
     local elapsed = now_ms() - t0
 
     if not res then
-      if is_l2 and tostring(err):find("timeout", 1, true) then adaptive:timeout(timeout_ms) end
-      return nil, tostring(err)
+      -- no answer at all; the cosocket names a timeout "timeout"
+      local timed_out = tostring(err):find("timeout", 1, true)
+      if is_l2 and timed_out then adaptive:timeout(timeout_ms) end
+      return nil, tostring(err), timed_out and judge.TIMEOUT or judge.TRANSPORT
     end
     -- req.ctx: per-call state the provider needs to read its own answer
     -- (openai-compat's question set); never stored on the shared cfg table.
     local answers, perr2, usage = provider.parse_response(res.status, res.body, cfg, req.ctx)
     if metrics and usage then metrics(usage) end
-    if not answers then return nil, perr2 end
+    -- Classified by the status, for every provider, custom ones included: a
+    -- 200 the provider could not read and a 4xx the judged text provoked are
+    -- not the provider failing, and must not trip the breaker (judge.counts).
+    if not answers then return nil, perr2, judge.status_kind(res.status) end
     if is_l2 then adaptive:success(elapsed) end
     return answers
   end
@@ -113,16 +119,16 @@ function _M.new(cfg, inflight, metrics)
         return nil, judge.BUSY
       end
     end
-    local ok, answers, err = pcall(do_call, prompt, requested_timeout)
+    local ok, answers, err, kind = pcall(do_call, prompt, requested_timeout)
     release()
     if not ok then return nil, "judge error: " .. tostring(answers) end
-    return answers, err
+    return answers, err, kind
   end
 
   --- Several prompts at once, one light thread each (text judged in chunks,
   -- core's judge_chunks): the wall time is the slowest call, not the sum.
-  -- Each call takes its own in-flight slot. Returns { { answers, err }, ... }
-  -- in prompt order.
+  -- Each call takes its own in-flight slot. Returns
+  -- { { answers, err, kind }, ... } in prompt order.
   function self.call_many(prompts, requested_timeout)
     local results = {}
     if not (ngx and ngx.thread) or #prompts < 2 then
@@ -137,8 +143,8 @@ function _M.new(cfg, inflight, metrics)
     end
     for i, th in ipairs(threads) do
       if th then
-        local ok, answers, err = ngx.thread.wait(th)
-        results[i] = ok and { answers, err } or { nil, "judge error: " .. tostring(answers) }
+        local ok, answers, err, kind = ngx.thread.wait(th)
+        results[i] = ok and { answers, err, kind } or { nil, "judge error: " .. tostring(answers) }
       end
     end
     return results

@@ -25,7 +25,7 @@ local judge     = require "jev.core.judge"
 local defaults  = require "jev.core.defaults"
 local breaker_m = require "jev.core.breaker"
 
-local FORMAT_VERSION = 1
+local FORMAT_VERSION = 2
 local NULL = setmetatable({}, { __tostring = function() return "null" end })  -- explicit JSON null
 local out_dir = arg and arg[1] or "core/golden"
 
@@ -434,14 +434,22 @@ local function eval_case(name, spec)
     end
   end
 
-  -- spec.breaker: "open" | "closed" | nil (no breaker injected). "open" is a
-  -- breaker whose open period has not elapsed at spec.clock.
-  local breaker
+  -- spec.breaker: "open" | "closed" | "half-open" | nil (no breaker
+  -- injected). "open" is a breaker whose open period has not elapsed at
+  -- spec.clock; "half-open" one whose open period ends at spec.clock. Every
+  -- call core makes on it is recorded, with its state afterwards.
+  local breaker, brk, brk_calls
   if spec.breaker then
     local bstore = H.store()
-    local st = spec.breaker == "open" and breaker_m.OPEN or breaker_m.CLOSED
-    bstore:set("brk:state", { state = st, until_ts = (spec.clock or 1000) + 30 })
-    breaker = breaker_m.new(bstore, function() return spec.clock or 1000 end, {})
+    local st = spec.breaker == "closed" and breaker_m.CLOSED or breaker_m.OPEN
+    local clock = spec.clock or 1000
+    bstore:set("brk:state", { state = st, until_ts = spec.breaker == "half-open" and clock or clock + 30 })
+    brk = breaker_m.new(bstore, function() return clock end, {})
+    brk_calls = {}
+    breaker = {}
+    for _, m in ipairs({ "allow", "success", "failure", "release" }) do
+      breaker[m] = function() brk_calls[#brk_calls + 1] = m; return brk[m](brk) end
+    end
   end
 
   -- subject: spec.subject is nil (no subject at all), or { id = ..., history = ... }.
@@ -478,7 +486,7 @@ local function eval_case(name, spec)
     judge = { call = function(prompt)
       calls = calls + 1
       seen_prompt = prompt
-      if spec.judge.error then return nil, spec.judge.error end
+      if spec.judge.error then return nil, spec.judge.error, spec.judge.kind end
       if spec.judge.by_question then
         -- answers only the questions this prompt asked, as a provider does
         local a = {}
@@ -513,6 +521,7 @@ local function eval_case(name, spec)
       judge_calls = calls, prompt = prompt_seen or NULL, cache_writes = writes,
       subject_record = recorded or NULL,
       subject_store_writes = subject_writes or NULL,
+      breaker = brk and { calls = brk_calls, state = brk:state() } or NULL,
     },
   }
 end
@@ -574,6 +583,38 @@ eval_case("cache entry without numeric score is ignored", { req = req(LONG),
 eval_case("breaker open skips L2", { req = req(ATTACK), breaker = "open", judge = { answers = { injection = 0.9 } } })
 eval_case("breaker closed calls L2", { req = req(ATTACK), breaker = "closed",
   judge = { answers = { injection = 0.9 } } })
+-- Which failed calls count against the breaker: only a provider that could
+-- not be reached or could not cope (transport, timeout, 5xx, 429). A 200 with
+-- nothing usable in it and any other 4xx are the judged text's doing: they
+-- fail open all the same, count nothing, and hand a half-open probe on.
+eval_case("breaker: a transport error counts", { req = req(ATTACK), breaker = "closed",
+  judge = { error = "connection refused", kind = "transport" } })
+eval_case("breaker: a timeout counts", { req = req(ATTACK), breaker = "closed",
+  judge = { error = "timeout", kind = "timeout" } })
+eval_case("breaker: a 5xx counts", { req = req(ATTACK), breaker = "closed",
+  judge = { error = "laya http 503", kind = "unavailable" } })
+eval_case("breaker: a 429 counts", { req = req(ATTACK), breaker = "closed",
+  judge = { error = "openai-compat http 429", kind = "unavailable" } })
+eval_case("breaker: a 4xx does not count", { req = req(ATTACK), breaker = "closed",
+  config = { policy = { mode = "enforce" } }, judge = { error = "openai-compat http 400", kind = "rejected" } })
+eval_case("breaker: a 200 with an unusable answer does not count", { req = req(ATTACK), breaker = "closed",
+  config = { policy = { mode = "enforce" } }, judge = { error = "openai-compat: no content", kind = "unusable" } })
+eval_case("breaker: an answer with no scores does not count", { req = req(ATTACK), breaker = "closed",
+  judge = { answers = {} } })
+eval_case("breaker: the gateway's own in-flight cap does not count", { req = req(ATTACK), breaker = "closed",
+  judge = { error = judge.BUSY } })
+eval_case("breaker: an error without a kind counts, as before kinds", { req = req(ATTACK), breaker = "closed",
+  judge = { error = "provider error" } })
+eval_case("breaker: an answered half-open probe closes it", { req = req(ATTACK), breaker = "half-open",
+  judge = { answers = { injection = 0.9 } } })
+eval_case("breaker: a half-open probe that fails re-opens it", { req = req(ATTACK), breaker = "half-open",
+  judge = { error = "laya http 502", kind = "unavailable" } })
+eval_case("breaker: a half-open probe with an unusable answer hands the probe on", { req = req(ATTACK),
+  breaker = "half-open", judge = { error = "openai-compat: no content", kind = "unusable" } })
+eval_case("breaker: a half-open probe refused with a 4xx hands the probe on", { req = req(ATTACK),
+  breaker = "half-open", judge = { error = "laya http 400", kind = "rejected" } })
+eval_case("breaker: a half-open probe with no scores hands the probe on", { req = req(ATTACK),
+  breaker = "half-open", judge = { answers = {} } })
 eval_case("custom thresholds", { req = req(LONG),
   config = { policy = { mode = "enforce", block_threshold = 0.4, suspect_threshold = 0.2 } },
   judge = { answers = { injection = 0.45 } } })
@@ -714,6 +755,15 @@ eval_case("chunks: a judge error does not undo a chunk that already blocks", {
   req = req(FITS), rules = { CHUNKED }, config = { policy = { mode = "enforce" } },
   cache = { [chunk_key(FITS, 3)] = { score = 0.95, reason = "injection 0.95" } },
   judge = { error = "timeout" } })
+eval_case("chunks: a 5xx on the chunks is one breaker failure", {
+  req = req(FITS), rules = { CHUNKED }, breaker = "closed",
+  judge = { error = "laya http 500", kind = "unavailable" } })
+eval_case("chunks: an unusable answer on the chunks is not a breaker failure", {
+  req = req(FITS), rules = { CHUNKED }, breaker = "closed", config = { policy = { mode = "enforce" } },
+  judge = { error = "laya: malformed response", kind = "unusable" } })
+eval_case("chunks: a half-open probe blocked as unjudgeable hands the probe on", {
+  req = req(OVER), rules = { CHUNKED }, breaker = "half-open",
+  config = { policy = { mode = "enforce", unjudgeable = "block" } }, judge = { answers = { injection = 0.2 } } })
 
 -- untrusted content (config.untrusted): retrieved content judged on its own --
 -- bodies are written out by hand so the bytes are stable
@@ -773,6 +823,11 @@ eval_case("untrusted: a tool result already judged is not judged again", {
   cache = { [untrusted_key(U_EMAIL, U_ON)] = { score = 0.85, reason = "untrusted 0.85" } }, judge = U_SCORES })
 eval_case("untrusted: no answer to the untrusted question is an error", {
   req = raw_req(U_TOOL), config = U_ON_ENF, judge = { by_question = { injection = 0.2 } } })
+eval_case("untrusted: no answer to one question, an answer to the other, is a breaker success", {
+  req = raw_req(U_TOOL), config = U_ON_ENF, breaker = "closed", judge = { by_question = { injection = 0.2 } } })
+eval_case("untrusted: a 4xx on both parts is not a breaker failure", {
+  req = raw_req(U_TOOL), config = U_ON_ENF, breaker = "closed",
+  judge = { error = "laya http 400", kind = "rejected" } })
 eval_case("untrusted: a short tool result is not judged on its own", {
   req = raw_req(U_SHORT), config = U_ON, judge = U_SCORES })
 eval_case("untrusted: a rule's own untrusted table turns it on for that rule", {

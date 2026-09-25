@@ -234,6 +234,97 @@ describe("in-flight cap and the breaker", () => {
   });
 });
 
+// Twin of "which judge errors count against the breaker" in core/spec/init_spec.lua.
+describe("which judge errors count against the breaker", () => {
+  const J = core.judge;
+  function request(i: number) {
+    const body = JSON.stringify({ messages: [{ role: "user", content: "Please write a detailed summary, variant " + "x".repeat(i + 1) }] });
+    return { method: "POST", path: "/v1/chat/completions", headers: { "content-type": "application/json" }, body, body_size: body.length, client_ip: "203.0.113.7" };
+  }
+  function ctxFor(breaker: Breaker, call: core.Judge["call"], clock = () => 1000): core.Ctx {
+    return {
+      config: core.defaults.merge(core.defaults.config, { policy: { mode: "enforce" } }),
+      rules: [load("llm-endpoints")], cache: memoryStore(), breaker, clock, hash: djb2, json_decode: JSON.parse,
+      judge: { call },
+    } as core.Ctx;
+  }
+
+  it("a 200 the judged text made unusable, or a 4xx it provoked, never trips it", async () => {
+    const cases: core.JudgeResult[] = [
+      [null, "openai-compat: no content", J.UNUSABLE],
+      [null, 'openai-compat: no numeric answers in {"status":"ok"}', J.UNUSABLE],
+      [null, "openai-compat http 400", J.REJECTED],
+      [null, "laya http 400", J.REJECTED],
+    ];
+    for (const r of cases) {
+      const breaker = new Breaker(memoryStore(), () => 1000, { min_samples: 1, fail_ratio: 0.5 });
+      for (let i = 0; i < 25; i++) {
+        const v = await core.evaluate(request(i), ctxFor(breaker, () => r));
+        expect(v.verdict).toBe(core.verdict.ERROR);
+        expect(v.action).toBe(core.verdict.ACTION_PASS);
+        expect(v.reason).toBe(`${r[2]}: ${r[1]}`);
+      }
+      expect(await breaker.state()).toBe(CLOSED);
+    }
+    const breaker = new Breaker(memoryStore(), () => 1000, { min_samples: 1, fail_ratio: 0.5 });
+    const v = await core.evaluate(request(0), ctxFor(breaker, () => [{}, null]));
+    expect(v.reason).toBe("unusable: no scores in answer");
+    expect(await breaker.state()).toBe(CLOSED);
+  });
+
+  it("transport errors, timeouts, 5xx and 429 still trip it", async () => {
+    const cases: core.JudgeResult[] = [
+      [null, "fetch failed", J.TRANSPORT],
+      [null, "timeout after 400 ms", J.TIMEOUT],
+      [null, "laya http 503", J.UNAVAILABLE],
+      [null, "openai-compat http 429", J.UNAVAILABLE],
+      [null, "error from a judge that gives no kind"],
+    ];
+    for (const r of cases) {
+      const breaker = new Breaker(memoryStore(), () => 1000, { min_samples: 1, fail_ratio: 0.5 });
+      const v = await core.evaluate(request(0), ctxFor(breaker, () => r));
+      expect(v.reason).toBe(r[1]);
+      expect(await breaker.state()).toBe(OPEN);
+    }
+  });
+
+  it("a half-open probe with a non-counting error hands the probe on", async () => {
+    let now = 1000;
+    const breaker = new Breaker(memoryStore(), () => now, { open_s: 30 });
+    await breaker.trip();
+    now += 31;
+    let answer: core.JudgeResult = [null, "openai-compat: no content", J.UNUSABLE];
+    let calls = 0;
+    const ctx = ctxFor(breaker, () => { calls++; return answer; }, () => now);
+    let v = await core.evaluate(request(1), ctx);
+    expect(v.reason).toBe("unusable: openai-compat: no content");
+    expect(await breaker.state()).toBe(2); // HALF_OPEN: not re-opened, not closed
+    answer = [{ injection: 0.9 }, null];
+    v = await core.evaluate(request(2), ctx);
+    expect(v.source).toBe(core.verdict.SRC_L2);
+    expect(calls).toBe(2);
+    expect(await breaker.state()).toBe(CLOSED);
+  });
+
+  it("Breaker.release frees a half-open probe and counts nothing", async () => {
+    let now = 1000;
+    const b = new Breaker(memoryStore(), () => now, { window_s: 60, min_samples: 4, fail_ratio: 0.5, open_s: 30 });
+    await b.success(); await b.failure(); await b.failure();
+    for (let i = 0; i < 10; i++) await b.release();
+    expect(await b.state()).toBe(CLOSED);
+    await b.failure();
+    expect(await b.state()).toBe(OPEN);
+    await b.release();
+    expect(await b.allow()).toBe(false);
+    now += 31;
+    expect(await b.allow()).toBe(true);
+    expect(await b.allow()).toBe(false);
+    await b.release();
+    expect(await b.allow()).toBe(true);
+    expect(await b.allow()).toBe(false);
+  });
+});
+
 describe("normalize.fieldKeys", () => {
   it("matches core/normalize.lua field_keys, in linear time", () => {
     const want: Record<string, string> = {

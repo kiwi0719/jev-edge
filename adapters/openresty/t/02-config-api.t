@@ -219,8 +219,8 @@ server {
 --- more_headers
 Content-Type: application/json
 --- response_body eval
-["verdict=error score=0.00 source=l2 reason=no+scores+in+answer\n",
- "verdict=error score=0.00 source=l2 reason=no+scores+in+answer\n"]
+["verdict=error score=0.00 source=l2 reason=unusable%3A+no+scores+in+answer\n",
+ "verdict=error score=0.00 source=l2 reason=unusable%3A+no+scores+in+answer\n"]
 
 
 

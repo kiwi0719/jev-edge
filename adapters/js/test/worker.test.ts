@@ -305,6 +305,17 @@ describe("stores", () => {
     expect(await rt.adaptive.current()).toBe(400); // warmup
   });
 
+  it("a released half-open probe is free again inside the Durable Object", async () => {
+    const { stub } = dobj();
+    const rt = createRuntime({ config: { jev: { provider: "mock", mock_score: 0.2, timeout_ms: 400 }, breaker: { open_s: 10 } }, state: stub });
+    await rt.breaker.trip(Date.now() / 1000 - 60); // open period already over: half-open
+    expect(await rt.breaker.allow()).toBe(true);
+    expect(await rt.breaker.allow()).toBe(false);
+    await rt.breaker.release!();
+    expect(await rt.breaker.allow()).toBe(true);
+    expect(await rt.breaker.state()).toBe(2);
+  });
+
   it("the adaptive estimate is one document", async () => {
     const { Adaptive } = await import("../src/cf/adaptive");
     const store = memoryStore();

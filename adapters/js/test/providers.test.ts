@@ -2,7 +2,7 @@
 // echoed fake answer cannot lower. Twin of adapters/openresty/spec/openai_compat_spec.lua.
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { build } from "../src/core/judge";
-import { jev, laya, openaiCompat, openaiSystemPrompt, openaiUserMessage, parseOpenaiContent, jsonObjects, stripNonce, echoesInput } from "../src/providers";
+import { jev, laya, backend, openaiCompat, openaiSystemPrompt, openaiUserMessage, parseOpenaiContent, jsonObjects, stripNonce, echoesInput } from "../src/providers";
 import type { JevConfig } from "../src/core/defaults";
 
 const NONCE = "0123456789abcdef0123456789abcdef";
@@ -161,9 +161,9 @@ describe("System One providers: jev and laya", () => {
 
   it("names itself in errors", async () => {
     capture(() => new Response("no", { status: 413 }));
-    expect(await laya.call(prompt("x"), {} as JevConfig, 1000)).toEqual([null, "laya http 413"]);
+    expect(await laya.call(prompt("x"), {} as JevConfig, 1000)).toEqual([null, "laya http 413", "rejected"]);
     capture(() => new Response("no", { status: 500 }));
-    expect(await jev.call(prompt("x"), {} as JevConfig, 1000)).toEqual([null, "jev http 500"]);
+    expect(await jev.call(prompt("x"), {} as JevConfig, 1000)).toEqual([null, "jev http 500", "unavailable"]);
   });
 
   it("cfg.questions replaces the wording of that question only", async () => {
@@ -174,5 +174,64 @@ describe("System One providers: jev and laya", () => {
     expect(qs.injection.instructions).toBe("Custom?");
     expect(qs.injection.criteria).toEqual({ true: "yes-case", false: "no-case" });
     expect(qs.abuse.instructions).not.toBe("Custom?");
+  });
+});
+
+// What a failed call ran into (core/judge.ts ErrorKind). Only transport,
+// timeout and unavailable (5xx, 429) are breaker failures: a 200 whose answer
+// the judged text made unusable and a 4xx the text provoked are not.
+describe("providers: error kinds", () => {
+  afterEach(() => vi.unstubAllGlobals());
+  const OAI = { provider: "openai-compat", endpoint: "http://x/v1" } as JevConfig;
+  const reply = (r: () => Response) => vi.stubGlobal("fetch", vi.fn(async () => r()));
+  const chat = (content: unknown) => Response.json({ choices: [{ message: { role: "assistant", content } }] });
+
+  it("openai-compat: a 200 with no usable answer is unusable", async () => {
+    reply(() => chat(null));
+    expect((await openaiCompat.call(prompt("x"), OAI, 1000))[2]).toBe("unusable");
+    reply(() => chat('{"status":"ok"}'));
+    expect(await openaiCompat.call(prompt("x"), OAI, 1000)).toEqual(
+      [null, 'openai-compat: no numeric answers in {"status":"ok"}', "unusable"]);
+    reply(() => chat("I cannot help with that."));
+    expect(await openaiCompat.call(prompt("x"), OAI, 1000)).toEqual([null, "openai-compat: content is not JSON", "unusable"]);
+    reply(() => chat('{"injection": 0.2}'));
+    expect(await openaiCompat.call(prompt("x", ["injection", "abuse"]), OAI, 1000)).toEqual(
+      [null, "openai-compat: no answer for abuse", "unusable"]);
+    reply(() => new Response("<html>", { status: 200 }));
+    expect(await openaiCompat.call(prompt("x"), OAI, 1000)).toEqual([null, "openai-compat: malformed response", "unusable"]);
+  });
+
+  it("openai-compat: a content-filter 400 is rejected, 429 and 5xx are unavailable", async () => {
+    reply(() => Response.json({ error: { code: "content_filter" } }, { status: 400 }));
+    expect(await openaiCompat.call(prompt("x"), OAI, 1000)).toEqual([null, "openai-compat http 400", "rejected"]);
+    reply(() => new Response("slow down", { status: 429 }));
+    expect(await openaiCompat.call(prompt("x"), OAI, 1000)).toEqual([null, "openai-compat http 429", "unavailable"]);
+    reply(() => new Response("down", { status: 503 }));
+    expect(await openaiCompat.call(prompt("x"), OAI, 1000)).toEqual([null, "openai-compat http 503", "unavailable"]);
+  });
+
+  it("no HTTP answer is transport, or timeout past the deadline", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => { throw new TypeError("fetch failed"); }));
+    expect(await openaiCompat.call(prompt("x"), OAI, 1000)).toEqual([null, "fetch failed", "transport"]);
+    expect(await laya.call(prompt("x"), {} as JevConfig, 1000)).toEqual([null, "fetch failed", "transport"]);
+    vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>(() => {})));
+    expect(await laya.call(prompt("x"), {} as JevConfig, 20)).toEqual([null, "timeout after 20 ms", "timeout"]);
+  });
+
+  it("System One: a 200 without answers is unusable", async () => {
+    reply(() => new Response("not json", { status: 200 }));
+    expect(await laya.call(prompt("x"), {} as JevConfig, 1000)).toEqual([null, "laya: malformed response", "unusable"]);
+    reply(() => Response.json({ result: "ok" }));
+    expect(await laya.call(prompt("x"), {} as JevConfig, 1000)).toEqual([null, "laya: malformed response", "unusable"]);
+  });
+
+  it("backend: an origin that answered without a score is unusable, its 4xx rejected", async () => {
+    const cfg = { provider: "backend", endpoint: "http://origin" } as JevConfig;
+    reply(() => new Response(null, { status: 200, headers: { "X-Jev-Verdict": "error", "X-Jev-Reason": "laya+http+400" } }));
+    expect(await backend.call(prompt("x"), cfg, 1000)).toEqual([null, "backend: laya http 400", "unusable"]);
+    reply(() => new Response(null, { status: 414 }));
+    expect(await backend.call(prompt("x"), cfg, 1000)).toEqual([null, "backend http 414", "rejected"]);
+    reply(() => new Response(null, { status: 502 }));
+    expect(await backend.call(prompt("x"), cfg, 1000)).toEqual([null, "backend http 502", "unavailable"]);
   });
 });

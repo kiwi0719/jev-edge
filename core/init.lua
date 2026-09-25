@@ -8,10 +8,12 @@
 --   trust       same contract, for fingerprint trust only (default: cache).
 --               Split it out to put trust somewhere shared or durable without
 --               moving the hot verdict cache too.
---   judge       { call = fn(prompt, timeout_ms) -> answers|nil, err }
+--   judge       { call = fn(prompt, timeout_ms) -> answers|nil, err, kind }
 --                 answers: { [template_name] = probability }
 --                 err == judge.BUSY: the adapter's own in-flight cap refused
 --                 the call; not a provider failure, not fed to the breaker
+--                 kind: judge.TRANSPORT | TIMEOUT | UNAVAILABLE (breaker
+--                 failures) or REJECTED | UNUSABLE (not); none = counted
 --   breaker     object from core/breaker.lua (optional)
 --   subject     optional { id = string, history = table|nil, record = fn(entry) }
 --                 Per-subject trajectory (core/subject.lua). Absent, or absent
@@ -50,6 +52,17 @@ local function finish(ctx, v)
   subject.record(ctx, v)
   subject.rep_record(ctx, v)
   return v
+end
+
+-- Tell the breaker how a request it admitted went. Only calls that reached
+-- the provider and found it failing count against it (judge.counts); a
+-- request that says nothing about its health releases a half-open probe.
+local function settle(ctx, failed, answered)
+  local b = ctx.breaker
+  if not b then return end
+  if failed then b:failure()
+  elseif answered then b:success()
+  elseif b.release then b:release() end
 end
 
 --- Verdict-cache key for a fingerprint judged under `rule`.
@@ -107,6 +120,7 @@ local function judge_parts(ctx, rule, parts, suffix, fp, ckey, reason)
       local prompt, perr = judge.build(part.templates, part.text, part.context)
       if not prompt then
         log(ctx, "error", "jev-edge: " .. perr)
+        settle(ctx)
         local action, label, async = policy.on_error()
         return finish(ctx, verdict.new({ action = action, verdict = label, async = async,
           source = verdict.SRC_L2, reason = perr, fingerprint = fp }))
@@ -123,20 +137,22 @@ local function judge_parts(ctx, rule, parts, suffix, fp, ckey, reason)
     results = ctx.judge.call_many(prompts, cfg.jev.timeout_ms) or {}
   else
     for k, p in ipairs(pending) do
-      local a, e = ctx.judge.call(p.prompt, cfg.jev.timeout_ms)
-      results[k] = { a, e }
+      local a, e, kind = ctx.judge.call(p.prompt, cfg.jev.timeout_ms)
+      results[k] = { a, e, kind }
     end
   end
   local elapsed = now_ms(ctx) - t0
 
   local err, failed, answered
   for k, p in ipairs(pending) do
-    local a, e = results[k] and results[k][1], results[k] and results[k][2]
+    local r = results[k] or {}
+    local a, e, kind = r[1], r[2], r[3]
     local s, t, n
     if a then s, t, n = judge.reduce(a) end
     if not a or n == 0 then
-      err = err or tostring(e or (a and "no scores in answer") or "error")
-      if e ~= judge.BUSY then failed = true end
+      if a then e, kind = "no scores in answer", judge.UNUSABLE end
+      err = err or judge.reason(e, kind)
+      if judge.counts(e, kind) then failed = true end
     else
       answered = true
       scores[p.i], tops[p.i] = s, t
@@ -146,9 +162,7 @@ local function judge_parts(ctx, rule, parts, suffix, fp, ckey, reason)
     end
   end
   -- only calls that reached the provider say anything about its health
-  if ctx.breaker then
-    if failed then ctx.breaker:failure() elseif answered then ctx.breaker:success() end
-  end
+  settle(ctx, failed, answered)
 
   local best, top = nil, ""
   for i = 1, #parts do
@@ -253,6 +267,7 @@ function _M.evaluate(req, ctx)
     -- full; what still did not fit is unjudgeable, and policy.unjudgeable
     -- decides as it does for any other unreadable request
     if capped and cfg.policy.unjudgeable == "block" and cfg.policy.mode == "enforce" then
+      settle(ctx)
       return finish(ctx, verdict.new({
         action = verdict.ACTION_BLOCK, verdict = verdict.SKIPPED, source = verdict.SRC_L1,
         reason = "unjudgeable: text over max_judge_chunks", fingerprint = fp,
@@ -290,33 +305,37 @@ function _M.evaluate(req, ctx)
   })
   if not prompt then
     log(ctx, "error", "jev-edge: " .. perr)
+    settle(ctx)
     local action, label, async = policy.on_error()
     return finish(ctx, verdict.new({ action = action, verdict = label, async = async,
       source = verdict.SRC_L2, reason = perr, fingerprint = fp }))
   end
 
   local t0 = now_ms(ctx)
-  local answers, jerr = ctx.judge.call(prompt, cfg.jev.timeout_ms)
+  local answers, jerr, jkind = ctx.judge.call(prompt, cfg.jev.timeout_ms)
   local elapsed = now_ms(ctx) - t0
 
   if not answers then
-    if ctx.breaker and jerr ~= judge.BUSY then ctx.breaker:failure() end
-    log(ctx, "warn", "jev-edge: L2 failed: " .. tostring(jerr))
+    local why = judge.reason(jerr, jkind)
+    settle(ctx, judge.counts(jerr, jkind))
+    log(ctx, "warn", "jev-edge: L2 failed: " .. why)
     local action, label, async = policy.on_error()
     return finish(ctx, verdict.new({ action = action, verdict = label, async = async,
-      source = verdict.SRC_L2, reason = tostring(jerr or "error"),
+      source = verdict.SRC_L2, reason = why,
       fingerprint = fp, l2_ms = elapsed }))
   end
 
   local score, top, n = judge.reduce(answers)
   if n == 0 then
-    -- An answer with no score in it is a provider fault, not a SAFE verdict:
-    -- caching score 0 would wave the same text through for fp_ttl.
-    if ctx.breaker then ctx.breaker:failure() end
+    -- An answer with no score in it is an error, not a SAFE verdict: caching
+    -- score 0 would wave the same text through for fp_ttl. Nor is it the
+    -- provider failing: the judged text can make a judge answer that way.
+    local why = judge.reason("no scores in answer", judge.UNUSABLE)
+    settle(ctx)
     log(ctx, "warn", "jev-edge: L2 answer has no scores")
     local action, label, async = policy.on_error()
     return finish(ctx, verdict.new({ action = action, verdict = label, async = async,
-      source = verdict.SRC_L2, reason = "no scores in answer",
+      source = verdict.SRC_L2, reason = why,
       fingerprint = fp, l2_ms = elapsed }))
   end
   if ctx.breaker then ctx.breaker:success() end

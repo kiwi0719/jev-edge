@@ -2,10 +2,13 @@ name: release-npm
 
 # Publishes adapters/js as @jev-edge/js. A tag push `vX.Y.Z` publishes when
 # X.Y.Z is the version in adapters/js/package.json; a manual run is a dry run
-# unless `dry_run` is unticked. Authentication is npm trusted publishing: npm
-# trusts this repository's release-npm.yml through GitHub's OIDC token, so no
-# npm token is stored anywhere (configured on npmjs.com, package settings ->
-# Trusted Publisher). A version already on npm is skipped with a notice.
+# unless `dry_run` is unticked, and an unticked one must be started on a `v*`
+# tag (on a branch it fails), so every real publish passes the same tag check.
+# Authentication is npm trusted publishing: npm trusts this repository's
+# release-npm.yml through GitHub's OIDC token, so no npm token is stored
+# anywhere (configured on npmjs.com, package settings -> Trusted Publisher).
+# A version already on npm is skipped with a notice when it was published from
+# this run's commit (a rerun); from any other commit the run fails.
 
 on:
   push:
@@ -13,7 +16,7 @@ on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "pnpm publish --dry-run (nothing is uploaded)"
+        description: "npm publish --dry-run (nothing is uploaded); untick only on a v* tag"
         type: boolean
         default: true
 
@@ -33,6 +36,15 @@ jobs:
       run:
         working-directory: adapters/js
     steps:
+      - name: Non-dry publishes come from a tag
+        if: github.event_name == 'workflow_dispatch' && !inputs.dry_run && github.ref_type != 'tag'
+        working-directory: .
+        env:
+          REF: ${{ github.ref_name }}
+        run: |
+          echo "::error::a manual publish runs on a v* tag, not on $REF; start it on the tag, or leave dry_run ticked"
+          exit 1
+
       - uses: actions/checkout@v7
       - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
@@ -85,14 +97,35 @@ jobs:
           pnpm pack --pack-destination "$RUNNER_TEMP"
           tar -tzf "$RUNNER_TEMP"/jev-edge-js-*.tgz
 
+      # On a real publish, a version already on npm must come from this commit
+      # (a rerun of the same tag). gitHead is set by a publish from a checkout;
+      # a tarball publish has none, and then the provenance names the commit.
       - name: Already on npm?
         id: exists
+        env:
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && '--dry-run' || '' }}
         run: |
           v="$(node -p "require('./package.json').version")"
-          if npm view "@jev-edge/js@$v" version >/dev/null 2>&1; then
-            echo "::notice::@jev-edge/js@$v is already on npm; nothing to publish"
-            echo "yes=true" >> "$GITHUB_OUTPUT"
+          npm view "@jev-edge/js@$v" version >/dev/null 2>&1 || exit 0
+          if [ -z "$DRY_RUN" ]; then
+            src="$(npm view "@jev-edge/js@$v" gitHead 2>/dev/null || true)"
+            if [ -z "$src" ]; then
+              url="$(npm view "@jev-edge/js@$v" dist.attestations.url 2>/dev/null || true)"
+              src="$(curl -fsSL "$url" 2>/dev/null | node -e '
+                const b = JSON.parse(require("fs").readFileSync(0, "utf8"));
+                for (const a of b.attestations || []) {
+                  if (a.predicateType !== "https://slsa.dev/provenance/v1") continue;
+                  const s = JSON.parse(Buffer.from(a.bundle.dsseEnvelope.payload, "base64"));
+                  console.log(s.predicate.buildDefinition.resolvedDependencies[0].digest.gitCommit);
+                }' 2>/dev/null || true)"
+            fi
+            if [ "$src" != "$GITHUB_SHA" ]; then
+              echo "::error::@jev-edge/js@$v is already on npm from commit ${src:-unknown}, not from $GITHUB_SHA; bump the version"
+              exit 1
+            fi
           fi
+          echo "::notice::@jev-edge/js@$v is already on npm; nothing to publish"
+          echo "yes=true" >> "$GITHUB_OUTPUT"
 
       # trusted publishing needs npm >= 11.5.1 (Node 22 ships npm 10)
       - name: npm for trusted publishing

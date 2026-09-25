@@ -488,6 +488,24 @@ class JevEdgeGuardrail(CustomGuardrail):
                  self.base, self.enforce, self.timeout, self.path, self.max_body_bytes,
                  ",".join(self.extra_fields) or "-", self.unjudged)
 
+    def get_disable_global_guardrail(self, data: dict) -> Optional[bool]:
+        """Whether a default_on guardrail is switched off for this request.
+        Newer LiteLLM reads that from the key's and team's settings only.
+        Older versions (1.80) read `disable_global_guardrail` from the request
+        body and the client's metadata, so any client could switch this
+        guardrail off; there only the key's or team's
+        `disable_global_guardrails`, which the proxy itself records, counts."""
+        if hasattr(CustomGuardrail, "_get_admin_metadata"):
+            return super().get_disable_global_guardrail(data)  # type: ignore[misc]
+        md = data.get(_metadata_key(data)) if isinstance(data, dict) else None
+        if not isinstance(md, dict):
+            return False
+        for key in ("user_api_key_metadata", "user_api_key_team_metadata"):
+            admin = md.get(key)
+            if isinstance(admin, dict) and admin.get("disable_global_guardrails") is True:
+                return True
+        return False
+
     # ------------------------------------------------------------------
     # request -> the body jev-edge judges
     # ------------------------------------------------------------------

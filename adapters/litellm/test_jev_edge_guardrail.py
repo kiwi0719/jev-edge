@@ -757,3 +757,23 @@ def test_hook_signature_matches_litellm():
     ours = inspect.signature(JevEdgeGuardrail.async_pre_call_hook)
     assert list(base.parameters) == list(ours.parameters)
     assert issubclass(JevEdgeGuardrail, litellm_cg.CustomGuardrail)
+
+
+# ---------------------------------------------------------------------------
+# LiteLLM's own bookkeeping
+# ---------------------------------------------------------------------------
+
+def test_a_client_cannot_switch_the_guardrail_off_on_old_litellm():
+    # LiteLLM 1.80 read disable_global_guardrail from the request body and the
+    # client's metadata; only the key's or team's setting counts
+    g = guard(httpx.MockTransport(lambda r: httpx.Response(200)))
+    if hasattr(jg.CustomGuardrail, "_get_admin_metadata"):
+        pytest.skip("this LiteLLM reads key and team settings only")
+    assert g.get_disable_global_guardrail({"disable_global_guardrail": True, "metadata": {"disable_global_guardrail": True,
+                                                                                         "disable_global_guardrails": True},
+                                           "proxy_server_request": psr("/v1/chat/completions")}) is False
+    assert g.get_disable_global_guardrail({"metadata": {"user_api_key_metadata": {"disable_global_guardrails": True}},
+                                           "proxy_server_request": psr("/v1/chat/completions")}) is True
+    assert g.get_disable_global_guardrail({"litellm_metadata": {"user_api_key_team_metadata": {"disable_global_guardrails": True}},
+                                           "metadata": {}, "proxy_server_request": psr("/v1/responses")}) is True
+

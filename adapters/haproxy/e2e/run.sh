@@ -47,8 +47,12 @@ check "repeated Content-Type (json, then image/png) is judged" "403" \
   "$(http_code -H 'Content-Type: application/json' -H 'Content-Type: image/png' -H 'X-Jev-Mock-Score: 0.97' -d "$ATTACK" $base/v1/chat/completions)"
 check "Content-Type 'application/json; charset=utf-8, image/png' is judged" "403" \
   "$(http_code -H 'Content-Type: application/json; charset=utf-8, image/png' -H 'X-Jev-Mock-Score: 0.97' -d "$ATTACK" $base/v1/chat/completions)"
-check "image/png alone is still not watched" "app verdict=skipped score=0.00 source=l1" \
+# A media type is only the client's word: a JSON prompt under it is judged,
+# a binary body is still skipped.
+check "image/png with a JSON prompt is judged" '{"error":"request rejected"}' \
   "$(curl -s -H 'Content-Type: image/png' -H 'X-Jev-Mock-Score: 0.97' -d "$ATTACK" $base/v1/chat/completions)"
+check "image/png with a binary body is not judged" "app verdict=skipped score=0.00 source=l1" \
+  "$(printf '\211PNG\r\n\032\n\000\000\000\rIHDR\000\000\000\001' | curl -s -H 'Content-Type: image/png' -H 'X-Jev-Mock-Score: 0.97' --data-binary @- $base/v1/chat/completions)"
 
 # Size contract: what HAProxy accepts fits one SPOE frame and jev-edge's
 # header buffers; the rest is refused, whatever the agent answered.

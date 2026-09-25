@@ -39,6 +39,7 @@ jobs:
       - run: luarocks install luacheck
       - run: make lint
       # tripwires for bug classes a past audit found (scripts/invariants.lua)
+      # and their mutation tests (scripts/invariants_test.lua)
       - run: make invariants
       - run: luarocks lint *.rockspec
       # ops/: alert rules parse and their unit tests pass (prom/prometheus v3.5.0, by digest)

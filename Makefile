@@ -19,9 +19,11 @@ luajit-check:
 
 check: lint invariants luajit-check golden-check conformance-check test
 
-# Tripwires for bug classes a past audit found (scripts/invariants.lua).
+# Tripwires for bug classes a past audit found (scripts/invariants.lua), then
+# their mutation tests: each edit a rule guards against must still trip it.
 invariants:
 	lua scripts/invariants.lua
+	lua scripts/invariants_test.lua
 
 # Golden vectors: the cross-implementation contract for core (core/golden/README.md).
 # `golden` regenerates them from the Lua core after a deliberate behaviour change;

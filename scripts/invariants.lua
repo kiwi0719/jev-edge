@@ -52,6 +52,22 @@ local function code(path)
   return table.concat(out, "\n")
 end
 
+-- run Lua source in an empty environment and return that environment
+-- (Lua 5.1 and LuaJIT: loadstring + setfenv; 5.2+: load with an env)
+local function eval(src, name)
+  local env, chunk, err = {}
+  if setfenv then
+    chunk, err = loadstring(src, "=" .. name)
+    if chunk then setfenv(chunk, env) end
+  else
+    chunk, err = load(src, "=" .. name, "t", env)
+  end
+  if not chunk then return nil, err end
+  local ok, e = pcall(chunk)
+  if not ok then return nil, e end
+  return env
+end
+
 local function rule(name, fn)
   checked = checked + 1
   local ok, err = pcall(fn, name)
@@ -81,14 +97,40 @@ rule("version", function(r)
 end)
 
 -- 2. The rockspec ships every module (0.4.0 nearly shipped without decode.lua)
+--    under the name its path gives it. The rockspec is loaded, as LuaRocks
+--    loads it, so a commented-out line or a duplicate key is not "listed".
+local function module_name(file)
+  for _, root in ipairs({ { "adapters/openresty/lib/", "" }, { "adapters/kong/", "" },
+                          { "core/", "jev.core." }, { "rules/", "jev.rules." } }) do
+    local rest = file:sub(1, #root[1]) == root[1] and file:sub(#root[1] + 1):match("^(.+)%.lua$")
+    if rest then return ((root[2] .. rest:gsub("/", ".")):gsub("%.init$", "")) end
+  end
+end
+
 rule("rockspec-modules", function(r)
   local specs = tracked(".", "^[^/]+%.rockspec$")
   local s = specs[1] and read(specs[1])
   if not s then return fail(r, "no rockspec") end
+  local env, err = eval(s, specs[1])
+  if not env then return fail(r, specs[1] .. " does not load: " .. tostring(err)) end
+  local modules = type(env.build) == "table" and env.build.modules
+  if type(modules) ~= "table" then return fail(r, specs[1] .. " has no build.modules table") end
+  local names = {}
+  for name in pairs(modules) do names[#names + 1] = name end
+  table.sort(names, function(a, b) return tostring(a) < tostring(b) end)
   local listed = {}
-  for file in s:gmatch('=%s*"([^"]+%.lua)"') do
-    listed[file] = true
-    if not read(file) then fail(r, "listed but missing: " .. file) end
+  for _, name in ipairs(names) do
+    local file = modules[name]
+    if type(name) ~= "string" or type(file) ~= "string" then
+      fail(r, "build.modules[" .. tostring(name) .. "] is not a module name mapped to a file path")
+    else
+      listed[file] = (listed[file] or 0) + 1
+      if not read(file) then fail(r, "listed but missing: " .. file) end
+      local want_name = module_name(file)
+      if want_name ~= name then
+        fail(r, ('["%s"] = "%s": the module name for that file is %s'):format(name, file, tostring(want_name)))
+      end
+    end
   end
   local want = {}
   for _, f in ipairs(tracked("adapters/openresty/lib", "%.lua$")) do want[#want + 1] = f end
@@ -97,7 +139,8 @@ rule("rockspec-modules", function(r)
   for _, f in ipairs(tracked("rules", "%.lua$")) do want[#want + 1] = f end
   for _, f in ipairs(tracked("adapters/kong/kong", "%.lua$")) do want[#want + 1] = f end
   for _, f in ipairs(want) do
-    if not listed[f] then fail(r, "not in the rockspec: " .. f) end
+    if not listed[f] then fail(r, "not in the rockspec: " .. f)
+    elseif listed[f] > 1 then fail(r, "listed " .. listed[f] .. " times: " .. f) end
   end
 end)
 
@@ -320,20 +363,56 @@ rule("template-parity", function(r)
 end)
 
 -- 12. The ruleset's one required check covers every CI job: `ci-ok` needs
---     all of them (a job left out could fail and still let a PR merge)
+--     all of them, runs whatever they did, and fails unless all succeeded (a
+--     job left out could fail and still let a PR merge; a skipped ci-ok
+--     counts as passing, so its `if:` is exactly always(): !cancelled() skips
+--     it in a cancelled run, `!cancelled() && !failure()` when a job failed)
 rule("ci-ok", function(r)
-  local ci = read(".github/workflows/ci.yml") or ""
-  local jobs_block = ci:match("\njobs:\n(.*)$") or ""
-  local jobs = {}
-  for name in jobs_block:gmatch("\n  ([%w_%-]+):") do jobs[#jobs + 1] = name end
-  local first = jobs_block:match("^  ([%w_%-]+):")
-  if first then table.insert(jobs, 1, first) end
-  local needs = ci:match("\n  ci%-ok:.-\n    needs:%s*%[([^%]]*)%]")
-  if not needs then return fail(r, "ci.yml has no ci-ok job with a needs list") end
+  local ci = (read(".github/workflows/ci.yml") or ""):gsub("\r\n?", "\n")
+  -- the top-level jobs mapping: job ids at two spaces, each with its lines
+  local jobs, body, cur, injobs = {}, {}, nil, false
+  for l in (ci .. "\n"):gmatch("([^\n]*)\n") do
+    if not injobs then
+      injobs = l:match("^jobs:%s*$") or l:match("^jobs:%s*#")
+    elseif l:match("^[^%s#]") then
+      break
+    else
+      local name = l:match("^  ([%w_%-]+):")
+      if name then
+        jobs[#jobs + 1], cur, body[name] = name, name, {}
+      elseif cur then
+        table.insert(body[cur], l)
+      end
+    end
+  end
+  if #jobs < 2 then return fail(r, "found " .. #jobs .. " jobs in ci.yml") end
+  if not body["ci-ok"] then return fail(r, "ci.yml has no ci-ok job") end
+  local ok_job = "\n" .. table.concat(body["ci-ok"], "\n")
+  local needs = ok_job:match("\n    needs:%s*%[([^%]]*)%]")
+  if not needs then return fail(r, "ci-ok has no needs: [...] list") end
   local listed = {}
   for n in needs:gmatch("[%w_%-]+") do listed[n] = true end
   for _, j in ipairs(jobs) do
     if j ~= "ci-ok" and not listed[j] then fail(r, "ci-ok does not need job " .. j) end
+  end
+  -- the job's if:, without a trailing comment, quotes or ${{ }}
+  local raw = ok_job:match("\n    if:([^\n]*)")
+  local cond = (raw or ""):gsub("%s+#.*$", ""):match("^%s*(.-)%s*$")
+  cond = cond:match('^"(.*)"$') or cond:match("^'(.*)'$") or cond
+  cond = cond:match("^%${{%s*(.-)%s*}}$") or cond
+  if cond ~= "always()" then
+    fail(r, "ci-ok has no `if: always()`" .. (raw and " (it has `if:" .. raw .. "`)" or "")
+      .. ": any other condition skips it in some run where a job did not succeed")
+  end
+  local tested = false
+  for l in ok_job:gmatch("[^\n]+") do
+    if not l:match("^%s*#") and l:find("jq -e", 1, true)
+       and l:find([['all(.[]; .result == "success")']], 1, true) then
+      tested = true
+    end
+  end
+  if not tested then
+    fail(r, [[ci-ok does not run jq -e 'all(.[]; .result == "success")' on its needs]])
   end
 end)
 

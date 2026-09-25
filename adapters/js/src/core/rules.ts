@@ -21,6 +21,8 @@ export interface Rule {
   id: string;
   /** Lua patterns in the rule files; the subset used (anchors, literals, %-escapes) converts 1:1. */
   watch_paths: string[];
+  /** Match watch_paths without folding ASCII case (default: folded, see pathMatches). */
+  paths_case_sensitive?: boolean;
   methods?: Record<string, boolean>;
   /** Allow list (the pre-0.4 behaviour); without it, skip_content_types applies. */
   content_types?: string[];
@@ -207,9 +209,55 @@ export function luaPatternToRegExp(p: string): RegExp {
   return re;
 }
 
-export function pathMatches(s: string, patterns: string[] | undefined): string | null {
-  for (const p of patterns ?? []) {
-    if (luaPatternToRegExp(p).test(s)) return p;
+// Port of canonical_path() in core/rules.lua: watch paths match the path the
+// backend routes on. `;` parameters leave every segment (Tomcat, Jetty and
+// Spring route /v1;a=b/chat/completions as /v1/chat/completions), then empty
+// and `.` segments go and `..` is resolved; ASCII letters are folded unless
+// the rule matches case-sensitively (Express, Koa, ASP.NET Core and Fiber
+// route /V1/Chat/Completions to /v1/chat/completions). ASCII only, as in Lua:
+// toLowerCase() would fold other letters too.
+const asciiLower = (s: string): string => s.replace(/[A-Z]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 32));
+
+export function canonicalPath(path: string, caseSensitive = false): string {
+  let p = path.replace(/;[^/]*/g, "");
+  if (p.includes("//") || p.includes("/.")) {
+    const out: string[] = [];
+    for (const seg of p.split("/")) {
+      if (seg === "" || seg === ".") continue;
+      if (seg === "..") out.pop();
+      else out.push(seg);
+    }
+    let q = "/" + out.join("/");
+    if (p.endsWith("/") && q !== "/") q += "/";
+    p = q;
+  }
+  return caseSensitive ? p : asciiLower(p);
+}
+
+// the pattern folded the same way; a letter after `%` names a class (%S, %W)
+// and keeps its case
+const foldedPatterns = new Map<string, string>();
+function foldPattern(p: string): string {
+  let f = foldedPatterns.get(p);
+  if (f === undefined) {
+    f = p.replace(/%?[\s\S]/g, (t) => (t.length === 1 ? asciiLower(t) : t));
+    foldedPatterns.set(p, f);
+  }
+  return f;
+}
+
+/**
+ * Port of rules.path_matches: the first of `patterns` (a rule's watch_paths)
+ * that matches `path`, or null. Every place that decides whether a rule
+ * watches a path uses this one, so reading the body and judging it agree.
+ * `caseSensitive` is the rule's paths_case_sensitive.
+ */
+export function pathMatches(path: string, patterns: string[] | undefined, caseSensitive?: boolean): string | null {
+  if (!patterns || patterns.length === 0) return null;
+  const cs = caseSensitive === true;
+  const s = canonicalPath(path ?? "", cs);
+  for (const p of patterns) {
+    if (luaPatternToRegExp(cs ? p : foldPattern(p)).test(s)) return p;
   }
   return null;
 }
@@ -380,7 +428,7 @@ export async function evaluate(
   req: Req, rule: Rule, ctx?: RulesCtx,
 ): Promise<[RuleResult, string, string, boolean?, string[]?, boolean?, UntrustedPart?]> {
   // 1. path watch list
-  if (!pathMatches(req.path ?? "", rule.watch_paths)) return [PASS, "", "path not watched"];
+  if (!pathMatches(req.path ?? "", rule.watch_paths, rule.paths_case_sensitive)) return [PASS, "", "path not watched"];
 
   // 2. reputation, before anything that needs a body. It only ever blocks:
   //    safe verdicts earn an IP nothing (see core/rules.lua)
@@ -438,7 +486,7 @@ export async function evaluate(
 export function ruleFor(req: Req, rules: Rule[] | undefined): Rule | undefined {
   const ct = contentType(req.headers);
   for (const r of rules ?? []) {
-    if (pathMatches(req.path ?? "", r.watch_paths)
+    if (pathMatches(req.path ?? "", r.watch_paths, r.paths_case_sensitive)
       && !(r.methods && !r.methods[(req.method ?? "").toUpperCase()])
       && ctWatched(ct, r)) return r;
   }

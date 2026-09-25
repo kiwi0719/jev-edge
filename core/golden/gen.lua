@@ -252,6 +252,20 @@ rules_case("natural language on a watched path", req(LONG))
 rules_case("path not watched", req(LONG, { path = "/static/app.js" }))
 rules_case("second watch path", req(LONG, { path = "/api/chat/stream" }))
 rules_case("watch pattern is a prefix, not a substring", req(LONG, { path = "/proxy/v1/chat" }))
+-- watch paths match the path the backend routes on: ASCII case folded
+-- (Express, Koa, ASP.NET Core, Fiber), `;` parameters dropped from every
+-- segment and the empty or dot segments they leave resolved (Tomcat, Jetty,
+-- Spring)
+rules_case("watch paths ignore ASCII case", req(LONG, { path = "/v1/Chat/Completions" }))
+rules_case("watch paths ignore ASCII case in the first segment", req(LONG, { path = "/V1/COMPLETIONS" }))
+rules_case("watch paths ignore ASCII case on the Ollama route", req(LONG, { path = "/API/chat" }))
+rules_case("case folding keeps the anchor", req(LONG, { path = "/Proxy/V1/Chat" }))
+rules_case("path parameters are dropped before matching", req(LONG, { path = "/v1;a=b/chat/completions" }))
+rules_case("a bare path parameter is dropped", req(LONG, { path = "/api;x/chat" }))
+rules_case("the empty segment a path parameter leaves is merged",
+  req(LONG, { path = "/v1/;a=b/chat/completions" }))
+rules_case("the dot segment a path parameter leaves is resolved",
+  req(LONG, { path = "/v1/x/..;/chat/completions" }))
 rules_case("method not watched", req(LONG, { method = "GET" }))
 rules_case("method is case-insensitive", req(LONG, { method = "post" }))
 rules_case("content-type not watched", req(LONG, { headers = { ["content-type"] = "image/png" } }))
@@ -591,6 +605,20 @@ eval_case("text/plain body", { req = req("", { headers = { ["content-type"] = "t
     body = LONG, body_size = #LONG }), judge = { answers = { injection = 0.1 } } })
 eval_case("default rule set watches nothing", { req = req(ATTACK), rules = { "default" },
   judge = { answers = { injection = 0.9 } } })
+-- watch paths fold ASCII case unless a rule sets paths_case_sensitive (for a
+-- backend that routes case-sensitively); path parameters go either way
+local STRICT = { id = "strict", extends = "llm-endpoints", paths_case_sensitive = true }
+eval_case("paths_case_sensitive: the path is matched as sent",
+  { req = req(ATTACK, { path = "/V1/chat/completions" }), rules = { STRICT },
+    judge = { answers = { injection = 0.9 } } })
+eval_case("paths_case_sensitive: path parameters are still dropped",
+  { req = req(ATTACK, { path = "/v1;a=b/chat/completions" }), rules = { STRICT },
+    judge = { answers = { injection = 0.9 } } })
+eval_case("a tenant pattern with capitals and a set is folded like the path", {
+  req = req(LONG, { path = "/tenants/acme/Chat" }),
+  rules = { { id = "tenant", extends = "llm-endpoints", watch_paths = { "^/Tenants/[A-Z]+/chat" },
+              deployment_context = "A tenant assistant." }, "llm-endpoints" },
+  judge = { answers = { injection = 0.1 } } })
 eval_case("trusted fingerprint passes without L2", { req = req(ATTACK),
   config = { feedback = { enabled = true, token = "t" } },
   cache = { ["trust:" .. fp_of(ATTACK)] = { trusted_until = 2000, renewals = 0, by = "alice" } },

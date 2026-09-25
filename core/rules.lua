@@ -27,13 +27,62 @@ _M.SKIP_CONTENT_TYPES = {
   "image/", "audio/", "video/", "font/", "application/pdf", "application/zip", "application/gzip",
 }
 
--- Path patterns are Lua patterns (cheap, anchored, no alternation needed).
-local function path_matches(s, patterns)
-  for _, p in ipairs(patterns or {}) do
-    if s:find(p) then return p end
+-- Path patterns are Lua patterns (cheap, anchored, no alternation needed),
+-- matched against the path the backend routes on, not the one the gateway
+-- reports. Every segment loses its `;` parameters (Tomcat, Jetty and Spring
+-- route /v1;a=b/chat/completions as /v1/chat/completions), then empty and
+-- `.` segments go and `..` is resolved, as the backend does once they are
+-- gone (/v1/x/..;/chat). Unless the rule sets paths_case_sensitive = true,
+-- ASCII letters are folded in the path and in the patterns alike: Express,
+-- Koa, ASP.NET Core and Fiber route /V1/Chat/Completions to the
+-- /v1/chat/completions handler. A letter after `%` names a class (%S, %W)
+-- and keeps its case.
+local LOWER = {}
+for c = 65, 90 do LOWER[string.char(c)] = string.char(c + 32) end
+
+local function canonical_path(path, case_sensitive)
+  local p = path:gsub(";[^/]*", "")
+  if p:find("//", 1, true) or p:find("/.", 1, true) then
+    local out = {}
+    for seg in p:gmatch("[^/]+") do
+      if seg == ".." then
+        out[#out] = nil
+      elseif seg ~= "." then
+        out[#out + 1] = seg
+      end
+    end
+    local q = "/" .. table.concat(out, "/")
+    if p:sub(-1) == "/" and q ~= "/" then q = q .. "/" end
+    p = q
+  end
+  if case_sensitive then return p end
+  return (p:gsub("[A-Z]", LOWER))
+end
+
+local folded = {}
+local function fold_pattern(p)
+  local f = folded[p]
+  if not f then
+    f = p:gsub("%%?.", function(t) if #t == 1 then return LOWER[t] end end)
+    folded[p] = f
+  end
+  return f
+end
+
+--- The first of `patterns` (a rule's watch_paths) that matches `path`, or
+-- nil. Every place that decides whether a rule watches a path uses this one,
+-- core and adapters alike, so reading the body and judging it agree.
+-- @param case_sensitive the rule's paths_case_sensitive
+function _M.path_matches(path, patterns, case_sensitive)
+  if not patterns or #patterns == 0 then return nil end
+  local cs = case_sensitive == true
+  local s = canonical_path(path or "", cs)
+  for _, p in ipairs(patterns) do
+    if s:find(cs and p or fold_pattern(p)) then return p end
   end
   return nil
 end
+local path_matches = _M.path_matches
 
 -- always_suspect patterns are PCRE, matched through ctx.re_find so the same
 -- rule files work under ngx.re (OpenResty), lrexlib (tests) or JS RegExp.
@@ -202,7 +251,7 @@ end
 --         windowed } of retrieved content to judge on its own, or nil)
 function _M.evaluate(req, rule, ctx)
   -- 1. path watch list
-  if not path_matches(req.path or "", rule.watch_paths) then
+  if not path_matches(req.path, rule.watch_paths, rule.paths_case_sensitive) then
     return _M.PASS, "", "path not watched"
   end
 
@@ -421,7 +470,7 @@ end
 function _M.rule_for(req, rules)
   local ct = _M.content_type(req.headers)
   for _, r in ipairs(rules or {}) do
-    if path_matches(req.path or "", r.watch_paths)
+    if path_matches(req.path, r.watch_paths, r.paths_case_sensitive)
       and not (r.methods and not r.methods[(req.method or ""):upper()])
       and ct_watched(ct, r) then
       return r

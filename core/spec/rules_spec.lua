@@ -196,3 +196,50 @@ describe("rules.evaluate_all", function()
     assert.equals("no rules", reason)
   end)
 end)
+
+describe("rules.path_matches", function()
+  local W = rule.watch_paths
+
+  it("matches the path the backend routes on: ASCII case folded", function()
+    for _, p in ipairs({ "/v1/Chat/Completions", "/V1/COMPLETIONS", "/API/chat" }) do
+      assert.is_not_nil(R.path_matches(p, W), p)
+    end
+    assert.is_nil(R.path_matches("/Proxy/V1/Chat", W))
+  end)
+
+  it("drops ';' parameters from every segment and resolves what they leave", function()
+    for _, p in ipairs({ "/v1;a=b/chat/completions", "/api;x/chat", "/v1/;a=b/chat/completions",
+                         "/v1/x/..;/chat/completions", "/;jsessionid=1/v1/chat" }) do
+      assert.is_not_nil(R.path_matches(p, W), p)
+    end
+    assert.is_nil(R.path_matches("/static;v=1/app.js", W))
+  end)
+
+  it("keeps the case when the rule asks for it, and still drops parameters", function()
+    assert.is_nil(R.path_matches("/V1/chat/completions", W, true))
+    assert.is_not_nil(R.path_matches("/v1;a=b/chat/completions", W, true))
+    assert.is_not_nil(R.path_matches("/Tenant/Chat", { "^/Tenant/Chat" }, true))
+    assert.is_nil(R.path_matches("/tenant/chat", { "^/Tenant/Chat" }, true))
+  end)
+
+  it("folds pattern letters but not the letter that names a %-class", function()
+    assert.is_not_nil(R.path_matches("/tenants/acme/chat", { "^/Tenants/[A-Z]+/Chat" }))
+    -- %S is "not a space", %W "not alphanumeric": folding them to %s / %w would invert them
+    assert.is_not_nil(R.path_matches("/t/Abc", { "^/T/%S+$" }))
+    assert.is_nil(R.path_matches("/t/a c", { "^/T/%S+$" }))
+    assert.is_not_nil(R.path_matches("/t/-", { "^/t/%W$" }))
+    -- %% is a literal percent; the letter after it is a letter
+    assert.is_not_nil(R.path_matches("/t/%a", { "^/t/%%A$" }))
+  end)
+
+  it("folds ASCII only, like the TypeScript core", function()
+    assert.is_nil(R.path_matches("/v1/\195\137", { "^/v1/\195\169" }))   -- É is not é
+  end)
+
+  it("is what rule_for uses", function()
+    local req = H.chat_req("summarise this long document please", { path = "/V1;x=y/Chat/Completions" })
+    assert.equals("llm-endpoints", R.rule_for(req, { rule }).id)
+    local strict = setmetatable({ paths_case_sensitive = true }, { __index = rule })
+    assert.is_nil(R.rule_for(req, { strict }))
+  end)
+end)

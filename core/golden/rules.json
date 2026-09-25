@@ -94,6 +94,190 @@
     },
     {
       "expect": {
+        "reason": "natural language",
+        "result": "suspect",
+        "text": "Please write a detailed summary of the attached quarterly report."
+      },
+      "input": {
+        "cache": {},
+        "clock": 1000,
+        "req": {
+          "body": "{\"messages\":[{\"role\":\"user\",\"content\":\"Please write a detailed summary of the attached quarterly report.\"}]}",
+          "body_size": 108,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/v1/Chat/Completions"
+        },
+        "rule": "llm-endpoints"
+      },
+      "name": "watch paths ignore ASCII case"
+    },
+    {
+      "expect": {
+        "reason": "natural language",
+        "result": "suspect",
+        "text": "Please write a detailed summary of the attached quarterly report."
+      },
+      "input": {
+        "cache": {},
+        "clock": 1000,
+        "req": {
+          "body": "{\"messages\":[{\"role\":\"user\",\"content\":\"Please write a detailed summary of the attached quarterly report.\"}]}",
+          "body_size": 108,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/V1/COMPLETIONS"
+        },
+        "rule": "llm-endpoints"
+      },
+      "name": "watch paths ignore ASCII case in the first segment"
+    },
+    {
+      "expect": {
+        "reason": "natural language",
+        "result": "suspect",
+        "text": "Please write a detailed summary of the attached quarterly report."
+      },
+      "input": {
+        "cache": {},
+        "clock": 1000,
+        "req": {
+          "body": "{\"messages\":[{\"role\":\"user\",\"content\":\"Please write a detailed summary of the attached quarterly report.\"}]}",
+          "body_size": 108,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/API/chat"
+        },
+        "rule": "llm-endpoints"
+      },
+      "name": "watch paths ignore ASCII case on the Ollama route"
+    },
+    {
+      "expect": {
+        "reason": "path not watched",
+        "result": "pass",
+        "text": ""
+      },
+      "input": {
+        "cache": {},
+        "clock": 1000,
+        "req": {
+          "body": "{\"messages\":[{\"role\":\"user\",\"content\":\"Please write a detailed summary of the attached quarterly report.\"}]}",
+          "body_size": 108,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/Proxy/V1/Chat"
+        },
+        "rule": "llm-endpoints"
+      },
+      "name": "case folding keeps the anchor"
+    },
+    {
+      "expect": {
+        "reason": "natural language",
+        "result": "suspect",
+        "text": "Please write a detailed summary of the attached quarterly report."
+      },
+      "input": {
+        "cache": {},
+        "clock": 1000,
+        "req": {
+          "body": "{\"messages\":[{\"role\":\"user\",\"content\":\"Please write a detailed summary of the attached quarterly report.\"}]}",
+          "body_size": 108,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/v1;a=b/chat/completions"
+        },
+        "rule": "llm-endpoints"
+      },
+      "name": "path parameters are dropped before matching"
+    },
+    {
+      "expect": {
+        "reason": "natural language",
+        "result": "suspect",
+        "text": "Please write a detailed summary of the attached quarterly report."
+      },
+      "input": {
+        "cache": {},
+        "clock": 1000,
+        "req": {
+          "body": "{\"messages\":[{\"role\":\"user\",\"content\":\"Please write a detailed summary of the attached quarterly report.\"}]}",
+          "body_size": 108,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/api;x/chat"
+        },
+        "rule": "llm-endpoints"
+      },
+      "name": "a bare path parameter is dropped"
+    },
+    {
+      "expect": {
+        "reason": "natural language",
+        "result": "suspect",
+        "text": "Please write a detailed summary of the attached quarterly report."
+      },
+      "input": {
+        "cache": {},
+        "clock": 1000,
+        "req": {
+          "body": "{\"messages\":[{\"role\":\"user\",\"content\":\"Please write a detailed summary of the attached quarterly report.\"}]}",
+          "body_size": 108,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/v1/;a=b/chat/completions"
+        },
+        "rule": "llm-endpoints"
+      },
+      "name": "the empty segment a path parameter leaves is merged"
+    },
+    {
+      "expect": {
+        "reason": "natural language",
+        "result": "suspect",
+        "text": "Please write a detailed summary of the attached quarterly report."
+      },
+      "input": {
+        "cache": {},
+        "clock": 1000,
+        "req": {
+          "body": "{\"messages\":[{\"role\":\"user\",\"content\":\"Please write a detailed summary of the attached quarterly report.\"}]}",
+          "body_size": 108,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/v1/x/..;/chat/completions"
+        },
+        "rule": "llm-endpoints"
+      },
+      "name": "the dot segment a path parameter leaves is resolved"
+    },
+    {
+      "expect": {
         "reason": "method not watched",
         "result": "pass",
         "text": ""

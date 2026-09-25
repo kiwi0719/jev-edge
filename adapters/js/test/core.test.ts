@@ -3,7 +3,7 @@
 // id hygiene and the breaker's post-probe reset (twin of the Lua specs).
 import { describe, it, expect, vi } from "vitest";
 import * as core from "../src/core";
-import { luaPatternToRegExp, patternError, evaluate as rulesEvaluate } from "../src/core/rules";
+import { luaPatternToRegExp, patternError, pathMatches, canonicalPath, evaluate as rulesEvaluate } from "../src/core/rules";
 import { resolve, load } from "../src/rules";
 import { truncateBytes, normalize, fingerprint, djb2 } from "../src/core/normalize";
 import { encodeReason } from "../src/core/verdict";
@@ -52,6 +52,39 @@ describe("luaPatternToRegExp", () => {
     expect(patternError("^/(v1%1)")).toBe("invalid capture index %1");
     expect(patternError("^/%0")).toBe("invalid capture index %0");
     for (const ok of ["^/v1/(chat)", "^/(v1)/%1", "^/v1/()", "^/v1/[()]", "^/v1/%(", "^/%b()"]) expect(patternError(ok)).toBeNull();
+  });
+});
+
+describe("pathMatches (twin of core/spec/rules_spec.lua)", () => {
+  const W = load("llm-endpoints").watch_paths;
+
+  it("matches the path the backend routes on: ASCII case folded", () => {
+    for (const p of ["/v1/Chat/Completions", "/V1/COMPLETIONS", "/API/chat"]) expect(pathMatches(p, W), p).not.toBeNull();
+    expect(pathMatches("/Proxy/V1/Chat", W)).toBeNull();
+  });
+
+  it("drops ';' parameters from every segment and resolves what they leave", () => {
+    for (const p of ["/v1;a=b/chat/completions", "/api;x/chat", "/v1/;a=b/chat/completions", "/v1/x/..;/chat/completions", "/;jsessionid=1/v1/chat"]) {
+      expect(pathMatches(p, W), p).not.toBeNull();
+    }
+    expect(pathMatches("/static;v=1/app.js", W)).toBeNull();
+  });
+
+  it("keeps the case when the rule asks for it, and still drops parameters", () => {
+    expect(pathMatches("/V1/chat/completions", W, true)).toBeNull();
+    expect(pathMatches("/v1;a=b/chat/completions", W, true)).not.toBeNull();
+    expect(pathMatches("/Tenant/Chat", ["^/Tenant/Chat"], true)).not.toBeNull();
+    expect(pathMatches("/tenant/chat", ["^/Tenant/Chat"], true)).toBeNull();
+  });
+
+  it("folds pattern letters but not the letter after %", () => {
+    expect(pathMatches("/tenants/acme/chat", ["^/Tenants/[A-Z]+/Chat"])).not.toBeNull();
+    expect(pathMatches("/t/%a", ["^/t/%%A$"])).not.toBeNull();
+  });
+
+  it("folds ASCII only, like the Lua core", () => {
+    expect(pathMatches("/v1/É", ["^/v1/é"])).toBeNull();
+    expect(canonicalPath("/V1/É;x")).toBe("/v1/É");
   });
 });
 

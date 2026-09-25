@@ -168,6 +168,16 @@ describe("nodeMiddleware", () => {
     expect(res.headers["x-jev-verdict"]).toBe("malicious");
   });
 
+  it("judges the paths Express routes case-insensitively and Tomcat without ';' parameters", async () => {
+    for (const path of ["/V1/Chat/Completions", "/API/chat", "/v1;a=b/chat/completions"]) {
+      const mw = nodeMiddleware(opts());
+      const req = nodeReq(ATTACK, { "x-jev-mock-score": "0.95" }, path);
+      const res = nodeRes();
+      await mw(req as never, res, () => {});
+      expect(res.statusCode, path).toBe(403);
+    }
+  });
+
   it("GET on an unwatched path is skipped at L1", async () => {
     const mw = nodeMiddleware(opts());
     const req = nodeReq(null, {}, "/static/x");

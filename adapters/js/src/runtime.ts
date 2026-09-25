@@ -137,7 +137,7 @@ export function normalizePath(pathname: string): string {
 
 function isCandidate(rt: Runtime, path: string, method: string): boolean {
   const m = method.toUpperCase();
-  return rt.rules.some((r) => core.rules.pathMatches(path, r.watch_paths) && (!r.methods || r.methods[m]));
+  return rt.rules.some((r) => core.rules.pathMatches(path, r.watch_paths, r.paths_case_sensitive) && (!r.methods || r.methods[m]));
 }
 
 /** Requests an adapter built from a body it only had the start of

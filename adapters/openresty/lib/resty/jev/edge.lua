@@ -113,11 +113,9 @@ local function build_req(rules, over)
   -- max_body_bytes, head and tail past it, decoded (resty.jev.body).
   local max = 0
   for _, r in ipairs(rules) do
-    local ok = false
-    for _, p in ipairs(r.watch_paths or {}) do
-      if req.path:find(p) then ok = true break end
+    if rules_mod.path_matches(req.path, r.watch_paths, r.paths_case_sensitive) then
+      max = math.max(max, r.max_body_bytes or rules_mod.MAX_BODY_BYTES)
     end
-    if ok then max = math.max(max, r.max_body_bytes or rules_mod.MAX_BODY_BYTES) end
   end
   if max > 0 then
     body_m.fill(req, max)

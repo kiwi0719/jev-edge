@@ -106,8 +106,9 @@ TEXT_KEYS = ("query", "text", "prompt", "input", "messages")
 # Content parts that carry media: only their `type` (and any `text` or
 # `content`, which jev-edge would read in-line too) is sent.
 MEDIA_PARTS = frozenset({"image_url", "input_image", "image", "input_audio", "audio", "file", "input_file"})
-# Keys whose values are media payloads wherever they appear.
-MEDIA_KEYS = frozenset({"image_url", "input_audio", "file_data", "inline_data", "inlineData"})
+# Keys whose values are media payloads wherever they appear (`bytes`: a
+# Bedrock Converse image, document or video source).
+MEDIA_KEYS = frozenset({"image_url", "input_audio", "file_data", "inline_data", "inlineData", "bytes"})
 # Strings under these keys name structure, not text: a body with nothing else
 # is not worth a round trip.
 STRUCTURAL_KEYS = frozenset({"role", "type", "id", "call_id", "tool_call_id", "tool_use_id", "name",
@@ -148,6 +149,20 @@ NOT_VISIBLE_CALLS = {
     "arealtime_calls": "realtime (WebRTC) audio is not visible to the guardrail",
     "_aresponses_websocket": "the socket's messages are not visible to the guardrail",
 }
+
+# Pass-through routes. The Bedrock pass-through (/bedrock/..., call type
+# allm_passthrough_route) nests the client's body, in Bedrock's own format,
+# under `data`, next to LiteLLM's own keys. The generic pass-through
+# (/anthropic, /openai, /gemini, /vertex_ai, /vllm, ..., and a config's
+# pass_through_endpoints; call type pass_through_endpoint) hands the client's
+# body itself with LiteLLM's logging object added, and a WebSocket
+# pass-through (Vertex AI Live) an empty dict.
+NESTED_PASSTHROUGH_CALLS = frozenset({"allm_passthrough_route", "llm_passthrough_route"})
+PASSTHROUGH_CALL = "pass_through_endpoint"
+# Keys LiteLLM adds next to a generic pass-through's body (its `metadata` is
+# taken out before the body is sent on).
+LITELLM_OWN_KEYS = frozenset({"litellm_logging_obj", "litellm_call_id", "proxy_server_request", "secret_fields",
+                              "metadata", "litellm_metadata"})
 
 # The routes whose proxy metadata LiteLLM keeps in `litellm_metadata` (their
 # API has a `metadata` parameter of its own, which is the client's), from
@@ -299,6 +314,10 @@ def _parse_fields(value: Any) -> tuple:
 
 def _is_definition(key: str, value: Any) -> bool:
     return key in DEFINITION_KEYS or (key == "text" and isinstance(value, dict))
+
+
+# Every top-level key the body is built from (with the extra fields).
+READ_KEYS = DEFINITION_KEYS + SYSTEM_KEYS + TEXT_KEYS + ("systemInstruction", "system_instruction", "contents")
 
 
 def _body_dict(data: dict, extra_fields: tuple = ()) -> Optional[dict]:
@@ -472,13 +491,25 @@ def _proxy_path(data: dict) -> Optional[str]:
         return None
 
 
+def _is_object(value: Any) -> bool:
+    """Something no JSON body decodes to: a Python object the proxy put there."""
+    return value is not None and not isinstance(value, (dict, list, tuple, str, int, float, bool))
+
+
 def _metadata_key(data: dict) -> str:
-    """Where LiteLLM keeps its own metadata for this request: `litellm_metadata`
-    on the routes whose API has a `metadata` parameter (Responses, Anthropic
-    messages, batches, files, assistants), `metadata` elsewhere. Decided by
-    the route, as LiteLLM decides it, so the client's own `metadata` (sent on
-    to the provider) or a `litellm_metadata` a client put in a chat request
-    is never taken for the proxy's."""
+    """Where LiteLLM keeps its own metadata for this request: the bag holding
+    the proxy's UserAPIKeyAuth object (`user_api_key_auth`, which no client
+    can send: it is not JSON). Without one, by the route, as LiteLLM decides
+    it: `litellm_metadata` on the routes whose API has a `metadata`
+    parameter (Responses, Anthropic messages, batches, files, assistants,
+    and Bedrock on 1.102.1 but not on 1.80.11), `metadata` elsewhere. Either
+    way the client's own `metadata` (sent on to the provider) or a
+    `litellm_metadata` a client put in a chat request is never taken for the
+    proxy's."""
+    for key in ("metadata", "litellm_metadata"):
+        bag = data.get(key)
+        if isinstance(bag, dict) and _is_object(bag.get("user_api_key_auth")):
+            return key
     path = _proxy_path(data)
     if path is not None:
         return "litellm_metadata" if any(r in path for r in LITELLM_METADATA_ROUTES) else "metadata"
@@ -603,6 +634,22 @@ class JevEdgeGuardrail(_ApplyGuardrailBase):
             return "skip", f"call type {name} not judged"
         if name in NOT_VISIBLE_CALLS:
             return "unjudged", f"unjudgeable: call type {name}: {NOT_VISIBLE_CALLS[name]}"
+        if name in NESTED_PASSTHROUGH_CALLS:
+            inner = data.get("data")
+            if isinstance(inner, dict):
+                provider = data.get("custom_llm_provider") or "provider"
+                return self._plan_passthrough(name, inner, f"{provider} body")
+            if inner is None or inner in ("", b""):
+                return "judge", None
+            return "unjudged", f"unjudgeable: call type {name}: the body is not JSON the guardrail reads"
+        if name == PASSTHROUGH_CALL:
+            if not data:
+                # a WebSocket pass-through hands an empty dict: its messages
+                # go to the provider without passing through here
+                return "unjudged", (f"unjudgeable: call type {name}: "
+                                    "a WebSocket pass-through's messages are not visible to the guardrail")
+            client = {k: v for k, v in data.items() if k not in LITELLM_OWN_KEYS}
+            return self._plan_passthrough(name, client, "body")
         if name in ("create_file", "acreate_file"):
             # LiteLLM passes the file's name, type and size, not its content
             purpose = str(data.get("purpose") or "unknown")
@@ -619,6 +666,22 @@ class JevEdgeGuardrail(_ApplyGuardrailBase):
         elif name in ("create_assistants", "acreate_assistants"):
             data = _assistant(data)
         return "judge", _body_dict(data, self.extra_fields)
+
+    def _plan_passthrough(self, name: str, body: dict, what: str) -> tuple:
+        """A pass-through client's body, in the provider's own format: judged
+        like any request's. One with none of the fields the guardrail reads
+        (Titan's `inputText`, Cohere's `message`, a batch's `requests`, ...)
+        is unjudgeable, not "no text": the format is not one it knows. An
+        empty one (a GET) has no text."""
+        judged = _body_dict(body, self.extra_fields)
+        if judged is not None:
+            return "judge", judged
+        read = READ_KEYS + self.extra_fields
+        if any(body.get(k) is not None for k in read):
+            return "judge", None  # the fields it reads, holding no text (an image)
+        if any(v is not None for v in body.values()):
+            return "unjudged", f"unjudgeable: call type {name}: no field the guardrail reads in the {what}"
+        return "judge", None
 
     @staticmethod
     def client_ip(data: dict) -> Optional[str]:
@@ -654,7 +717,12 @@ class JevEdgeGuardrail(_ApplyGuardrailBase):
         call_type: Any,
     ) -> Optional[Union[Exception, str, dict]]:
         started = time.time()
-        if isinstance(data.get("proxy_server_request"), dict):
+        name = str(getattr(call_type, "value", call_type) or "")
+        if name == PASSTHROUGH_CALL:
+            # the data is the client's own body: a proxy_server_request in it
+            # is the client's too, and LiteLLM recorded no address
+            ip = None
+        elif isinstance(data.get("proxy_server_request"), dict):
             ip = self.client_ip(data)
             _CLIENT_IP.set(ip)
         else:  # a batch file's line: the upload's client

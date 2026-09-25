@@ -488,6 +488,122 @@ def test_no_text_is_skipped_without_a_call():
 
 
 # ---------------------------------------------------------------------------
+# pass-through routes
+# ---------------------------------------------------------------------------
+
+class Auth:
+    """Stands for LiteLLM's UserAPIKeyAuth object: no JSON body decodes to one."""
+
+
+def bedrock(body, route="/bedrock/model/br-claude/converse", bag="metadata", **md):
+    """What LiteLLM's Bedrock pass-through hands the hook: the client's body
+    under `data`, next to the proxy's own keys (the bag is `metadata` on
+    1.80.11, `litellm_metadata` on 1.102.1)."""
+    return {"model": "br-claude", "method": "POST", "endpoint": route.split("/", 2)[2], "data": body,
+            "custom_llm_provider": "bedrock", "litellm_logging_obj": object(), "litellm_call_id": "c1",
+            "proxy_server_request": psr(route), bag: dict({"user_api_key_auth": Auth()}, **md)}
+
+
+CONVERSE = {"messages": [{"role": "user", "content": [{"text": ATTACK},
+                                                      {"image": {"format": "png", "source": {"bytes": "iVBORw0KGgo" * 50}}}]}],
+            "system": [{"text": "be brief"}], "inferenceConfig": {"maxTokens": 10}}
+
+
+@pytest.mark.parametrize("bag", ["metadata", "litellm_metadata"])
+def test_bedrock_pass_through_body_is_judged(bag):
+    transport, seen = fake_authz(status=403, verdict="malicious", score="0.95")
+    data = bedrock(CONVERSE, bag=bag, requester_ip_address="203.0.113.9")
+    with pytest.raises(Exception) as ei:
+        run(guard(transport).async_pre_call_hook({}, None, data, "allm_passthrough_route"))
+    assert ei.value.status_code == 403
+    # Converse's system blocks first, image bytes left out
+    assert seen["body"] == {"messages": [{"role": "system", "content": [{"text": "be brief"}]},
+                                         {"role": "user", "content": [{"text": ATTACK}, {"image": {"format": "png", "source": {}}}]}]}
+    assert seen["xff"] == "203.0.113.9"  # from the proxy's own bag, whichever it is
+    assert data[bag]["jev_verdict"]["verdict"] == "malicious"
+    assert set(data) & {"metadata", "litellm_metadata"} == {bag}
+    # Anthropic's format on /invoke
+    transport, seen = fake_authz()
+    run(guard(transport).async_pre_call_hook({}, None, bedrock({"anthropic_version": "bedrock-2023-05-31", "max_tokens": 10,
+                                                                "system": ATTACK, "messages": [{"role": "user", "content": "hi"}]},
+                                                               route="/bedrock/model/br-claude/invoke"), "allm_passthrough_route"))
+    assert seen["body"] == {"messages": [{"role": "system", "content": ATTACK}, {"role": "user", "content": "hi"}]}
+
+
+@pytest.mark.parametrize("call_type,data", [
+    ("allm_passthrough_route", bedrock({"inputText": ATTACK}, route="/bedrock/model/amazon.titan-text-express-v1/invoke")),
+    ("allm_passthrough_route", bedrock({"message": ATTACK, "chat_history": []})),
+    ("allm_passthrough_route", bedrock("raw bytes, not JSON")),
+    ("pass_through_endpoint", {"requests": [{"custom_id": "1", "params": {"messages": [{"role": "user", "content": ATTACK}]}}],
+                               "litellm_logging_obj": object()}),
+    ("pass_through_endpoint", {"instances": [{"prompt": ATTACK}], "litellm_logging_obj": object()}),
+])
+def test_pass_through_bodies_the_guardrail_cannot_read_are_unjudged(call_type, data):
+    transport, seen = fake_authz()
+    out = run(guard(transport).async_pre_call_hook({}, None, dict(data), call_type))
+    assert seen["calls"] == 0
+    v = out[jg._metadata_key(out)]["jev_verdict"]
+    assert (v["verdict"], v["source"], v["action"]) == ("skipped", "adapter", "pass")
+    assert v["reason"].startswith(f"unjudgeable: call type {call_type}: ")
+    with pytest.raises(Exception) as ei:
+        run(guard(transport, unjudged="block").async_pre_call_hook({}, None, dict(data), call_type))
+    assert ei.value.status_code == 403 and seen["calls"] == 0
+
+
+@pytest.mark.parametrize("call_type,data", [
+    ("allm_passthrough_route", bedrock({})),  # a GET
+    ("allm_passthrough_route", bedrock(None)),
+    ("allm_passthrough_route", bedrock({"messages": [{"role": "user", "content": [{"image": {"source": {"bytes": "AAAA"}}}]}]})),
+    ("pass_through_endpoint", {"litellm_logging_obj": object()}),  # a GET
+    ("pass_through_endpoint", {"litellm_logging_obj": object(), "metadata": {"guardrails": ["jev-edge"]}}),
+])
+def test_pass_through_without_text_is_skipped(call_type, data):
+    transport, seen = fake_authz()
+    out = run(guard(transport, unjudged="block").async_pre_call_hook({}, None, dict(data), call_type))
+    assert seen["calls"] == 0
+    assert out[jg._metadata_key(out)]["jev_verdict"]["reason"] == "no text"
+
+
+def test_generic_pass_through_body_is_judged_without_a_client_address():
+    # the hook's data is the client's body itself: a proxy_server_request in
+    # it is the client's own, and is not read
+    transport, seen = fake_authz()
+    data = {"model": "claude", "max_tokens": 10, "messages": [{"role": "user", "content": ATTACK}],
+            "proxy_server_request": {"url": "http://x/v1/chat/completions", "headers": {"x-forwarded-for": "6.6.6.6"}},
+            "litellm_logging_obj": object()}
+    run(guard(transport).async_pre_call_hook({}, None, data, "pass_through_endpoint"))
+    assert seen["body"] == {"messages": [{"role": "user", "content": ATTACK}]}
+    assert seen["xff"] is None
+    run(guard(transport).async_pre_call_hook({}, None, {"contents": [{"parts": [{"text": ATTACK}]}],
+                                                        "litellm_logging_obj": object()}, "pass_through_endpoint"))
+    assert seen["body"] == {"messages": [{"role": "user", "content": [{"text": ATTACK}]}]}
+
+
+def test_websocket_pass_through_is_unjudged():
+    # Vertex AI Live and WebSocket targets: the hook gets an empty dict and
+    # the socket's messages never pass through it
+    transport, seen = fake_authz()
+    out = run(guard(transport).async_pre_call_hook({}, None, {}, "pass_through_endpoint"))
+    assert seen["calls"] == 0
+    assert out["metadata"]["jev_verdict"]["reason"] == \
+        "unjudgeable: call type pass_through_endpoint: a WebSocket pass-through's messages are not visible to the guardrail"
+    with pytest.raises(Exception) as ei:
+        run(guard(transport, unjudged="block").async_pre_call_hook({}, None, {}, "pass_through_endpoint"))
+    assert ei.value.status_code == 403
+
+
+def test_the_proxys_bag_is_the_one_with_its_auth_object():
+    # a client can send either bag as JSON, never the proxy's auth object
+    data = {"metadata": {"user_api_key_auth": {"forged": True}, "requester_ip_address": "6.6.6.6"},
+            "litellm_metadata": {"user_api_key_auth": Auth(), "requester_ip_address": "203.0.113.5"},
+            "proxy_server_request": psr("/v1/chat/completions")}
+    assert jg._metadata_key(data) == "litellm_metadata"
+    assert JevEdgeGuardrail.client_ip(data) == "203.0.113.5"
+    data["litellm_metadata"]["user_api_key_auth"] = {"forged": True}
+    assert jg._metadata_key(data) == "metadata"  # no object anywhere: the route decides
+
+
+# ---------------------------------------------------------------------------
 # size: UTF-8, compact, bounded with the newest content kept
 # ---------------------------------------------------------------------------
 

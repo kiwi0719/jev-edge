@@ -15,9 +15,15 @@
 // "unjudgeable: ...", and action pass or block (403) as -unjudged says,
 // like jev-edge's policy.unjudgeable. Any other answer (a 5xx without the
 // header included), and any failure to reach jev-edge, sets
-// verdict=error, action=pass (fail-open). Paths containing "..",
-// "%2e" or "//" are never forwarded (they could reach the adapter's admin
-// endpoints next to /_jev/authz) and fail open too.
+// verdict=error, action=pass (fail-open). A path the agent cannot relay as
+// the backend reads it (a '%' without two hex digits after it, such as the
+// IIS-style %u0063 that cpp-httplib under llama.cpp decodes to 'c'; a %00;
+// a control character; bytes that are not UTF-8) is blocked with 400
+// (verdict=skipped, reason "invalid path"), as nginx answers it inline,
+// whatever -unjudged says: it is the client's error, so it never fails
+// open. Paths containing "..", "%2e" or "//" are never forwarded (they
+// could reach the adapter's admin endpoints next to /_jev/authz) and fail
+// open.
 package main
 
 import (
@@ -33,6 +39,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/negasus/haproxy-spoe-go/action"
 	"github.com/negasus/haproxy-spoe-go/agent"
@@ -95,6 +102,35 @@ func safePath(p string) bool {
 		return false
 	}
 	return !strings.Contains(p, "..") && !strings.Contains(strings.ToLower(p), "%2e") && !strings.Contains(p, "//")
+}
+
+// wellFormedPath reports whether p can be relayed as the backend reads it:
+// every '%' starts a two-digit hex escape, no escape decodes to NUL, there
+// is no control character and the decoded bytes are UTF-8 (no overlong
+// forms such as %C0%AE for '.'). nginx refuses the first three with 400
+// before jev-edge runs, so the inline deployment never judges such a path
+// either; Go cannot even build the authz URL for most of them. Backends may
+// still decode them (cpp-httplib, under llama.cpp, reads %u0063 as 'c').
+func wellFormedPath(p string) bool {
+	dec, err := url.PathUnescape(p)
+	if err != nil {
+		return false
+	}
+	for i := 0; i < len(p); i++ {
+		if p[i] < 0x20 || p[i] == 0x7f {
+			return false
+		}
+	}
+	return strings.IndexByte(dec, 0) < 0 && utf8.ValidString(dec)
+}
+
+// badPath blocks a request whose path is not well formed with 400, the
+// status nginx gives it inline (haproxy.cfg needs its deny_status 400 line
+// for that; without it the catch-all denies with 403). The client's error,
+// not jev-edge's: never fail-open, whatever -unjudged says.
+func badPath() map[string]string {
+	return map[string]string{"verdict": "skipped", "score": "0.00", "source": "adapter",
+		"reason": url.QueryEscape("invalid path"), "action": "block", "rid": "", "status": "400"}
 }
 
 // headers HAProxy or the HTTP client own; never copied from req.hdrs.
@@ -166,6 +202,12 @@ func check(get func(string) string) map[string]string {
 	}
 	if method == "" {
 		method = "POST"
+	}
+	// before safePath: a malformed path is refused even when it also has a
+	// dot segment or a doubled slash
+	if !wellFormedPath(path) {
+		log.Printf("jev-spoa: refusing malformed path %.256q with 400", path)
+		return badPath()
 	}
 	if !safePath(path) {
 		log.Printf("jev-spoa: refusing path %q, failing open", path)

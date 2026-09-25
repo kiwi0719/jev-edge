@@ -123,3 +123,55 @@ func TestDecisionBlockAndFailOpen(t *testing.T) {
 		t.Fatalf("unreachable: vars = %v", v)
 	}
 }
+
+// A path the agent cannot relay as the backend reads it: a '%' without two
+// hex digits after it (IIS-style %u0063, a bare %, %zz, a cut-off %4), a
+// %00, a control character, an overlong UTF-8 form. cpp-httplib (llama.cpp)
+// decodes %u0063 to 'c', so /v1/%u0063ompletions is /v1/completions there.
+// It is blocked with 400 as nginx answers it inline, whatever -unjudged
+// says, and jev-edge is not asked; before, Go could not build the authz URL
+// for most of them and the agent failed open.
+func TestMalformedPathIsBlockedWith400(t *testing.T) {
+	called := false
+	authz(t, func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.Header().Set("X-Jev-Verdict", "safe")
+	})
+	want := map[string]string{"verdict": "skipped", "score": "0.00", "source": "adapter",
+		"reason": "invalid+path", "action": "block", "rid": "", "status": "400"}
+	for _, unj := range []string{"pass", "block"} {
+		*unjudged = unj
+		for _, p := range []string{
+			"/v1/%u0063ompletions", "/%u0063ompletion", "/v1%u002fchat/completions", "/v1/chat/%U0063ompletions",
+			"/v1/chat/completions%", "/v1/%zzchat/completions", "/v1/chat/completions%4",
+			"/v1/chat/completions%00", "/v1/comp\x01letions", "/v1/comp\x7fletions",
+			"/v1/%C0%AEchat/completions", "/v1%C0%AFchat/completions", "/v1/%E0%80%AE/completions", "/v1/%FFchat",
+			// refused with 400 even when safePath would also refuse them
+			"/v1//%u0063ompletions", "/v1/../%zz", "/v1/%2e%2e/%u002f", "v1/%u0063ompletions",
+		} {
+			if v := check(msg(map[string]string{"method": "POST", "path": p, "body": "{}"})); !reflect.DeepEqual(v, want) {
+				t.Fatalf("-unjudged=%s %q: vars = %v, want %v", unj, p, v, want)
+			}
+		}
+	}
+	if called {
+		t.Fatal("jev-edge was asked about a malformed path")
+	}
+}
+
+// Well-formed escapes, UTF-8 included, still reach jev-edge as sent.
+func TestWellFormedEscapesAreForwardedAsSent(t *testing.T) {
+	var got string
+	authz(t, func(w http.ResponseWriter, r *http.Request) {
+		got = r.RequestURI
+		w.Header().Set("X-Jev-Verdict", "safe")
+	})
+	for _, p := range []string{"/v1/%63ompletions", "/v1/chat%2Fcompletions", "/v1/models/%E6%A8%A1%E5%9E%8B", "/v1/a%25b", "/v1/%0a"} {
+		if v := check(msg(map[string]string{"method": "POST", "path": p, "body": "{}"})); v["verdict"] != "safe" || v["action"] != "pass" {
+			t.Fatalf("%q: vars = %v", p, v)
+		}
+		if got != "/_jev/authz"+p {
+			t.Fatalf("%q: jev-edge saw %q", p, got)
+		}
+	}
+}

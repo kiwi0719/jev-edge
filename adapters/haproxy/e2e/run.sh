@@ -109,6 +109,22 @@ check "authz refused, -unjudged block: 403" "403" \
 check "block variant judges as usual" "app verdict=safe score=0.20 source=l2" \
   "$(curl -s -H 'Content-Type: application/json' -d "$LONG" $bbase/v1/chat/completions)"
 
+# A path the agent cannot relay as the backend reads it: IIS-style %u0063,
+# which cpp-httplib under llama.cpp decodes to 'c', any other '%' without two
+# hex digits, a %00, an overlong UTF-8 form. Blocked with 400 and the block
+# body, as nginx refuses it inline, whatever the unjudged policy says. Before,
+# the agent failed open and the request reached the app (whose nginx answers
+# its own HTML 400 here; llama.cpp served it).
+for p in '/v1/%u0063ompletions' '/v1/chat/%u0063ompletions' '/v1%u002fchat/completions' '/%u0063ompletion' \
+         '/v1/chat/completions%zz' '/v1/chat/completions%' '/v1/chat/completions%00' '/v1/chat/%C0%AEcompletions'; do
+  for b in $base $bbase; do
+    code=$(curl -s -o /tmp/jev-haproxy-body -w '%{http_code}' -H 'Content-Type: application/json' -d "$ATTACK" "$b$p")
+    check "malformed path $p (${b##*:}): 400" '400 {"error":"request rejected"}' "$code $(cat /tmp/jev-haproxy-body)"
+  done
+done
+check "well-formed escape /v1/chat/%63ompletions is judged" "403" \
+  "$(http_code -H 'Content-Type: application/json' -H 'X-Jev-Mock-Score: 0.97' -d "$ATTACK" "$base/v1/chat/%63ompletions")"
+
 docker compose stop jev-edge >/dev/null 2>&1
 check "jev-edge down fails open" "app verdict=error score=0.00 source=adapter" "$(post /v1/chat/completions '' "$LONG")"
 check "jev-edge down fails open with -unjudged block too" "app verdict=error score=0.00 source=adapter" \

@@ -3,6 +3,7 @@
 // fails a named case when the two drift.
 import { patternError, type Rule } from "../core/rules.js";
 import { validateUntrusted } from "../core/defaults.js";
+import { pathError } from "../core/normalize.js";
 
 export const llmEndpoints: Rule = {
   id: "llm-endpoints",
@@ -21,9 +22,15 @@ export const llmEndpoints: Rule = {
   max_body_bytes: 1048576,
   max_judge_bytes: 32768,
   max_judge_chunks: 1,
-  // oldest first: the judging window keeps the last ones first
+  // oldest first: the judging window keeps the last ones first. Tool-call
+  // arguments (".**": every key and string below, a string of JSON read
+  // decoded) come before the messages, so the newest turn is kept first.
   text_fields: [
-    "system", "template", "messages[*].content", "messages[*].parts", "prompt", "input",
+    "system", "template",
+    "messages[*].tool_calls[*].function.arguments.**", "messages[*].tool_calls[*].custom.input",
+    "messages[*].function_call.arguments.**", "messages[*].content[*].input.**",
+    "input[*].arguments.**", "input[*].input",
+    "messages[*].content", "messages[*].parts", "prompt", "input",
     "input[*].output", "query", "text", "suffix", "input_prefix", "input_suffix",
     "input_extra[*].text",
   ],
@@ -88,10 +95,19 @@ export function resolve(spec: RuleSpec): Rule {
   const [uok, uerr] = validateUntrusted(out.untrusted, `rule ${out.id}: untrusted`);
   if (!uok) throw new Error(uerr);
   out.text_fields ??= [
-    "system", "template", "messages[*].content", "messages[*].parts", "prompt", "input",
+    "system", "template",
+    "messages[*].tool_calls[*].function.arguments.**", "messages[*].tool_calls[*].custom.input",
+    "messages[*].function_call.arguments.**", "messages[*].content[*].input.**",
+    "input[*].arguments.**", "input[*].input",
+    "messages[*].content", "messages[*].parts", "prompt", "input",
     "input[*].output", "query", "text", "suffix", "input_prefix", "input_suffix",
     "input_extra[*].text",
   ];
+  if (!Array.isArray(out.text_fields)) throw new Error(`rule ${out.id}: text_fields must be a list of paths`);
+  out.text_fields.forEach((p, i) => {
+    const perr = pathError(p);
+    if (perr) throw new Error(`rule ${out.id}: text_fields[${i + 1}] ${perr}`);
+  });
   out.templates ??= ["injection"];
   return out;
 }

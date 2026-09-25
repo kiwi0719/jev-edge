@@ -399,11 +399,14 @@ async function judged(
   } else {
     let kind: string;
     let decoded: JsonValue | undefined;
-    [text, kind, values, decoded] = extract(req.body, ct, rule.text_fields, ctx?.json_decode);
+    let cut: boolean | undefined;
+    [text, kind, values, decoded, cut] = extract(req.body, ct, rule.text_fields, ctx?.json_decode);
     if (media && (kind === "binary" || kind === "none")) return { text: "", unj: CT_NOT_WATCHED };
     if (kind === "binary") return { text: "", unj: "unjudgeable: binary body" };
     // declared JSON the decoder refused, with no text-field value to scan
     if (kind === "invalid") return { text: "", unj: "unjudgeable: invalid json" };
+    // a "**" field hit its bound: the text is not all there
+    if (cut) partial = true;
     untrusted = untrustedPart(decoded, rule, ctx);
   }
   if (text === "") return { text: "", untrusted };

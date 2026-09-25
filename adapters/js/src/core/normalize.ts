@@ -39,19 +39,33 @@ export type JsonValue = null | boolean | number | string | JsonValue[] | { [k: s
 
 // ---------------------------------------------------------------------------
 // Path extraction: "messages[*].content", "prompt", "input.text"
+// A last segment "**" reads every key and string below the value, whatever
+// its shape: tool-call arguments are a string of JSON in OpenAI's APIs (read
+// decoded) and an object in Ollama's and Anthropic's; see deepValue.
 // ---------------------------------------------------------------------------
 
-interface Seg { key: string; each: boolean }
+interface Seg { key: string; each: boolean; deep?: boolean }
 
 function splitPath(path: string): Seg[] {
   const segs: Seg[] = [];
   for (const seg of path.split(".")) {
     if (seg === "") continue; // Lua's gmatch("[^%.]+") skips empty segments
     const m = /^([^[]*)\[\*\]$/.exec(seg);
-    if (m) segs.push({ key: m[1], each: true });
+    if (seg === "**") segs.push({ key: seg, each: false, deep: true });
+    else if (m) segs.push({ key: m[1], each: true });
     else segs.push({ key: seg, each: false });
   }
   return segs;
+}
+
+/** Port of normalize.path_error: why `path` (a text_fields entry, or any path in that syntax) is not one, or null. */
+export function pathError(path: unknown): string | null {
+  if (typeof path !== "string" || path === "") return "must be a non-empty string";
+  const segs = splitPath(path);
+  for (let i = 0; i < segs.length; i++) {
+    if (segs[i].deep && i < segs.length - 1) return '"**" must be the last segment';
+  }
+  return null;
 }
 
 function isObj(v: unknown): v is { [k: string]: JsonValue } | JsonValue[] {
@@ -123,44 +137,178 @@ function variants(node: { [k: string]: JsonValue }, key: string): string[] | und
   return others?.sort();
 }
 
-function descend(child: JsonValue | undefined, segs: Seg[], i: number, out: string[]): void {
+// ---------------------------------------------------------------------------
+// Bounded walks over JSON of any shape (port of the Lua ones): tool-call
+// arguments ("**"). The client picks the shape, so the walk is bounded:
+// DEEP.nodes object keys and array items per extraction, and DEEP.depth
+// levels below the path's value (cjson's nesting limit, which tooDeep()
+// applies here: JSON either core decodes is never cut by depth). Object keys
+// are read in UTF-8 byte order, as Lua's table.sort orders them. Past a
+// bound the rest is left out and `capped` says so. An empty object or array
+// (and null) adds nothing and is not counted. Tests lower the bounds.
+// ---------------------------------------------------------------------------
+
+export const DEEP = { depth: 1000, nodes: 50000 };
+
+type Decode = (s: string) => JsonValue;
+
+interface WalkState {
+  out: string[];
+  nodes: number;
+  bytes: number;
+  /** cap on the UTF-8 bytes of the strings taken (undefined: none) */
+  max?: number;
+  capped: boolean;
+  full: boolean;
+  /** json_decode, for "**" values that are a string of JSON */
+  decode?: Decode;
+}
+
+function newState(max?: number, decode?: Decode): WalkState {
+  return { out: [], nodes: DEEP.nodes, bytes: 0, max, capped: false, full: false, decode };
+}
+
+/** Lua string order (bytes): UTF-16 order except that a character above U+FFFF sorts after all others. */
+export function byteOrder(a: string, b: string): number {
+  const n = Math.min(a.length, b.length);
+  for (let i = 0; i < n; i++) {
+    const x = a.charCodeAt(i);
+    const y = b.charCodeAt(i);
+    if (x !== y) {
+      const xs = x >= 0xd800 && x <= 0xdfff;
+      const ys = y >= 0xd800 && y <= 0xdfff;
+      if (xs !== ys) return xs ? 1 : -1;
+      return x - y;
+    }
+  }
+  return a.length - b.length;
+}
+
+// Port of keys_of: the keys of object `node` in byte order, counted against
+// the node budget; undefined once the budget cannot cover them.
+function keysOf(node: { [k: string]: JsonValue }, st: WalkState): string[] | undefined {
+  const keys = Object.keys(node);
+  if (keys.length > st.nodes) {
+    st.nodes = 0;
+    st.capped = true;
+    return undefined;
+  }
+  st.nodes -= keys.length;
+  return keys.sort(byteOrder);
+}
+
+// Port of count_item: one array item against the node budget.
+function countItem(st: WalkState): boolean {
+  if (st.nodes <= 0) {
+    st.capped = true;
+    return false;
+  }
+  st.nodes--;
+  return true;
+}
+
+// Port of take: adds `s` (unless empty); past the byte cap the string that
+// crosses it is cut at a character boundary and the walk ends.
+function take(st: WalkState, s: string): void {
+  if (st.full) return;
+  let n = byteLength(s);
+  if (st.max !== undefined && st.bytes + n > st.max) {
+    s = head(s, st.max - st.bytes);
+    n = byteLength(s);
+    st.full = true;
+    st.capped = true;
+  }
+  if (s === "") return;
+  st.bytes += n;
+  st.out.push(s);
+}
+
+const isEmpty = (node: object) => (Array.isArray(node) ? node.length === 0 : Object.keys(node).length === 0);
+
+// Port of every_string: every key and string value below `node`, keys in byte order.
+function everyString(node: JsonValue | undefined, st: WalkState, depth: number): void {
+  if (typeof node === "string") return take(st, node);
+  if (!isObj(node) || st.full || isEmpty(node)) return;
+  if (depth > DEEP.depth) {
+    st.capped = true;
+    return;
+  }
+  if (Array.isArray(node)) {
+    for (const v of node) {
+      if (!countItem(st)) return;
+      everyString(v, st, depth + 1);
+      if (st.full) return;
+    }
+    return;
+  }
+  const keys = keysOf(node, st);
+  if (!keys) return;
+  for (const k of keys) {
+    take(st, k);
+    everyString(node[k], st, depth + 1);
+    if (st.full) return;
+  }
+}
+
+// Port of deep_value: the value a "**" path ends at; a string holding a JSON
+// object or array is read decoded, anything else (and JSON the decoder
+// refuses, cjson's depth limit included) as it is.
+function deepValue(node: JsonValue, st: WalkState): void {
+  if (typeof node === "string" && st.decode && /^[ \t\n\r]*[[{]/.test(node) && !tooDeep(node)) {
+    let v: JsonValue | undefined;
+    try {
+      v = st.decode(loneSurrogates(node));
+    } catch {
+      v = undefined;
+    }
+    if (isObj(v)) return everyString(v, st, 1);
+  }
+  everyString(node, st, 1);
+}
+
+function descend(child: JsonValue | undefined, segs: Seg[], i: number, st: WalkState): void {
   if (segs[i].each) {
     // Lua ipairs over a cjson array: null is a value, skipped, not the end
     if (!Array.isArray(child)) return;
     for (const item of child) {
       if (item === null || item === undefined) continue;
-      walk(item, segs, i + 1, out);
+      walk(item, segs, i + 1, st);
     }
   } else {
-    walk(child, segs, i + 1, out);
+    walk(child, segs, i + 1, st);
   }
 }
 
 // A path key is matched the way fold() says, and every key that folds to it
 // is read, since with several the backend may take any one: the exact key
 // first, the others in byte order.
-function walk(node: JsonValue | undefined, segs: Seg[], i: number, out: string[]): void {
-  if (node === undefined || node === null) return;
+function walk(node: JsonValue | undefined, segs: Seg[], i: number, st: WalkState): void {
+  if (node === undefined || node === null || st.full) return;
   if (i >= segs.length) {
-    collect(node, out, 1);
+    collect(node, st.out, 1);
     return;
   }
+  if (segs[i].deep) return deepValue(node, st);
   const key = segs[i].key;
-  if (key === "") return descend(node, segs, i, out);
+  if (key === "") return descend(node, segs, i, st);
   if (!isObj(node) || Array.isArray(node)) return;
-  descend(node[key], segs, i, out);
-  for (const k of variants(node, key) ?? []) descend(node[k], segs, i, out);
+  descend(node[key], segs, i, st);
+  for (const k of variants(node, key) ?? []) descend(node[k], segs, i, st);
 }
 
-export function extractJson(decoded: JsonValue, fields: string[]): string {
-  return extractJsonValues(decoded, fields).join("\n");
+export function extractJson(decoded: JsonValue, fields: string[], jsonDecode?: Decode): string {
+  return extractJsonValues(decoded, fields, jsonDecode).join("\n");
 }
 
 /** The strings extractJson joins, in order (newest last), for window(). */
-export function extractJsonValues(decoded: JsonValue, fields: string[]): string[] {
-  const out: string[] = [];
-  for (const f of fields ?? []) walk(decoded, splitPath(f), 0, out);
-  return out;
+export function extractJsonValues(decoded: JsonValue, fields: string[], jsonDecode?: Decode): string[] {
+  return extractJsonState(decoded, fields, jsonDecode).out;
+}
+
+function extractJsonState(decoded: JsonValue, fields: string[], jsonDecode?: Decode): WalkState {
+  const st = newState(undefined, jsonDecode);
+  for (const f of fields ?? []) walk(decoded, splitPath(f), 0, st);
+  return st;
 }
 
 // Port of tool_results() in core/normalize.lua. Tool results in the chat shapes
@@ -204,10 +352,11 @@ function toolResults(decoded: JsonValue, out: string[]): void {
  * `spec.fields`, in that order. Returns the values (newest last).
  */
 export function extractUntrustedValues(decoded: JsonValue | undefined, spec: { tool_results?: boolean; fields?: string[] }): string[] {
-  const out: string[] = [];
+  const st = newState();
+  const out = st.out;
   if (!isObj(decoded)) return out;
   if (spec.tool_results !== false) toolResults(decoded, out);
-  for (const f of spec.fields ?? []) walk(decoded, splitPath(f), 0, out);
+  for (const f of spec.fields ?? []) walk(decoded, splitPath(f), 0, st);
   return out;
 }
 
@@ -349,15 +498,16 @@ function tooDeep(s: string): boolean {
 
 /**
  * Extract text from a raw body. Returns the text (values joined with "\n"),
- * the kind, the values in order (newest last) for window(), and the decoded
- * JSON value when the kind is "json".
+ * the kind, the values in order (newest last) for window(), the decoded
+ * JSON value when the kind is "json", and true when a "**" walk hit a bound
+ * and left something out.
  */
 export function extract(
   body: string | undefined | null,
   contentType: string | undefined | null,
   fields: string[],
   jsonDecode: (s: string) => JsonValue = (s) => JSON.parse(s) as JsonValue,
-): [string, ExtractKind, string[], JsonValue?] {
+): [string, ExtractKind, string[], JsonValue?, boolean?] {
   if (typeof body !== "string" || body === "") return ["", "none", []];
   const rawCt = typeof contentType === "string" ? contentType : "";
   const ct = asciiLower(rawCt);
@@ -379,8 +529,8 @@ export function extract(
     }
     if (ok && isObj(decoded) && tooDeep(body)) ok = false;
     if (ok && isObj(decoded)) {
-      const values = extractJsonValues(decoded as JsonValue, fields);
-      return [values.join("\n"), "json", values, decoded as JsonValue];
+      const st = extractJsonState(decoded as JsonValue, fields, jsonDecode);
+      return [st.out.join("\n"), "json", st.out, decoded as JsonValue, st.capped];
     }
     if (declaredJson) {
       // a JSON scalar has no text fields
@@ -457,7 +607,9 @@ export function fieldKeys(fields: string[] | undefined): Set<string> {
   // characters before any trailing "[", "]" or "*". A linear scan, not a
   // regex: the unanchored pattern backtracks quadratically on long input.
   const special = (c: string) => c === "." || c === "[" || c === "]" || c === "*";
-  for (const f of fields ?? []) {
+  for (let f of fields ?? []) {
+    // "arguments.**": the strings under "arguments"
+    if (f.endsWith(".**")) f = f.slice(0, -3);
     let end = f.length;
     while (end > 0 && (f[end - 1] === "[" || f[end - 1] === "]" || f[end - 1] === "*")) end--;
     let start = end;

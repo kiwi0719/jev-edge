@@ -46,11 +46,21 @@ return {
   max_judge_chunks = 1,
   -- Oldest first: the judging window keeps the last ones first.
   -- system: Anthropic Messages and Ollama /api/generate; template: Ollama.
+  -- Tool-call arguments, which chat templates render for the model and a
+  -- client can write into the history: OpenAI and Ollama tool_calls, legacy
+  -- function_call, Anthropic tool_use input, Responses function_call and
+  -- mcp_call arguments (".**": every key and string below, a string of JSON
+  -- read decoded), and the free-text input of custom tool calls. Before the
+  -- messages, so the window keeps the newest turn first.
   -- messages[*].parts: AI SDK 5 UIMessages, which carry no content.
   -- input[*].output: a Responses API function_call_output (a tool result).
   -- suffix: OpenAI completions and Ollama; input_prefix, input_suffix,
   -- input_extra: llama.cpp /infill.
-  text_fields = { "system", "template", "messages[*].content", "messages[*].parts", "prompt", "input",
+  text_fields = { "system", "template",
+                  "messages[*].tool_calls[*].function.arguments.**", "messages[*].tool_calls[*].custom.input",
+                  "messages[*].function_call.arguments.**", "messages[*].content[*].input.**",
+                  "input[*].arguments.**", "input[*].input",
+                  "messages[*].content", "messages[*].parts", "prompt", "input",
                   "input[*].output", "query", "text", "suffix", "input_prefix", "input_suffix",
                   "input_extra[*].text" },
   min_text_chars = 20,

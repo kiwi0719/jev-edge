@@ -40,8 +40,9 @@ describe("golden: normalize", () => {
 describe("golden: extract", () => {
   for (const c of load("extract").cases) {
     it(c.name, () => {
-      const [text, kind] = core.normalize.extract(c.input.body, c.input.content_type, c.input.fields, jsonDecode);
-      expect({ text, kind }).toEqual(c.expect);
+      const [text, kind, , , cut] = core.normalize.extract(c.input.body, c.input.content_type, c.input.fields, jsonDecode);
+      // expect.cut is there only when a "**" walk hit a bound
+      expect({ text, kind, ...(cut ? { cut } : {}) }).toEqual(c.expect);
     });
   }
 });

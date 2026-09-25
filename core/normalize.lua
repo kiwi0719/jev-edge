@@ -6,19 +6,34 @@ local _M = {}
 
 -- ---------------------------------------------------------------------------
 -- Path extraction: "messages[*].content", "prompt", "input.text"
+-- A last segment "**" reads every key and string below the value, whatever
+-- its shape: tool-call arguments are a string of JSON in OpenAI's APIs (read
+-- decoded) and an object in Ollama's and Anthropic's; see deep_value.
 -- ---------------------------------------------------------------------------
 
 local function split_path(path)
   local segs = {}
   for seg in path:gmatch("[^%.]+") do
     local name = seg:match("^([^%[]*)%[%*%]$")
-    if name then
+    if seg == "**" then
+      segs[#segs + 1] = { key = seg, deep = true }
+    elseif name then
       segs[#segs + 1] = { key = name, each = true }
     else
       segs[#segs + 1] = { key = seg, each = false }
     end
   end
   return segs
+end
+
+--- Why `path` (a text_fields entry, or any path in that syntax) is not one, or nil.
+function _M.path_error(path)
+  if type(path) ~= "string" or path == "" then return "must be a non-empty string" end
+  local segs = split_path(path)
+  for i, s in ipairs(segs) do
+    if s.deep and i < #segs then return "\"**\" must be the last segment" end
+  end
+  return nil
 end
 
 -- A leaf that is not a string is a "content parts" value: the array form of
@@ -95,44 +110,153 @@ local function variants(node, key)
   return others
 end
 
-local NONE = {}
-local walk
-local function descend(child, segs, i, out)
-  if segs[i].each then
-    if type(child) ~= "table" then return end
-    for _, item in ipairs(child) do
-      walk(item, segs, i + 1, out)
+-- ---------------------------------------------------------------------------
+-- Bounded walks over JSON of any shape: tool-call arguments ("**"). The
+-- client picks the shape, so the walk is bounded: DEEP_NODES object keys
+-- and array items per extraction (sorting the keys of one big object is
+-- what costs: 150k keys take 45 ms under LuaJIT, 50k about 13), and
+-- DEEP_DEPTH levels below the path's value, which is cjson's own nesting
+-- limit: JSON either core decodes is never cut by depth, the bound only
+-- guards the recursion. Object keys are read in byte order: a Lua table has
+-- none, and both cores must produce the same text. Past a bound the rest is
+-- left out and `capped` says so. An empty object or array (and a decoder's
+-- null, which may be an empty table) adds nothing and is not counted.
+-- ---------------------------------------------------------------------------
+
+_M.DEEP_DEPTH = 1000
+_M.DEEP_NODES = 50000
+
+-- @param max_bytes cap on the bytes of the strings taken (nil: none)
+-- @param decode    json_decode, for "**" values that are a string of JSON
+local function new_state(max_bytes, decode)
+  return { out = {}, nodes = _M.DEEP_NODES, bytes = 0, max = max_bytes, capped = false, full = false,
+           decode = decode }
+end
+
+-- The string keys of object `node` in byte order, counted against the node
+-- budget; nil once the budget cannot cover them (the walk stops there).
+local function keys_of(node, st)
+  local keys, n = {}, 0
+  for k in pairs(node) do
+    if type(k) == "string" then
+      n = n + 1
+      if n > st.nodes then
+        st.nodes, st.capped = 0, true
+        return nil
+      end
+      keys[n] = k
     end
-  else
-    walk(child, segs, i + 1, out)
+  end
+  st.nodes = st.nodes - n
+  table.sort(keys)
+  return keys
+end
+
+-- Counts one array item against the node budget; false once it is spent.
+local function count_item(st)
+  if st.nodes <= 0 then
+    st.capped = true
+    return false
+  end
+  st.nodes = st.nodes - 1
+  return true
+end
+
+-- Adds `s` (unless empty) to the output; with a byte cap (st.max, over the
+-- strings' bytes) the string that crosses it is cut at a character boundary
+-- and the walk ends.
+local function take(st, s)
+  if st.full then return end
+  if st.max and st.bytes + #s > st.max then
+    s = _M.head(s, st.max - st.bytes)
+    st.full, st.capped = true, true
+  end
+  if s == "" then return end
+  st.bytes = st.bytes + #s
+  st.out[#st.out + 1] = s
+end
+
+--- Every key and string value below `node`, keys in byte order: what a
+-- template that renders the value as JSON shows the model.
+local function every_string(node, st, depth)
+  if type(node) == "string" then return take(st, node) end
+  if type(node) ~= "table" or st.full or next(node) == nil then return end
+  if depth > _M.DEEP_DEPTH then
+    st.capped = true
+    return
+  end
+  if node[1] ~= nil then
+    for _, v in ipairs(node) do
+      if not count_item(st) then return end
+      every_string(v, st, depth + 1)
+      if st.full then return end
+    end
+    return
+  end
+  local keys = keys_of(node, st)
+  if not keys then return end
+  for _, k in ipairs(keys) do
+    take(st, k)
+    every_string(node[k], st, depth + 1)
+    if st.full then return end
   end
 end
 
-walk = function(node, segs, i, out)
-  if node == nil then return end
+-- The value a "**" path ends at. A string that holds a JSON object or array
+-- (OpenAI tool-call arguments) is read decoded, as the chat templates that
+-- render arguments read it: its keys and strings, escapes resolved, and no
+-- "{}" of an empty call. Anything else, and JSON the decoder refuses, is
+-- read as it is.
+local function deep_value(node, st)
+  if type(node) == "string" and st.decode and node:find("^[ \t\n\r]*[%[{]") then
+    local ok, v = pcall(st.decode, _M.lone_surrogates(node))
+    if ok and type(v) == "table" then return every_string(v, st, 1) end
+  end
+  every_string(node, st, 1)
+end
+
+local NONE = {}
+local walk
+local function descend(child, segs, i, st)
+  if segs[i].each then
+    if type(child) ~= "table" then return end
+    for _, v in ipairs(child) do
+      walk(v, segs, i + 1, st)
+    end
+  else
+    walk(child, segs, i + 1, st)
+  end
+end
+
+-- st.out collects the values
+walk = function(node, segs, i, st)
+  if node == nil or st.full then return end
   if i > #segs then
-    collect(node, out, 1)
+    collect(node, st.out, 1)
     return
   end
+  if segs[i].deep then return deep_value(node, st) end
   local key = segs[i].key
-  if key == "" then return descend(node, segs, i, out) end
+  if key == "" then return descend(node, segs, i, st) end
   if type(node) ~= "table" then return end
-  descend(node[key], segs, i, out)
+  descend(node[key], segs, i, st)
   for _, k in ipairs(variants(node, key) or NONE) do
-    descend(node[k], segs, i, out)
+    descend(node[k], segs, i, st)
   end
 end
 
 --- Extract candidate text from a decoded JSON value using the given field paths.
--- @param decoded table (decoded JSON)
--- @param fields  list of path strings
--- @return string (joined with "\n"), may be ""; and the list of strings found
-function _M.extract_json(decoded, fields)
-  local out = {}
+-- @param decoded     table (decoded JSON)
+-- @param fields      list of path strings
+-- @param json_decode optional: reads a "**" value that is a string of JSON
+-- @return string (joined with "\n"), may be ""; the list of strings found;
+--         and true when a "**" walk hit a bound and left something out
+function _M.extract_json(decoded, fields, json_decode)
+  local st = new_state(nil, json_decode)
   for _, f in ipairs(fields or {}) do
-    walk(decoded, split_path(f), 1, out)
+    walk(decoded, split_path(f), 1, st)
   end
-  return table.concat(out, "\n"), out
+  return table.concat(st.out, "\n"), st.out, st.capped
 end
 
 -- Tool results in the chat shapes gateways see:
@@ -182,11 +306,12 @@ end
 -- @param spec    { tool_results = bool, fields = { path, ... } }
 -- @return string (joined with "\n"), may be ""; and the list of strings found
 function _M.extract_untrusted(decoded, spec)
-  local out = {}
+  local st = new_state()
+  local out = st.out
   if type(decoded) ~= "table" or type(spec) ~= "table" then return "", out end
   if spec.tool_results ~= false then tool_results(decoded, out) end
   for _, f in ipairs(spec.fields or {}) do
-    walk(decoded, split_path(f), 1, out)
+    walk(decoded, split_path(f), 1, st)
   end
   return table.concat(out, "\n"), out
 end
@@ -300,7 +425,8 @@ end
 -- @return text string (the values joined with "\n"),
 --         kind ("json"|"scan"|"invalid"|"form"|"multipart"|"text"|"binary"|"none"),
 --         list of the values found (newest last), for window(),
---         and the decoded JSON value when kind is "json"
+--         the decoded JSON value when kind is "json", and true when a "**"
+--         walk hit a bound and left something out
 function _M.extract(body, content_type, fields, json_decode)
   if type(body) ~= "string" or body == "" then return "", "none", {} end
   local raw_ct = type(content_type) == "string" and content_type or ""
@@ -317,8 +443,8 @@ function _M.extract(body, content_type, fields, json_decode)
     if not json_decode then return "", "none", {} end
     local ok, decoded = pcall(json_decode, _M.lone_surrogates(body))
     if ok and type(decoded) == "table" then
-      local text, out = _M.extract_json(decoded, fields)
-      return text, "json", out, decoded
+      local text, out, capped = _M.extract_json(decoded, fields, json_decode)
+      return text, "json", out, decoded, capped
     end
     if declared_json then
       -- a JSON scalar has no text fields
@@ -407,7 +533,8 @@ end
 function _M.field_keys(fields)
   local keys = {}
   for _, f in ipairs(fields or {}) do
-    local last = f:match("([^%.%[%]%*]+)[%[%]%*]*$")
+    -- "arguments.**": the strings under "arguments"
+    local last = f:gsub("%.%*%*$", ""):match("([^%.%[%]%*]+)[%[%]%*]*$")
     if last then keys[fold(last)] = true end
   end
   -- content parts carry their text under "text"

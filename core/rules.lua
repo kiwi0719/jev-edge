@@ -224,12 +224,14 @@ local function judged(req, rule, ctx, ct, size)
     if #values == 0 then return nil, "unjudgeable: body too large" end
     text, partial = table.concat(values, "\n"), true
   else
-    local kind, decoded
-    text, kind, values, decoded = normalize.extract(req.body, ct, rule.text_fields, ctx and ctx.json_decode)
+    local kind, decoded, cut
+    text, kind, values, decoded, cut = normalize.extract(req.body, ct, rule.text_fields, ctx and ctx.json_decode)
     if media and (kind == "binary" or kind == "none") then return nil, CT_NOT_WATCHED end
     if kind == "binary" then return nil, "unjudgeable: binary body" end
     -- declared JSON the decoder refused, with no text-field value to scan
     if kind == "invalid" then return nil, "unjudgeable: invalid json" end
+    -- a "**" field hit its bound: the text is not all there
+    if cut then partial = true end
     untrusted = untrusted_part(decoded, rule, ctx)
   end
   if text == "" then return "", nil, nil, nil, nil, nil, untrusted end
@@ -462,9 +464,18 @@ function _M.resolve(spec, load)
   local uok, uerr = defaults.validate_untrusted(out.untrusted, "rule " .. out.id .. ": untrusted")
   if not uok then return nil, uerr end
   if not out.text_fields then
-    out.text_fields = { "system", "template", "messages[*].content", "messages[*].parts", "prompt", "input",
+    out.text_fields = { "system", "template",
+                        "messages[*].tool_calls[*].function.arguments.**", "messages[*].tool_calls[*].custom.input",
+                        "messages[*].function_call.arguments.**", "messages[*].content[*].input.**",
+                        "input[*].arguments.**", "input[*].input",
+                        "messages[*].content", "messages[*].parts", "prompt", "input",
                         "input[*].output", "query", "text", "suffix", "input_prefix", "input_suffix",
                         "input_extra[*].text" }
+  end
+  if type(out.text_fields) ~= "table" then return nil, "rule " .. out.id .. ": text_fields must be a list of paths" end
+  for i, p in ipairs(out.text_fields) do
+    local perr = normalize.path_error(p)
+    if perr then return nil, "rule " .. out.id .. ": text_fields[" .. i .. "] " .. perr end
   end
   if not out.templates then out.templates = { "injection" } end
   return out

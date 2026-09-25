@@ -52,8 +52,9 @@ end)
 describe("golden: extract", function()
   for _, c in ipairs(load("extract").cases) do
     it(c.name, function()
-      local text, kind = normalize.extract(c.input.body, c.input.content_type, c.input.fields, H.body_decode)
-      same(c.expect, { text = text, kind = kind })
+      local text, kind, _, _, cut = normalize.extract(c.input.body, c.input.content_type, c.input.fields,
+        H.body_decode)
+      same(c.expect, { text = text, kind = kind, cut = cut or nil })
     end)
   end
 end)

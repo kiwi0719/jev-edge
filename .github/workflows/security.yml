@@ -81,9 +81,15 @@ jobs:
           cache-dependency-path: ${{ matrix.module }}/go.sum
       - run: go install golang.org/x/vuln/cmd/govulncheck@latest
       - run: govulncheck ./... || true
+      # -format json exits 0 whatever it finds and non-zero only when the scan
+      # itself failed (DB unreachable, packages not loaded): that must fail
+      # the job, not pass it with an empty vuln.json.
       - name: fail on reachable vulnerabilities with a released fix
+        shell: bash
         run: |
-          govulncheck -format json ./... > vuln.json || true
+          govulncheck -format json ./... > vuln.json
+          jq -s -e 'any(.[]; has("config"))' vuln.json > /dev/null \
+            || { echo "::error::govulncheck produced no results"; exit 1; }
           jq -r 'select(.finding) | .finding
                  | select(.trace[0].function != null)
                  | select((.fixed_version // "") != "" and (.fixed_version | test("-") | not))

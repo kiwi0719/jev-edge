@@ -234,26 +234,45 @@ DIST      := dist/lua-resty-jev-edge-$(VERSION)
 LUA_LIB_DIR ?= /usr/local/openresty/lualib
 PREFIX_CONF ?= /etc/nginx
 
+# `opm build` packs only lib/**.lua, the Markdown under doc/, and README.md
+# from the root (it means to take COPYING too, but its root scan globs *.md
+# only). So the license and the starter config also go into doc/ as Markdown:
+# that is how they reach an `opm get` user. conf/ is for `make install`.
 dist:
 	rm -rf $(DIST) && mkdir -p $(DIST)/lib/jev/core $(DIST)/lib/jev/rules $(DIST)/lib/resty
 	cp -R adapters/openresty/lib/resty/jev $(DIST)/lib/resty/
 	cp core/*.lua $(DIST)/lib/jev/core/ && cp -R core/templates $(DIST)/lib/jev/core/
 	cp rules/*.lua $(DIST)/lib/jev/rules/
 	mkdir -p $(DIST)/doc && cp dist.ini LICENSE README.md $(DIST)/ && cp README.md CHANGELOG.md $(DIST)/doc/
+	cp LICENSE $(DIST)/COPYING
+	{ printf '# License\n\n````text\n'; cat LICENSE; printf '````\n'; } > $(DIST)/doc/LICENSE.md
+	{ printf '# Configuration\n\nThe starter config and an example nginx.conf, as `make install` installs them.\n'; \
+	  printf 'Copy the first to /etc/nginx/jev-edge.conf.lua (or wherever init() points) and edit it.\n\n'; \
+	  printf '## jev-edge.conf.lua\n\n````lua\n'; cat adapters/openresty/conf/jev-edge.conf.lua; \
+	  printf '````\n\n## example.nginx.conf\n\n````nginx\n'; cat adapters/openresty/conf/example.nginx.conf; \
+	  printf '````\n'; } > $(DIST)/doc/configuration.md
 	cp -R adapters/openresty/conf $(DIST)/conf
 	@echo "assembled $(DIST)"
 
 # opm build/upload run from the assembled tree (opm needs lib/ next to dist.ini).
 # `opm build` only works inside a full OpenResty install (it looks for
 # <prefix>/site); a Homebrew opm alone cannot. Without one, build in the
-# official image instead: same command, same output under dist/.
+# official image instead: same command, same output under dist/. The image
+# gets your ~/.opmrc (OPMRC=) when there is one, else a throwaway rc with the
+# fields opm checks (building needs no token); nothing is written to $HOME.
+OPMRC ?= $(HOME)/.opmrc
 opm-build: dist
 	@if [ -d "$$(dirname $$(dirname $$(command -v opm 2>/dev/null || echo /x/x)))/site" ]; then \
 	  cd $(DIST) && opm build; \
 	else \
 	  echo "no local OpenResty install; running opm build in openresty/openresty:alpine-fat"; \
-	  test -f "$$HOME/.opmrc" || printf 'github_account=%s\n' "$$(sed -n 's/^author = //p' dist.ini)" > "$$HOME/.opmrc"; \
-	  docker run --rm -v "$(CURDIR)/$(DIST)":/pkg -v "$$HOME/.opmrc":/root/.opmrc:ro -w /pkg openresty/openresty:alpine-fat opm build; \
+	  rc="$(OPMRC)"; \
+	  if [ ! -f "$$rc" ]; then \
+	    rc=$$(mktemp) && trap 'rm -f "$$rc"' EXIT && \
+	    printf 'github_account=%s\ngithub_token=\nupload_server=https://opm.openresty.org\ndownload_server=https://opm.openresty.org\n' \
+	      "$$(sed -n 's/^author = //p' dist.ini)" > "$$rc"; \
+	  fi; \
+	  docker run --rm -v "$(CURDIR)/$(DIST)":/pkg -v "$$rc":/root/.opmrc:ro -w /pkg openresty/openresty:alpine-fat opm build; \
 	fi
 
 # ---------------------------------------------------------------------------
@@ -278,5 +297,6 @@ install: dist
 	mkdir -p $(LUA_LIB_DIR)/jev $(LUA_LIB_DIR)/resty
 	cp -R $(DIST)/lib/jev $(LUA_LIB_DIR)/
 	cp -R $(DIST)/lib/resty/jev $(LUA_LIB_DIR)/resty/
+	mkdir -p $(PREFIX_CONF)
 	@test -f $(PREFIX_CONF)/jev-edge.conf.lua || cp $(DIST)/conf/jev-edge.conf.lua $(PREFIX_CONF)/jev-edge.conf.lua
 	@echo "installed to $(LUA_LIB_DIR); config at $(PREFIX_CONF)/jev-edge.conf.lua"

@@ -33,7 +33,9 @@ return {
   async   = { enabled = true, max_async = 32, rep_block_after = 0, rep_block_ttl = 600 },
   -- Who a trajectory belongs to. Off by default. The raw header or cookie is a
   -- credential: it is hashed with `salt` before it is stored or logged, so set
-  -- a per-deployment secret. Needs `lua_shared_dict jev_subject` in nginx.conf.
+  -- a per-deployment secret. Needs `lua_shared_dict jev_subject` and
+  -- `env JEV_SUBJECT_SALT;` in nginx.conf (this file runs again in the workers
+  -- on every reload, and they only see declared variables).
   -- subject = { enabled = true, from = "header", name = "x-api-key", salt = os.getenv("JEV_SUBJECT_SALT"),
   --             history_ttl = 3600, max_entries = 20 },
   -- Decision sampling for replay and labelling: a share of suspicious-and-up
@@ -46,7 +48,8 @@ return {
   -- always expires (trust_ttl) and traffic may extend it at most max_renewals
   -- times (~5 weeks), after which the false positive comes back on purpose --
   -- by then it is a rule or deployment_context bug, not a label. The token is
-  -- required: this endpoint writes bypasses.
+  -- required: this endpoint writes bypasses. Needs `env JEV_FEEDBACK_TOKEN;`
+  -- in nginx.conf, like the salt above.
   feedback = { enabled = false, trust_ttl = 604800, max_renewals = 4, token = os.getenv("JEV_FEEDBACK_TOKEN") },
   breaker = { window_s = 60, min_samples = 20, fail_ratio = 0.5, open_s = 30 },
   -- Retrieved content (tool results, and any `fields` path) judged on its own

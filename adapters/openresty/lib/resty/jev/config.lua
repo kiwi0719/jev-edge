@@ -12,6 +12,7 @@ local state = {
   path = nil,
   file_cfg = {},
   file_mtime = 0,
+  file_env_unset = {},
   override_version = 0,
   current = defaults.merge(defaults.config),
   rules = {},
@@ -52,6 +53,21 @@ local function read_api_key(cfg)
   end
 end
 
+-- The variables the last loaded file read with os.getenv and got nothing
+-- for, as a hint on the error line: a worker only has the variables
+-- nginx.conf declares with `env NAME;`, and the file runs again in every
+-- worker on each reload, so a salt or token that was there at startup (in
+-- the master) is empty after the first edit and the reload is refused.
+local function env_hint()
+  local names = state.file_env_unset
+  if not names or #names == 0 then return "" end
+  local decl = {}
+  for i, name in ipairs(names) do decl[i] = "`env " .. name .. ";`" end
+  return "; the config file read " .. table.concat(names, ", ") .. " from the environment and got nothing:"
+    .. " did you add " .. table.concat(decl, " ") .. " to nginx.conf?"
+    .. " workers do not inherit undeclared variables"
+end
+
 local function rebuild()
   local override = {}
   local dict = ngx.shared[state.dict_name]
@@ -62,7 +78,7 @@ local function rebuild()
   local merged = defaults.merge(defaults.merge(defaults.config, state.file_cfg), override)
   local ok, err = defaults.validate(merged)
   if not ok then
-    ngx.log(ngx.ERR, "jev-edge: config invalid, keeping previous: ", err)
+    ngx.log(ngx.ERR, "jev-edge: config invalid, keeping previous: ", err, env_hint())
     return false
   end
   read_api_key(merged)
@@ -88,9 +104,23 @@ end
 local function load_file(path)
   local chunk, err = loadfile(path)
   if not chunk then return nil, err end
+  -- os.getenv is wrapped while the file runs to note what came back empty
+  -- (env_hint), and put back even when the file fails. A config file has no
+  -- reason to yield, so no request runs while the wrapper is in place.
+  local getenv, unset, seen = os.getenv, {}, {}
+  os.getenv = function(name)  -- luacheck: ignore 122
+    local v = getenv(name)
+    if v == nil and not seen[name] then
+      seen[name] = true
+      unset[#unset + 1] = tostring(name)
+    end
+    return v
+  end
   local ok, cfg = pcall(chunk)
+  os.getenv = getenv  -- luacheck: ignore 122
   if not ok then return nil, cfg end
   if type(cfg) ~= "table" then return nil, "config must return a table" end
+  state.file_env_unset = unset
   return cfg
 end
 

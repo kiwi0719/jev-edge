@@ -1,18 +1,23 @@
 // jev-spoa: HAProxy SPOE agent that asks a running jev-edge (/_jev/authz)
 // and hands the verdict back as transaction variables.
 //
-// HAProxy sends one message per request with method, path, client IP,
-// content type and (with `option http-buffer-request`) the body. The agent
-// sets txn.jev.verdict / score / source / reason / action / rid / status;
-// haproxy.cfg turns action=block into a deny (status from txn.jev.status)
-// and copies the rest to X-Jev-* headers.
+// HAProxy sends one message per request with method, path, client IP, the
+// raw header block and (with `option http-buffer-request`) the body. The
+// agent sets txn.jev.verdict / score / source / reason / action / rid /
+// status; haproxy.cfg turns action=block into a deny (status from
+// txn.jev.status) and copies the rest to X-Jev-* headers.
 //
 // Contract: only an answer carrying X-Jev-Verdict is trusted. 200 with the
 // header is a decision; any status >= 400 with the header is a block, with
-// that status in txn.jev.status; anything else, and any failure to reach
-// jev-edge, sets verdict=error, action=pass (fail-open). Paths containing
-// "..", "%2e" or "//" are never forwarded (they could reach the adapter's
-// admin endpoints next to /_jev/authz) and fail open too.
+// that status in txn.jev.status. An answer without the header below 500
+// (the server in front of jev-edge refused the request before it ran: 400,
+// 413, 414) means nobody judged it: verdict=skipped, reason
+// "unjudgeable: ...", and action pass or block (403) as -unjudged says,
+// like jev-edge's policy.unjudgeable. Any other answer (a 5xx without the
+// header included), and any failure to reach jev-edge, sets
+// verdict=error, action=pass (fail-open). Paths containing "..",
+// "%2e" or "//" are never forwarded (they could reach the adapter's admin
+// endpoints next to /_jev/authz) and fail open too.
 package main
 
 import (
@@ -24,6 +29,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -39,6 +45,7 @@ var (
 	upstream = flag.String("upstream", "http://127.0.0.1:8080/_jev/authz", "jev-edge authz URL prefix")
 	timeout  = flag.Duration("timeout", 1500*time.Millisecond, "per-check timeout (fail-open when exceeded); keep it below spoe.conf's `timeout processing` so the fail-open answer still reaches HAProxy")
 	message  = flag.String("message", "check-request", "SPOE message name")
+	unjudged = flag.String("unjudged", "pass", "a request jev-edge's server answered without X-Jev-Verdict (refused before judging): pass, marked verdict=skipped, or block with 403; keep it equal to jev-edge's policy.unjudgeable")
 )
 
 var client *http.Client
@@ -69,6 +76,18 @@ func failOpen(reason string) map[string]string {
 	return map[string]string{"verdict": "error", "score": "0.00", "source": "adapter", "reason": reason, "action": "pass", "rid": "", "status": "0"}
 }
 
+// unjudgeable: the request reached jev-edge's server but was never judged.
+// Marked skipped like jev-edge's own "unjudgeable: ..." verdicts, reason
+// URL-encoded the same way; blocked with 403 when policy is "block".
+func unjudgeable(reason, policy string) map[string]string {
+	v := map[string]string{"verdict": "skipped", "score": "0.00", "source": "adapter",
+		"reason": url.QueryEscape("unjudgeable: " + reason), "action": "pass", "rid": "", "status": "0"}
+	if policy == "block" {
+		v["action"], v["status"] = "block", "403"
+	}
+	return v
+}
+
 // safePath rejects anything that could escape /_jev/authz/ once normalised:
 // dot segments, encoded dots and doubled slashes.
 func safePath(p string) bool {
@@ -78,10 +97,12 @@ func safePath(p string) bool {
 	return !strings.Contains(p, "..") && !strings.Contains(strings.ToLower(p), "%2e") && !strings.Contains(p, "//")
 }
 
-// headers HAProxy or the HTTP client own; never copied from req.hdrs
+// headers HAProxy or the HTTP client own; never copied from req.hdrs.
+// Content-Type is copied, every occurrence: jev-edge watches a request when
+// any of its content types is watched, since the backend may read any one.
 var skipHeader = map[string]bool{
 	"host": true, "content-length": true, "transfer-encoding": true, "connection": true,
-	"x-forwarded-for": true, "content-type": true, "expect": true, "accept-encoding": true,
+	"x-forwarded-for": true, "expect": true, "accept-encoding": true,
 	"te": true, "upgrade": true, "keep-alive": true, "proxy-connection": true,
 	// client-IP headers jev-edge consults before X-Forwarded-For; a client
 	// copy would override the source address set below
@@ -121,14 +142,21 @@ func handler(req *request.Request) {
 	if err != nil {
 		return
 	}
-	get := func(k string) string {
+	setVars(req, check(func(k string) string {
 		v, ok := msg.KV.Get(k)
 		if !ok {
 			return ""
 		}
 		return str(v)
-	}
-	method, path, ip, ct, hdrs := get("method"), get("path"), get("ip"), get("ct"), get("hdrs")
+	}))
+}
+
+// check asks jev-edge about one SPOE message (get returns its arguments)
+// and returns the txn.jev.* variables to set.
+func check(get func(string) string) map[string]string {
+	// An older spoe.conf may still send `ct` (req.hdr(content-type): the last
+	// value only). It is ignored; Content-Type comes from hdrs.
+	method, path, ip, hdrs := get("method"), get("path"), get("ip"), get("hdrs")
 	body := []byte(get("body"))
 	if path == "" {
 		path = "/"
@@ -141,46 +169,46 @@ func handler(req *request.Request) {
 	}
 	if !safePath(path) {
 		log.Printf("jev-spoa: refusing path %q, failing open", path)
-		setVars(req, failOpen("bad path"))
-		return
+		return failOpen("bad path")
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
 	hreq, err := http.NewRequestWithContext(ctx, method, strings.TrimRight(*upstream, "/")+path, bytes.NewReader(body))
 	if err != nil {
-		setVars(req, failOpen(err.Error()))
-		return
+		return failOpen(err.Error())
 	}
 	// forward the original headers (req.hdrs is the raw header block) so
 	// jev-edge sees the same request Envoy or nginx would; hop-by-hop and
 	// framing headers are recomputed by the client
 	copyHeaders(hreq.Header, hdrs)
-	if ct != "" {
-		hreq.Header.Set("Content-Type", ct)
-	}
 	if ip != "" {
 		hreq.Header.Set("X-Forwarded-For", ip)
 	}
-	// HAProxy hands over at most tune.bufsize of the body: when the declared
-	// size is larger, jev-edge must scan what it got as the head of a larger
-	// body, not parse it as a whole (truncated JSON would read as "no text").
+	// HAProxy hands over at most tune.bufsize of the body, and spoe.conf cuts
+	// it further so the message fits one frame: when the declared size is
+	// larger, jev-edge must scan what it got as the head of a larger body,
+	// not parse it as a whole (truncated JSON would read as "no text").
 	if partialBody(get("size"), len(body)) {
 		hreq.Header.Set("X-Jev-Body-Partial", "1")
 	}
 	res, err := client.Do(hreq)
 	if err != nil {
 		log.Printf("jev-spoa: jev-edge unreachable, failing open: %v", err)
-		setVars(req, failOpen("unreachable"))
-		return
+		return failOpen("unreachable")
 	}
 	defer res.Body.Close()
 	io.Copy(io.Discard, io.LimitReader(res.Body, 4096))
 
 	if res.Header.Get("X-Jev-Verdict") == "" {
-		log.Printf("jev-spoa: jev-edge answered %d without X-Jev-Verdict, failing open", res.StatusCode)
-		setVars(req, failOpen(fmt.Sprintf("http %d", res.StatusCode)))
-		return
+		// a 5xx is the server (or a proxy in front of it) failing, like an
+		// unreachable jev-edge; anything else refused this request
+		if res.StatusCode >= 500 {
+			log.Printf("jev-spoa: jev-edge answered %d without X-Jev-Verdict, failing open", res.StatusCode)
+			return failOpen(fmt.Sprintf("http %d", res.StatusCode))
+		}
+		log.Printf("jev-spoa: jev-edge answered %d without X-Jev-Verdict, unjudgeable (-unjudged=%s)", res.StatusCode, *unjudged)
+		return unjudgeable(fmt.Sprintf("authz answered %d", res.StatusCode), *unjudged)
 	}
 	vars := map[string]string{
 		"verdict": res.Header.Get("X-Jev-Verdict"),
@@ -198,14 +226,16 @@ func handler(req *request.Request) {
 		vars["status"] = strconv.Itoa(res.StatusCode)
 	default:
 		log.Printf("jev-spoa: jev-edge answered %d, failing open", res.StatusCode)
-		setVars(req, failOpen(fmt.Sprintf("http %d", res.StatusCode)))
-		return
+		return failOpen(fmt.Sprintf("http %d", res.StatusCode))
 	}
-	setVars(req, vars)
+	return vars
 }
 
 func main() {
 	flag.Parse()
+	if *unjudged != "pass" && *unjudged != "block" {
+		log.Fatalf("-unjudged must be pass or block, got %q", *unjudged)
+	}
 	client = &http.Client{Timeout: *timeout}
 	ln, err := net.Listen("tcp", *listen)
 	if err != nil {

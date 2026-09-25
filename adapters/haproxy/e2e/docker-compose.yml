@@ -1,8 +1,8 @@
 # HAProxy end-to-end: real HAProxy with the SPOE filter, the jev-spoa agent,
 # one jev-edge (mock provider) and a stub app that echoes X-Jev-* headers.
-#   :8090  HAProxy
-# haproxy.cfg is the reference one with tune.bufsize cut to 16 KiB (run.sh
-# writes it to .gen/), so the partial-body checks stay small.
+#   :8090  HAProxy, the reference haproxy.cfg and spoe.conf as shipped
+#   :8091  the same with proc.jev_unjudged = block and its agent run with
+#          -unjudged block (run.sh writes that haproxy.cfg to .gen/)
 services:
   jev-edge:
     image: jev-edge-test
@@ -20,10 +20,21 @@ services:
     build: ../spoa
     command: ["-listen", ":9000", "-upstream", "http://jev-edge:8080/_jev/authz"]
     depends_on: [jev-edge]
+  jev-spoa-block:
+    build: ../spoa
+    command: ["-listen", ":9000", "-upstream", "http://jev-edge:8080/_jev/authz", "-unjudged", "block"]
+    depends_on: [jev-edge]
   haproxy:
     image: haproxy:3.1-alpine
     volumes:
-      - ./.gen/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - ../haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
       - ../spoe.conf:/usr/local/etc/haproxy/spoe.conf:ro
     ports: ["8090:8080"]
     depends_on: [jev-spoa, app]
+  haproxy-block:
+    image: haproxy:3.1-alpine
+    volumes:
+      - ./.gen/haproxy-block.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - ../spoe.conf:/usr/local/etc/haproxy/spoe.conf:ro
+    ports: ["8091:8080"]
+    depends_on: [jev-spoa-block, app]

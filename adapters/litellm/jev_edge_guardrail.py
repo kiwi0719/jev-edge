@@ -76,12 +76,19 @@ HEADER_NAMES = ("x-jev-verdict", "x-jev-score", "x-jev-source", "x-jev-reason", 
 MAX_BODY_BYTES = 1048576  # jev-edge's rules.max_body_bytes, nginx's default client_max_body_size
 TAIL_BYTES = 65536        # jev-edge's rules.TAIL_BYTES: the tail scanned with the head of a larger body
 
+# Tool definitions, sent first and unchanged: jev-edge judges them on their
+# own, apart from the conversation.
+DEFINITION_KEYS = ("tools", "functions", "response_format")
 # Top-level keys that carry text, in the order they are sent: the
 # conversation last, so the newest turn is in the tail of a body that has to
 # be cut. `messages` / `input` keep their structure (roles, content parts,
 # tool_result / tool_use blocks, function_call_output items) so jev-edge's
-# untrusted judging finds tool results exactly as it does in-line.
-LEAD_KEYS = ("system", "instructions")
+# untrusted judging finds tool results exactly as it does in-line. A system
+# prompt (Anthropic's top-level `system`, the Responses API's `instructions`,
+# Gemini's `systemInstruction`) is sent as the first `messages` entry, with
+# role system: every jev-edge version reads messages[*].content, none reads
+# a top-level `instructions`, and not every version reads `system`.
+SYSTEM_KEYS = ("system", "instructions")
 TEXT_KEYS = ("query", "text", "prompt", "input", "messages")
 
 # Content parts that carry media: only their `type` (and any `text` or
@@ -165,8 +172,9 @@ def _file_text(f: Any) -> Optional[str]:
 _DROP = object()
 
 
-def _clean(node: Any, depth: int = 1) -> Any:
-    """A JSON-safe copy of `node` without media payloads, to MAX_DEPTH."""
+def _clean(node: Any, depth: int = 1, media: bool = True) -> Any:
+    """A JSON-safe copy of `node` to MAX_DEPTH, without media payloads (with
+    `media` false, everything JSON can carry is kept)."""
     if isinstance(node, str) or node is None or isinstance(node, (bool, int)):
         return node
     if isinstance(node, float):
@@ -179,7 +187,7 @@ def _clean(node: Any, depth: int = 1) -> Any:
         except Exception:
             return _DROP
     if isinstance(node, dict):
-        t = node.get("type")
+        t = node.get("type") if media else None
         keep = None
         if t == "base64":  # Anthropic source: the bytes are the payload
             keep = ("type", "media_type")
@@ -188,14 +196,14 @@ def _clean(node: Any, depth: int = 1) -> Any:
         out = {}
         for k, v in node.items():
             k = str(k)
-            if k in MEDIA_KEYS or (keep is not None and k not in keep):
+            if media and (k in MEDIA_KEYS or (keep is not None and k not in keep)):
                 continue
-            c = _clean(v, depth + 1)
+            c = _clean(v, depth + 1, media)
             if c is not _DROP:
                 out[k] = c
         return out
     if isinstance(node, (list, tuple)):
-        return [c for c in (_clean(v, depth + 1) for v in node) if c is not _DROP]
+        return [c for c in (_clean(v, depth + 1, media) for v in node) if c is not _DROP]
     return _DROP
 
 
@@ -209,15 +217,27 @@ def _has_text(node: Any, key: str = "") -> bool:
     return False
 
 
-def _contents_as_messages(data: dict) -> list:
-    """Gemini `contents` (generate_content, pass-through) as messages: each
-    part's `text` is read by jev-edge's content-part rule."""
+def _system_messages(data: dict) -> list:
+    """The request's system prompt as messages: Anthropic's top-level
+    `system` (a string or text blocks), the Responses API's `instructions`
+    and Gemini's `systemInstruction`, each with role system."""
     msgs: list = []
+    for key in SYSTEM_KEYS:
+        v = data.get(key)
+        if v is not None and v != "":
+            msgs.append({"role": "system", "content": v})
     si = data.get("systemInstruction", data.get("system_instruction"))
     if isinstance(si, dict):
         msgs.append({"role": "system", "content": si.get("parts")})
     elif isinstance(si, str):
         msgs.append({"role": "system", "content": si})
+    return msgs
+
+
+def _contents_as_messages(data: dict) -> list:
+    """Gemini `contents` (generate_content, pass-through) as messages: each
+    part's `text` is read by jev-edge's content-part rule."""
+    msgs: list = []
     contents = data.get("contents")
     if isinstance(contents, str):
         contents = [contents]
@@ -249,12 +269,29 @@ def _parse_fields(value: Any) -> tuple:
 
 def _body_dict(data: dict, extra_fields: tuple = ()) -> Optional[dict]:
     body: dict[str, Any] = {}
-    keys = LEAD_KEYS + tuple(k for k in extra_fields if k not in LEAD_KEYS + TEXT_KEYS) + TEXT_KEYS
+    for key in DEFINITION_KEYS:
+        if data.get(key) is not None:
+            c = _clean(data[key], media=False)
+            if c is not _DROP:
+                body[key] = c
+    system = _system_messages(data)
+    convo = data.get("messages")
+    if convo is not None and not isinstance(convo, list):
+        convo = [convo]
     gemini = _contents_as_messages(data)
-    for key in keys:
+    if gemini:
+        convo = (convo or []) + gemini
+    if system and convo is None:
+        # no conversation under `messages` (the Responses API): the system
+        # prompt goes first, before the input
+        body["messages"] = _clean(system)
+    taken = DEFINITION_KEYS + SYSTEM_KEYS + TEXT_KEYS
+    for key in tuple(k for k in extra_fields if k not in taken) + TEXT_KEYS:
         value = data.get(key)
-        if key == "messages" and gemini:
-            value = (value if isinstance(value, list) else ([] if value is None else [value])) + gemini
+        if key == "messages":
+            if convo is None:
+                continue
+            value = system + convo
         if value is None:
             continue
         c = _clean(value)
@@ -424,10 +461,12 @@ class JevEdgeGuardrail(CustomGuardrail):
     @staticmethod
     def body_for(data: dict, extra_fields: Any = ()) -> Optional[str]:
         """The request's text as the compact JSON body jev-edge judges, in its
-        original structure: `system`, `instructions`, the `extra_fields`,
-        `query`, `text`, `prompt`, `input` and `messages` (Gemini `contents`
-        joins `messages`), with media payloads removed. None when no value
-        holds any text."""
+        original structure: the tool definitions (`tools`, `functions`,
+        `response_format`) unchanged, the `extra_fields`, `query`, `text`,
+        `prompt`, `input` and `messages`, with the system prompt (`system`,
+        `instructions`, Gemini's `systemInstruction`) as the first message
+        and Gemini `contents` joining `messages`, and media payloads removed.
+        None when no value holds any text."""
         body = _body_dict(data, _parse_fields(extra_fields) if extra_fields else ())
         return None if body is None else json.dumps(body, ensure_ascii=False, separators=(",", ":"))
 
@@ -476,7 +515,7 @@ class JevEdgeGuardrail(CustomGuardrail):
             body, url = obj.get("body"), obj.get("url")
             if not isinstance(body, dict) or (isinstance(url, str) and not _is_generation_url(url)):
                 continue
-            for key in LEAD_KEYS + TEXT_KEYS:
+            for key in SYSTEM_KEYS + TEXT_KEYS:
                 v = body.get(key)
                 if v is not None:
                     merged.setdefault(key, []).extend(v if isinstance(v, list) else [v])

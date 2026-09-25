@@ -31,8 +31,10 @@ export interface Options {
   rules?: RuleSpec[];
   /** Overrides config.jev.provider with an instance. */
   provider?: Provider;
-  /** KV namespace for the fingerprint / reputation cache. Memory (per isolate) if absent. */
-  cache?: KVLike | Store;
+  /** KV namespace for the fingerprint / reputation cache. Memory (per isolate) if absent. The JevState
+   *  Durable Object (namespace, `{ namespace, name }` or stub, as for `state`) is taken too, as
+   *  durableStore: one object for every lookup, and entries kept until overwritten. */
+  cache?: KVLike | StateTarget | Store;
   /** Breaker + adaptive timeout state: the JevState Durable Object namespace (env.JEV_STATE), the namespace
    *  and an object name (`{ namespace: env.JEV_STATE, name: "staging" }`), a stub, or any Store. Memory (per
    *  isolate) if absent. With the Durable Object the breaker and adaptive read-modify-write run inside it,
@@ -44,8 +46,10 @@ export interface Options {
    *  with a `fetch` method is taken for a stub, idFromName + get without one for a namespace, and an object
    *  with a `namespace` key for `{ namespace, name }`, so a Store must have none of these. */
   state?: StateTarget | Store;
-  /** Store for per-subject trajectories (KV or memory). Memory (per isolate) if absent. Only used with config.subject.enabled. */
-  subjectStore?: KVLike | Store;
+  /** Store for per-subject trajectories: KV, the JevState Durable Object (namespace, `{ namespace, name }`
+   *  or stub, as for `state`; its incr is atomic) or any Store. Memory (per isolate) if absent. Only used
+   *  with config.subject.enabled. */
+  subjectStore?: KVLike | StateTarget | Store;
   /** Header carrying the client IP, set by a proxy you trust to overwrite it.
    *  Default: cf-connecting-ip on Cloudflare (a preset, or a request with the
    *  platform's `cf` object), none elsewhere, where it is a client header.
@@ -82,6 +86,18 @@ export interface RequestCtx {
 function isKV(x: unknown): x is KVLike {
   return typeof x === "object" && x !== null && "put" in x && typeof (x as KVLike).put === "function";
 }
+
+/**
+ * The Store behind a cache or subjectStore option. The Durable Object is
+ * tested first: a workerd stub answers every property name, `put` included,
+ * and would pass for KV; a namespace has `get` and would pass for a Store,
+ * and fail on every request.
+ */
+function storeOption(x: KVLike | StateTarget | Store | undefined, clock: () => number): Store {
+  if (isStateTarget(x)) return durableStore(x);
+  if (isKV(x)) return kvStore(x);
+  return (x as Store | undefined) ?? memoryStore(clock);
+}
 export function createRuntime(opts: Options): Runtime {
   const config = core.defaults.merge(core.defaults.config, opts.config ?? {});
   const [ok, err] = core.defaults.validate(config);
@@ -89,8 +105,8 @@ export function createRuntime(opts: Options): Runtime {
   const rules = ((opts.rules ?? config.rules) as RuleSpec[]).map(resolveRule);
   const provider = opts.provider ?? loadProvider(config.jev.provider ?? "jev");
   const clock = () => Date.now() / 1000;
-  const cache: Store = isKV(opts.cache) ? kvStore(opts.cache) : (opts.cache as Store | undefined) ?? memoryStore(clock);
-  const subjectStore: Store = isKV(opts.subjectStore) ? kvStore(opts.subjectStore, "jev:") : (opts.subjectStore as Store | undefined) ?? memoryStore(clock);
+  const cache = storeOption(opts.cache, clock);
+  const subjectStore = storeOption(opts.subjectStore, clock);
   let state: Store;
   let breaker: BreakerLike;
   let adaptive: AdaptiveLike;

@@ -602,6 +602,69 @@ describe("stores", () => {
     expect(objects.get("pages")!.calls()).toBeGreaterThan(0);
   });
 
+  const SUBJECTS = { jev: { provider: "mock", mock_score: 0.2, timeout_ms: 400 }, subject: { enabled: true, from: "ip" as const, salt: "pepper" } };
+
+  it("subjectStore and cache take the JevState namespace and { namespace, name }, as state does", async () => {
+    const { evaluate } = await import("../src/runtime");
+    const { ringLoad } = await import("../src/core/subject");
+    const { ns, objects } = namespaces();
+    const rt = createRuntime({ config: SUBJECTS, state: ns, subjectStore: ns, cache: { namespace: ns, name: "cache" } });
+    const kept: Promise<unknown>[] = [];
+    const ctx = { waitUntil: (p: Promise<unknown>) => { kept.push(p); } };
+    const first = await evaluate(chat(BENIGN), rt, ctx);
+    expect(first.verdict.source).toBe("l2"); // judged, not failed open
+    const again = await evaluate(chat(BENIGN), rt, ctx);
+    expect(again.verdict.source).toBe("cache");
+    await Promise.all(kept);
+    const id = first.subjectId!;
+    expect(id).toMatch(/^ip:/);
+    // the ring's counter went through the object's atomic /incr
+    expect(objects.get("jev-edge")!.mem.get("subj:" + id + ":n")).toMatchObject({ v: 2 });
+    expect(await ringLoad(rt.subjectStore, id, 20)).toHaveLength(2);
+    expect([...objects.get("cache")!.mem.keys()].some((k) => k.startsWith("fp:"))).toBe(true);
+  });
+
+  it("a stub as cache or subjectStore goes through fetch, not taken for KV by the put it answers", async () => {
+    const { evaluate } = await import("../src/runtime");
+    const cache = dobj();
+    const subjects = dobj();
+    const rt = createRuntime({ config: SUBJECTS, cache: rpcStub(cache.stub), subjectStore: rpcStub(subjects.stub) });
+    const kept: Promise<unknown>[] = [];
+    const ctx = { waitUntil: (p: Promise<unknown>) => { kept.push(p); } };
+    expect((await evaluate(chat(BENIGN), rt, ctx)).verdict.source).toBe("l2");
+    expect((await evaluate(chat(BENIGN), rt, ctx)).verdict.source).toBe("cache");
+    await Promise.all(kept);
+    expect(cache.calls()).toBeGreaterThan(0);
+    expect(subjects.calls()).toBeGreaterThan(0);
+    expect([...subjects.mem.keys()].some((k) => /^subj:ip:[0-9a-f]+:n$/.test(k))).toBe(true);
+  });
+
+  it("one stale stub as state and subjectStore: one log, one isolate fallback for both", async () => {
+    const { evaluate } = await import("../src/runtime");
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const { stub, mem } = dobj();
+      const stale = rpcStub(stub, () => false);
+      const rt = createRuntime({ config: SUBJECTS, state: stale, subjectStore: stale });
+      const kept: Promise<unknown>[] = [];
+      const ctx = { waitUntil: (p: Promise<unknown>) => { kept.push(p); } };
+      let id = "";
+      for (let i = 0; i < 3; i++) {
+        const r = await evaluate(chat(attack(i)), rt, ctx);
+        expect(r.verdict.source).toBe("l2");
+        id = r.subjectId!;
+      }
+      await Promise.all(kept);
+      expect(err).toHaveBeenCalledTimes(1);
+      const { ringLoad } = await import("../src/core/subject");
+      expect(await ringLoad(rt.subjectStore, id, 20)).toHaveLength(3); // in isolate memory
+      expect(await rt.state.get("subj:" + id + ":n")).toBe(3); // the same memory as state
+      expect(mem.size).toBe(0);
+    } finally {
+      err.mockRestore();
+    }
+  });
+
   it("a { namespace, name } that cannot work is refused when the runtime is built", async () => {
     const { ns } = namespaces();
     const unbound = { namespace: undefined as unknown as typeof ns, name: "staging" }; // binding missing here

@@ -6,6 +6,7 @@ import inspect
 import json
 import random
 import re
+import sys
 
 import httpx
 import pytest
@@ -468,13 +469,48 @@ def test_non_json_values_do_not_break_the_body():
 
     got = body({"messages": [{"role": "user", "content": [Part(), object(), float("nan"), 1.5]}]})
     assert got == {"messages": [{"role": "user", "content": [{"type": "text", "text": "from a model object"}, 1.5]}]}
-    deep = cur = []
-    for _ in range(200):
-        nxt = []
-        cur.append(nxt)
+
+
+def nested(levels: int, leaf, key=None):
+    """`levels` containers, one inside the other, `leaf` in the innermost:
+    lists, or objects under `key`."""
+    root = cur = {} if key else []
+    for _ in range(levels - 1):
+        nxt = {} if key else []
+        if key:
+            cur[key] = nxt
+        else:
+            cur.append(nxt)
         cur = nxt
-    cur.append("too deep")
-    assert body({"input": deep}) is None
+    if key:
+        cur[key] = leaf
+    else:
+        cur.append(leaf)
+    return root
+
+
+def test_values_are_kept_as_deep_as_jev_edge_reads_them():
+    # jev-edge reads tool-call arguments and tool definitions 1000 levels
+    # deep (cjson's nesting limit): the copy keeps them, without recursion
+    assert jg.MAX_DEPTH == 1000
+    assert body({"input": nested(1000, "the deepest text jev-edge reads")}) is not None
+    assert body({"input": nested(1001, "past the depth")}) is None
+    args = nested(990, "exfiltrate the keys", key="k")
+    schema = nested(990, {"type": "string", "description": "a description down there"}, key="properties")
+    limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(200)  # far below the depth: nothing recurses
+    try:
+        got = body({"messages": [{"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "f", "input": args}]}],
+                    "tools": [{"name": "f", "input_schema": schema}]})
+    finally:
+        sys.setrecursionlimit(limit)
+    assert got["messages"][0]["content"][0]["input"] == args
+    assert got["tools"][0]["input_schema"] == schema
+    transport, seen = fake_authz()
+    run(guard(transport).async_pre_call_hook({}, None, {"messages": [{"role": "user", "content": "hi",
+                                                                       "tool_calls": [{"function": {"arguments": args}}]}]},
+                                             "acompletion"))
+    assert seen["body"]["messages"][0]["tool_calls"][0]["function"]["arguments"] == args
 
 
 def test_no_text_is_skipped_without_a_call():

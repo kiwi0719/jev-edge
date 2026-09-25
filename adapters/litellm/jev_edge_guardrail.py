@@ -113,7 +113,12 @@ MEDIA_KEYS = frozenset({"image_url", "input_audio", "file_data", "inline_data", 
 # is not worth a round trip.
 STRUCTURAL_KEYS = frozenset({"role", "type", "id", "call_id", "tool_call_id", "tool_use_id", "name",
                              "media_type", "status", "model", "cache_control"})
-MAX_DEPTH = 32  # deeper values are dropped; jev-edge reads 4 levels below a text field
+# Containers nested deeper than this below a top-level key are dropped.
+# jev-edge reads tool definitions and tool-call arguments 1000 levels deep
+# (its DEEP_DEPTH, which is cjson's nesting limit: a body nested deeper is one
+# its decoder refuses, in-line too). The copy is made without recursion, so
+# the depth is not bounded by Python's recursion limit.
+MAX_DEPTH = 1000
 
 # ---------------------------------------------------------------------------
 # call types (LiteLLM passes the route's call type to async_pre_call_hook,
@@ -217,48 +222,75 @@ def _litellm_scans_batch_files() -> bool:
 _DROP = object()
 
 
-def _clean(node: Any, depth: int = 1, media: bool = True) -> Any:
+def _clean(node: Any, media: bool = True) -> Any:
     """A JSON-safe copy of `node` to MAX_DEPTH, without media payloads (with
-    `media` false, everything JSON can carry is kept)."""
-    if isinstance(node, str) or node is None or isinstance(node, (bool, int)):
-        return node
-    if isinstance(node, float):
-        return node if math.isfinite(node) else _DROP
-    if depth > MAX_DEPTH:
-        return _DROP
-    if not isinstance(node, (dict, list, tuple)) and callable(getattr(node, "model_dump", None)):
-        try:  # a pydantic object LiteLLM put in the request
-            node = node.model_dump()
-        except Exception:
+    `media` false, everything JSON can carry is kept). Built with a stack of
+    its own, so a client's nesting cannot exhaust Python's recursion limit;
+    every container is placed when its parent is copied, so keys and items
+    keep their order."""
+    stack: list = []
+
+    def start(v: Any, depth: int) -> Any:
+        """A scalar as it is sent, an empty container queued to be filled,
+        or _DROP."""
+        if isinstance(v, str) or v is None or isinstance(v, (bool, int)):
+            return v
+        if isinstance(v, float):
+            return v if math.isfinite(v) else _DROP
+        if depth > MAX_DEPTH:
             return _DROP
-    if isinstance(node, dict):
-        t = node.get("type") if media else None
+        if not isinstance(v, (dict, list, tuple)) and callable(getattr(v, "model_dump", None)):
+            try:  # a pydantic object LiteLLM put in the request
+                v = v.model_dump()
+            except Exception:
+                return _DROP
+        if isinstance(v, dict):
+            out: Any = {}
+        elif isinstance(v, (list, tuple)):
+            out = []
+        else:
+            return _DROP
+        stack.append((v, out, depth))
+        return out
+
+    root = start(node, 1)
+    while stack:
+        src, out, depth = stack.pop()
+        if isinstance(out, list):
+            for v in src:
+                c = start(v, depth + 1)
+                if c is not _DROP:
+                    out.append(c)
+            continue
+        t = src.get("type") if media else None
         keep = None
         if t == "base64":  # Anthropic source: the bytes are the payload
             keep = ("type", "media_type")
         elif isinstance(t, str) and t in MEDIA_PARTS:
             keep = ("type", "text", "content")
-        out = {}
-        for k, v in node.items():
+        for k, v in src.items():
             k = str(k)
             if media and (k in MEDIA_KEYS or (keep is not None and k not in keep)):
                 continue
-            c = _clean(v, depth + 1, media)
+            c = start(v, depth + 1)
             if c is not _DROP:
                 out[k] = c
-        return out
-    if isinstance(node, (list, tuple)):
-        return [c for c in (_clean(v, depth + 1, media) for v in node) if c is not _DROP]
-    return _DROP
+    return root
 
 
-def _has_text(node: Any, key: str = "") -> bool:
-    if isinstance(node, str):
-        return node != "" and key not in STRUCTURAL_KEYS
-    if isinstance(node, dict):
-        return any(_has_text(v, k) for k, v in node.items())
-    if isinstance(node, list):
-        return any(_has_text(v, key) for v in node)
+def _has_text(node: Any) -> bool:
+    """Whether any string in `node` is text, not a structural name; without
+    recursion, as _clean."""
+    stack = [(node, "")]
+    while stack:
+        n, key = stack.pop()
+        if isinstance(n, str):
+            if n != "" and key not in STRUCTURAL_KEYS:
+                return True
+        elif isinstance(n, dict):
+            stack.extend((v, k) for k, v in n.items())
+        elif isinstance(n, list):
+            stack.extend((v, key) for v in n)
     return False
 
 

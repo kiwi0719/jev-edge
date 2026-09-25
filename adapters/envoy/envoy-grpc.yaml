@@ -15,6 +15,11 @@ static_resources:
                 # ext_authz, so it cannot be steered at the adapter's admin endpoints
                 normalize_path: true
                 merge_slashes: true
+                # size contract of the authz hop: the whole header block, path
+                # included, is capped here (431 past it), and the nginx serving
+                # /_jev/authz must take any request under the cap (README:
+                # large_client_header_buffers 4 64k). Raise both together.
+                max_request_headers_kb: 60
                 route_config:
                   name: local
                   virtual_hosts:

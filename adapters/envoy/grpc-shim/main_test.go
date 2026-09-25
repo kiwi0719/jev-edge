@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -80,9 +81,61 @@ func TestBlockWithAnyStatusAndVerdict(t *testing.T) {
 	}
 }
 
-func TestFailOpenWithoutVerdictHeader(t *testing.T) {
-	for _, status := range []int{404, 403, 500, 200} {
+// An answer without X-Jev-Verdict below 500 (nginx refusing an oversized
+// header or URI with 400 / 414 before jev-edge runs, or something that is
+// not jev-edge) is unjudgeable: passed marked skipped, never an unmarked
+// pass or an `error`.
+func TestUnjudgeableWithoutVerdictHeader(t *testing.T) {
+	for _, status := range []int{400, 414, 413, 404, 403, 200} {
 		s, _ := newServer(t, func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(status) })
+		res, _ := s.Check(context.Background(), checkReq("/v1/chat/completions", nil))
+		ok := res.GetOkResponse()
+		if res.Status.Code != int32(codes.OK) || ok == nil {
+			t.Fatalf("status %d: expected OK, got %v", status, res)
+		}
+		for k, want := range map[string]string{"X-Jev-Verdict": "skipped", "X-Jev-Score": "0.00", "X-Jev-Source": "shim",
+			"X-Jev-Reason": fmt.Sprintf("unjudgeable%%3A+authz+answered+%d", status)} {
+			if v, _ := header(ok.Headers, k); v != want {
+				t.Fatalf("status %d: %s = %q, want %q", status, k, v, want)
+			}
+		}
+		for _, o := range ok.Headers {
+			if o.AppendAction != corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD {
+				t.Fatalf("status %d: %s not overwritten", status, o.Header.Key)
+			}
+		}
+		if len(ok.HeadersToRemove) != 1 || ok.HeadersToRemove[0] != "X-Jev-Request-Id" {
+			t.Fatalf("status %d: headers_to_remove = %v", status, ok.HeadersToRemove)
+		}
+	}
+}
+
+// -unjudged=block denies the same answers with 403 and the default block body.
+func TestUnjudgeableBlock(t *testing.T) {
+	s, _ := newServer(t, func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(400) })
+	s.unjudged = "block"
+	res, _ := s.Check(context.Background(), checkReq("/v1/chat/completions", nil))
+	d := res.GetDeniedResponse()
+	if res.Status.Code != int32(codes.PermissionDenied) || d == nil {
+		t.Fatalf("expected denied, got %v", res)
+	}
+	if int(d.Status.Code) != 403 || d.Body != `{"error":"request rejected"}` {
+		t.Fatalf("status/body = %d %q", d.Status.Code, d.Body)
+	}
+	if v, _ := header(d.Headers, "Content-Type"); v != "application/json" {
+		t.Fatalf("content-type = %q", v)
+	}
+}
+
+// The adapter failing is still `error` (fail-open), not unjudgeable, even
+// with -unjudged=block: a 5xx without X-Jev-Verdict, or no answer at all.
+func TestFailOpenWhenAdapterFails(t *testing.T) {
+	for _, status := range []int{500, 502, 503, 0} {
+		s, ts := newServer(t, func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(status) })
+		if status == 0 {
+			ts.Close()
+		}
+		s.unjudged = "block"
 		res, _ := s.Check(context.Background(), checkReq("/v1/chat/completions", nil))
 		ok := res.GetOkResponse()
 		if ok == nil {

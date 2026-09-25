@@ -8,13 +8,18 @@
 //
 // Contract: only an answer that carries X-Jev-Verdict is trusted. 200 with the
 // header is a decision (OK, headers copied upstream); status >= 400 with the
-// header is a block (PermissionDenied with that status, body and headers);
-// anything else, including a 404 / 5xx from something that is not jev-edge,
-// or any error talking to the adapter, fails open: OK with X-Jev-Verdict:
-// error and X-Jev-Source: shim, matching the adapter's own behaviour. Every
-// X-Jev-* header is overwritten on the way upstream so a forged inbound
-// value never survives. Paths containing "..", "%2e" or "//" are not
-// forwarded at all (they could reach the adapter's admin endpoints).
+// header is a block (PermissionDenied with that status, body and headers).
+// An answer without the header below 500 (nginx refusing the request before
+// jev-edge runs: 400, 413, 414; a 404 from something that is not jev-edge)
+// means nobody judged it: X-Jev-Verdict: skipped with reason
+// "unjudgeable: ...", passed or denied (403) as -unjudged says, like
+// jev-edge's policy.unjudgeable. Any other answer (a 5xx without the
+// header included), and any error talking to the adapter, fails open: OK
+// with X-Jev-Verdict: error and X-Jev-Source: shim, matching the adapter's
+// own behaviour. Every X-Jev-* header is overwritten on the way upstream so
+// a forged inbound value never survives. Paths containing "..", "%2e" or
+// "//" are not forwarded at all (they could reach the adapter's admin
+// endpoints).
 package main
 
 import (
@@ -26,6 +31,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -45,6 +51,7 @@ type server struct {
 	authv3.UnimplementedAuthorizationServer
 	upstream string // e.g. http://openresty:8080/_jev/authz
 	client   *http.Client
+	unjudged string // "pass" or "block": an answer without X-Jev-Verdict
 }
 
 func (s *server) Check(ctx context.Context, req *authv3.CheckRequest) (*authv3.CheckResponse, error) {
@@ -104,7 +111,12 @@ func (s *server) Check(ctx context.Context, req *authv3.CheckRequest) (*authv3.C
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 
 	if resp.Header.Get("X-Jev-Verdict") == "" {
-		return failOpen(fmt.Sprintf("adapter answered %d without X-Jev-Verdict", resp.StatusCode)), nil
+		// a 5xx is the server (or a proxy in front of it) failing, like an
+		// unreachable adapter; anything else refused this request
+		if resp.StatusCode >= 500 {
+			return failOpen(fmt.Sprintf("adapter answered %d without X-Jev-Verdict", resp.StatusCode)), nil
+		}
+		return unjudgeable(fmt.Sprintf("authz answered %d", resp.StatusCode), s.unjudged), nil
 	}
 
 	// Overwrite every X-Jev-* header the adapter set and remove the ones it
@@ -184,11 +196,47 @@ func failOpen(reason string) *authv3.CheckResponse {
 	}
 }
 
+// unjudgeable: the request reached the adapter's server but was never
+// judged. Marked skipped like jev-edge's own "unjudgeable: ..." verdicts
+// (reason URL-encoded the same way), and denied with 403 and the default
+// block body when policy is "block".
+func unjudgeable(reason, policy string) *authv3.CheckResponse {
+	log.Printf("jev-edge shim: unjudgeable (%s): %s", policy, reason)
+	headers := []*corev3.HeaderValueOption{
+		overwrite("X-Jev-Verdict", "skipped"),
+		overwrite("X-Jev-Score", "0.00"),
+		overwrite("X-Jev-Source", "shim"),
+		overwrite("X-Jev-Reason", url.QueryEscape("unjudgeable: "+reason)),
+	}
+	if policy == "block" {
+		return &authv3.CheckResponse{
+			Status: &rpcstatus.Status{Code: int32(codes.PermissionDenied)},
+			HttpResponse: &authv3.CheckResponse_DeniedResponse{
+				DeniedResponse: &authv3.DeniedHttpResponse{
+					Status:  &typev3.HttpStatus{Code: typev3.StatusCode_Forbidden},
+					Headers: []*corev3.HeaderValueOption{overwrite("Content-Type", "application/json")},
+					Body:    `{"error":"request rejected"}`,
+				},
+			},
+		}
+	}
+	return &authv3.CheckResponse{
+		Status: &rpcstatus.Status{Code: int32(codes.OK)},
+		HttpResponse: &authv3.CheckResponse_OkResponse{
+			OkResponse: &authv3.OkHttpResponse{Headers: headers, HeadersToRemove: []string{"X-Jev-Request-Id"}},
+		},
+	}
+}
+
 func main() {
 	listen := flag.String("listen", ":9001", "gRPC listen address")
 	upstream := flag.String("upstream", "http://127.0.0.1:8080/_jev/authz", "adapter HTTP ext_authz base URL (no trailing slash)")
 	timeout := flag.Duration("timeout", 1500*time.Millisecond, "HTTP timeout to the adapter (fail-open when exceeded); keep it above the adapter's L2 ceiling and below the ext_authz grpc_service timeout in envoy-grpc.yaml so the fail-open answer still reaches Envoy")
+	unjudged := flag.String("unjudged", "pass", "a request the adapter's server answered without X-Jev-Verdict (refused before judging): pass, marked X-Jev-Verdict: skipped, or block with 403; keep it equal to jev-edge's policy.unjudgeable")
 	flag.Parse()
+	if *unjudged != "pass" && *unjudged != "block" {
+		log.Fatalf("-unjudged must be pass or block, got %q", *unjudged)
+	}
 
 	s := &server{
 		upstream: strings.TrimRight(*upstream, "/"),
@@ -196,6 +244,7 @@ func main() {
 			Timeout:   *timeout,
 			Transport: &http.Transport{MaxIdleConnsPerHost: 64, IdleConnTimeout: 90 * time.Second},
 		},
+		unjudged: *unjudged,
 	}
 
 	lis, err := net.Listen("tcp", *listen)

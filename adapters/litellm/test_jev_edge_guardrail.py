@@ -938,6 +938,45 @@ def test_realtime_text_carries_the_sessions_client_address():
 # LiteLLM's own bookkeeping
 # ---------------------------------------------------------------------------
 
+class Recording(JevEdgeGuardrail):
+    """LiteLLM's CustomGuardrail method, recorded."""
+
+    def add_standard_logging_guardrail_information_to_request_data(self, **kw):
+        self.logged = kw
+        bag_key = next(k for k in kw["request_data"] if k in ("metadata", "litellm_metadata"))
+        kw["request_data"][bag_key].setdefault("standard_logging_guardrail_information", []).append(kw["guardrail_json_response"])
+
+
+@pytest.mark.parametrize("route,call_type,key", [("/v1/chat/completions", "acompletion", "metadata"),
+                                                 ("/v1/responses", "aresponses", "litellm_metadata")])
+def test_verdict_is_logged_as_guardrail_information_in_the_proxys_metadata(route, call_type, key):
+    transport, _ = fake_authz()
+    g = Recording(jev_edge_url=URL, transport=transport)
+    data = {"messages": [{"role": "user", "content": ATTACK}], "metadata": {"k": "v"}, "litellm_metadata": {},
+            "proxy_server_request": psr(route), "litellm_logging_obj": "LOGGING"}
+    if key == "metadata":
+        data.pop("litellm_metadata")
+    out = run(g.async_pre_call_hook({}, None, data, call_type))
+    assert g.logged["guardrail_status"] == "success" and g.logged["guardrail_json_response"]["verdict"] == "safe"
+    assert set(g.logged["request_data"]) == {key, "litellm_logging_obj"}
+    assert out[key]["standard_logging_guardrail_information"][0]["verdict"] == "safe"
+    if key == "litellm_metadata":
+        assert out["metadata"] == {"k": "v"}  # the client's metadata, sent on to the provider, untouched
+
+
+def test_logged_status_follows_the_verdict():
+    for status, verdict, kw, expected in [(403, "malicious", {}, "guardrail_intervened"),
+                                          (403, "malicious", {"enforce": False}, "success"),
+                                          (502, None, {}, "guardrail_failed_to_respond")]:
+        transport, _ = fake_authz(status=status, verdict=verdict or "x", with_verdict=verdict is not None)
+        g = Recording(jev_edge_url=URL, transport=transport, **kw)
+        try:
+            run(g.async_pre_call_hook({}, None, dict(CHAT, metadata={}), "acompletion"))
+        except Exception as e:
+            assert e.status_code == 403
+        assert g.logged["guardrail_status"] == expected
+
+
 def test_a_client_cannot_switch_the_guardrail_off_on_old_litellm():
     # LiteLLM 1.80 read disable_global_guardrail from the request body and the
     # client's metadata; only the key's or team's setting counts

@@ -57,6 +57,7 @@ import logging
 import math
 import os
 import re
+import time
 from typing import Any, Callable, Optional, Union
 from urllib.parse import unquote_plus, urlsplit
 
@@ -641,6 +642,7 @@ class JevEdgeGuardrail(_ApplyGuardrailBase):
         data: dict,
         call_type: Any,
     ) -> Optional[Union[Exception, str, dict]]:
+        started = time.time()
         if isinstance(data.get("proxy_server_request"), dict):
             ip = self.client_ip(data)
             _CLIENT_IP.set(ip)
@@ -662,7 +664,9 @@ class JevEdgeGuardrail(_ApplyGuardrailBase):
         if not isinstance(md, dict):
             md = data[key] = {}
         md["jev_verdict"] = verdict
-        if verdict.get("action") == "block" and self.enforce:
+        blocks = verdict.get("action") == "block" and self.enforce
+        self._log_verdict(key, md, data, verdict, started, blocks)
+        if blocks:
             self._raise(verdict)
         return data
 
@@ -685,6 +689,24 @@ class JevEdgeGuardrail(_ApplyGuardrailBase):
         if HTTPException is not None:
             raise HTTPException(status_code=status, detail=detail)
         raise JevEdgeBlocked(status, detail)
+
+    def _log_verdict(self, key: str, md: dict, data: dict, verdict: dict, started: float, blocks: bool) -> None:
+        """The verdict in LiteLLM's standard guardrail logging too, so it
+        reaches callbacks and the spend logs' `guardrail_information`. Handed
+        the proxy's own metadata only: LiteLLM 1.80 writes it to a request's
+        `metadata` whenever there is one, the client's on the routes that
+        send `metadata` on to the provider."""
+        add = getattr(self, "add_standard_logging_guardrail_information_to_request_data", None)
+        if add is None:
+            return
+        status = ("guardrail_intervened" if blocks else
+                  "guardrail_failed_to_respond" if verdict.get("verdict") == "error" else "success")
+        ended = time.time()
+        try:
+            add(guardrail_json_response=dict(verdict), request_data={key: md, "litellm_logging_obj": data.get("litellm_logging_obj")},
+                guardrail_status=status, start_time=started, end_time=ended, duration=ended - started)
+        except Exception as e:  # logging never costs a request
+            log.debug("jev-edge: guardrail information not logged: %s", e)
 
     @staticmethod
     def _adapter(verdict: str, reason: str) -> dict[str, Any]:

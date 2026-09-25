@@ -246,3 +246,26 @@ describe("normalize.fieldKeys", () => {
     expect(Date.now() - t0).toBeLessThan(200);
   });
 });
+
+// Twins of tests in core/spec/normalize_spec.lua and core/spec/judge_spec.lua.
+describe("normalize.extract: form bodies", () => {
+  // the regex formValues replaced; the new code gives the same values
+  const old = (b: string) => [...b.matchAll(/([^&=]+)=([^&]*)/g)].map((m) => m[2]).join("\n");
+  const FORM = "application/x-www-form-urlencoded";
+
+  it("gives the values the old regex gave", () => {
+    for (const b of ["a=1&b=2", "a=b=c", "=b=c", "==b=c=d", "&&a=1&&", "a", "=", "a=&b=",
+      "a=1&=2&c", "x==", "=&=&a", "a&b=1", "name=v&&=&k=v2=v3"]) {
+      expect(core.normalize.extract(b, FORM, [])[0], b).toBe(old(b));
+    }
+  });
+
+  it("reads a 1 MiB body without & or = in linear time", () => {
+    const a = "a".repeat(1 << 20);
+    const t0 = Date.now();
+    expect(core.normalize.extract(a, FORM, [])[0]).toBe("");
+    expect(core.normalize.extract("x=1&" + a, undefined, [])[0]).toBe("1");
+    // the regex took about 30 s on 256 KiB; this is milliseconds
+    expect(Date.now() - t0).toBeLessThan(2000);
+  });
+});

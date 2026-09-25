@@ -139,10 +139,24 @@ function _M.is_text(s)
   return ctl * 100 <= #s
 end
 
+-- The value of every `name=value` pair: in each `&`-separated piece, the text
+-- after the first `=` that follows a non-empty name (leading `=` are skipped).
+-- Plain finds, linear in the body: the pattern this replaces,
+-- gmatch("([^&=]+)=([^&]*)"), gives the same values but backtracks from every
+-- byte of a long run without `&` or `=`, quadratic in the access phase.
 local function form_values(body, out)
-  for _, v in body:gmatch("([^&=]+)=([^&]*)") do
-    v = v:gsub("+", " "):gsub("%%(%x%x)", function(h) return string.char(tonumber(h, 16)) end)
-    out[#out + 1] = v
+  local i, n = 1, #body
+  while i <= n do
+    local amp = body:find("&", i, true) or n + 1
+    local piece = body:sub(i, amp - 1)
+    local name = piece:find("[^=]")
+    local eq = name and piece:find("=", name, true)
+    if eq then
+      local v = piece:sub(eq + 1)
+      v = v:gsub("+", " "):gsub("%%(%x%x)", function(h) return string.char(tonumber(h, 16)) end)
+      out[#out + 1] = v
+    end
+    i = amp + 1
   end
 end
 

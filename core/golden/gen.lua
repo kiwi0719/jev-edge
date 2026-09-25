@@ -210,6 +210,8 @@ extract_case("multipart fields and text files, binary files skipped",
   .. "--B1\r\nContent-Disposition: form-data; name=\"i\"; filename=\"a.png\"\r\n"
   .. "Content-Type: image/png\r\n\r\n\0PNG\r\n"
   .. "--B1--\r\n", "multipart/form-data; boundary=B1")
+extract_case("form values: leading = skipped, = kept in the value", "=a=b&c==d&e&=&f=",
+  "application/x-www-form-urlencoded")
 
 -- ---------------------------------------------------------------------------
 -- rules: L1 decisions with the shipped llm-endpoints rule set

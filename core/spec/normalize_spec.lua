@@ -154,3 +154,28 @@ describe("normalize.normalize + fingerprint", function()
     assert.equals(a, N.fingerprint(string.rep("\n\t ", 40), nil, N.djb2))
   end)
 end)
+
+describe("normalize.extract: form bodies", function()
+  -- the pattern form_values replaced; the new code gives the same values
+  local function old(body)
+    local out = {}
+    for _, v in body:gmatch("([^&=]+)=([^&]*)") do out[#out + 1] = v end
+    return table.concat(out, "\n")
+  end
+
+  it("gives the values the old pattern gave", function()
+    for _, b in ipairs({ "a=1&b=2", "a=b=c", "=b=c", "==b=c=d", "&&a=1&&", "a", "=", "a=&b=",
+                         "a=1&=2&c", "x==", "=&=&a", "a&b=1", "name=v&&=&k=v2=v3" }) do
+      assert.equals(old(b), (N.extract(b, "application/x-www-form-urlencoded", nil, nil)), b)
+    end
+  end)
+
+  it("reads a 1 MiB body without & or = in linear time", function()
+    local a = string.rep("a", 1024 * 1024)
+    local t0 = os.clock()
+    assert.equals("", (N.extract(a, "application/x-www-form-urlencoded", nil, nil)))
+    assert.equals("1", (N.extract("x=1&" .. a, nil, nil, nil)))
+    -- the gmatch pattern took minutes on one such body; this is milliseconds
+    assert.is_true(os.clock() - t0 < 2, "form_values is not linear")
+  end)
+end)

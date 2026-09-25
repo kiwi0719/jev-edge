@@ -445,6 +445,24 @@
         ]
       },
       "name": "multipart fields and text files, binary files skipped"
+    },
+    {
+      "expect": {
+        "kind": "form",
+        "text": "b\n=d\n"
+      },
+      "input": {
+        "body": "=a=b&c==d&e&=&f=",
+        "content_type": "application/x-www-form-urlencoded",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "form values: leading = skipped, = kept in the value"
     }
   ],
   "core_version": "0.6.1",

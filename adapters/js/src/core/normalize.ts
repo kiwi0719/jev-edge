@@ -197,11 +197,23 @@ export function isText(s: string): boolean {
   return ctl * 100 <= byteLength(s);
 }
 
+// Port of form_values(): the value of every `name=value` pair, in each
+// `&`-separated piece the text after the first `=` that follows a non-empty
+// name (leading `=` are skipped). The same values as the regex
+// /([^&=]+)=([^&]*)/g, which backtracks quadratically on a long run without
+// `&` or `=`; this is linear.
 function formValues(body: string, out: string[]): void {
-  // Lua: body:gmatch("([^&=]+)=([^&]*)")
-  const re = /([^&=]+)=([^&]*)/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(body)) !== null) out.push(formDecode(m[2]));
+  let i = 0;
+  while (i < body.length) {
+    let amp = body.indexOf("&", i);
+    if (amp === -1) amp = body.length;
+    const piece = body.slice(i, amp);
+    let name = 0;
+    while (name < piece.length && piece[name] === "=") name++;
+    const eq = name < piece.length ? piece.indexOf("=", name) : -1;
+    if (eq !== -1) out.push(formDecode(piece.slice(eq + 1)));
+    i = amp + 1;
+  }
 }
 
 const MAX_PARTS = 100;

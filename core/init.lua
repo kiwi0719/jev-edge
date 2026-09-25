@@ -120,6 +120,66 @@ local TOOLS_SEP = "\n<tool definitions>\n"
 -- Names the tool-definitions part in the reason when its score decides.
 local TOOLS_LABEL = "tools+"
 
+-- What L2 judges for a request L1 found suspect, and L3 after it: the
+-- request's fingerprint and whole-request cache key, the judge's context,
+-- and, when it is judged in more than one piece, the parts and the suffix
+-- their reason takes (for one piece, the suffix its reason takes).
+local function plan(req, cfg, hash, rule, text, windowed, chunks, capped, untrusted, tools)
+  local whole = text
+  if untrusted then whole = whole .. UNTRUSTED_SEP .. untrusted.text end
+  if tools then whole = whole .. TOOLS_SEP .. tools.text end
+  local p = { fp = normalize.fingerprint(whole, { prefix_bytes = cfg.cache.fp_prefix_bytes }, hash) }
+  local uspec = untrusted and defaults.untrusted_spec(cfg, rule)
+  -- The whole request's entry. Judged in parts, it names the parts in its
+  -- scope, so it never answers for the same text judged in one piece.
+  local over
+  if uspec or tools then
+    local names = { table.concat(rule.templates or {}, ",") }
+    if uspec then names[#names + 1] = "+" .. table.concat(uspec.templates, ",") end
+    if tools then names[#names + 1] = "+tools" end
+    over = { templates = names }
+  end
+  p.key = p.fp ~= "" and _M.cache_key(p.fp, rule, cfg, hash, over) or nil
+  p.context = {
+    path = req.path or "", method = req.method or "",
+    deployment = rule.deployment_context or cfg.jev.deployment_context or "",
+  }
+  if not ((chunks and #chunks > 1) or untrusted or tools) then
+    -- the score is for the window, not the whole text; the reason says so
+    p.suffix = windowed and " (window)" or ""
+    return p
+  end
+  local parts = {}
+  -- the text only stands aside when it alone would have passed
+  if not ((untrusted and untrusted.only) or (tools and tools.only)) then
+    for _, c in ipairs((chunks and #chunks > 1) and chunks or { text }) do
+      parts[#parts + 1] = { text = c, templates = rule.templates, context = p.context }
+    end
+  end
+  local suffix = ""
+  if chunks and #chunks > 1 then
+    suffix = capped and " (window)" or (" (" .. #chunks .. " chunks" .. (windowed and ", window" or "") .. ")")
+  elseif windowed or (untrusted and untrusted.windowed) or (tools and tools.windowed) then
+    suffix = " (window)"
+  end
+  if untrusted then
+    -- asked without the deployment context, the way the question was measured
+    parts[#parts + 1] = { text = untrusted.text, templates = uspec.templates,
+      context = { path = req.path or "", method = req.method or "", deployment = "" },
+      over = { templates = uspec.templates, deployment = "" } }
+  end
+  if tools then
+    -- the client sent them: the same question and scope as its own text,
+    -- so the entry is the one any text like it gets. An agent loads them
+    -- from servers the user may not control: their score decides the
+    -- request, but the subject's reputation is charged for its own text.
+    parts[#parts + 1] = { text = tools.text, templates = rule.templates, context = p.context,
+      label = TOOLS_LABEL, rep = false }
+  end
+  p.parts, p.suffix = parts, suffix
+  return p
+end
+
 -- Judge a request in parts: text that did not fit one window, chunk by chunk
 -- (rule.max_judge_chunks), retrieved content with its own question
 -- (untrusted.enabled), and the tool definitions (rule.tool_fields). Each part
@@ -247,13 +307,8 @@ function _M.evaluate(req, ctx)
     }))
   end
 
-  local whole = text
-  if untrusted then whole = whole .. UNTRUSTED_SEP .. untrusted.text end
-  if tools then whole = whole .. TOOLS_SEP .. tools.text end
-  local fp = normalize.fingerprint(whole, { prefix_bytes = cfg.cache.fp_prefix_bytes }, ctx.hash)
-  local uspec = untrusted and defaults.untrusted_spec(cfg, rule)
-  -- the text only stands aside when it alone would have passed
-  local only = (untrusted and untrusted.only) or (tools and tools.only)
+  local p = plan(req, cfg, ctx.hash, rule, text, windowed, chunks, capped, untrusted, tools)
+  local fp, ckey = p.fp, p.key
 
   -- trust ---------------------------------------------------------------
   -- An operator called this exact text a false positive. Checked before the
@@ -273,16 +328,6 @@ function _M.evaluate(req, ctx)
   end
 
   -- cache ---------------------------------------------------------------
-  -- The whole request's entry. Judged in parts, it names the parts in its
-  -- scope, so it never answers for the same text judged in one piece.
-  local over
-  if uspec or tools then
-    local names = { table.concat(rule.templates or {}, ",") }
-    if uspec then names[#names + 1] = "+" .. table.concat(uspec.templates, ",") end
-    if tools then names[#names + 1] = "+tools" end
-    over = { templates = names }
-  end
-  local ckey = fp ~= "" and _M.cache_key(fp, rule, cfg, ctx.hash, over) or nil
   if ckey and ctx.cache then
     local hit = ctx.cache:get(ckey)
     if type(hit) == "table" and type(hit.score) == "number" then
@@ -321,43 +366,8 @@ function _M.evaluate(req, ctx)
       }))
     end
   end
-  if (chunks and #chunks > 1) or untrusted or tools then
-    local context = {
-      path = req.path or "", method = req.method or "",
-      deployment = rule.deployment_context or cfg.jev.deployment_context or "",
-    }
-    local parts = {}
-    if not only then
-      for _, c in ipairs((chunks and #chunks > 1) and chunks or { text }) do
-        parts[#parts + 1] = { text = c, templates = rule.templates, context = context }
-      end
-    end
-    local suffix = ""
-    if chunks and #chunks > 1 then
-      suffix = capped and " (window)" or (" (" .. #chunks .. " chunks" .. (windowed and ", window" or "") .. ")")
-    elseif windowed or (untrusted and untrusted.windowed) or (tools and tools.windowed) then
-      suffix = " (window)"
-    end
-    if untrusted then
-      -- asked without the deployment context, the way the question was measured
-      parts[#parts + 1] = { text = untrusted.text, templates = uspec.templates,
-        context = { path = req.path or "", method = req.method or "", deployment = "" },
-        over = { templates = uspec.templates, deployment = "" } }
-    end
-    if tools then
-      -- the client sent them: the same question and scope as its own text,
-      -- so the entry is the one any text like it gets. An agent loads them
-      -- from servers the user may not control: their score decides the
-      -- request, but the subject's reputation is charged for its own text.
-      parts[#parts + 1] = { text = tools.text, templates = rule.templates, context = context,
-        label = TOOLS_LABEL, rep = false }
-    end
-    return judge_parts(ctx, rule, parts, suffix, fp, ckey, reason)
-  end
-  local prompt, perr = judge.build(rule.templates, text, {
-    path = req.path or "", method = req.method or "",
-    deployment = rule.deployment_context or cfg.jev.deployment_context or "",
-  })
+  if p.parts then return judge_parts(ctx, rule, p.parts, p.suffix, fp, ckey, reason) end
+  local prompt, perr = judge.build(rule.templates, text, p.context)
   if not prompt then
     log(ctx, "error", "jev-edge: " .. perr)
     settle(ctx)
@@ -407,6 +417,92 @@ function _M.evaluate(req, ctx)
     action = action, verdict = label, score = score, async = async,
     source = verdict.SRC_L2, reason = why, fingerprint = fp, l2_ms = elapsed,
   }))
+end
+
+-- ---------------------------------------------------------------------------
+-- L3: an adapter re-judges a request off the request path when L2 could not
+-- answer it or answered in the suspicious band. It judges what L2 judged:
+-- the same parts (every chunk, the retrieved content, the tool definitions)
+-- with the same prompts, keeps each part's answer under that part's cache
+-- key, and writes the whole request's key only when every part answered, so
+-- a cached score is never one for less than the whole request.
+-- ---------------------------------------------------------------------------
+
+--- What L3 judges for a request: its parts as prompts, with the key each
+-- answer is kept under. The request goes through L1 again with the same
+-- rules, without the stores (reputation is not looked up again).
+-- @param req the request, as evaluate() had it
+-- @param ctx { config, rules, hash, json_decode, re_find, log }
+-- @return nil when L1 no longer finds it suspect or a prompt cannot be
+--         built; else { fingerprint, key (the whole request's cache key, or
+--         nil), reason (L1's), suffix, parts = { { prompt, key, label, rep } } }
+function _M.l3_job(req, ctx)
+  local cfg = ctx.config
+  local r, text, reason, rule, windowed, chunks, capped, untrusted, tools = rules_mod.evaluate_all(req, ctx.rules,
+    { config = cfg, json_decode = ctx.json_decode, re_find = ctx.re_find, log = ctx.log })
+  if r ~= rules_mod.SUSPECT then return nil end
+  local p = plan(req, cfg, ctx.hash, rule, text, windowed, chunks, capped, untrusted, tools)
+  local job = { fingerprint = p.fp, key = p.key, reason = reason, suffix = p.suffix, parts = {} }
+  -- one piece: its answer is the whole request's
+  local parts = p.parts or { { text = text, templates = rule.templates, context = p.context } }
+  for i, part in ipairs(parts) do
+    local prompt = judge.build(part.templates, part.text, part.context)
+    if not prompt then return nil end
+    local key = p.key
+    if p.parts then
+      local cfp = normalize.fingerprint(part.text, { prefix_bytes = cfg.cache.fp_prefix_bytes }, ctx.hash)
+      key = cfp ~= "" and _M.cache_key(cfp, rule, cfg, ctx.hash, part.over) or nil
+    end
+    job.parts[i] = { prompt = prompt, key = key, label = part.label, rep = part.rep }
+  end
+  return job
+end
+
+--- What L3's answers make of a job: the highest part score and its verdict
+-- and reason (as L2 would have given them), the label reputation charges
+-- (that of the subject's own text; see rep_of), and the cache writes.
+-- @param job     from l3_job
+-- @param results results[k] is the judge's answers for job.parts[k], or nil
+--                when that call failed
+-- @param cfg     merged config
+-- @return nil when no part answered with a score; else { score, verdict,
+--         reason, charge (a label, or nil: charge nothing), writes =
+--         { { key, value }, ... } }: each answered part under its own key,
+--         and the whole request's key only when every part answered
+function _M.l3_result(job, results, cfg)
+  local best, top, own, all = nil, "", nil, true
+  local writes = {}
+  for k, part in ipairs(job.parts) do
+    local a = results[k]
+    local s, t, n
+    if type(a) == "table" then s, t, n = judge.reduce(a) end
+    if not s or n == 0 then
+      all = false
+    else
+      if part.key and part.key ~= job.key then
+        writes[#writes + 1] = { part.key, { score = s, reason = t .. " " .. string.format("%.2f", s) } }
+      end
+      if not best or s > best then
+        best, top = s, t
+        if top ~= "" and part.label then top = part.label .. top end
+      end
+      if part.rep ~= false and (not own or s > own) then own = s end
+    end
+  end
+  if not best then return nil end
+  local _, label = policy.decide(best, cfg.policy)
+  local why = top ~= "" and (top .. " " .. string.format("%.2f", best) .. job.suffix) or job.reason
+  local rep = rep_of(best, own)
+  if all and job.key then
+    writes[#writes + 1] = { job.key, { score = best, reason = why, rep = rep } }
+  end
+  local charge = label
+  if rep == false then
+    charge = nil
+  elseif rep then
+    charge = select(2, policy.decide(rep, cfg.policy))
+  end
+  return { score = best, verdict = label, reason = why, charge = charge, writes = writes }
 end
 
 return _M

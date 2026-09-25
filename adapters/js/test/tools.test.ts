@@ -297,7 +297,7 @@ describe("tool definitions", () => {
     expect(a.fingerprint).not.toBe(b.fingerprint);
   });
 
-  it("leaves L3's text (judgedText) as it was: the text alone", async () => {
+  it("leaves judgedText the text alone (the Lua gateways' L3 judges every part: core.l3_job)", async () => {
     expect(await rules.judgedText(toolsReq("Please summarise the attached quarterly report.", weather()), load("llm-endpoints"),
       { json_decode: decode, re_find: rules.reFind })).toBe("Please summarise the attached quarterly report.");
   });

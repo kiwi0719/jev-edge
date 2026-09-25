@@ -473,12 +473,12 @@ async function judged(
 // otherwise pass unjudged for lack of text.
 const BOUND_REASON = "unjudgeable: json over the walk bounds";
 
-/** Port of rules.judged_text: the text evaluate() judges under `rule` ("" when none). */
+/** Port of rules.judged_text: the text evaluate() judges under `rule`, in one window ("" when none); only the text, not the parts. */
 export async function judgedText(req: Req, rule: Rule | undefined, ctx?: RulesCtx): Promise<string> {
   if (!rule || !req) return "";
   const declared = Number(req.body_size);
   const size = Math.max(Number.isFinite(declared) ? declared : 0, typeof req.body === "string" ? byteLength(req.body) : 0);
-  // one window, never chunks: L3-style re-judging uses one call
+  // one window, never chunks
   const r = await judged(req, { ...rule, max_judge_chunks: 1 }, ctx, contentType(req.headers), size);
   return r.text;
 }

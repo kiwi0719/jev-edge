@@ -402,13 +402,15 @@ function _M.evaluate(req, rule, ctx)
   return _M.SUSPECT, text, why, windowed, chunks, capped, untrusted, tools
 end
 
---- The text evaluate() judges for this request under `rule`: the same
--- extraction and window, for adapters that rebuild the prompt off the
--- request path (L3) or sample it. "" when there is none.
+--- The text evaluate() judges for this request under `rule`, in one window:
+-- the same extraction, for an adapter that wants the request's text off the
+-- request path. "" when there is none. Only the text: a request judged in
+-- parts (chunks, retrieved content, tool definitions) is more than this, and
+-- L3 judges all of them (core.l3_job).
 function _M.judged_text(req, rule, ctx)
   if not rule or not req then return "" end
   local size = math.max(tonumber(req.body_size) or 0, req.body and #req.body or 0)
-  -- one window, never chunks: L3 re-judges off the request path with one call
+  -- one window, never chunks
   local one = setmetatable({ max_judge_chunks = 1 }, { __index = rule })
   local text = judged(req, one, ctx, _M.content_type(req.headers), size)
   return text or ""

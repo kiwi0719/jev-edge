@@ -30,7 +30,6 @@ local core      = require("apisix.core")
 local jev_core  = require("jev.core")
 local defaults  = require("jev.core.defaults")
 local verdict   = require("jev.core.verdict")
-local judge_mod = require("jev.core.judge")
 local breaker_m = require("jev.core.breaker")
 local cache_m   = require("resty.jev.cache")
 local http      = require("resty.jev.http")
@@ -314,19 +313,13 @@ local function maybe_async(rt, v, req)
   -- L3 exists to get an answer L2 could not; while the breaker is open the
   -- provider is the reason, and hammering it from timers only keeps it open.
   if rt.breaker:state() ~= breaker_m.CLOSED then return end
-  local rule = rule_for(rt, req)
-  if not rule then return end
-  -- the same text L2 judged: the window, not the whole body
-  local text = rules_mod.judged_text(req, rule, { json_decode = cjson.decode, re_find = re_find })
-  if text == "" then return end
-  local prompt = judge_mod.build(rule.templates, text, {
-    path = req.path, method = req.method,
-    deployment = rule.deployment_context or rt.cfg.jev.deployment_context or "",
-  })
-  if not prompt then return end
-  async.schedule({ cfg = rt.cfg, cache = cache, state = rt.state, judge = rt.judge, prompt = prompt,
-    fingerprint = v.fingerprint, client_ip = req.client_ip,
-    cache_key = v.fingerprint ~= "" and jev_core.cache_key(v.fingerprint, rule, rt.cfg, sha256_hex) or nil })
+  -- the parts L2 judged, their prompts and cache keys (core.l3_job): never a
+  -- whole-request cache entry for less than the whole request
+  local job = jev_core.l3_job(req, { config = rt.cfg, rules = rt.rules, hash = sha256_hex,
+                                     json_decode = cjson.decode, re_find = re_find })
+  if not job then return end
+  async.schedule({ cfg = rt.cfg, cache = cache, state = rt.state, judge = rt.judge, job = job,
+    client_ip = req.client_ip })
 end
 
 -- ---------------------------------------------------------------------------

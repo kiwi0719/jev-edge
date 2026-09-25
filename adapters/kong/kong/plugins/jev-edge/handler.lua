@@ -17,7 +17,6 @@ require("resty.jev.loader")()
 local jev_core  = require("jev.core")
 local defaults  = require("jev.core.defaults")
 local verdict   = require("jev.core.verdict")
-local judge_mod = require("jev.core.judge")
 local breaker_m = require("jev.core.breaker")
 local rules_mod = require("jev.core.rules")
 local sampling  = require("jev.core.sampling")
@@ -200,18 +199,12 @@ end
 local function maybe_async(rt, v, req)
   if not v.async then return end
   if rt.breaker:state() ~= breaker_m.CLOSED then return end
-  local rule = rules_mod.rule_for(req, rt.rules)
-  if not rule then return end
-  local text = rules_mod.judged_text(req, rule, { json_decode = cjson.decode, re_find = re_find })
-  if text == "" then return end
-  local prompt = judge_mod.build(rule.templates, text, {
-    path = req.path, method = req.method,
-    deployment = rule.deployment_context or rt.cfg.jev.deployment_context or "",
-  })
-  if not prompt then return end
-  async.schedule({ cfg = rt.cfg, cache = cache, state = rt.state, judge = rt.judge, prompt = prompt,
-    fingerprint = v.fingerprint, client_ip = req.client_ip,
-    cache_key = v.fingerprint ~= "" and jev_core.cache_key(v.fingerprint, rule, rt.cfg, sha256_hex) or nil })
+  -- the parts L2 judged, their prompts and cache keys (core.l3_job)
+  local job = jev_core.l3_job(req, { config = rt.cfg, rules = rt.rules, hash = sha256_hex,
+                                     json_decode = cjson.decode, re_find = re_find })
+  if not job then return end
+  async.schedule({ cfg = rt.cfg, cache = cache, state = rt.state, judge = rt.judge, job = job,
+    client_ip = req.client_ip })
 end
 
 local function maybe_sample(rt, v, req)

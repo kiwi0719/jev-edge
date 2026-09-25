@@ -327,7 +327,7 @@ describe("tool definitions", function()
     assert.are_not.equal(a.fingerprint, plain.fingerprint)
   end)
 
-  it("leaves L3's text (judged_text) as it was: the text alone", function()
+  it("leaves judged_text the text alone (L3 judges every part: core.l3_job, l3_spec.lua)", function()
     local rule = load("llm-endpoints")
     assert.equals("Please summarise the attached quarterly report.",
       rules_mod.judged_text(tools_req("Please summarise the attached quarterly report.", weather()), rule, H.ctx()))

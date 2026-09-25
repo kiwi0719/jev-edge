@@ -45,6 +45,7 @@ says. Requires ``httpx``, which LiteLLM already depends on.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import logging
 import math
@@ -107,7 +108,10 @@ MAX_DEPTH = 32  # deeper values are dropped; jev-edge reads 4 levels below a tex
 # sync and async names both seen)
 # ---------------------------------------------------------------------------
 
-# Not model input, and not watched by in-line jev-edge either.
+# Not model input, and not watched by in-line jev-edge either: embeddings,
+# moderation, audio, rerank, media generation, and search queries (a vector
+# store's or a web search tool's; what they return reaches a model only in a
+# later request, which is judged).
 SKIP_CALLS = frozenset({
     "embedding", "aembedding", "embeddings",
     "moderation", "amoderation",
@@ -116,12 +120,20 @@ SKIP_CALLS = frozenset({
     "rerank", "arerank",
     "image_generation", "aimage_generation", "image_edit", "aimage_edit",
     "image_variation", "aimage_variation",
-    "video_generation", "avideo_generation",
+    "video_generation", "avideo_generation", "create_video", "acreate_video",
+    "video_remix", "avideo_remix", "video_edit", "avideo_edit", "video_extension", "avideo_extension",
+    "vector_store_search", "avector_store_search", "search", "asearch",
 })
 
 # Calls whose prompts reach the model without passing through this hook's
 # data: nothing to judge, so the request is unjudgeable.
-NOT_VISIBLE_CALLS = frozenset({"create_batch", "acreate_batch", "realtime", "arealtime"})
+NOT_VISIBLE_CALLS = {
+    "create_batch": "the prompts are in the input file",
+    "acreate_batch": "the prompts are in the input file",
+    "_arealtime": "realtime messages are not visible to the guardrail",
+    "arealtime_calls": "realtime (WebRTC) audio is not visible to the guardrail",
+    "_aresponses_websocket": "the socket's messages are not visible to the guardrail",
+}
 
 # The routes whose proxy metadata LiteLLM keeps in `litellm_metadata` (their
 # API has a `metadata` parameter of its own, which is the client's), from
@@ -152,23 +164,21 @@ def _assistant(data: dict) -> dict:
     return {"messages": [{"role": "system", "content": data.get("instructions")}]}
 
 
-def _is_generation_url(url: str) -> bool:
-    path = url.split("?", 1)[0].rstrip("/")
-    return path.endswith(("/chat/completions", "/completions", "/responses", "/messages"))
+_BATCH_SCAN: list = []
 
 
-def _file_text(f: Any) -> Optional[str]:
-    """The text of an uploaded file as LiteLLM holds it: the content, or a
-    (filename, content[, content_type]) tuple. None when it is not UTF-8."""
-    content = f[1] if isinstance(f, (tuple, list)) and len(f) >= 2 else f
-    if isinstance(content, (bytes, bytearray)):
+def _litellm_scans_batch_files() -> bool:
+    """Whether this LiteLLM runs the pre-call guardrails over every line of a
+    batch input file after the upload's own hook (litellm 1.99 and later:
+    batch_guardrails.scan_batch_input_file). The upload's hook itself only
+    sees the file's name, type and size."""
+    if not _BATCH_SCAN:
         try:
-            content = bytes(content).decode("utf-8")
-        except UnicodeDecodeError:
-            return None
-    if not isinstance(content, str):
-        return None
-    return content[1:] if content.startswith("\ufeff") else content
+            found = importlib.util.find_spec("litellm.proxy.openai_files_endpoints.batch_guardrails") is not None
+        except Exception:  # no LiteLLM, or no proxy
+            found = False
+        _BATCH_SCAN.append(found)
+    return _BATCH_SCAN[0]
 
 
 # ---------------------------------------------------------------------------
@@ -529,49 +539,23 @@ class JevEdgeGuardrail(CustomGuardrail):
         if name in SKIP_CALLS:
             return "skip", f"call type {name} not judged"
         if name in NOT_VISIBLE_CALLS:
-            return "unjudged", f"unjudgeable: call type {name}: prompts not visible to the guardrail"
+            return "unjudged", f"unjudgeable: call type {name}: {NOT_VISIBLE_CALLS[name]}"
+        if name in ("create_file", "acreate_file"):
+            # LiteLLM passes the file's name, type and size, not its content
+            purpose = str(data.get("purpose") or "unknown")
+            if purpose == "batch" and _litellm_scans_batch_files():
+                return "skip", f"call type {name}: batch file lines are judged one by one as LiteLLM scans them"
+            return "unjudged", f"unjudgeable: call type {name}: file purpose {purpose}: content not visible to the guardrail"
+        # Thread messages, runs and assistants: no LiteLLM version checked
+        # (1.80, 1.102) runs pre-call guardrails on these routes, but if one
+        # does, their text is where these read it.
         if name in ("add_message", "a_add_message"):
             data = _thread_message(data)
         elif name in ("run_thread", "arun_thread", "run_thread_stream", "arun_thread_stream"):
             data = _run(data)
         elif name in ("create_assistants", "acreate_assistants"):
             data = _assistant(data)
-        elif name in ("create_file", "acreate_file"):
-            purpose = str(data.get("purpose") or "unknown")
-            if purpose != "batch":
-                return "unjudged", f"unjudgeable: call type {name}: file purpose {purpose} not judged"
-            text = _file_text(data.get("file"))
-            if text is None:
-                return "unjudged", f"unjudgeable: call type {name}: batch file not readable"
-            data = self._batch(text)
-            if data is None:
-                return "unjudged", f"unjudgeable: call type {name}: batch file is not JSONL"
-            if not data:
-                return "skip", f"call type {name}: no generation requests in the batch file"
         return "judge", _body_dict(data, self.extra_fields)
-
-    @staticmethod
-    def _batch(text: str) -> Optional[dict]:
-        """The generation requests of a Batch input file, merged into one body."""
-        merged: dict[str, list] = {}
-        for line in text.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except ValueError:
-                return None
-            if not isinstance(obj, dict):
-                return None
-            body, url = obj.get("body"), obj.get("url")
-            if not isinstance(body, dict) or (isinstance(url, str) and not _is_generation_url(url)):
-                continue
-            for key in SYSTEM_KEYS + TEXT_KEYS:
-                v = body.get(key)
-                if v is not None:
-                    merged.setdefault(key, []).extend(v if isinstance(v, list) else [v])
-        return merged
 
     @staticmethod
     def client_ip(data: dict) -> Optional[str]:

@@ -38,7 +38,8 @@ export interface Options {
    *  read-modify-write run inside it, one fetch per operation.
    *  Pass the namespace: the runtime makes a stub per operation (`idFromName("jev-edge")`), so it can be kept
    *  at module scope. workerd binds a stub to the request that created it; a runtime kept across requests
-   *  with a stub logs that once and falls back to isolate memory. Anything with a `fetch` method is taken
+   *  with a stub logs that once per stub and isolate, and from then on keeps breaker and adaptive state in
+   *  that isolate's memory, one operation at a time (cf/stores.ts). Anything with a `fetch` method is taken
    *  for a stub, and idFromName + get without one for a namespace, so a Store must have neither. */
   state?: DONamespaceLike | DOStubLike | Store;
   /** Store for per-subject trajectories (KV or memory). Memory (per isolate) if absent. Only used with config.subject.enabled. */

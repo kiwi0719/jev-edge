@@ -224,12 +224,26 @@ export function isNamespace(x: unknown): x is DONamespaceLike {
 // any later one. A namespace is not, so a runtime given one (and kept at
 // module scope, or across requests by a preset) makes its stub per call;
 // idFromName is a hash and get() no round trip.
+//
+// workerd's refusal is raised in the calling isolate, before anything is
+// sent: an Error with this message and no `remote` property. An exception
+// thrown inside the Durable Object reaches the caller with `remote: true`
+// (checked in Miniflare 4.20260714 / workerd 1.20260714, fetch stubs on
+// compatibility dates before and after RPC), whatever its message, and is the
+// caller's to handle like any other.
 const CROSS_REQUEST = /Cannot perform I\/O on behalf of a different request/;
 const STALE_STUB =
   "jev-edge: a Durable Object stub made in one request was used in a later one, which workerd refuses " +
-  '("Cannot perform I/O on behalf of a different request"). Breaker, adaptive timeout and any durableStore on ' +
-  "this stub now use this isolate's memory. Fix: pass the namespace, createRuntime({ state: env.JEV_STATE }) " +
-  "or durableStore(env.JEV_STATE), which makes a stub per call; or build the runtime per request.";
+  '("Cannot perform I/O on behalf of a different request"). From now on this isolate keeps the breaker, ' +
+  "adaptive timeout and any durableStore on this stub in its own memory, apart from every other isolate; " +
+  "logged once per stub and isolate. Fix: pass the namespace, createRuntime({ state: env.JEV_STATE }) or " +
+  "durableStore(env.JEV_STATE), which makes a stub per call; or build the runtime per request.";
+
+/** workerd's refusal of a stub used past its request, and nothing else. */
+function isCrossRequest(e: unknown): boolean {
+  if (typeof e === "object" && e !== null && (e as { remote?: unknown }).remote === true) return false;
+  return CROSS_REQUEST.test(e instanceof Error ? e.message : String(e));
+}
 
 const resolved = new WeakSet<object>();
 const guards = new WeakMap<object, DOStubLike>();
@@ -237,27 +251,30 @@ const guards = new WeakMap<object, DOStubLike>();
 /**
  * A stub kept past its request answers every call with the cross-request
  * error, which would fail open every request after the first. Instead the
- * first such error is logged once, naming the fix, and this stub's calls go to
- * a JevState over isolate memory: the same state a runtime without a binding
- * keeps. Any other error is the caller's, as before.
+ * first such error is logged (once per stub, in each isolate that hits it)
+ * and this stub's calls go from then on to a JevState over isolate memory.
+ * That state is per isolate, like a runtime's without a binding, and the
+ * JevState takes one request at a time, as the Durable Object's input gate
+ * would: an incr, a breaker record or a half-open probe claim is atomic
+ * within the isolate, though no longer across isolates. Any other error,
+ * including one thrown inside the object, is the caller's, as before.
  */
 function guarded(stub: DOStubLike): DOStubLike {
   const known = guards.get(stub);
   if (known) return known;
-  let local: JevState | undefined;
-  const toLocal = (input: string | Request, init?: RequestInit) => local!.fetch(new Request(input, init));
+  let local: ((req: Request) => Promise<Response>) | undefined;
   const g: DOStubLike = {
     fetch: async (input, init) => {
-      if (local) return toLocal(input, init);
+      if (local) return local(new Request(input, init));
       try {
         return await stub.fetch(input, init);
       } catch (e) {
-        if (!CROSS_REQUEST.test(e instanceof Error ? e.message : String(e))) throw e;
+        if (!isCrossRequest(e)) throw e;
         if (!local) {
           console.error(STALE_STUB);
-          local = new JevState(memoryState());
+          local = isolateState();
         }
-        return toLocal(input, init);
+        return local(new Request(input, init));
       }
     },
   };
@@ -266,9 +283,16 @@ function guarded(stub: DOStubLike): DOStubLike {
   return g;
 }
 
-function memoryState(): DOStateLike {
+/** A JevState over this isolate's memory, one request at a time. */
+function isolateState(): (req: Request) => Promise<Response> {
   const m = new Map<string, unknown>();
-  return { storage: { get: async (k) => m.get(k), put: async (k, v) => { m.set(k, v); }, delete: async (k) => m.delete(k) } };
+  const d = new JevState({ storage: { get: async (k) => m.get(k), put: async (k, v) => { m.set(k, v); }, delete: async (k) => m.delete(k) } });
+  let queue: Promise<unknown> = Promise.resolve();
+  return (req) => {
+    const p = queue.then(() => d.fetch(req));
+    queue = p.catch(() => {});
+    return p;
+  };
 }
 
 /**

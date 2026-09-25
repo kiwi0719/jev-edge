@@ -30,7 +30,10 @@ export interface Options {
   /** KV namespace for the fingerprint / reputation cache. Memory (per isolate) if absent. */
   cache?: KVLike | Store;
   /** Durable Object stub (JevState) or any Store for breaker + adaptive timeout. Memory (per isolate) if absent.
-   *  With a stub the breaker and adaptive read-modify-write run inside the Durable Object, one fetch per operation. */
+   *  With a stub the breaker and adaptive read-modify-write run inside the Durable Object, one fetch per operation.
+   *  Anything with a `fetch` method is taken for a stub, so a Store must not have one. workerd binds a stub to
+   *  the request that created it: a runtime kept across requests needs `{ fetch }` that gets a fresh stub per
+   *  call, which is what the Cloudflare presets pass. */
   state?: DOStubLike | Store;
   /** Store for per-subject trajectories (KV or memory). Memory (per isolate) if absent. Only used with config.subject.enabled. */
   subjectStore?: KVLike | Store;
@@ -70,8 +73,15 @@ export interface RequestCtx {
 function isKV(x: unknown): x is KVLike {
   return typeof x === "object" && x !== null && "put" in x && typeof (x as KVLike).put === "function";
 }
+/**
+ * A Durable Object stub, told apart from a Store by the one thing it always
+ * has and a Store never does: a `fetch` method. Not by what it lacks: a
+ * workerd stub answers every property name (each one an RPC method on
+ * compatibility dates from 2024-04-03, the old Fetcher get / put / delete
+ * before that), so `"get" in stub` is true for every real one.
+ */
 function isStub(x: unknown): x is DOStubLike {
-  return typeof x === "object" && x !== null && "fetch" in x && !("get" in x);
+  return (typeof x === "object" || typeof x === "function") && x !== null && typeof (x as DOStubLike).fetch === "function";
 }
 
 export function createRuntime(opts: Options): Runtime {

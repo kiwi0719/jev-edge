@@ -305,6 +305,69 @@ describe("stores", () => {
     expect(await rt.adaptive.current()).toBe(400); // warmup
   });
 
+  /** A stub shaped like workerd's: every property name answers (an RPC method
+   *  on compatibility dates from 2024-04-03, so "get" in stub is true), and
+   *  calling one on JevState, which does not extend DurableObject, throws.
+   *  `then` is undefined, as on the real stub. `live()` false models a stub
+   *  used from a request other than the one that created it. */
+  function rpcStub(target: { fetch(i: string | Request, init?: RequestInit): Promise<Response> }, live: () => boolean = () => true) {
+    return new Proxy({}, {
+      has: () => true,
+      get: (_, p) => {
+        if (p === "then") return undefined;
+        if (!live()) return () => { throw new Error("Cannot perform I/O on behalf of a different request."); };
+        if (p === "fetch") return (i: string | Request, init?: RequestInit) => target.fetch(i, init);
+        return () => { throw new TypeError("The receiving Durable Object does not support RPC, because its class was not declared with `extends DurableObject`."); };
+      },
+    }) as unknown as { fetch(i: string | Request, init?: RequestInit): Promise<Response> };
+  }
+
+  it("recognises a workerd stub, which answers every property, by its fetch", async () => {
+    const { stub, calls } = dobj();
+    const rt = createRuntime({ config: { jev: { provider: "mock", mock_score: 0.95, timeout_ms: 400 }, policy: { mode: "enforce" } }, state: rpcStub(stub) });
+    const res = await handle(chat(ATTACK), rt, echo);
+    expect(res.status).toBe(403);
+    expect(res.headers.get("x-jev-source")).toBe("l2");
+    expect(calls()).toBeGreaterThan(0); // breaker and adaptive went through fetch, not RPC
+  });
+
+  it("the Cloudflare presets get a fresh stub per call: a stub is bound to the request that made it", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ upstream: true })));
+    try {
+      const { stub } = dobj();
+      let request = 0;
+      let made = 0;
+      const env = {
+        JEV_STATE: {
+          idFromName: (n: string) => n,
+          get: () => {
+            made++;
+            const mine = request;
+            return rpcStub(stub, () => request === mine);
+          },
+        },
+      };
+      const opts = { provider: providers.mock, config: { jev: { mock_score: 0.95, timeout_ms: 400 }, policy: { mode: "enforce" as const } } };
+      const w = fullWorker({ upstream: "https://app.internal", ...opts });
+      const mw = pagesMiddleware(opts);
+      for (let i = 0; i < 3; i++) {
+        request++;
+        // distinct texts, so each one reaches the breaker instead of the cache
+        const body = ATTACK.replace("prompt.", "prompt, take " + i + ".");
+        const a = await w.fetch(chat(body), env);
+        expect(a.status).toBe(403);
+        expect(a.headers.get("x-jev-source")).toBe("l2");
+        request++;
+        const b = await mw({ request: chat(body.replace("take", "again")), env, next: async () => Response.json({ reached: true }) });
+        expect(b.status).toBe(403);
+        expect(b.headers.get("x-jev-source")).toBe("l2");
+      }
+      expect(made).toBeGreaterThan(6);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("the adaptive estimate is one document", async () => {
     const { Adaptive } = await import("../src/cf/adaptive");
     const store = memoryStore();

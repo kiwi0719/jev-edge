@@ -3,7 +3,9 @@
 -- fingerprint, score, verdict) so an operator can replay and label them
 -- later. Pure: the adapter supplies randomness, the clock and the store.
 -- The raw body is never kept; `text` is normalize.normalize() of the
--- extracted text, truncated to sampling.text_bytes.
+-- extracted text, truncated to sampling.text_bytes, and `tools` the same of
+-- the tool definitions (rule.tool_fields), when the request has any: they
+-- are judged as a part of their own and may be what scored it.
 
 local normalize = require "jev.core.normalize"
 local verdict   = require "jev.core.verdict"
@@ -38,15 +40,21 @@ end
 -- @param extra { rid = ..., ts = ..., json_decode = fn }
 function _M.build(cfg, v, req, rule, extra)
   extra = extra or {}
-  local text = ""
+  local text, tools = "", nil
   if rule and req and req.body then
-    text = normalize.extract(req.body, rules_mod.content_type(req.headers), rule.text_fields, extra.json_decode)
-    text = normalize.normalize(text, { prefix_bytes = cfg.sampling.text_bytes or 512 })
+    local n = cfg.sampling.text_bytes or 512
+    local raw, _, _, decoded = normalize.extract(req.body, rules_mod.content_type(req.headers), rule.text_fields,
+      extra.json_decode)
+    text = normalize.normalize(raw, { prefix_bytes = n })
+    if type(decoded) == "table" and type(rule.tool_fields) == "table" and #rule.tool_fields > 0 then
+      local ttext = normalize.extract_tools(decoded, rule.tool_fields, extra.json_decode)
+      if ttext ~= "" then tools = normalize.normalize(ttext, { prefix_bytes = n }) end
+    end
   end
   return {
     ts = extra.ts or 0, rid = extra.rid or "", path = req and req.path or "", ip = req and req.client_ip or "",
     method = req and req.method or "", fp = v.fingerprint, score = v.score, verdict = v.verdict,
-    action = v.action, source = v.source, reason = v.reason, l2_ms = v.l2_ms, text = text,
+    action = v.action, source = v.source, reason = v.reason, l2_ms = v.l2_ms, text = text, tools = tools,
   }
 end
 

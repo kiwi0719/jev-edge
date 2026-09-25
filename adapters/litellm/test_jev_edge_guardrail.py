@@ -663,7 +663,7 @@ FILE_INFO = {"filename": "b.jsonl", "content_type": "application/jsonl", "size":
     ("acreate_batch", "/v1/batches", {"input_file_id": "file-1", "endpoint": "/v1/chat/completions", "litellm_metadata": {}},
      "unjudgeable: call type acreate_batch: the prompts are in the input file"),
     ("_arealtime", "/v1/realtime?model=gpt-4o-realtime", {"model": "gpt-4o-realtime", "query_params": {}, "metadata": {}},
-     "unjudgeable: call type _arealtime: realtime messages are not visible to the guardrail"),
+     "unjudgeable: call type _arealtime: realtime audio and session instructions are not visible to the guardrail"),
     ("_aresponses_websocket", "/v1/responses?model=gpt-4o", {"model": "gpt-4o", "litellm_metadata": {}},
      "unjudgeable: call type _aresponses_websocket: the socket's messages are not visible to the guardrail"),
     ("arealtime_calls", "/v1/realtime/calls", {"model": "gpt-4o-realtime", "sdp_body": b"v=0", "metadata": {}},
@@ -717,6 +717,7 @@ def test_batch_upload_is_left_to_litellms_per_line_scan(monkeypatch):
     assert sorted(seen["bodies"], key=json.dumps) == sorted([
         {"messages": [{"role": "user", "content": ATTACK}]},
         {"messages": [{"role": "system", "content": "Be brief."}], "input": ATTACK}], key=json.dumps)
+    assert seen["xff"] == "198.51.100.7"  # the uploader's address, not the proxy's
 
 
 @pytest.mark.parametrize("spec,expected", [(ModuleNotFoundError("No module named 'litellm'"), False), (None, False),
@@ -798,6 +799,75 @@ def test_hook_signature_matches_litellm():
     ours = inspect.signature(JevEdgeGuardrail.async_pre_call_hook)
     assert list(base.parameters) == list(ours.parameters)
     assert issubclass(JevEdgeGuardrail, litellm_cg.CustomGuardrail)
+
+
+def test_apply_guardrail_signature_matches_litellm():
+    litellm_cg = pytest.importorskip("litellm.integrations.custom_guardrail")
+    base = inspect.signature(litellm_cg.CustomGuardrail.apply_guardrail)
+    ours = inspect.signature(JevEdgeGuardrail.apply_guardrail)
+    assert list(base.parameters) == list(ours.parameters)
+
+
+# ---------------------------------------------------------------------------
+# apply_guardrail: realtime text
+# ---------------------------------------------------------------------------
+
+def test_apply_guardrail_is_inherited_so_litellm_keeps_the_pre_call_hook():
+    # LiteLLM routes every hook of a class whose own __dict__ has
+    # apply_guardrail through its unified guardrail; realtime calls it
+    # whenever use_native_lifecycle_hooks is off
+    assert "apply_guardrail" not in vars(JevEdgeGuardrail) and callable(JevEdgeGuardrail.apply_guardrail)
+    assert "async_pre_call_hook" in vars(JevEdgeGuardrail)
+    assert getattr(JevEdgeGuardrail, "use_native_lifecycle_hooks", False) is False
+    assert guard(httpx.MockTransport(lambda r: httpx.Response(200))).uses_apply_guardrail_interface() is False
+
+
+def test_realtime_text_is_judged_as_a_user_message():
+    transport, seen = fake_authz()
+    g = guard(transport)
+    # what LiteLLM's realtime bridge passes for a typed message or a tool output
+    inputs = {"texts": [ATTACK], "images": []}
+    out = run(g.apply_guardrail(inputs=inputs, request_data={"user_api_key_dict": object()}, input_type="request"))
+    assert out is inputs
+    assert seen["body"] == {"messages": [{"role": "user", "content": ATTACK}]}
+    assert seen["path"] == "/_jev/authz/v1/chat/completions"
+
+
+def test_realtime_text_block_raises_and_monitor_passes():
+    transport, seen = fake_authz(status=403, verdict="malicious", score="0.95")
+    with pytest.raises(Exception) as ei:
+        run(guard(transport).apply_guardrail(inputs={"texts": [ATTACK]}, request_data={}, input_type="request"))
+    assert ei.value.status_code == 403 and ei.value.detail["jev"]["verdict"] == "malicious"
+    run(guard(transport, enforce=False).apply_guardrail(inputs={"texts": [ATTACK]}, request_data={}, input_type="request"))
+    # jev-edge down: fail open
+    g = guard(httpx.MockTransport(lambda r: (_ for _ in ()).throw(httpx.ConnectError("refused"))))
+    assert run(g.apply_guardrail(inputs={"texts": [ATTACK]}, request_data={}, input_type="request")) == {"texts": [ATTACK]}
+
+
+def test_apply_guardrail_leaves_responses_and_empty_texts_alone():
+    transport, seen = fake_authz(status=403, verdict="malicious")
+    g = guard(transport)
+    run(g.apply_guardrail(inputs={"texts": [ATTACK]}, request_data={}, input_type="response"))
+    run(g.apply_guardrail(inputs={"texts": ["", None]}, request_data={}, input_type="request"))
+    run(g.apply_guardrail(inputs={"images": ["data:image/png;base64,AAAA"]}, request_data={}, input_type="request"))
+    assert seen["calls"] == 0
+
+
+def test_realtime_text_carries_the_sessions_client_address():
+    # the session's pre-call hook (call type _arealtime) runs in the task that
+    # later bridges its messages: the address it saw goes with them
+    transport, seen = fake_authz()
+    g = guard(transport)
+
+    async def session():
+        await g.async_pre_call_hook({}, None, {"model": "rt", "metadata": {"requester_ip_address": "203.0.113.4"},
+                                               "proxy_server_request": psr("/v1/realtime?model=rt")}, "_arealtime")
+        await g.apply_guardrail(inputs={"texts": ["hello there, realtime"]}, request_data={}, input_type="request")
+
+    run(session())
+    assert seen["xff"] == "203.0.113.4"
+    run(g.apply_guardrail(inputs={"texts": ["another session"]}, request_data={}, input_type="request"))
+    assert seen["xff"] is None  # nothing leaks across tasks
 
 
 # ---------------------------------------------------------------------------

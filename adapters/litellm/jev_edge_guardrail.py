@@ -45,6 +45,7 @@ says. Requires ``httpx``, which LiteLLM already depends on.
 
 from __future__ import annotations
 
+import contextvars
 import importlib.util
 import json
 import logging
@@ -130,7 +131,10 @@ SKIP_CALLS = frozenset({
 NOT_VISIBLE_CALLS = {
     "create_batch": "the prompts are in the input file",
     "acreate_batch": "the prompts are in the input file",
-    "_arealtime": "realtime messages are not visible to the guardrail",
+    # the realtime WebSocket: audio and the session's instructions are never
+    # judged; typed text is, one message at a time, through apply_guardrail
+    # where LiteLLM calls it (see _ApplyGuardrailBase)
+    "_arealtime": "realtime audio and session instructions are not visible to the guardrail",
     "arealtime_calls": "realtime (WebRTC) audio is not visible to the guardrail",
     "_aresponses_websocket": "the socket's messages are not visible to the guardrail",
 }
@@ -456,6 +460,12 @@ def _metadata_key(data: dict) -> str:
     return "litellm_metadata" if isinstance(data.get("litellm_metadata"), dict) else "metadata"
 
 
+# The client address of the proxy request being handled, for work LiteLLM
+# does on its behalf without the request's data: a batch file's lines,
+# realtime messages. Context-local, so it never crosses requests.
+_CLIENT_IP: contextvars.ContextVar = contextvars.ContextVar("jev_edge_client_ip", default=None)
+
+
 class JevEdgeBlocked(Exception):
     """Raised on a block when FastAPI is not installed (tests)."""
 
@@ -465,7 +475,23 @@ class JevEdgeBlocked(Exception):
         self.detail = detail
 
 
-class JevEdgeGuardrail(CustomGuardrail):
+class _ApplyGuardrailBase(CustomGuardrail):
+    """apply_guardrail, which LiteLLM calls with bare texts: the typed user
+    messages and tool outputs of a realtime WebSocket session (LiteLLM's
+    realtime bridge; 1.102 does, 1.80 does not) and the
+    /guardrails/apply_guardrail test endpoint. It sits here, on a base
+    class, and not on JevEdgeGuardrail itself: LiteLLM sends every hook of a
+    class whose own ``__dict__`` defines apply_guardrail through its unified
+    guardrail (the request flattened to texts, model responses judged too)
+    instead of async_pre_call_hook, and realtime skips a guardrail with
+    ``use_native_lifecycle_hooks``."""
+
+    async def apply_guardrail(self, inputs: Any, request_data: dict, input_type: Any,
+                              logging_obj: Optional[Any] = None) -> Any:
+        return await self._judge_texts(inputs, input_type)  # type: ignore[attr-defined]
+
+
+class JevEdgeGuardrail(_ApplyGuardrailBase):
     def __init__(
         self,
         jev_edge_url: Optional[str] = None,
@@ -497,6 +523,11 @@ class JevEdgeGuardrail(CustomGuardrail):
         log.info("jev-edge guardrail: url=%s enforce=%s timeout=%s path=%s max_body_bytes=%d extra_fields=%s unjudged=%s",
                  self.base, self.enforce, self.timeout, self.path, self.max_body_bytes,
                  ",".join(self.extra_fields) or "-", self.unjudged)
+
+    def uses_apply_guardrail_interface(self) -> bool:
+        # apply_guardrail only answers LiteLLM's direct calls (realtime text,
+        # the test endpoint); every proxy hook stays async_pre_call_hook
+        return False
 
     def get_disable_global_guardrail(self, data: dict) -> Optional[bool]:
         """Whether a default_on guardrail is switched off for this request.
@@ -580,7 +611,7 @@ class JevEdgeGuardrail(CustomGuardrail):
         return str(ip) if ip else None
 
     # ------------------------------------------------------------------
-    # LiteLLM hook
+    # LiteLLM hooks
     # ------------------------------------------------------------------
 
     async def async_pre_call_hook(
@@ -590,6 +621,11 @@ class JevEdgeGuardrail(CustomGuardrail):
         data: dict,
         call_type: Any,
     ) -> Optional[Union[Exception, str, dict]]:
+        if isinstance(data.get("proxy_server_request"), dict):
+            ip = self.client_ip(data)
+            _CLIENT_IP.set(ip)
+        else:  # a batch file's line: the upload's client
+            ip = _CLIENT_IP.get()
         kind, arg = self.plan(data, call_type)
         verdict: dict[str, Any]
         if kind == "skip":
@@ -599,21 +635,36 @@ class JevEdgeGuardrail(CustomGuardrail):
         elif arg is None:
             verdict = self._adapter("skipped", "no text")
         else:
-            verdict = await self.judge(arg, self.client_ip(data))
+            verdict = await self.judge(arg, ip)
 
         key = _metadata_key(data)
         md = data.get(key)
         if not isinstance(md, dict):
             md = data[key] = {}
         md["jev_verdict"] = verdict
-
         if verdict.get("action") == "block" and self.enforce:
-            status = int(verdict.get("status") or 403)
-            detail = {"error": "request rejected", "jev": verdict}
-            if HTTPException is not None:
-                raise HTTPException(status_code=status, detail=detail)
-            raise JevEdgeBlocked(status, detail)
+            self._raise(verdict)
         return data
+
+    async def _judge_texts(self, inputs: Any, input_type: Any) -> Any:
+        """apply_guardrail: each text judged as a user message; only requests,
+        jev-edge judges input."""
+        if str(getattr(input_type, "value", input_type)) != "request" or not isinstance(inputs, dict):
+            return inputs
+        texts = [t for t in (inputs.get("texts") or []) if isinstance(t, str) and t]
+        if texts:
+            verdict = await self.judge({"messages": [{"role": "user", "content": t} for t in texts]}, _CLIENT_IP.get())
+            if verdict.get("action") == "block" and self.enforce:
+                self._raise(verdict)
+        return inputs
+
+    @staticmethod
+    def _raise(verdict: dict) -> None:
+        status = int(verdict.get("status") or 403)
+        detail = {"error": "request rejected", "jev": verdict}
+        if HTTPException is not None:
+            raise HTTPException(status_code=status, detail=detail)
+        raise JevEdgeBlocked(status, detail)
 
     @staticmethod
     def _adapter(verdict: str, reason: str) -> dict[str, Any]:

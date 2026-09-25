@@ -59,9 +59,11 @@ conformance-check:
 	    echo "conformance vectors are stale: run 'make conformance-vectors' and commit conformance/*.json"; rm -rf $$tmp; exit 1; fi
 
 # laya-server (adapters/laya-server): unit tests, and the whole conformance
-# suite in process against its mock backend. Standard library only.
+# suite in process against its mock backend; then run.py's own transport
+# checks against stub servers (conformance/test_run.py). Standard library only.
 test-laya:
 	cd adapters/laya-server && python3 -m unittest -v test_laya_server
+	cd conformance && python3 -m unittest -v test_run
 
 # JavaScript adapter: the TypeScript core replays the same golden vectors (needs pnpm).
 test-js:

@@ -343,9 +343,10 @@ rule("template-parity", function(r)
 end)
 
 -- 12. The ruleset's one required check covers every CI job: `ci-ok` needs
---     all of them, runs when one failed, and fails unless all succeeded (a
+--     all of them, runs whatever they did, and fails unless all succeeded (a
 --     job left out could fail and still let a PR merge; a skipped ci-ok
---     counts as passing)
+--     counts as passing, so its `if:` is exactly always(): !cancelled() skips
+--     it in a cancelled run, `!cancelled() && !failure()` when a job failed)
 rule("ci-ok", function(r)
   local ci = (read(".github/workflows/ci.yml") or ""):gsub("\r\n?", "\n")
   -- the top-level jobs mapping: job ids at two spaces, each with its lines
@@ -374,9 +375,14 @@ rule("ci-ok", function(r)
   for _, j in ipairs(jobs) do
     if j ~= "ci-ok" and not listed[j] then fail(r, "ci-ok does not need job " .. j) end
   end
-  local cond = ok_job:match("\n    if:([^\n]*)") or ""
-  if not (cond:find("always()", 1, true) or cond:find("!cancelled()", 1, true)) then
-    fail(r, "ci-ok has no `if: always()` (or `!cancelled()`): it is skipped when a job fails")
+  -- the job's if:, without a trailing comment, quotes or ${{ }}
+  local raw = ok_job:match("\n    if:([^\n]*)")
+  local cond = (raw or ""):gsub("%s+#.*$", ""):match("^%s*(.-)%s*$")
+  cond = cond:match('^"(.*)"$') or cond:match("^'(.*)'$") or cond
+  cond = cond:match("^%${{%s*(.-)%s*}}$") or cond
+  if cond ~= "always()" then
+    fail(r, "ci-ok has no `if: always()`" .. (raw and " (it has `if:" .. raw .. "`)" or "")
+      .. ": any other condition skips it in some run where a job did not succeed")
   end
   local tested = false
   for l in ok_job:gmatch("[^\n]+") do

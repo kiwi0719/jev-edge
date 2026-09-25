@@ -86,19 +86,35 @@ function collect(node: JsonValue | undefined, out: string[], depth: number): voi
   if (node.content !== undefined && node.content !== null) collect(node.content, out, depth + 1);
 }
 
-function walk(node: JsonValue | undefined, segs: Seg[], i: number, out: string[]): void {
-  if (node === undefined || node === null) return;
-  if (i >= segs.length) {
-    collect(node, out, 1);
-    return;
+/**
+ * Port of fold() in core/normalize.lua. Go's encoding/json (Ollama's
+ * /api/chat) matches an object key to a field without regard to case, and
+ * folds U+017F (long s) to s and U+212A (Kelvin sign) to k: {"MESSAGES": ...}
+ * reaches the model. ASCII letters only otherwise, as Lua's lower().
+ */
+export function fold(s: string): string {
+  if (!/[A-Z\u0080-\uFFFF]/.test(s)) return s;
+  return asciiLower(s).replace(/\u017F/g, "s").replace(/\u212A/g, "k");
+}
+
+// The keys of object `node` other than `key` itself that fold to `key`, in
+// byte order (UTF-16 order is the same for the characters that can fold to
+// a field name); undefined when there are none (nearly always).
+function variants(node: { [k: string]: JsonValue }, key: string): string[] | undefined {
+  const want = fold(key);
+  const b = want.charCodeAt(0);
+  let others: string[] | undefined;
+  for (const k of Object.keys(node)) {
+    if (k === key) continue;
+    const c = k.charCodeAt(0);
+    if ((c === b || (c >= 0x41 && c <= 0x5a && c + 32 === b) || (b === 0x73 && c === 0x17f) || (b === 0x6b && c === 0x212a))
+      && fold(k) === want) (others ??= []).push(k);
   }
-  const seg = segs[i];
-  let child: JsonValue | undefined = node;
-  if (seg.key !== "") {
-    if (!isObj(node)) return;
-    child = Array.isArray(node) ? undefined : node[seg.key];
-  }
-  if (seg.each) {
+  return others?.sort();
+}
+
+function descend(child: JsonValue | undefined, segs: Seg[], i: number, out: string[]): void {
+  if (segs[i].each) {
     // Lua ipairs over a cjson array: null is a value, skipped, not the end
     if (!Array.isArray(child)) return;
     for (const item of child) {
@@ -108,6 +124,22 @@ function walk(node: JsonValue | undefined, segs: Seg[], i: number, out: string[]
   } else {
     walk(child, segs, i + 1, out);
   }
+}
+
+// A path key is matched the way fold() says, and every key that folds to it
+// is read, since with several the backend may take any one: the exact key
+// first, the others in byte order.
+function walk(node: JsonValue | undefined, segs: Seg[], i: number, out: string[]): void {
+  if (node === undefined || node === null) return;
+  if (i >= segs.length) {
+    collect(node, out, 1);
+    return;
+  }
+  const key = segs[i].key;
+  if (key === "") return descend(node, segs, i, out);
+  if (!isObj(node) || Array.isArray(node)) return;
+  descend(node[key], segs, i, out);
+  for (const k of variants(node, key) ?? []) descend(node[k], segs, i, out);
 }
 
 export function extractJson(decoded: JsonValue, fields: string[]): string {
@@ -401,7 +433,7 @@ function readString(s: string, i: number): [string, number] {
   return [buf, n];
 }
 
-/** The last key of each text-field path: "messages[*].content" -> "content". */
+/** The last key of each text-field path, folded: "messages[*].content" -> "content". */
 export function fieldKeys(fields: string[] | undefined): Set<string> {
   const keys = new Set<string>();
   // Lua: f:match("([^%.%[%]%*]+)[%[%]%*]*$") -- the last run of name
@@ -413,20 +445,24 @@ export function fieldKeys(fields: string[] | undefined): Set<string> {
     while (end > 0 && (f[end - 1] === "[" || f[end - 1] === "]" || f[end - 1] === "*")) end--;
     let start = end;
     while (start > 0 && !special(f[start - 1])) start--;
-    if (end > start) keys.add(f.slice(start, end));
+    if (end > start) keys.add(fold(f.slice(start, end)));
   }
   // content parts carry their text under "text"
   if (keys.has("content")) keys.add("text");
   return keys;
 }
 
-/** Collect the string values of `keys` from possibly truncated JSON. */
+/**
+ * Collect the string values of `keys` (from fieldKeys) from possibly
+ * truncated JSON. Keys match the way walk() matches them: folded.
+ */
 export function scanStrings(s: string, keys: Set<string>, out: string[]): string[] {
-  const re = /"([A-Za-z0-9_-]+)"[ \t\n\v\f\r]*:[ \t\n\v\f\r]*"/g;
+  // key characters: ASCII word characters, U+017F and U+212A
+  const re = /"([A-Za-z0-9_\-\u017F\u212A]+)"[ \t\n\v\f\r]*:[ \t\n\v\f\r]*"/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(s)) !== null) {
     const [value, next] = readString(s, m.index + m[0].length);
-    if (keys.has(m[1]) && value !== "") out.push(value);
+    if (keys.has(fold(m[1])) && value !== "") out.push(value);
     re.lastIndex = next;
   }
   return out;

@@ -233,6 +233,31 @@ describe("normalize.extract: form bodies", function()
   end)
 end)
 
+describe("normalize: JSON keys match without regard to case", function()
+  local FIELDS = { "messages[*].content", "prompt", "task" }
+
+  it("reads a key in any case, U+017F and U+212A folded, every spelling of it", function()
+    local d = { MESSAGES = { { ROLE = "user", CONTENT = "upper" } } }
+    assert.equals("upper", N.extract_json(d, FIELDS))
+    d = { messages = { { content = "benign" } }, Messages = { { content = "attack" } } }
+    assert.equals("benign\nattack", N.extract_json(d, FIELDS))
+    d = { ["me\197\191\197\191ages"] = { { content = "long s" } }, ["ta\197\191\226\132\170"] = "kelvin" }
+    assert.equals("long s\nkelvin", N.extract_json(d, FIELDS))
+    -- the exact key first, the others in byte order
+    d = { messages = { { content = "b", Content = "a", CONTENT = "c" } } }
+    assert.equals("b\nc\na", N.extract_json(d, FIELDS))
+    assert.equals("", N.extract_json({ messagez = { { content = "x" } }, promp = "y" }, FIELDS))
+  end)
+
+  it("scans keys the same way past max_body_bytes", function()
+    local keys = N.field_keys({ "messages[*].CONTENT", "prompt" })
+    local s = '{"MESSAGES":[{"Content":"one"},{"TEXT":"two"}],"PROMPT":"three","Model":"m","ta\197\191k":"x'
+    assert.same({ "one", "two", "three" }, N.scan_strings(s, keys, {}))
+    -- U+0144 is made of the same bytes as U+017F and U+212A: not a key
+    assert.same({ "b" }, N.scan_strings('{"\197\132":"prompt":"b"', keys, {}))
+  end)
+end)
+
 describe("normalize.chunks", function()
   it("cuts a run of continuation bytes hard instead of walking it back", function()
     local pieces = N.chunks(string.rep("\128", 5000), 64)

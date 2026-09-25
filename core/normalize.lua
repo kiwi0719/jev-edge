@@ -44,25 +44,70 @@ local function collect(node, out, depth)
   if node.content ~= nil then collect(node.content, out, depth + 1) end
 end
 
-local function walk(node, segs, i, out)
-  if node == nil then return end
-  if i > #segs then
-    collect(node, out, 1)
-    return
+-- Go's encoding/json (Ollama's /api/chat, a default watched path) matches an
+-- object key to a field without regard to case, and folds U+017F (long s) to
+-- s and U+212A (Kelvin sign) to k: {"MESSAGES": ...} reaches the model. A
+-- path key is matched the same way, and every key that folds to it is read,
+-- since with several the backend may take any one: the exact key first, the
+-- others in byte order.
+local function fold(s)
+  if not s:find("[A-Z\128-\255]") then return s end
+  return (s:lower():gsub("\197\191", "s"):gsub("\226\132\170", "k"))
+end
+_M.fold = fold
+
+-- A folded key starts with the folded name's first byte, or with that
+-- letter's other case, or with the first byte of U+017F / U+212A.
+local FIRST = { s = { [0x53] = true, [0x73] = true, [0xC5] = true },
+                k = { [0x4B] = true, [0x6B] = true, [0xE2] = true } }
+
+-- The keys of object `node` other than `key` itself that fold to `key`, in
+-- byte order; nil when there are none (nearly always).
+local function variants(node, key)
+  if node[1] ~= nil then return nil end   -- an array
+  local want = fold(key)
+  local b = want:byte(1)
+  local first = FIRST[want:sub(1, 1)]
+  local others
+  for k in pairs(node) do
+    if type(k) == "string" and k ~= key and #k >= #want then
+      local c = k:byte(1)
+      if (c == b or (first and first[c]) or (c and c >= 0x41 and c <= 0x5A and c + 32 == b))
+         and fold(k) == want then
+        others = others or {}
+        others[#others + 1] = k
+      end
+    end
   end
-  local seg = segs[i]
-  local child = node
-  if seg.key ~= "" then
-    if type(node) ~= "table" then return end
-    child = node[seg.key]
-  end
-  if seg.each then
+  if others then table.sort(others) end
+  return others
+end
+
+local NONE = {}
+local walk
+local function descend(child, segs, i, out)
+  if segs[i].each then
     if type(child) ~= "table" then return end
     for _, item in ipairs(child) do
       walk(item, segs, i + 1, out)
     end
   else
     walk(child, segs, i + 1, out)
+  end
+end
+
+walk = function(node, segs, i, out)
+  if node == nil then return end
+  if i > #segs then
+    collect(node, out, 1)
+    return
+  end
+  local key = segs[i].key
+  if key == "" then return descend(node, segs, i, out) end
+  if type(node) ~= "table" then return end
+  descend(node[key], segs, i, out)
+  for _, k in ipairs(variants(node, key) or NONE) do
+    descend(node[k], segs, i, out)
   end
 end
 
@@ -331,27 +376,43 @@ local function read_string(s, i)
   return table.concat(buf), n + 1
 end
 
---- The last key of each text-field path: "messages[*].content" -> "content".
+--- The last key of each text-field path, folded (see fold):
+-- "messages[*].content" -> "content".
 function _M.field_keys(fields)
   local keys = {}
   for _, f in ipairs(fields or {}) do
     local last = f:match("([^%.%[%]%*]+)[%[%]%*]*$")
-    if last then keys[last] = true end
+    if last then keys[fold(last)] = true end
   end
   -- content parts carry their text under "text"
   if keys.content then keys.text = true end
   return keys
 end
 
---- Collect the string values of `keys` from possibly truncated JSON.
+-- True when `key` is ASCII word characters, U+017F and U+212A only: the
+-- byte class scan_strings finds keys with also matches other sequences of
+-- those bytes (U+0144 is \197\132), which are not keys to either core.
+local function key_chars(key)
+  if not key:find("[\128-\255]") then return true end
+  return key:gsub("\197\191", "s"):gsub("\226\132\170", "k"):find("^[%w_%-]+$") ~= nil
+end
+
+--- Collect the string values of `keys` (from field_keys) from possibly
+-- truncated JSON. Keys match the way walk() matches them: folded, so every
+-- spelling a case-insensitive backend reads is collected.
 function _M.scan_strings(s, keys, out)
   local i = 1
   while true do
-    local a, b, key = s:find('"([%w_%-]+)"%s*:%s*"', i)
+    -- key bytes: ASCII word characters and the bytes of U+017F and U+212A
+    local a, b, key = s:find('"([%w_%-\197\191\226\132\170]+)"%s*:%s*"', i)
     if not a then break end
-    local value, nexti = read_string(s, b + 1)
-    if keys[key] and value ~= "" then out[#out + 1] = value end
-    i = nexti
+    if key_chars(key) then
+      local value, nexti = read_string(s, b + 1)
+      if keys[fold(key)] and value ~= "" then out[#out + 1] = value end
+      i = nexti
+    else
+      i = a + 1   -- not a key: look again from the next byte
+    end
   end
   return out
 end

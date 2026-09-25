@@ -315,6 +315,28 @@ describe("normalize.extract: form bodies", () => {
   });
 });
 
+describe("normalize: JSON keys match without regard to case", () => {
+  const FIELDS = ["messages[*].content", "prompt", "task"];
+  const ex = (d: object) => core.normalize.extractJson(d as never, FIELDS);
+
+  it("reads a key in any case, U+017F and U+212A folded, every spelling of it", () => {
+    expect(ex({ MESSAGES: [{ ROLE: "user", CONTENT: "upper" }] })).toBe("upper");
+    expect(ex({ messages: [{ content: "benign" }], Messages: [{ content: "attack" }] })).toBe("benign\nattack");
+    expect(ex({ "me\u017F\u017Fages": [{ content: "long s" }], "ta\u017F\u212A": "kelvin" })).toBe("long s\nkelvin");
+    // the exact key first, the others in byte order
+    expect(ex({ messages: [{ content: "b", Content: "a", CONTENT: "c" }] })).toBe("b\nc\na");
+    expect(ex({ messagez: [{ content: "x" }], promp: "y" })).toBe("");
+  });
+
+  it("scans keys the same way past max_body_bytes", () => {
+    const keys = core.normalize.fieldKeys(["messages[*].CONTENT", "prompt"]);
+    const s = '{"MESSAGES":[{"Content":"one"},{"TEXT":"two"}],"PROMPT":"three","Model":"m","ta\u017Fk":"x';
+    expect(core.normalize.scanStrings(s, keys, [])).toEqual(["one", "two", "three"]);
+    // U+0144 is made of the same bytes as U+017F and U+212A: not a key
+    expect(core.normalize.scanStrings('{"\u0144":"prompt":"b"', keys, [])).toEqual(["b"]);
+  });
+});
+
 describe("normalize.chunks", () => {
   it("still cuts valid UTF-8 at a character boundary", () => {
     const [pieces] = core.normalize.chunks("\u{1F600}".repeat(40), 63);

@@ -46,10 +46,66 @@ function H.clock(start)
 end
 
 H.json = require "dkjson"
--- Request bodies decode JSON null to a non-nil value, as cjson (cjson.null)
--- does in production: `[null, {...}]` must not end the array at the hole
--- dkjson would otherwise leave.
-function H.body_decode(s) return H.json.decode(s, 1, H.json.null) end
+
+-- Deepest array/object nesting in JSON text, strings skipped.
+local function json_depth(s)
+  local depth, max, i = 0, 0, 1
+  while true do
+    local j, _, c = s:find('(["%[%]{}])', i)
+    if not j then return max end
+    if c == '"' then
+      -- to the closing quote, past escapes
+      local k = j + 1
+      while true do
+        local q = s:find('["\\]', k)
+        if not q then return max end
+        if s:sub(q, q) == '"' then j = q break end
+        k = q + 2
+      end
+    elseif c == "[" or c == "{" then
+      depth = depth + 1
+      if depth > max then max = depth end
+    else
+      depth = depth - 1
+    end
+    i = j + 1
+  end
+end
+
+-- True when JSON text has a \uD800-\uDFFF escape that is not half of a
+-- pair (cjson refuses it; raw bytes of an encoded surrogate it passes on).
+local function lone_surrogate_escape(s)
+  local i = 1
+  while true do
+    local j = s:find("\\", i, true)
+    if not j then return false end
+    local hex = s:sub(j + 1, j + 1) == "u" and s:match("^%x%x%x%x", j + 2)
+    if not hex then
+      i = j + 2
+    else
+      local cp = tonumber(hex, 16)
+      i = j + 6
+      if cp >= 0xD800 and cp <= 0xDFFF then
+        local lo = cp <= 0xDBFF and tonumber(s:match("^\\u(%x%x%x%x)", i) or "", 16)
+        if not (lo and lo >= 0xDC00 and lo <= 0xDFFF) then return true end
+        i = i + 6
+      end
+    end
+  end
+end
+
+-- Request bodies are decoded the way cjson.safe decodes them in production:
+-- JSON null is a non-nil value (cjson.null), so `[null, {...}]` does not end
+-- the array at the hole dkjson would otherwise leave; and what cjson refuses
+-- and dkjson accepts (anything after the value, nesting past 1000, a lone
+-- surrogate escape) is refused, returning nil.
+function H.body_decode(s)
+  local v, pos = H.json.decode(s, 1, H.json.null)
+  if v == nil or not s:find("^[ \t\n\r]*$", pos) or json_depth(s) > 1000 or lone_surrogate_escape(s) then
+    return nil
+  end
+  return v
+end
 
 -- PCRE matcher with the same contract the OpenResty adapter gives core:
 -- re_find(subject, pattern) -> truthy on a case-insensitive match.

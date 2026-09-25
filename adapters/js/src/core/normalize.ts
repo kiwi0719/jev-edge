@@ -63,10 +63,14 @@ function isObj(v: unknown): v is { [k: string]: JsonValue } | JsonValue[] {
 // (`[{type:"text", text:"..."}, {type:"image_url", ...}]`), the Responses API's
 // `input_text`, and Anthropic's `tool_result` whose `content` nests once more.
 // Collect every string, every part's `text`, and recurse into `content`, to a
-// bounded depth. Anything else (numbers, images) contributes nothing.
+// bounded depth. Two parts keep their text elsewhere: an Anthropic `document`
+// block under `source.data` (source type "text") or `source.content` (type
+// "content"), and a Responses `file_search_call` under `results[*].text`.
+// The depth leaves room for a content document inside a tool_result.
+// Anything else (numbers, images) contributes nothing.
 // Mirrors collect() in core/normalize.lua, including Lua's "array if [1] is
 // set" test: an empty array is a table with no array part and yields nothing.
-const LEAF_DEPTH = 4;
+const LEAF_DEPTH = 6;
 function collect(node: JsonValue | undefined, out: string[], depth: number): void {
   if (typeof node === "string") {
     out.push(node);
@@ -84,21 +88,43 @@ function collect(node: JsonValue | undefined, out: string[], depth: number): voi
   }
   if (typeof node.text === "string") out.push(node.text);
   if (node.content !== undefined && node.content !== null) collect(node.content, out, depth + 1);
+  const src = node.source;
+  if (isObj(src) && !Array.isArray(src)) {
+    if (src.type === "text" && typeof src.data === "string") out.push(src.data);
+    if (src.type === "content" && src.content !== undefined && src.content !== null) collect(src.content, out, depth + 1);
+  }
+  if (node.type === "file_search_call" && isObj(node.results)) collect(node.results, out, depth + 1);
 }
 
-function walk(node: JsonValue | undefined, segs: Seg[], i: number, out: string[]): void {
-  if (node === undefined || node === null) return;
-  if (i >= segs.length) {
-    collect(node, out, 1);
-    return;
+/**
+ * Port of fold() in core/normalize.lua. Go's encoding/json (Ollama's
+ * /api/chat) matches an object key to a field without regard to case, and
+ * folds U+017F (long s) to s and U+212A (Kelvin sign) to k: {"MESSAGES": ...}
+ * reaches the model. ASCII letters only otherwise, as Lua's lower().
+ */
+export function fold(s: string): string {
+  if (!/[A-Z\u0080-\uFFFF]/.test(s)) return s;
+  return asciiLower(s).replace(/\u017F/g, "s").replace(/\u212A/g, "k");
+}
+
+// The keys of object `node` other than `key` itself that fold to `key`, in
+// byte order (UTF-16 order is the same for the characters that can fold to
+// a field name); undefined when there are none (nearly always).
+function variants(node: { [k: string]: JsonValue }, key: string): string[] | undefined {
+  const want = fold(key);
+  const b = want.charCodeAt(0);
+  let others: string[] | undefined;
+  for (const k of Object.keys(node)) {
+    if (k === key) continue;
+    const c = k.charCodeAt(0);
+    if ((c === b || (c >= 0x41 && c <= 0x5a && c + 32 === b) || (b === 0x73 && c === 0x17f) || (b === 0x6b && c === 0x212a))
+      && fold(k) === want) (others ??= []).push(k);
   }
-  const seg = segs[i];
-  let child: JsonValue | undefined = node;
-  if (seg.key !== "") {
-    if (!isObj(node)) return;
-    child = Array.isArray(node) ? undefined : node[seg.key];
-  }
-  if (seg.each) {
+  return others?.sort();
+}
+
+function descend(child: JsonValue | undefined, segs: Seg[], i: number, out: string[]): void {
+  if (segs[i].each) {
     // Lua ipairs over a cjson array: null is a value, skipped, not the end
     if (!Array.isArray(child)) return;
     for (const item of child) {
@@ -108,6 +134,22 @@ function walk(node: JsonValue | undefined, segs: Seg[], i: number, out: string[]
   } else {
     walk(child, segs, i + 1, out);
   }
+}
+
+// A path key is matched the way fold() says, and every key that folds to it
+// is read, since with several the backend may take any one: the exact key
+// first, the others in byte order.
+function walk(node: JsonValue | undefined, segs: Seg[], i: number, out: string[]): void {
+  if (node === undefined || node === null) return;
+  if (i >= segs.length) {
+    collect(node, out, 1);
+    return;
+  }
+  const key = segs[i].key;
+  if (key === "") return descend(node, segs, i, out);
+  if (!isObj(node) || Array.isArray(node)) return;
+  descend(node[key], segs, i, out);
+  for (const k of variants(node, key) ?? []) descend(node[k], segs, i, out);
 }
 
 export function extractJson(decoded: JsonValue, fields: string[]): string {
@@ -125,7 +167,12 @@ export function extractJsonValues(decoded: JsonValue, fields: string[]): string[
 // gateways see:
 //   OpenAI Chat Completions  messages[*] with role "tool" (or legacy "function"): content
 //   Anthropic Messages       messages[*].content[*] with type "tool_result": content
-//   OpenAI Responses         input[*] with type "function_call_output": output
+//   OpenAI Responses         input[*] with a type ending in "_call_output"
+//                            (function_call_output, custom_tool_call_output,
+//                            local_shell_call_output, ...) or "mcp_call": output;
+//                            "file_search_call": results[*].text
+const responsesResult = (t: unknown) => typeof t === "string" && (t.endsWith("_call_output") || t === "mcp_call");
+
 function toolResults(decoded: JsonValue, out: string[]): void {
   if (!isObj(decoded) || Array.isArray(decoded)) return;
   const msgs = decoded.messages;
@@ -144,7 +191,9 @@ function toolResults(decoded: JsonValue, out: string[]): void {
   const input = decoded.input;
   if (Array.isArray(input)) {
     for (const item of input) {
-      if (isObj(item) && !Array.isArray(item) && item.type === "function_call_output") collect(item.output, out, 1);
+      if (!isObj(item) || Array.isArray(item)) continue;
+      if (responsesResult(item.type)) collect(item.output, out, 1);
+      else if (item.type === "file_search_call" && isObj(item.results)) collect(item.results, out, 1);
     }
   }
 }
@@ -162,7 +211,7 @@ export function extractUntrustedValues(decoded: JsonValue | undefined, spec: { t
   return out;
 }
 
-export type ExtractKind = "json" | "text" | "form" | "multipart" | "binary" | "none";
+export type ExtractKind = "json" | "scan" | "invalid" | "text" | "form" | "multipart" | "binary" | "none";
 
 /** Lua's tonumber(h, 16) + string.char: bytes, so %C3%BC is two bytes not one char. */
 function formDecode(v: string): string {
@@ -197,11 +246,23 @@ export function isText(s: string): boolean {
   return ctl * 100 <= byteLength(s);
 }
 
+// Port of form_values(): the value of every `name=value` pair, in each
+// `&`-separated piece the text after the first `=` that follows a non-empty
+// name (leading `=` are skipped). The same values as the regex
+// /([^&=]+)=([^&]*)/g, which backtracks quadratically on a long run without
+// `&` or `=`; this is linear.
 function formValues(body: string, out: string[]): void {
-  // Lua: body:gmatch("([^&=]+)=([^&]*)")
-  const re = /([^&=]+)=([^&]*)/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(body)) !== null) out.push(formDecode(m[2]));
+  let i = 0;
+  while (i < body.length) {
+    let amp = body.indexOf("&", i);
+    if (amp === -1) amp = body.length;
+    const piece = body.slice(i, amp);
+    let name = 0;
+    while (name < piece.length && piece[name] === "=") name++;
+    const eq = name < piece.length ? piece.indexOf("=", name) : -1;
+    if (eq !== -1) out.push(formDecode(piece.slice(eq + 1)));
+    i = amp + 1;
+  }
 }
 
 const MAX_PARTS = 100;
@@ -231,6 +292,62 @@ function multipartValues(body: string, contentType: string, out: string[]): void
 }
 
 /**
+ * Port of lone_surrogates(): `s` with every \uD800-\uDFFF escape that is not
+ * half of a valid pair written as \uFFFD, before decoding. cjson refuses a
+ * lone surrogate and JSON.parse keeps it; both cores read U+FFFD, as Go does.
+ */
+export function loneSurrogates(s: string): string {
+  if (!/\\u[dD][89a-fA-F]/.test(s)) return s;
+  let out = "";
+  let last = 0;
+  let i = 0;
+  for (;;) {
+    const j = s.indexOf("\\", i);
+    if (j === -1) break;
+    i = j + 2; // any other escape is two characters
+    if (s[j + 1] !== "u") continue;
+    const hex = /^[0-9a-fA-F]{4}/.exec(s.slice(j + 2, j + 6))?.[0];
+    if (!hex) continue;
+    const cp = parseInt(hex, 16);
+    i = j + 6;
+    if (cp < 0xd800 || cp > 0xdfff) continue;
+    const lo = cp <= 0xdbff ? /^\\u([0-9a-fA-F]{4})/.exec(s.slice(i, i + 6))?.[1] : undefined;
+    const lcp = lo ? parseInt(lo, 16) : NaN;
+    if (lcp >= 0xdc00 && lcp <= 0xdfff) {
+      i += 6;
+      continue;
+    }
+    out += s.slice(last, j) + "\\ufffd";
+    last = i;
+  }
+  return last === 0 ? s : out + s.slice(last);
+}
+
+// cjson, the Lua adapters' decoder, refuses JSON nested deeper than 1000;
+// JSON.parse does not. A body that deep is read by the scanner in both cores.
+const MAX_JSON_DEPTH = 1000;
+function tooDeep(s: string): boolean {
+  if (s.length < 2 * (MAX_JSON_DEPTH + 1)) return false;
+  let depth = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c === 0x22) {
+      // to the closing quote, past escapes
+      for (i++; i < s.length; i++) {
+        const d = s.charCodeAt(i);
+        if (d === 0x5c) i++;
+        else if (d === 0x22) break;
+      }
+    } else if (c === 0x5b || c === 0x7b) {
+      if (++depth > MAX_JSON_DEPTH) return true;
+    } else if (c === 0x5d || c === 0x7d) {
+      depth--;
+    }
+  }
+  return false;
+}
+
+/**
  * Extract text from a raw body. Returns the text (values joined with "\n"),
  * the kind, the values in order (newest last) for window(), and the decoded
  * JSON value when the kind is "json".
@@ -247,22 +364,36 @@ export function extract(
   // A UTF-8 BOM is not JSON, but Python's json.loads on bytes and Express's
   // body-parser skip it: judge what the backend reads.
   if (body.startsWith("﻿")) body = body.slice(1);
-  const declaredJson = ct.includes("json");
+  // declared JSON: a JSON media type (application/json, text/json,
+  // application/*+json), not "json" in a parameter such as a multipart
+  // boundary or "text/plain; profile=json"
+  const declaredJson = ct.split(";")[0].includes("json");
   const first = /^[ \t\n\v\f\r]*([\s\S])/.exec(body)?.[1];
   if (first === "{" || first === "[" || declaredJson) {
     let decoded: JsonValue | undefined;
     let ok = true;
     try {
-      decoded = jsonDecode(body);
+      decoded = jsonDecode(loneSurrogates(body));
     } catch {
       ok = false;
     }
+    if (ok && isObj(decoded) && tooDeep(body)) ok = false;
     if (ok && isObj(decoded)) {
       const values = extractJsonValues(decoded as JsonValue, fields);
       return [values.join("\n"), "json", values, decoded as JsonValue];
     }
-    // declared JSON that is not: the backend rejects it too
-    if (declaredJson) return ["", "none", []];
+    if (declaredJson) {
+      // a JSON scalar has no text fields
+      if (ok && decoded !== undefined) return ["", "none", []];
+      // The decoder refused it; the backend's parser may not (cjson refuses
+      // nesting past 1000 and bytes after the value, Go and Node do not).
+      // The text fields' string values, read by the tolerant scanner past
+      // max_body_bytes uses, are judged; a body with none is unjudgeable,
+      // never "no text".
+      const out = scanStrings(body, fieldKeys(fields), []);
+      if (out.length === 0) return ["", "invalid", []];
+      return [out.join("\n"), "scan", out];
+    }
   }
   const out: string[] = [];
   if (ct.includes("application/x-www-form-urlencoded") || (ct === "" && /^[A-Za-z0-9._~%+[\]-]+=[^ \t\n\v\f\r]*$/.test(body))) {
@@ -306,6 +437,8 @@ function readString(s: string, i: number): [string, number] {
           i += 6;
         }
       }
+      // a lone surrogate is U+FFFD, as in loneSurrogates()
+      if (cp >= 0xd800 && cp <= 0xdfff) cp = 0xfffd;
       buf += String.fromCodePoint(cp);
     } else if (e === undefined) {
       return [buf, n];
@@ -317,7 +450,7 @@ function readString(s: string, i: number): [string, number] {
   return [buf, n];
 }
 
-/** The last key of each text-field path: "messages[*].content" -> "content". */
+/** The last key of each text-field path, folded: "messages[*].content" -> "content". */
 export function fieldKeys(fields: string[] | undefined): Set<string> {
   const keys = new Set<string>();
   // Lua: f:match("([^%.%[%]%*]+)[%[%]%*]*$") -- the last run of name
@@ -329,20 +462,24 @@ export function fieldKeys(fields: string[] | undefined): Set<string> {
     while (end > 0 && (f[end - 1] === "[" || f[end - 1] === "]" || f[end - 1] === "*")) end--;
     let start = end;
     while (start > 0 && !special(f[start - 1])) start--;
-    if (end > start) keys.add(f.slice(start, end));
+    if (end > start) keys.add(fold(f.slice(start, end)));
   }
   // content parts carry their text under "text"
   if (keys.has("content")) keys.add("text");
   return keys;
 }
 
-/** Collect the string values of `keys` from possibly truncated JSON. */
+/**
+ * Collect the string values of `keys` (from fieldKeys) from possibly
+ * truncated JSON. Keys match the way walk() matches them: folded.
+ */
 export function scanStrings(s: string, keys: Set<string>, out: string[]): string[] {
-  const re = /"([A-Za-z0-9_-]+)"[ \t\n\v\f\r]*:[ \t\n\v\f\r]*"/g;
+  // key characters: ASCII word characters, U+017F and U+212A
+  const re = /"([A-Za-z0-9_\-\u017F\u212A]+)"[ \t\n\v\f\r]*:[ \t\n\v\f\r]*"/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(s)) !== null) {
     const [value, next] = readString(s, m.index + m[0].length);
-    if (keys.has(m[1]) && value !== "") out.push(value);
+    if (keys.has(fold(m[1])) && value !== "") out.push(value);
     re.lastIndex = next;
   }
   return out;
@@ -406,7 +543,11 @@ export function chunks(text: string, budget: number): [string[], number[]] {
       }
     }
     if (next === undefined) {
-      while (e > i && isCont(b, e)) e--;
+      // back to a character boundary, at most 3 bytes (valid UTF-8); a
+      // longer run of continuation bytes is cut where it is, as in Lua
+      const cut = e;
+      for (let k = 0; k < 3 && e > i && isCont(b, e); k++) e--;
+      if (e > i && isCont(b, e)) e = cut;
       next = e + 1;
     }
     pieces.push(dec.decode(b.subarray(i - 1, e)));
@@ -453,6 +594,19 @@ export function window(text: string, values: string[], budget: number, from?: nu
     if (c !== undefined) out.push(c);
   }
   return [out.join("\n"), true];
+}
+
+// ---------------------------------------------------------------------------
+// Well-formed text for the judge (port of valid_utf8). A string decoded from
+// bytes with TextDecoder is already well formed, invalid UTF-8 replaced the
+// way valid_utf8 does in Lua; a lone surrogate can still come from a caller's
+// string, and a provider would serialise it as "\ud800", which a strict judge
+// server refuses (an L2 error, which passes the request).
+// ---------------------------------------------------------------------------
+
+/** `s` with every lone surrogate replaced by U+FFFD (String.prototype.toWellFormed). */
+export function wellFormed(s: string): string {
+  return s.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, "\uFFFD");
 }
 
 // ---------------------------------------------------------------------------

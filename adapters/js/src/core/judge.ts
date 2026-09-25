@@ -1,5 +1,6 @@
 // Port of core/judge.lua: prompt building and answer reduction.
 import { TEMPLATES, type Template } from "./templates.js";
+import { wellFormed } from "./normalize.js";
 
 export interface PromptContext {
   path: string;
@@ -71,6 +72,11 @@ export function get(name: string): Template | undefined {
   return registry[name];
 }
 
+/**
+ * Port of judge.build. A lone surrogate in `text` is sent as U+FFFD
+ * (wellFormed), the text Lua sends for the same body: a strict judge server
+ * refuses the call otherwise, and an L2 error passes the request.
+ */
 export function build(names: string[] | undefined, text: string, context: PromptContext): [Prompt, null] | [null, string] {
   const qs: Record<string, Template> = {};
   let n = 0;
@@ -82,7 +88,7 @@ export function build(names: string[] | undefined, text: string, context: Prompt
     }
   }
   if (n === 0) return [null, "no templates registered for: " + (names ?? []).join(",")];
-  return [{ text, context, questions: qs }, null];
+  return [{ text: typeof text === "string" ? wellFormed(text) : text, context, questions: qs }, null];
 }
 
 /**

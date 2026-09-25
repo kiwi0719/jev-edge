@@ -30,8 +30,9 @@ _M.config = {
     block_status      = 403,
     block_body        = '{"error":"request rejected"}',
     -- A watched request L1 cannot read (an encoding the adapter could not
-    -- decode, a binary body, or an oversized one with no text in the part
-    -- the adapter has): "pass" forwards it as `skipped` with reason
+    -- decode, a binary body, declared JSON the decoder refused with no text
+    -- in it, or an oversized one with no text in the part the adapter
+    -- has): "pass" forwards it as `skipped` with reason
     -- "unjudgeable: ...", "block" rejects it in enforce mode. Normal SDKs
     -- send none of these; "block" is the stricter choice once you are sure.
     unjudgeable       = "pass",

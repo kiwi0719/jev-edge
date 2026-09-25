@@ -83,6 +83,19 @@ describe("untrusted content: extraction", function()
     assert.equals("the output", t)
   end)
 
+  it("finds every Responses *_call_output item, mcp_call output and file_search_call results", function()
+    local t = normalize.extract_untrusted({ input = {
+      { role = "user", content = "hi" },
+      { type = "custom_tool_call", call_id = "c1", name = "f", input = "x" },
+      { type = "custom_tool_call_output", call_id = "c1", output = "custom output" },
+      { type = "local_shell_call_output", call_id = "c2", output = "shell output" },
+      { type = "mcp_call", id = "m", name = "f", arguments = "{}", output = "mcp output" },
+      { type = "mcp_list_tools", server_label = "s", tools = {} },
+      { type = "file_search_call", id = "fs", results = { { file_id = "f", text = "file text" } } },
+    } }, spec)
+    assert.equals("custom output\nshell output\nmcp output\nfile text", t)
+  end)
+
   it("reads untrusted.fields, and skips tool results when tool_results is false", function()
     local doc = { messages = { { role = "tool", content = "tool" } }, documents = { { text = "d1" }, { text = "d2" } } }
     assert.equals("tool\nd1\nd2", (normalize.extract_untrusted(doc, { fields = { "documents[*].text" } })))

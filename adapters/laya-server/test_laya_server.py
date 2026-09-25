@@ -161,6 +161,41 @@ class Http(unittest.TestCase):
         self.assertEqual(status, 500)
         self.assertNotIn("answers", json.loads(data))
 
+    def test_malformed_text_is_judged_never_refused(self):
+        # A tokenizer that refuses what the HF tokenizers library refuses: a
+        # string that is not valid Unicode. A 400 or 500 for such text is an
+        # L2 error, which the gateway answers by passing the request.
+        class StrictTokenizer(L.MockBackend):
+            def spans(self, text):
+                text.encode("utf-8")
+                return super().spans(text)
+
+            def logit(self, first, second):
+                first.encode("utf-8")
+                second.encode("utf-8")
+                return super().logit(first, second)
+
+        q = json.dumps({"q": Q}).encode()
+        bodies = {
+            "lone surrogate escape": b'{"state":"\\ud800 ATTACK","questions":' + q + b"}",
+            "lone low surrogate in the assistant": b'{"state":{"assistant":"bot \\udc00","user_message":"ATTACK"},'
+                                                   b'"questions":' + q + b"}",
+            "invalid UTF-8 byte": b'{"state":"\xff ATTACK","questions":' + q + b"}",
+            "encoded surrogate bytes": b'{"state":"\xed\xa0\x80 ATTACK","questions":' + q + b"}",
+        }
+        srv, url = serve(backend=StrictTokenizer())
+        try:
+            t = conformance.Target(url, None, "laya", 5)
+            for name, body in bodies.items():
+                status, data, _ = t.request("POST", "/v1/systemone", body)
+                self.assertEqual(status, 200, f"{name}: {data!r}")
+                self.assertGreater(json.loads(data)["answers"]["q"]["noul"], 0.5, name)
+            status, _, _ = t.request("POST", "/v1/systemone", b'{"state":"x",\xff}')
+            self.assertEqual(status, 400)   # still not JSON
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
     def test_body_over_the_limit_is_413(self):
         srv, url = serve({"LAYA_MAX_BODY_BYTES": "100"})
         try:

@@ -161,3 +161,15 @@ describe("golden: evaluate", () => {
     });
   }
 });
+
+describe("golden: utf8", () => {
+  // the bytes as an adapter hands them to core: decoded with TextDecoder
+  for (const c of load("utf8").cases) {
+    it(c.name, () => {
+      const bytes = new Uint8Array((c.input.hex.match(/../g) ?? []).map((h: string) => parseInt(h, 16)));
+      const text = new TextDecoder().decode(bytes);
+      const [prompt] = core.judge.build(["injection"], text, { path: "", method: "", deployment: "" });
+      expect({ text: prompt!.text }).toEqual(c.expect);
+    });
+  }
+});

@@ -32,6 +32,19 @@ describe("untrusted: extraction", () => {
     expect(v).toEqual(["the output"]);
   });
 
+  it("finds every Responses *_call_output item, mcp_call output and file_search_call results", () => {
+    const v = normalize.extractUntrustedValues({ input: [
+      { role: "user", content: "hi" },
+      { type: "custom_tool_call", call_id: "c1", name: "f", input: "x" },
+      { type: "custom_tool_call_output", call_id: "c1", output: "custom output" },
+      { type: "local_shell_call_output", call_id: "c2", output: "shell output" },
+      { type: "mcp_call", id: "m", name: "f", arguments: "{}", output: "mcp output" },
+      { type: "mcp_list_tools", server_label: "s", tools: [] },
+      { type: "file_search_call", id: "fs", results: [{ file_id: "f", text: "file text" }] },
+    ] }, spec);
+    expect(v).toEqual(["custom output", "shell output", "mcp output", "file text"]);
+  });
+
   it("reads fields, and skips tool results when tool_results is false", () => {
     const doc = { messages: [{ role: "tool", content: "tool" }], documents: [{ text: "d1" }, { text: "d2" }] };
     expect(normalize.extractUntrustedValues(doc, { fields: ["documents[*].text"] })).toEqual(["tool", "d1", "d2"]);

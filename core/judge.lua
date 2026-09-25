@@ -2,6 +2,8 @@
 -- L2 abstraction. Builds a provider-neutral prompt table from templates and
 -- reduces a provider's answers to a single score.
 
+local normalize = require "jev.core.normalize"
+
 local _M = {}
 
 local templates = {}
@@ -62,7 +64,9 @@ end
 
 --- Build the prompt table sent to a provider.
 -- @param names  list of template names
--- @param text   extracted text
+-- @param text   extracted text; invalid UTF-8 in it is sent as U+FFFD
+--               (normalize.valid_utf8): a strict judge server refuses the
+--               call otherwise, and an L2 error passes the request
 -- @param context { path, method } (flat strings)
 -- @return { text = ..., context = ..., questions = { [name] = template } }
 function _M.build(names, text, context)
@@ -79,7 +83,7 @@ function _M.build(names, text, context)
     return nil, "no templates registered for: " .. table.concat(names or {}, ",")
   end
   return {
-    text = text,
+    text = type(text) == "string" and normalize.valid_utf8(text) or text,
     context = context or {},
     questions = qs,
   }

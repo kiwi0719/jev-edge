@@ -17,9 +17,13 @@
 // header included), and any error talking to the adapter, fails open: OK
 // with X-Jev-Verdict: error and X-Jev-Source: shim, matching the adapter's
 // own behaviour. Every X-Jev-* header is overwritten on the way upstream so
-// a forged inbound value never survives. Paths containing "..", "%2e" or
-// "//" are not forwarded at all (they could reach the adapter's admin
-// endpoints).
+// a forged inbound value never survives. A path the shim cannot relay as
+// the backend reads it (a '%' without two hex digits after it, such as the
+// IIS-style %u0063 that cpp-httplib under llama.cpp decodes to 'c'; a %00;
+// a control character; bytes that are not UTF-8) is denied with 400, as
+// nginx answers it inline, whatever -unjudged says: it is the client's
+// error, so it never fails open. Paths containing "..", "%2e" or "//" are
+// not forwarded at all (they could reach the adapter's admin endpoints).
 package main
 
 import (
@@ -34,6 +38,7 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	authv3 "github.com/envoyproxy/go-control-plane/envoy/service/auth/v3"
@@ -67,6 +72,11 @@ func (s *server) Check(ctx context.Context, req *authv3.CheckRequest) (*authv3.C
 	path := httpReq.GetPath()
 	if i := strings.IndexByte(path, '?'); i >= 0 {
 		path = path[:i]
+	}
+	// before safePath: a malformed path is refused even when it also has a
+	// dot segment or a doubled slash
+	if !wellFormedPath(path) {
+		return badPath(path), nil
 	}
 	if !safePath(path) {
 		return failOpen("refusing path " + path), nil
@@ -171,6 +181,44 @@ func safePath(p string) bool {
 	}
 	lower := strings.ToLower(p)
 	return !strings.Contains(p, "..") && !strings.Contains(lower, "%2e") && !strings.Contains(p, "//")
+}
+
+// wellFormedPath reports whether p can be relayed as the backend reads it:
+// every '%' starts a two-digit hex escape, no escape decodes to NUL, there
+// is no control character and the decoded bytes are UTF-8 (no overlong
+// forms such as %C0%AE for '.'). nginx refuses the first three with 400
+// before jev-edge runs, so the inline deployment never judges such a path
+// either; Go cannot even build the authz URL for most of them. Backends may
+// still decode them (cpp-httplib, under llama.cpp, reads %u0063 as 'c').
+func wellFormedPath(p string) bool {
+	dec, err := url.PathUnescape(p)
+	if err != nil {
+		return false
+	}
+	for i := 0; i < len(p); i++ {
+		if p[i] < 0x20 || p[i] == 0x7f {
+			return false
+		}
+	}
+	return strings.IndexByte(dec, 0) < 0 && utf8.ValidString(dec)
+}
+
+// badPath denies a request whose path is not well formed with 400 (the
+// status nginx gives it inline and Envoy's HTTP ext_authz hands on) and the
+// default block body. The client's error, not jev-edge's: never fail-open,
+// whatever -unjudged says.
+func badPath(path string) *authv3.CheckResponse {
+	log.Printf("jev-edge shim: refusing malformed path %.256q with 400", path)
+	return &authv3.CheckResponse{
+		Status: &rpcstatus.Status{Code: int32(codes.PermissionDenied)},
+		HttpResponse: &authv3.CheckResponse_DeniedResponse{
+			DeniedResponse: &authv3.DeniedHttpResponse{
+				Status:  &typev3.HttpStatus{Code: typev3.StatusCode_BadRequest},
+				Headers: []*corev3.HeaderValueOption{overwrite("Content-Type", "application/json")},
+				Body:    `{"error":"request rejected"}`,
+			},
+		},
+	}
 }
 
 func overwrite(key, value string) *corev3.HeaderValueOption {

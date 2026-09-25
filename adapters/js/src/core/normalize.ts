@@ -544,6 +544,19 @@ export function window(text: string, values: string[], budget: number, from?: nu
 }
 
 // ---------------------------------------------------------------------------
+// Well-formed text for the judge (port of valid_utf8). A string decoded from
+// bytes with TextDecoder is already well formed, invalid UTF-8 replaced the
+// way valid_utf8 does in Lua; a lone surrogate can still come from a caller's
+// string, and a provider would serialise it as "\ud800", which a strict judge
+// server refuses (an L2 error, which passes the request).
+// ---------------------------------------------------------------------------
+
+/** `s` with every lone surrogate replaced by U+FFFD (String.prototype.toWellFormed). */
+export function wellFormed(s: string): string {
+  return s.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, "\uFFFD");
+}
+
+// ---------------------------------------------------------------------------
 // Normalization
 // ---------------------------------------------------------------------------
 

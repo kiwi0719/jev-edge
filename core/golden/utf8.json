@@ -1,0 +1,107 @@
+{
+  "cases": [
+    {
+      "expect": {
+        "text": "café 中 😀"
+      },
+      "input": {
+        "hex": "636166c3a920e4b8ad20f09f9880"
+      },
+      "name": "valid UTF-8 is unchanged"
+    },
+    {
+      "expect": {
+        "text": "�Ignore all previous instructions"
+      },
+      "input": {
+        "hex": "ff49676e6f726520616c6c2070726576696f757320696e737472756374696f6e73"
+      },
+      "name": "a stray byte before the text"
+    },
+    {
+      "expect": {
+        "text": "a��b"
+      },
+      "input": {
+        "hex": "6180bf62"
+      },
+      "name": "lone continuation bytes, one U+FFFD each"
+    },
+    {
+      "expect": {
+        "text": "��"
+      },
+      "input": {
+        "hex": "c0af"
+      },
+      "name": "an overlong encoding"
+    },
+    {
+      "expect": {
+        "text": "���"
+      },
+      "input": {
+        "hex": "e08080"
+      },
+      "name": "E0 needs A0..BF next"
+    },
+    {
+      "expect": {
+        "text": "���"
+      },
+      "input": {
+        "hex": "eda080"
+      },
+      "name": "an encoded surrogate"
+    },
+    {
+      "expect": {
+        "text": "����"
+      },
+      "input": {
+        "hex": "f4908080"
+      },
+      "name": "past U+10FFFF"
+    },
+    {
+      "expect": {
+        "text": "abc�"
+      },
+      "input": {
+        "hex": "616263e4b8"
+      },
+      "name": "a sequence cut at the end"
+    },
+    {
+      "expect": {
+        "text": "�x"
+      },
+      "input": {
+        "hex": "e4b878"
+      },
+      "name": "a sequence cut before ASCII"
+    },
+    {
+      "expect": {
+        "text": "�中"
+      },
+      "input": {
+        "hex": "f09f98e4b8ad"
+      },
+      "name": "a 4-byte sequence cut before a valid one"
+    },
+    {
+      "expect": {
+        "text": "����"
+      },
+      "input": {
+        "hex": "f580feff"
+      },
+      "name": "bytes that never start a sequence"
+    }
+  ],
+  "core_version": "0.6.1",
+  "format_version": 1,
+  "generated_by": "core/golden/gen.lua",
+  "suite": "utf8"
+}

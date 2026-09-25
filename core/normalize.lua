@@ -461,6 +461,51 @@ function _M.window(text, values, budget, from, to)
 end
 
 -- ---------------------------------------------------------------------------
+-- Well-formed text for the judge. cjson keeps a string's bytes as sent, so
+-- invalid UTF-8 from the client reaches the provider request, and a strict
+-- judge server refuses the call (an L2 error, which passes the request).
+-- ---------------------------------------------------------------------------
+
+local FFFD = "\239\191\189"
+
+--- `s` with every ill-formed UTF-8 sequence replaced by U+FFFD, one per
+-- maximal subpart: what TextDecoder (the JavaScript core's body decoding),
+-- Go and Node make of the same bytes.
+function _M.valid_utf8(s)
+  local i = s:find("[\128-\255]")
+  if not i then return s end
+  local out, last = {}, 1
+  while i do
+    local c = s:byte(i)
+    -- bytes the lead byte needs, and the range of the first one after it
+    local need, lo, hi = 0, 0x80, 0xBF
+    if c >= 0xC2 and c <= 0xDF then need = 1
+    elseif c == 0xE0 then need, lo = 2, 0xA0
+    elseif c == 0xED then need, hi = 2, 0x9F
+    elseif c >= 0xE1 and c <= 0xEF then need = 2
+    elseif c == 0xF0 then need, lo = 3, 0x90
+    elseif c == 0xF4 then need, hi = 3, 0x8F
+    elseif c >= 0xF1 and c <= 0xF3 then need = 3
+    end
+    local j, bad = i + 1, need == 0
+    while need > 0 do
+      local d = s:byte(j)
+      if not d or d < lo or d > hi then bad = true break end
+      need, lo, hi, j = need - 1, 0x80, 0xBF, j + 1
+    end
+    if bad then
+      out[#out + 1] = s:sub(last, i - 1)
+      out[#out + 1] = FFFD
+      last = j
+    end
+    i = s:find("[\128-\255]", j)
+  end
+  if last == 1 then return s end
+  out[#out + 1] = s:sub(last)
+  return table.concat(out)
+end
+
+-- ---------------------------------------------------------------------------
 -- Normalization
 -- ---------------------------------------------------------------------------
 

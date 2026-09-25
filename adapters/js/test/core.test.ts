@@ -321,3 +321,11 @@ describe("normalize.chunks", () => {
     for (const p of pieces) expect(new TextEncoder().encode(p).length % 4).toBe(0);
   });
 });
+
+describe("judge.build", () => {
+  it("sends a lone surrogate as U+FFFD and keeps pairs", () => {
+    const [p] = core.judge.build(["injection"], "a\uD800b\uDC00c\uD83D\uDE00\uDBFF", { path: "", method: "", deployment: "" });
+    expect(p!.text).toBe("a\uFFFDb\uFFFDc\uD83D\uDE00\uFFFD");
+    expect(core.normalize.wellFormed("plain \u4E2D")).toBe("plain \u4E2D");
+  });
+});

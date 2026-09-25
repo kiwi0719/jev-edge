@@ -164,3 +164,13 @@ describe("golden: evaluate", function()
     end)
   end
 end)
+
+describe("golden: utf8", function()
+  local judge = require "jev.core.judge"
+  for _, c in ipairs(load("utf8").cases) do
+    it(c.name, function()
+      local bytes = c.input.hex:gsub("%x%x", function(h) return string.char(tonumber(h, 16)) end)
+      same(c.expect, { text = judge.build({ "injection" }, bytes, {}).text })
+    end)
+  end
+end)

@@ -248,3 +248,25 @@ describe("normalize.chunks", function()
     for _, piece in ipairs((N.chunks(text, 63))) do assert.equals(0, #piece % 4) end
   end)
 end)
+
+describe("normalize.valid_utf8", function()
+  local R = "\239\191\189"
+  it("replaces each maximal ill-formed subpart with one U+FFFD, as TextDecoder does", function()
+    local cases = {
+      { "plain ascii", "plain ascii" },
+      { "caf\195\169 \228\184\173 \240\159\152\128", "caf\195\169 \228\184\173 \240\159\152\128" },
+      { "\255x", R .. "x" },
+      { "\128\191", R .. R },
+      { "\192\175", R .. R },                       -- overlong
+      { "\224\128\128", R .. R .. R },              -- E0 needs A0..BF next
+      { "\237\160\128", R .. R .. R },              -- an encoded surrogate
+      { "\244\144\128\128", R .. R .. R .. R },     -- past U+10FFFF
+      { "\228\184", R },                             -- truncated at the end
+      { "\228\184x", R .. "x" },                     -- truncated before ASCII
+      { "\240\159\152", R },
+      { "\240\159\152\228\184\173", R .. "\228\184\173" },
+      { "\245\128", R .. R },
+    }
+    for _, c in ipairs(cases) do assert.equals(c[2], N.valid_utf8(c[1]), c[1]) end
+  end)
+end)

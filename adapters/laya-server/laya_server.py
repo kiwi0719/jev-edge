@@ -21,6 +21,8 @@ Guarantees the gateway relies on, checked by conformance/ (make conformance):
   * no silent truncation: text longer than one model window is scored in
     overlapping windows and the question takes the highest score; text that
     would need more than LAYA_MAX_WINDOWS windows is refused with 413;
+  * text that is not valid Unicode (a lone surrogate escape, invalid UTF-8)
+    is judged with U+FFFD in its place, never refused;
   * errors are JSON with a non-200 status (400, 401, 404, 405, 413, 500).
 
 Standard library only, apart from the backend: `onnx` needs onnxruntime,
@@ -50,6 +52,7 @@ import importlib
 import json
 import math
 import os
+import re
 import sys
 import threading
 import time
@@ -70,6 +73,17 @@ PATH = "/v1/systemone"
 #   second segment (window): a slice of the text being judged
 
 
+_SURROGATE = re.compile("[\ud800-\udfff]")
+
+
+def well_formed(s: str) -> str:
+    """`s` with every lone UTF-16 surrogate (a JSON "\\ud800" escape, or
+    invalid UTF-8 read with surrogatepass) replaced by U+FFFD. Tokenizers
+    refuse a lone surrogate; a 500 for it would be an L2 error, which the
+    gateway answers by passing the request unjudged."""
+    return _SURROGATE.sub("\uFFFD", s)
+
+
 def question_segment(question: dict, assistant: str | None) -> str:
     parts = [question["instructions"]]
     crit = question.get("criteria")
@@ -80,14 +94,14 @@ def question_segment(question: dict, assistant: str | None) -> str:
             parts.append("No if: " + crit["false"])
     if assistant:
         parts.append("assistant: " + assistant)
-    return "\n".join(parts)
+    return well_formed("\n".join(parts))
 
 
 def split_state(state) -> tuple[str | None, str]:
-    """(assistant or None, text to judge) from a request's `state`."""
+    """(assistant or None, text to judge) from a request's `state`, well formed."""
     if isinstance(state, str):
-        return None, state
-    return state["assistant"], state["user_message"]
+        return None, well_formed(state)
+    return well_formed(state["assistant"]), well_formed(state["user_message"])
 
 
 # ---------------------------------------------------------------------------
@@ -413,8 +427,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.close_connection = True
                 return
             try:
-                req = json.loads(raw)
-            except (ValueError, UnicodeDecodeError):
+                try:
+                    req = json.loads(raw)
+                except UnicodeDecodeError:
+                    # invalid UTF-8 from the client, passed on by a gateway:
+                    # read as U+FFFD, as Go and Node do (a 400 would pass it)
+                    req = json.loads(raw.decode("utf-8-sig", "replace"))
+            except ValueError:
                 raise Refused(400, "invalid_json", "body is not valid JSON") from None
             validate(req)
             t0 = time.perf_counter()

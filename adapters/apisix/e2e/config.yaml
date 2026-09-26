@@ -11,6 +11,7 @@ apisix:
 plugins:
   - jev-edge
   - proxy-rewrite
+  - limit-count
 nginx_config:
   error_log_level: warn
   envs:

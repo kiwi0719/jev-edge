@@ -161,9 +161,23 @@ local schema = {
   },
 }
 
+-- Priority 1000, access phase (APISIX 3.13). Every rewrite-phase plugin runs
+-- first, whatever its priority: the auth plugins (key-auth 2500, jwt-auth
+-- 2510, basic-auth, openid-connect 2599, ...) and the ones that rewrite the
+-- request (proxy-rewrite 1008, ai-prompt-decorator 1070, ai-prompt-template
+-- 1071, body-transformer 1080), so the judged request is the one they made.
+-- Of the access-phase plugins, these run before jev-edge: consumer-restriction
+-- (2400), forward-auth (2002), opa (2001), authz-keycloak (2000),
+-- ai-prompt-guard (1072), ai-rate-limiting (1030) and limit-conn, limit-count
+-- and limit-req (1001-1003). A request they refuse never costs a judge call
+-- and never gets a verdict, as with the Kong plugin (905, after
+-- rate-limiting). ai-proxy (1040) calls the model in before_proxy, after
+-- every access handler, so it only ever sees an admitted request.
+-- ai-request-rewrite (1073) calls its LLM in the access phase, before
+-- jev-edge: to judge first, raise jev-edge above it with _meta.priority.
 local _M = {
   version  = 0.1,
-  priority = 2450,   -- after auth plugins (2500+), before proxy-rewrite (1008) and the AI plugins
+  priority = 1000,
   name     = "jev-edge",
   schema   = schema,
 }

@@ -36,6 +36,16 @@ check "block response carries verdict header" "malicious" "$hdr"
 check "client-supplied X-Jev-* is stripped" "app verdict=skipped score=0.00 source=l1" "$(curl -s -H 'X-Jev-Verdict: safe' -H 'X-Jev-Score: 0.00' $base/healthz)"
 check "provider failure fails open" "app verdict=error score=0.00 source=l2" "$(post /v1/chat/completions fail "$ATTACK")"
 check "GET on a watched path passes at L1" "app verdict=skipped score=0.00 source=l1" "$(curl -s $base/v1/models)"
+# limit-count runs before jev-edge: the first attack is judged and blocked,
+# the second is over the limit and refused at once, with no verdict
+code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' -H 'X-Jev-Mock-Score: 0.95' -d "$ATTACK" $base/lim/chat/completions)
+check "first request under the limit is judged and blocked" "403" "$code"
+out=$(curl -s -o /dev/null -D - -w 'status=%{http_code} ms=%{time_total}\n' -H 'Content-Type: application/json' -H 'X-Jev-Mock-Score: 0.95' -d "$ATTACK" $base/lim/chat/completions | tr -d '\r')
+check "over the limit: 429 from limit-count" "status=429" "$(printf '%s\n' "$out" | grep -o 'status=[0-9]*')"
+check "over the limit: no X-Jev-* on the answer" "0" "$(printf '%s\n' "$out" | grep -ci '^x-jev-' || true)"
+check "over the limit: no judge call (the mock takes 700 ms)" "fast" \
+  "$(printf '%s\n' "$out" | sed -n 's/.*ms=\([0-9.]*\).*/\1/p' | awk '{ print ($1 < 0.5) ? "fast" : "slow " $1 }')"
+
 # jev_cache exists (custom_lua_shared_dict): the same text is answered from
 # the verdict cache the second time
 CACHED='{"messages":[{"role":"user","content":"Please list three facts about the moon for a school project."}]}'

@@ -29,6 +29,26 @@ routes:
       jev-edge:
         jev: { provider: mock, mock_score: 0.2, timeout_ms: 300 }
         policy: { mode: enforce }
+  # limit-count (1002) runs before jev-edge (1000): a request over the limit
+  # is refused without a judge call (the mock takes 700 ms) or a verdict.
+  - uri: /lim/*
+    upstream:
+      nodes:
+        "app:8081": 1
+      type: roundrobin
+    plugins:
+      limit-count:
+        count: 1
+        time_window: 60
+        key_type: var
+        key: remote_addr
+        rejected_code: 429
+        policy: local
+      jev-edge:
+        jev: { provider: mock, mock_score: 0.2, mock_header: x-jev-mock-score, mock_delay_ms: 700, timeout_ms: 1000, timeout_max_ms: 1500 }
+        rules: [{ id: lim, extends: llm-endpoints, watch_paths: ["^/lim/"] }]
+        policy: { mode: enforce, block_threshold: 0.7, suspect_threshold: 0.5 }
+        cache: { fp_ttl: 0.001 }
   # The verdict cache: needs jev_cache, which APISIX only declares from
   # nginx_config.http.custom_lua_shared_dict.
   - uri: /c/*

@@ -602,12 +602,52 @@ const PCRE_NOT_SPACE = "\\x00-\\x08\\x0e-\\x1f\\x21-\\x7f" + byteEscape(0x80) + 
  * in a class is a member, as in PCRE. `\w`, `\d` and `\b` are ASCII in both
  * already, and other syntax is left as it is.
  */
+// RegExp modifiers ((?-i:...), ES2025) where the engine has them: the only
+// way to switch case-insensitivity off for part of a pattern.
+const HAS_MODIFIERS = (() => {
+  try {
+    new RegExp("(?-i:a)", "i");
+    return true;
+  } catch {
+    return false;
+  }
+})();
+
+// PCRE inline options this translator carries into JS: dotall, multiline,
+// extended, and case-insensitivity (on already, from "ijo"; off only with
+// modifiers). (?opts) applies to the rest of its group, (?opts:...) to that
+// group.
+interface Opts {
+  s: boolean;
+  m: boolean;
+  x: boolean;
+  ci: boolean;
+}
+const INLINE_OPTS = /^\(\?([imsx]*)(?:-([imsx]*))?(\)|:)/;
+
 export function pcreToRegExp(pattern: string, flags = "i"): RegExp {
   const p = pcreBytes(pattern);
   let out = "";
   let inClass = false;
+  // one frame per open group: its options, and how many "(?-i:" / "(?i:"
+  // wrappers a (?opts) inside it opened, closed with the group
+  const stack: { o: Opts; wraps: number }[] = [{ o: { s: false, m: false, x: false, ci: true }, wraps: 0 }];
+  const top = () => stack[stack.length - 1];
+  const apply = (o: Opts, on: string, off: string): Opts => {
+    const n = { ...o };
+    for (const f of on) n[f === "i" ? "ci" : (f as "s" | "m" | "x")] = true;
+    for (const f of off) n[f === "i" ? "ci" : (f as "s" | "m" | "x")] = false;
+    return n;
+  };
+  // "(?-i:" or "(?i:" when case-insensitivity changes, else "(?:"
+  const open = (from: Opts, to: Opts): string => {
+    if (from.ci === to.ci) return "(?:";
+    if (!HAS_MODIFIERS) throw new SyntaxError(`inline (?-i) needs RegExp modifiers: ${pattern}`);
+    return to.ci ? "(?i:" : "(?-i:";
+  };
   for (let i = 0; i < p.length; i++) {
     const c = p[i];
+    const o = top().o;
     if (c === "\\") {
       const d = p[i + 1];
       i++;
@@ -626,6 +666,10 @@ export function pcreToRegExp(pattern: string, flags = "i"): RegExp {
     } else if (inClass) {
       if (c === "]") inClass = false;
       out += c;
+    } else if (o.x && (c === " " || c === "\t" || c === "\n" || c === "\r" || c === "\f" || c === "\v")) {
+      // extended: white space outside a class is not part of the pattern
+    } else if (o.x && c === "#") {
+      while (i + 1 < p.length && p[i + 1] !== "\n") i++;
     } else if (c === "[") {
       inClass = true;
       out += c;
@@ -635,12 +679,41 @@ export function pcreToRegExp(pattern: string, flags = "i"): RegExp {
         out += "\\]";
         i++;
       }
+    } else if (c === "(") {
+      const m = INLINE_OPTS.exec(p.slice(i));
+      if (m && (m[1] !== "" || (m[2] ?? "") !== "")) {
+        const to = apply(o, m[1], m[2] ?? "");
+        i += m[0].length - 1;
+        if (m[3] === ":") {
+          out += open(o, to);
+          stack.push({ o: to, wraps: 0 });
+        } else {
+          // the rest of the enclosing group: a wrapper closed with it
+          const w = open(o, to);
+          if (w !== "(?:") {
+            out += w;
+            top().wraps++;
+          }
+          top().o = to;
+        }
+      } else {
+        out += c;
+        stack.push({ o: { ...o }, wraps: 0 });
+      }
+    } else if (c === ")") {
+      const f = stack.length > 1 ? stack.pop()! : top();
+      out += ")".repeat(f.wraps) + ")";
     } else if (c === ".") {
-      out += "[^\\n]";
+      out += o.s ? "[\\s\\S]" : "[^\\n]";
+    } else if (c === "^" && o.m) {
+      out += "(?:^|(?<=\\n))";
+    } else if (c === "$" && o.m) {
+      out += "(?=\\n|$)";
     } else {
       out += c;
     }
   }
+  out += ")".repeat(stack[0].wraps);
   return new RegExp(out, flags);
 }
 

@@ -1183,6 +1183,29 @@ describe("core.cacheKey scope", () => {
 
 // js-core-parity#4: always_suspect runs as ngx.re runs it ("ijo", PCRE
 // without UTF), over bytes; spans are 1-based inclusive UTF-8 byte offsets.
+describe("PCRE inline options in the TS core", () => {
+  it("(?-i) turns case-insensitivity off where RegExp modifiers exist, and is refused where they do not", () => {
+    let has = true;
+    try {
+      new RegExp("(?-i:a)", "i");
+    } catch {
+      has = false;
+    }
+    if (has) {
+      expect(reFind("please IGNORE all", "(?-i)IGNORE all")).toEqual([8, 17]);
+      expect(reFind("please ignore all", "(?-i)IGNORE all")).toBeNull();
+      expect(reFind("x IGNORE y", "(?:(?-i)ignore|IGNORE) y")).toEqual([3, 10]);
+    } else {
+      // textMatches then counts the pattern as a hit (logged once): judged, never missed
+      expect(() => core.rules.pcreToRegExp("(?-i)IGNORE")).toThrow(SyntaxError);
+    }
+  });
+  it("(?x) drops white space and comments outside a class only", () => {
+    expect(reFind("a b", "(?x) a [ ] b # c")).toEqual([1, 3]);
+    expect(reFind("ab", "(?x) a [ ] b")).toBeNull();
+  });
+});
+
 describe("reFind (PCRE without UTF)", () => {
   it("takes only ASCII spaces for \\s and \\S, in a class too", () => {
     expect(reFind("system prompt", String.raw`system\s+prompt`)).toEqual([1, 13]);

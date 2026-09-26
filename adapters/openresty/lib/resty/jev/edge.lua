@@ -514,7 +514,14 @@ function _M.config_api()
     ngx.say('{"ok":true}')
     return
   elseif method == "DELETE" then
-    config.set_override(nil)
+    -- refused when the file in force needs something the override supplies
+    -- (the override then stays): say so instead of answering ok
+    local ok, err = config.set_override(nil)
+    if not ok then
+      ngx.status = 422
+      ngx.say(cjson.encode({ error = err }))
+      return
+    end
     ngx.say('{"ok":true}')
     return
   end

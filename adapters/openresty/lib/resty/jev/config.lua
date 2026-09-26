@@ -10,18 +10,25 @@ local _M = {}
 
 local state = {
   path = nil,
+  -- the file config in force: the last one that passed validation ({}, the
+  -- defaults, before any did). set_override validates against it.
   file_cfg = {},
+  -- a file read but not in force because it was refused; tried again, with
+  -- the override, whenever the override changes, and replaced by the next
+  -- edit of the file
+  file_pending = nil,
   file_mtime = 0,
   file_env = nil,
   override_version = 0,
   current = defaults.merge(defaults.config),
   rules = {},
   dict_name = "jev_config",
-  -- false until a config passed validation; then a refused one keeps it
+  -- false until a config was put in force; then a refused one keeps it
   applied = false,
   -- why the config in force is not the one asked for: the last validation
-  -- failure (cleared by the next config that passes) and the last time the
-  -- file could not be loaded (cleared when it loads)
+  -- failure of the file asked for (the pending one, else the one in force)
+  -- with the override, cleared when that passes, and the last time the file
+  -- could not be loaded (cleared when it loads)
   error = nil,
   file_error = nil,
 }
@@ -137,38 +144,72 @@ local function env_hint(err)
     .. " (workers only see the variables nginx.conf declares)"
 end
 
-local function rebuild()
-  local override = {}
+local function read_override()
   local dict = ngx.shared[state.dict_name]
-  if dict then
-    local raw = dict:get("override")
-    if raw then override = cjson.decode(raw) or {} end
-  end
-  local merged = defaults.merge(defaults.merge(defaults.config, state.file_cfg), override)
+  local raw = dict and dict:get("override")
+  return raw and cjson.decode(raw) or {}
+end
+
+-- defaults < file < override, validated and with its rules loaded; nothing in
+-- `state` changes. Returns what commit() puts in force, or nil, err.
+local function build(file_cfg, override)
+  local merged = defaults.merge(defaults.merge(defaults.config, file_cfg), override)
   local ok, err = defaults.validate(merged)
-  if not ok then
-    state.error = tostring(err)
-    if state.applied then
-      ngx.log(ngx.ERR, "jev-edge: config invalid, keeping previous: ", err, env_hint(err))
-      return false
+  if not ok then return nil, tostring(err) end
+  return { cfg = merged, rules = load_rules(merged.rules), file = file_cfg }
+end
+
+local function commit(b)
+  read_api_key(b.cfg)
+  state.current, state.rules, state.file_cfg = b.cfg, b.rules, b.file
+  state.applied = true
+end
+
+-- Puts in force the file asked for (the pending one, else the one in force)
+-- with the override. When that is refused, the file in force (the defaults
+-- before any passed) goes on with the override, which set_override checked
+-- against it; when even that is refused, the previous config stays, or, when
+-- nothing was ever in force (the init call), the defaults run, rules
+-- included, so what runs is what GET /_jev/config shows (monitor mode, the
+-- stock rules) and not the defaults' table with no rules loaded, where every
+-- request passes as "no rules". /_jev/config and /_jev/health report the
+-- error (config.error()) until the file asked for passes.
+local function rebuild(reloaded)
+  local override = read_override()
+  local was_applied = state.applied
+  local pending, perr = state.file_pending, nil
+  if pending then
+    local b, err = build(pending, override)
+    if b then
+      commit(b)
+      state.file_pending, state.error = nil, nil
+      if reloaded then ngx.log(ngx.NOTICE, "jev-edge: config file reloaded") end
+      return true
     end
-    -- Nothing valid was ever applied (the init call): run the defaults, rules
-    -- included, so what runs is what GET /_jev/config shows (monitor mode, the
-    -- stock rules) and not the defaults' table with no rules loaded, where
-    -- every request passes as "no rules". /_jev/config and /_jev/health
-    -- report the error until a config passes.
-    ngx.log(ngx.ERR, "jev-edge: config invalid, using the defaults (monitor mode): ", err, env_hint(err))
-    local fallback = defaults.merge(defaults.config)
-    read_api_key(fallback)
-    state.current = fallback
-    state.rules = load_rules(fallback.rules)
+    perr = err
+  end
+  local b, err = build(state.file_cfg, override)
+  local why = perr or err
+  if b then
+    commit(b)
+    state.error = perr
+  else
+    state.error = why
+  end
+  if not why then return true end
+  if was_applied then
+    ngx.log(ngx.ERR, "jev-edge: config invalid, keeping previous: ", why, env_hint(why))
     return false
   end
-  read_api_key(merged)
-  state.current = merged
-  state.rules = load_rules(merged.rules)
-  state.applied, state.error = true, nil
-  return true
+  if b then
+    ngx.log(ngx.ERR, "jev-edge: config invalid, using the defaults",
+      next(override) == nil and " (monitor mode)" or " and the override", ": ", why, env_hint(why))
+    return false
+  end
+  ngx.log(ngx.ERR, "jev-edge: config invalid, using the defaults (monitor mode): ", why, env_hint(why))
+  local fallback = build({}, {})
+  if fallback then commit(fallback) end
+  return false
 end
 
 local function file_mtime(path)
@@ -216,7 +257,7 @@ function _M.init(path, opts)
   if path then
     local cfg, err = load_file(path)
     if cfg then
-      state.file_cfg = cfg
+      state.file_pending = cfg
       state.file_mtime = file_mtime(path)
     else
       state.file_error = "cannot load " .. tostring(path) .. ": " .. tostring(err)
@@ -228,21 +269,26 @@ end
 
 --- Called by the reload timer. Returns true if anything changed.
 function _M.reload()
-  local changed = false
+  local changed, reloaded = false, false
   if state.path then
     local m = file_mtime(state.path)
     if m ~= state.file_mtime then
+      -- advanced whatever the file holds, so a bad one is not read and
+      -- refused again every 2 s
+      state.file_mtime = m
       local cfg, err = load_file(state.path)
       if cfg then
-        state.file_cfg = cfg
-        state.file_mtime = m
+        -- in force only once rebuild() has validated it: until then
+        -- state.file_cfg, which set_override checks against, is the last
+        -- file that passed
+        state.file_pending = cfg
         state.file_error = nil
-        changed = true
-        ngx.log(ngx.NOTICE, "jev-edge: config file reloaded")
+        changed, reloaded = true, true
       else
         state.file_error = "cannot load " .. tostring(state.path) .. ": " .. tostring(err)
         ngx.log(ngx.ERR, "jev-edge: config reload failed, keeping previous: ", tostring(err))
-        state.file_mtime = m
+        -- what was pending is no longer what the file holds
+        if state.file_pending then state.file_pending, state.error = nil, nil end
       end
     end
   end
@@ -254,7 +300,7 @@ function _M.reload()
       changed = true
     end
   end
-  if changed then rebuild() end
+  if changed then rebuild(reloaded) end
   return changed
 end
 

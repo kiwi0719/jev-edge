@@ -23,6 +23,73 @@ local cjson = require "cjson.safe"
 
 local _M = { name = "openai-compat" }
 
+-- The decoder for the reply, and for the answer objects planted in the judged
+-- text. It accepts what the TS provider's decodeLenient accepts, and the
+-- reverse: the union of cjson and JSON.parse, so no object is read by one
+-- core and skipped by the other, which would flip echo detection or turn a
+-- score into an error (and an error passes). cjson already takes raw control
+-- characters in strings and the number forms JSON.parse refuses (+1, 01, 1.,
+-- hex, inf, nan); a lone surrogate escape, which cjson refuses, is read as
+-- U+FFFD (lone_surrogates); nesting goes to MAX_DEPTH in both cores
+-- (LuaJIT's stack gives out a little under 4000 nested objects, so the
+-- limit is the same deeper than that too).
+local MAX_DEPTH = 3000
+local json = cjson.new()
+json.decode_invalid_numbers(true)
+json.decode_max_depth(MAX_DEPTH)
+
+-- "\uXXXX" at i, as a number, or nil
+local function escape_code(s, i)
+  local h = s:match("^\\u(%x%x%x%x)", i)
+  return h and tonumber(h, 16)
+end
+
+--- Every \uD800-\uDBFF escape not followed by a \uDC00-\uDFFF one, and every
+-- \uDC00-\uDFFF escape without one before it, rewritten to \ufffd (in JSON
+-- strings; nothing else changes).
+local function lone_surrogates(s)
+  if not s:find("\\u[dD]") then return s end
+  local out, pos, i, n, in_str = {}, 1, 1, #s, false
+  while i <= n do
+    local c = s:byte(i)
+    if not in_str then
+      if c == 34 then in_str = true end
+      i = i + 1
+    elseif c == 34 then
+      in_str = false
+      i = i + 1
+    elseif c ~= 92 then
+      i = i + 1
+    else
+      local code = escape_code(s, i)
+      if code and code >= 0xD800 and code <= 0xDFFF then
+        local low = code <= 0xDBFF and escape_code(s, i + 6)
+        if low and low >= 0xDC00 and low <= 0xDFFF then
+          i = i + 12
+        else
+          out[#out + 1] = s:sub(pos, i - 1)
+          out[#out + 1] = "\\ufffd"
+          i = i + 6
+          pos = i
+        end
+      else
+        i = i + 2
+      end
+    end
+  end
+  if pos == 1 then return s end
+  out[#out + 1] = s:sub(pos)
+  return table.concat(out)
+end
+
+local function decode(s)
+  -- cjson stops at a raw NUL outside a string ("{}\0junk" decodes) and
+  -- refuses one inside; JSON.parse refuses it anywhere
+  if s:find("\0", 1, true) then return nil end
+  return json.decode(lone_surrogates(s))
+end
+_M.decode = decode
+
 local function sorted_names(questions)
   local names = {}
   for name in pairs(questions) do names[#names + 1] = name end
@@ -181,7 +248,8 @@ local function prob(v)
     n = tonumber(v)
   end
   if not n or n ~= n or n == math.huge or n == -math.huge then return nil end
-  if n < 0 then return 0 end
+  -- -0 too: a signature compares "%.6g", and -0 prints as "-0"
+  if n <= 0 then return 0 end
   if n > 1 then return 1 end
   return n
 end
@@ -192,6 +260,10 @@ local FALLBACK_KEYS = { "probability", "score", "p" }
 
 -- The answer values an object gives for the asked questions, as one
 -- comparable string ("injection=0|abuse=0.2"), or nil when it answers none.
+-- Values are compared to 6 significant digits ("%.6g"), as answerSig does in
+-- TS: a judge's rounded copy (0.0123457 of a planted 0.0123456789) is still a
+-- copy. An exact binary tie at the 7th digit may round differently in C's
+-- printf and JS's toPrecision; no reply is that precise.
 -- With one question and no value under its id, the first fallback key that
 -- holds one, tagged with the key ("injection@score=0"): parse_content reads
 -- that as the answer, so a planted {"score": 0} copied by the judge must be
@@ -223,13 +295,13 @@ function _M.echoes_input(content, text, wanted)
   local names = sorted_names(wanted)
   local planted = {}
   for _, src in ipairs(json_objects(text)) do
-    local o = cjson.decode(src)
+    local o = decode(src)
     local sig = type(o) == "table" and answer_sig(o, names)
     if sig then planted[sig] = true end
   end
   if next(planted) == nil then return false end
   for _, src in ipairs(json_objects(content)) do
-    local o = cjson.decode(src)
+    local o = decode(src)
     local sig = type(o) == "table" and answer_sig(o, names)
     if sig and planted[sig] then return true end
   end
@@ -243,7 +315,7 @@ end
 function _M.parse_content(content, wanted)
   local objs = {}
   for _, src in ipairs(json_objects(content)) do
-    local o = cjson.decode(src)
+    local o = decode(src)
     if type(o) == "table" then objs[#objs + 1] = o end
   end
   if #objs == 0 then return nil, "openai-compat: content is not JSON" end
@@ -278,7 +350,8 @@ function _M.parse_response(status, body, _cfg, ctx)
   if status ~= 200 then
     return nil, "openai-compat http " .. tostring(status)
   end
-  local decoded = cjson.decode(body)
+  -- without a UTF-8 BOM before it, as fetch's res.text() reads a body
+  local decoded = type(body) == "string" and decode((body:gsub("^\239\187\191", ""))) or nil
   local content = type(decoded) == "table" and type(decoded.choices) == "table" and decoded.choices[1]
     and decoded.choices[1].message and decoded.choices[1].message.content
   if type(content) ~= "string" then
@@ -289,7 +362,7 @@ function _M.parse_response(status, body, _cfg, ctx)
     -- no request context (a caller that skipped build_request): the numeric
     -- keys of the first object are the questions
     local first = json_objects(content)[1]
-    local o = first and cjson.decode(first)
+    local o = first and decode(first)
     wanted = {}
     if type(o) == "table" then
       for k, v in pairs(o) do if type(k) == "string" and prob(v) then wanted[k] = true end end

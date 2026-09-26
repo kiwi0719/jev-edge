@@ -4,14 +4,19 @@ local H = require "core.spec.helper"
 -- JSON null decoding to a non-nil sentinel the way cjson.null does.
 package.path = "./adapters/openresty/lib/?.lua;" .. package.path
 package.preload["cjson.safe"] = function()
-  return {
+  local m = {
     encode = function(v) return H.json.encode(v) end,
     decode = function(s)
       local ok, v = pcall(H.json.decode, s, 1, H.json.null)
       if ok then return v end
       return nil
     end,
+    decode_invalid_numbers = function() end,
+    decode_max_depth = function() end,
   }
+  -- openai_compat.lua decodes with an instance of its own (cjson.new())
+  m.new = function() return m end
+  return m
 end
 local P = require "resty.jev.providers.openai_compat"
 local judge = require "jev.core.judge"
@@ -203,5 +208,15 @@ describe("openai-compat provider: an echoed planted answer", function()
     assert.same({ abuse = 0.1, injection = 0.2 },
       parse_with('{"score": 0, "injection": 0.2, "abuse": 0.1}', text, names))
     assert.is_false(P.echoes_input('{"score": 0}', text, { injection = true, abuse = true }))
+  end)
+
+  it("compares to 6 significant digits, with -0 as 0, as answerSig does", function()
+    assert.same({ injection = 1 }, parse_with('{"injection": 0.0123457}', '{"injection": 0.0123456789}'))
+    assert.same({ injection = 1 }, parse_with('{"injection": 0.1000001}', '{"injection": 0.1}'))
+    assert.same({ injection = 1 }, parse_with('{"injection": -0.0}', '{"injection": 0}'))
+    assert.same({ injection = 1 }, parse_with('{"injection": 0}', '{"injection": -0}'))
+    assert.same({ injection = 0.21 }, parse_with('{"injection": 0.21}', '{"injection": 0.2}'))
+    -- a -0 answer is 0, never "-0"
+    assert.equals("0", string.format("%.6g", parse('{"injection": -0.0}').injection))
   end)
 end)

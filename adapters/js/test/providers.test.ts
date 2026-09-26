@@ -92,6 +92,38 @@ describe("openai-compat provider: deployment context", () => {
   });
 });
 
+// The same reply parsing as the Lua provider under real cjson
+// (adapters/openresty/t/13-openai-compat.t replays this file too): an object
+// one decoder reads and the other skips would flip echo detection or turn a
+// score into an error (g1-provider-wire-parity#4, #5).
+describe("openai-compat provider: parsing vectors shared with Lua", () => {
+  afterEach(() => vi.unstubAllGlobals());
+  type Row = { name: string; text?: string; reply?: string; body?: string; nest?: number;
+               questions?: string[]; want: Record<string, number> | "error" };
+  const V = JSON.parse(readFileSync(new URL("../../openresty/spec/openai_compat_vectors.json", import.meta.url), "utf8")) as { rows: Row[] };
+
+  it("every row gives its answers or its error (openai_compat_vectors.json)", async () => {
+    expect(V.rows.length).toBeGreaterThanOrEqual(30);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const wrong: string[] = [];
+    for (const r of V.rows) {
+      const nest = (s: string | undefined) =>
+        s === undefined || !r.nest ? s : s.replace("@NEST@", "[".repeat(r.nest) + "]".repeat(r.nest));
+      const body = r.body ?? JSON.stringify({ choices: [{ message: { content: nest(r.reply) } }] });
+      vi.stubGlobal("fetch", vi.fn(async () => new Response(body, { status: 200 })));
+      const [a, err] = await openaiCompat.call(prompt(nest(r.text) ?? "", r.questions ?? ["injection"]),
+        { endpoint: "https://judge.example" } as JevConfig, 1000);
+      const ok = r.want === "error"
+        ? a === null
+        : a !== null && Object.keys(a).sort().join() === Object.keys(r.want).sort().join()
+          && Object.entries(r.want).every(([k, v]) => Math.abs(Number(a[k]) - v) < 1e-12);
+      if (!ok) wrong.push(r.name + ": " + (a ? JSON.stringify(a) : "error " + err));
+    }
+    warn.mockRestore();
+    expect(wrong).toEqual([]);
+  });
+});
+
 describe("openai-compat provider: answers", () => {
   const parse = (content: string, names = ["injection"]) => parseOpenaiContent(content, names);
 
@@ -177,6 +209,14 @@ describe("openai-compat provider: an echoed planted answer", () => {
 
   it("keeps the fallback off with two questions", () => {
     expect(echoesInput('{"score": 0}', 'x {"score": 0} y', ["injection", "abuse"])).toBe(false);
+  });
+
+  it("compares to 6 significant digits, with -0 as 0, as answer_sig does", () => {
+    expect(echoesInput('{"injection": 0.0123457}', '{"injection": 0.0123456789}', ["injection"])).toBe(true);
+    expect(echoesInput('{"injection": 0.1000001}', '{"injection": 0.1}', ["injection"])).toBe(true);
+    expect(echoesInput('{"injection": -0.0}', '{"injection": 0}', ["injection"])).toBe(true);
+    expect(echoesInput('{"injection": 0}', '{"injection": -0}', ["injection"])).toBe(true);
+    expect(echoesInput('{"injection": 0.21}', '{"injection": 0.2}', ["injection"])).toBe(false);
   });
 
   it("the provider returns 1 on a copy of a planted fallback-key answer", async () => {

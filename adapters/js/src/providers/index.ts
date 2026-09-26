@@ -255,11 +255,125 @@ export function jsonObjects(s: string): string[] {
   return out;
 }
 
-/** A JSON number, or a plain decimal string for small models; clamped to [0,1]. null, booleans and "" are not answers. */
+// The decoder for the reply and for the answer objects planted in the judged
+// text: the union of what JSON.parse and the Lua provider's cjson accept, so
+// no object is read by one core and skipped by the other (that would flip
+// echo detection, or turn a score into an error, and an error passes). Past
+// JSON.parse it takes what cjson takes: raw control characters in strings
+// (not NUL) and the number forms strtod reads (+1, 01, 1., .5 after a sign,
+// hex, inf, nan). A lone surrogate escape JSON.parse already takes (the Lua
+// side reads it as U+FFFD), and nesting past OPENAI_MAX_DEPTH is refused in
+// both cores. Port of decode in providers/openai_compat.lua.
+const OPENAI_MAX_DEPTH = 3000;
+
+function depthWithin(s: string, max: number): boolean {
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === 92) esc = true;
+      else if (c === 34) inStr = false;
+    } else if (c === 34) inStr = true;
+    else if (c === 123 || c === 91) {
+      if (++depth > max) return false;
+    } else if (c === 125 || c === 93) depth--;
+  }
+  return true;
+}
+
+// strtod's syntax, as cjson reads a number (decode_invalid_numbers): sign,
+// then hex (with a fraction and a binary exponent), inf[inity], nan[(...)],
+// or decimal digits with an optional fraction and exponent.
+const STRTOD = /[+-]?(?:0[xX](?:[0-9a-fA-F]+(?:\.[0-9a-fA-F]*)?|\.[0-9a-fA-F]+)(?:[pP][+-]?\d+)?|[iI][nN][fF](?:[iI][nN][iI][tT][yY])?|[nN][aA][nN](?:\([0-9A-Za-z_]*\))?|(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)/y;
+
+function strtodValue(tok: string): number {
+  const neg = tok[0] === "-";
+  const t = tok[0] === "-" || tok[0] === "+" ? tok.slice(1) : tok;
+  let v: number;
+  if (/^0x/i.test(t)) {
+    const m = /^0x([0-9a-f]*)(?:\.([0-9a-f]*))?(?:p([+-]?\d+))?$/i.exec(t)!;
+    v = 0;
+    for (const d of m[1]) v = v * 16 + parseInt(d, 16);
+    let scale = 1 / 16;
+    for (const d of m[2] ?? "") { v += parseInt(d, 16) * scale; scale /= 16; }
+    if (m[3]) v *= Math.pow(2, Number(m[3]));
+  } else if (/^inf/i.test(t)) v = Infinity;
+  else if (/^nan/i.test(t)) v = NaN;
+  else v = Number(t);
+  return neg ? -v : v;
+}
+
+/** JSON text as cjson reads it, rewritten into what JSON.parse reads: raw
+ *  control characters in strings escaped, strtod number forms written out
+ *  (a non-finite one as null, which no answer takes either). */
+function cjsonToJson(s: string): string {
+  let out = "";
+  let inStr = false;
+  let esc = false;
+  let i = 0;
+  while (i < s.length) {
+    const ch = s[i];
+    const c = s.charCodeAt(i);
+    if (inStr) {
+      // an escaped character stays as it is: cjson refuses a backslash
+      // before a raw control character, and so must the rewrite
+      if (esc) esc = false;
+      else if (c === 92) esc = true;
+      else if (c === 34) inStr = false;
+      else if (c >= 1 && c < 32) {
+        out += "\\u" + c.toString(16).padStart(4, "0");
+        i++;
+        continue;
+      }
+      out += ch;
+      i++;
+      continue;
+    }
+    if (c === 34) {
+      inStr = true;
+      out += ch;
+      i++;
+      continue;
+    }
+    const start = ch === "+" || ch === "-" || (c >= 48 && c <= 57) || /^(?:inf|nan)/i.test(s.slice(i, i + 3));
+    if (start) {
+      STRTOD.lastIndex = i;
+      const m = STRTOD.exec(s);
+      if (m) {
+        const v = strtodValue(m[0]);
+        out += !Number.isFinite(v) ? "null" : Object.is(v, -0) ? "-0" : String(v);
+        i = STRTOD.lastIndex;
+        continue;
+      }
+    }
+    out += ch;
+    i++;
+  }
+  return out;
+}
+
+function decodeLenient(src: string): unknown {
+  if (!depthWithin(src, OPENAI_MAX_DEPTH)) return undefined;
+  try {
+    return JSON.parse(src) as unknown;
+  } catch {
+    try {
+      return JSON.parse(cjsonToJson(src)) as unknown;
+    } catch {
+      return undefined;
+    }
+  }
+}
+
+/** A JSON number, or a plain decimal string for small models; clamped to [0,1]. null, booleans and "" are not answers.
+ *  The string form allows the whitespace Lua's %s does, no other. */
 function prob(v: unknown): number | undefined {
   let n: number | undefined;
   if (typeof v === "number") n = v;
-  else if (typeof v === "string" && /^\s*-?[\d.]+\s*$/.test(v)) n = Number(v);
+  else if (typeof v === "string" && /^[ \t\n\v\f\r]*-?[\d.]+[ \t\n\v\f\r]*$/.test(v)) n = Number(v);
   if (n === undefined || !Number.isFinite(n)) return undefined;
   return Math.min(1, Math.max(0, n));
 }
@@ -275,12 +389,8 @@ const FALLBACK_KEYS = ["probability", "score", "p"];
 export function parseOpenaiContent(content: string, wanted: string[]): JudgeResult {
   const objs: Record<string, unknown>[] = [];
   for (const src of jsonObjects(content)) {
-    try {
-      const o = JSON.parse(src) as unknown;
-      if (o && typeof o === "object" && !Array.isArray(o)) objs.push(o as Record<string, unknown>);
-    } catch {
-      // not JSON: skip it
-    }
+    const o = decodeLenient(src); // undefined when not JSON: skipped
+    if (o && typeof o === "object" && !Array.isArray(o)) objs.push(o as Record<string, unknown>);
   }
   if (objs.length === 0) return [null, "openai-compat: content is not JSON"];
   const names = [...wanted].sort();
@@ -316,17 +426,22 @@ export function parseOpenaiContent(content: string, wanted: string[]): JudgeResu
  *  answer, so a planted {"score": 0} is compared too, key and value. */
 function answerSig(o: Record<string, unknown>, names: string[]): string | undefined {
   const own = (k: string): unknown => (Object.prototype.hasOwnProperty.call(o, k) ? o[k] : undefined);
+  // to 6 significant digits, as answer_sig's "%.6g": a judge's rounded copy
+  // (0.0123457 of a planted 0.0123456789) is still a copy. An exact binary
+  // tie at the 7th digit may round differently in C's printf; no reply is
+  // that precise. prob() has already folded -0 into 0.
+  const sig6 = (v: number): string => String(Number(v.toPrecision(6)));
   let any = false;
   const parts = names.map((name) => {
     const v = prob(own(name));
     if (v !== undefined) any = true;
-    return name + "=" + (v !== undefined ? String(v) : "-");
+    return name + "=" + (v !== undefined ? sig6(v) : "-");
   });
   if (any) return parts.join("|");
   if (names.length === 1) {
     for (const k of FALLBACK_KEYS) {
       const v = prob(own(k));
-      if (v !== undefined) return names[0] + "@" + k + "=" + String(v);
+      if (v !== undefined) return names[0] + "@" + k + "=" + sig6(v);
     }
   }
   return undefined;
@@ -335,12 +450,8 @@ function answerSig(o: Record<string, unknown>, names: string[]): string | undefi
 function objectsOf(s: string): Record<string, unknown>[] {
   const out: Record<string, unknown>[] = [];
   for (const src of jsonObjects(s)) {
-    try {
-      const o = JSON.parse(src) as unknown;
-      if (o && typeof o === "object" && !Array.isArray(o)) out.push(o as Record<string, unknown>);
-    } catch {
-      // not JSON: skip it
-    }
+    const o = decodeLenient(src); // undefined when not JSON: skipped
+    if (o && typeof o === "object" && !Array.isArray(o)) out.push(o as Record<string, unknown>);
   }
   return out;
 }
@@ -388,13 +499,17 @@ export const openaiCompat: Provider = {
     try {
       content = await fetchWithin(endpoint + "/chat/completions", { method: "POST", headers, body }, timeoutMs, async (res) => {
         if (res.status !== 200) throw new HttpStatus(res.status);
+        let raw: string;
         try {
-          const d = (await res.json()) as { choices?: { message?: { content?: string } }[] };
-          return d.choices?.[0]?.message?.content ?? "";
+          raw = await res.text();
         } catch (e) {
           if (e instanceof Error && e.name === "AbortError") throw e;
           throw new Error("malformed response");
         }
+        // the envelope too goes through the decoder cjson's twin uses
+        const d = decodeLenient(raw) as { choices?: { message?: { content?: string } }[] } | null | undefined;
+        if (d === undefined) throw new Error("malformed response");
+        return d?.choices?.[0]?.message?.content ?? "";
       });
     } catch (e) {
       if (e instanceof HttpStatus) return [null, "openai-compat http " + e.status, statusKind(e.status)];

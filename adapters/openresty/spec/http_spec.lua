@@ -5,14 +5,19 @@ local H = require "core.spec.helper"
 -- stubbed; dkjson stands in for cjson.safe, as in openai_compat_spec.lua.
 package.path = "./adapters/openresty/lib/?.lua;" .. package.path
 package.preload["cjson.safe"] = function()
-  return {
+  local m = {
     encode = function(v) return H.json.encode(v) end,
     decode = function(s)
       local ok, v = pcall(H.json.decode, s, 1, H.json.null)
       if ok then return v end
       return nil
     end,
+    decode_invalid_numbers = function() end,
+    decode_max_depth = function() end,
   }
+  -- openai_compat.lua decodes with an instance of its own (cjson.new())
+  m.new = function() return m end
+  return m
 end
 local J = require "jev.core.judge"
 

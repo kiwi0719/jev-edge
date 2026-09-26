@@ -88,5 +88,19 @@ check "provider laya judges" "app verdict=safe score=0.10 source=l2" "$(post /la
 check "provider laya blocks an injection" "403" \
   "$(curl -s -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' -d "$ATTACK" $base/laya/chat/completions)"
 
+# Judged once per request (apisix.yaml /dbl, /cons, global rule 2)
+fast() { awk '{ print ($1 < 0.25) ? "fast" : "slow " $1 }'; }
+out=$(curl -s -w ' ms=%{time_total}' -H 'X-E2e-Global: 2' -H 'X-User: carol' -H 'Content-Type: application/json' -H 'X-Jev-Mock-Score: 0.55' -d "$LONG" $base/dbl/chat/completions)
+check "route conf and a global rule: one verdict" "app verdict=suspicious score=0.55 source=l2" "$(printf '%s\n' "$out" | head -1)"
+check "route conf and a global rule: the global rule's is skipped (its mock takes 300 ms)" "fast" "$(printf '%s\n' "${out##* ms=}" | fast)"
+check "route conf and a global rule: charged once, the route's conf judges the next" "app verdict=safe score=0.30 source=l2" \
+  "$(curl -s -H 'X-E2e-Global: 2' -H 'X-User: carol' -H 'Content-Type: application/json' -d "$LONG" $base/dbl/chat/completions)"
+check "consumer conf after a global rule: one verdict" "app verdict=suspicious score=0.55 source=l2" \
+  "$(curl -s -H 'X-E2e-Global: 2' -H 'apikey: e2e-key' -H 'X-User: dave' -H 'Content-Type: application/json' -H 'X-Jev-Mock-Score: 0.55' -d "$LONG" $base/cons/chat/completions)"
+check "consumer conf after a global rule: charged once, the global rule's verdict stands" "app verdict=safe score=0.20 source=l2" \
+  "$(curl -s -H 'X-E2e-Global: 2' -H 'apikey: e2e-key' -H 'X-User: dave' -H 'Content-Type: application/json' -d "$LONG" $base/cons/chat/completions)"
+check "consumer conf alone judges" "app verdict=safe score=0.30 source=l2" \
+  "$(curl -s -H 'apikey: e2e-key' -H 'X-User: erin' -H 'Content-Type: application/json' -d "$LONG" $base/cons/chat/completions)"
+
 if [ $fail -ne 0 ]; then echo; echo "--- apisix logs"; docker compose logs apisix | tail -40; exit 1; fi
 echo "apisix e2e: all checks passed"

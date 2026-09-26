@@ -12,6 +12,7 @@ plugins:
   - jev-edge
   - proxy-rewrite
   - limit-count
+  - key-auth
 nginx_config:
   error_log_level: warn
   envs:

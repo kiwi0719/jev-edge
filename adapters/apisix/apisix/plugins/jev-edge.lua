@@ -188,11 +188,19 @@ local schema = {
 -- every access handler, so it only ever sees an admitted request.
 -- ai-request-rewrite (1073) calls its LLM in the access phase, before
 -- jev-edge: to judge first, raise jev-edge above it with _meta.priority.
+--
+-- run_policy = "prefer_route": a global rule's instance is skipped for a
+-- request whose route (with its service and plugin_config) has jev-edge of
+-- its own, so the route's conf decides and the request is judged once. A
+-- conf that comes from a consumer is merged after the global rules ran, and
+-- two global rules can both carry the plugin: access() judges once per
+-- request whatever reaches it (ctx.jev_ran).
 local _M = {
-  version  = 0.1,
-  priority = 1000,
-  name     = "jev-edge",
-  schema   = schema,
+  version    = 0.1,
+  priority   = 1000,
+  name       = "jev-edge",
+  schema     = schema,
+  run_policy = "prefer_route",
 }
 
 function _M.check_schema(conf)
@@ -376,13 +384,36 @@ end
 -- phases
 -- ---------------------------------------------------------------------------
 
+-- The X-Jev-* request headers as this request's verdict set them; a name
+-- the table does not hold is removed.
+local function set_request_headers(ctx, headers)
+  for _, h in ipairs(HEADER_NAMES) do core.request.set_header(ctx, h, headers and headers[h]) end
+end
+
 function _M.access(conf, ctx)
   -- A global rule also runs for a request that matched no route, just before
   -- APISIX answers it 404. It never reaches a model: no judge call, no
   -- reputation charge, no headers.
   if ctx.conf_type == "global_rule" and not ctx.matched_route then return end
+  -- Judged once per request. A second run (a global rule's instance, then a
+  -- consumer's conf; two global rules) is not a second L2 call, reputation
+  -- charge, sample or L3 job: it puts back the headers of the verdict
+  -- already reached (a plugin in between may have changed them), or the
+  -- fail-open ones, and that verdict's block. The first verdict stands.
+  if ctx.jev_ran then
+    set_request_headers(ctx, ctx.jev_headers)
+    local b = ctx.jev_block
+    if b then
+      core.response.set_header("Content-Type", "application/json")
+      for k, val in pairs(b.headers) do core.response.set_header(k, val) end
+      return b.status, b.body
+    end
+    return
+  end
+  -- before anything can fail: a run that failed open is not repeated either
+  ctx.jev_ran = true
+  set_request_headers(ctx, nil)
   local rt = runtime_for(conf)
-  for _, h in ipairs(HEADER_NAMES) do core.request.set_header(ctx, h, nil) end
 
   local v
   local ok, err = pcall(function()
@@ -402,19 +433,24 @@ function _M.access(conf, ctx)
 
   if not ok then
     core.log.error("jev-edge: access error, failing open: ", err)
-    core.request.set_header(ctx, "X-Jev-Verdict", verdict.ERROR)
-    core.request.set_header(ctx, "X-Jev-Source", "adapter")
+    ctx.jev_headers = { ["X-Jev-Verdict"] = verdict.ERROR, ["X-Jev-Source"] = "adapter" }
+    set_request_headers(ctx, ctx.jev_headers)
     return
   end
 
   ctx.jev = v
-  for k, val in pairs(verdict.headers(v)) do core.request.set_header(ctx, k, val) end
-  core.request.set_header(ctx, "X-Jev-Request-Id", ctx.var.request_id or "")
+  local headers = verdict.headers(v)
+  headers["X-Jev-Request-Id"] = ctx.var.request_id or ""
+  ctx.jev_headers = headers
+  set_request_headers(ctx, headers)
 
   if v.action == verdict.ACTION_BLOCK then
+    local b = { status = rt.cfg.policy.block_status or 403, headers = verdict.headers(v),
+                body = rt.cfg.policy.block_body or '{"error":"request rejected"}' }
+    ctx.jev_block = b
     core.response.set_header("Content-Type", "application/json")
-    for k, val in pairs(verdict.headers(v)) do core.response.set_header(k, val) end
-    return rt.cfg.policy.block_status or 403, rt.cfg.policy.block_body or '{"error":"request rejected"}'
+    for k, val in pairs(b.headers) do core.response.set_header(k, val) end
+    return b.status, b.body
   end
 end
 

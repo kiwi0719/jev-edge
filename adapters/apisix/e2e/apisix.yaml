@@ -130,6 +130,36 @@ routes:
         policy: { mode: enforce }
         cache: { fp_ttl: 0.001 }
         async: { enabled: false }
+  # Judged once per request. /dbl has jev-edge of its own, so global rule 2
+  # is skipped there (run_policy prefer_route); /cons gets its conf from the
+  # consumer, merged after global rule 2 ran. All three share a subject
+  # whose reputation blocks at 2 points, 1 per suspicious verdict: a request
+  # judged twice is charged 2 and blocks the next one.
+  - uri: /dbl/*
+    upstream:
+      nodes:
+        "app:8081": 1
+      type: roundrobin
+    plugins:
+      jev-edge:
+        jev: { provider: mock, mock_score: 0.3, mock_header: x-jev-mock-score, timeout_ms: 300 }
+        rules: [{ id: dbl, extends: llm-endpoints, watch_paths: ["^/dbl/"] }]
+        policy: { mode: enforce, block_threshold: 0.7, suspect_threshold: 0.5 }
+        subject:
+          enabled: true
+          from: header
+          name: x-user
+          salt: e2e-salt
+          reputation: { block_at: 2, window_s: 60, block_ttl: 60, suspicious: 1, malicious: 3 }
+        cache: { fp_ttl: 0.001 }
+        async: { enabled: false }
+  - uri: /cons/*
+    upstream:
+      nodes:
+        "app:8081": 1
+      type: roundrobin
+    plugins:
+      key-auth: {}
   - uri: /plain
     upstream:
       nodes:
@@ -148,4 +178,40 @@ global_rules:
         rules: [{ id: g, extends: llm-endpoints, watch_paths: ["^/"] }]
         policy: { mode: enforce, block_threshold: 0.7, suspect_threshold: 0.5 }
         cache: { fp_ttl: 0.001 }
+  # Global rule 2, for the judged-once checks (X-E2e-Global: 2); the mock
+  # takes 300 ms.
+  - id: 2
+    plugins:
+      jev-edge:
+        _meta:
+          filter:
+            - ["http_x_e2e_global", "==", "2"]
+        jev: { provider: mock, mock_score: 0.2, mock_header: x-jev-mock-score, mock_delay_ms: 300, timeout_ms: 1000 }
+        rules: [{ id: g2, extends: llm-endpoints, watch_paths: ["^/"] }]
+        policy: { mode: enforce, block_threshold: 0.7, suspect_threshold: 0.5 }
+        subject:
+          enabled: true
+          from: header
+          name: x-user
+          salt: e2e-salt
+          reputation: { block_at: 2, window_s: 60, block_ttl: 60, suspicious: 1, malicious: 3 }
+        cache: { fp_ttl: 0.001 }
+        async: { enabled: false }
+consumers:
+  - username: e2euser
+    plugins:
+      key-auth:
+        key: e2e-key
+      jev-edge:
+        jev: { provider: mock, mock_score: 0.3, mock_header: x-jev-mock-score, timeout_ms: 300 }
+        rules: [{ id: cons, extends: llm-endpoints, watch_paths: ["^/cons/"] }]
+        policy: { mode: enforce, block_threshold: 0.7, suspect_threshold: 0.5 }
+        subject:
+          enabled: true
+          from: header
+          name: x-user
+          salt: e2e-salt
+          reputation: { block_at: 2, window_s: 60, block_ttl: 60, suspicious: 1, malicious: 3 }
+        cache: { fp_ttl: 0.001 }
+        async: { enabled: false }
 #END

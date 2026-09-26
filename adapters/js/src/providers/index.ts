@@ -426,6 +426,10 @@ export const openaiCompat: Provider = {
  * judgment, thresholds and deployment context live in one place: the origin.
  * A 403 from the backend is reported as score 1 so the Worker's policy blocks
  * in enforce mode too; an X-Jev-Verdict: error answer is an error here as well.
+ * With `jev.origin_token` (TS only; thinWorker's originToken or
+ * env.JEV_ORIGIN_TOKEN) every call carries it as X-Jev-Origin-Token, so an
+ * origin that must be reachable from Cloudflare can refuse everyone else's
+ * calls to /_jev/authz (example.nginx.conf).
  */
 export const backend: Provider = {
   name: "backend",
@@ -441,6 +445,7 @@ export const backend: Provider = {
     };
     if (info?.clientIp) headers["X-Forwarded-For"] = info.clientIp;
     if (info?.subjectId) headers["X-Jev-Subject"] = info.subjectId;
+    if (typeof cfg.origin_token === "string" && cfg.origin_token !== "") headers["X-Jev-Origin-Token"] = cfg.origin_token;
     // The answer is in the headers; the body (a 403's JSON) is drained so the
     // connection is reusable, still under the same deadline.
     let res: Response;

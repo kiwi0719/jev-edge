@@ -23,6 +23,8 @@ export interface WorkerEnv {
   JEV_STATE?: DONamespaceLike;
   TYPESAFE_API_KEY?: string;
   JEV_ORIGIN?: string;
+  /** thinWorker: the shared secret sent to the origin's /_jev/authz as X-Jev-Origin-Token. */
+  JEV_ORIGIN_TOKEN?: string;
   [k: string]: unknown;
 }
 
@@ -46,9 +48,13 @@ function runtimeFor<E extends WorkerEnv>(resolve: Resolve<E>, env: E, cache: Wea
  * Thin Worker: L1 + cache at the edge, judgment by the jev-edge you already
  * run. `origin` is that gateway's base URL (or env.JEV_ORIGIN); the Worker
  * proxies to `upstream` (default: the same origin) with X-Jev-* attached.
+ * The origin's /_jev/authz has to be reachable from Cloudflare, so from
+ * anyone: with `originToken` (or env.JEV_ORIGIN_TOKEN, a secret) every
+ * judgment call carries it as X-Jev-Origin-Token, and the origin refuses
+ * calls without it (example.nginx.conf). It is never sent upstream.
  */
 export function thinWorker<E extends WorkerEnv = WorkerEnv>(
-  opts: Resolve<E> & { origin?: string; upstream?: string } = {},
+  opts: Resolve<E> & { origin?: string; upstream?: string; originToken?: string } = {},
 ): { fetch(request: Request, env: E, ctx?: RequestCtx): Promise<Response> } {
   const cache = new WeakMap<object, Runtime>();
   return {
@@ -56,9 +62,13 @@ export function thinWorker<E extends WorkerEnv = WorkerEnv>(
       const o = typeof opts === "function" ? opts(env) : opts;
       const origin = (opts as { origin?: string }).origin ?? env.JEV_ORIGIN;
       if (!origin) throw new Error("thinWorker: origin (or env.JEV_ORIGIN) is required");
+      const token = (opts as { originToken?: string }).originToken ?? env.JEV_ORIGIN_TOKEN;
       const rt = runtimeFor(() => ({
         ...o,
-        config: { ...o.config, jev: { provider: "backend", endpoint: origin, ...o.config?.jev } },
+        config: {
+          ...o.config,
+          jev: { provider: "backend", endpoint: origin, ...(token ? { origin_token: token } : {}), ...o.config?.jev },
+        },
       }), env, cache);
       const upstream = (opts as { upstream?: string }).upstream ?? origin;
       return handle(request, rt, (req) => {

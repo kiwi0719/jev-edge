@@ -293,6 +293,19 @@ describe("providers: error kinds", () => {
     expect(await laya.call(prompt("x"), {} as JevConfig, 1000)).toEqual([null, "laya: malformed response", "unusable"]);
   });
 
+  it("backend: jev.origin_token goes to the origin as X-Jev-Origin-Token, and nothing without it", async () => {
+    const seen: (string | null)[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (_url: string, init: RequestInit) => {
+      seen.push(new Headers(init.headers).get("x-jev-origin-token"));
+      return new Response(null, { status: 200, headers: { "X-Jev-Verdict": "safe", "X-Jev-Score": "0.10", "X-Jev-Reason": "injection+0.10" } });
+    }));
+    const cfg = { provider: "backend", endpoint: "http://origin" } as JevConfig;
+    expect(await backend.call(prompt("x"), { ...cfg, origin_token: "s3cret" }, 1000)).toEqual([{ injection: 0.1 }, null]);
+    await backend.call(prompt("x"), cfg, 1000);
+    await backend.call(prompt("x"), { ...cfg, origin_token: "" }, 1000);
+    expect(seen).toEqual(["s3cret", null, null]);
+  });
+
   it("backend: an origin that answered without a score is unusable, its 4xx rejected", async () => {
     const cfg = { provider: "backend", endpoint: "http://origin" } as JevConfig;
     reply(() => new Response(null, { status: 200, headers: { "X-Jev-Verdict": "error", "X-Jev-Reason": "laya+http+400" } }));

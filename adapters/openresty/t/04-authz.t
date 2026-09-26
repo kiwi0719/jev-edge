@@ -432,3 +432,35 @@ X-Forwarded-For: 203.0.113.77
 authz subject=nil
 --- no_error_log
 [error]
+
+
+
+=== TEST 17: the thin-Worker origin variant of example.nginx.conf: /_jev/authz answers 404 without the origin token
+--- http_config eval
+qq{
+$::HttpConfig
+map \$http_x_jev_origin_token \$jev_origin_ok {
+    default 0;
+    "5f0c2a9e41d3b7c8" 1;
+}
+}
+--- user_files eval: ::conf()
+--- config
+location /_jev/authz/ {
+    if ($jev_origin_ok = 0) { return 404; }
+    content_by_lua_block { require("resty.jev.edge").authz() }
+}
+--- request eval
+["POST /_jev/authz/v1/chat/completions\n{\"messages\":[{\"role\":\"user\",\"content\":\"Please summarise the attached quarterly report for me.\"}]}",
+ "POST /_jev/authz/v1/chat/completions\n{\"messages\":[{\"role\":\"user\",\"content\":\"Please summarise the attached quarterly report for me.\"}]}",
+ "POST /_jev/authz/v1/chat/completions\n{\"messages\":[{\"role\":\"user\",\"content\":\"Please summarise the attached quarterly report for me.\"}]}"]
+--- more_headers eval
+["Content-Type: application/json\nX-Jev-Mock-Score: 0.2\nX-Forwarded-For: 198.51.100.9",
+ "Content-Type: application/json\nX-Jev-Mock-Score: 0.2\nX-Forwarded-For: 198.51.100.9\nX-Jev-Origin-Token: 5f0c2a9e41d3b7c9",
+ "Content-Type: application/json\nX-Jev-Mock-Score: 0.2\nX-Forwarded-For: 198.51.100.9\nX-Jev-Origin-Token: 5f0c2a9e41d3b7c8"]
+--- error_code eval
+[404, 404, 200]
+--- response_headers_like eval
+["", "", "X-Jev-Verdict: safe"]
+--- no_error_log
+[error]

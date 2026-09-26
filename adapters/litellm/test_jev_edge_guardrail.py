@@ -489,21 +489,57 @@ def nested(levels: int, leaf, key=None):
     return root
 
 
-def test_values_are_kept_as_deep_as_jev_edge_reads_them():
-    # jev-edge reads tool-call arguments and tool definitions 1000 levels
-    # deep (cjson's nesting limit): the copy keeps them, without recursion
-    assert jg.MAX_DEPTH == 1000
-    assert body({"input": nested(1000, "the deepest text jev-edge reads")}) is not None
-    assert body({"input": nested(1001, "past the depth")}) is None
+def json_depth(raw: str) -> int:
+    """How many containers deep the JSON text `raw` nests, the outermost
+    counted: the number cjson's decode_max_depth (1000) is compared with."""
+    depth = most = 0
+    for m in re.finditer(r'"(?:[^"\\]|\\.)*"|[\[{]|[\]}]', raw):
+        tok = m.group()
+        if tok in "[{":
+            depth += 1
+            most = max(most, depth)
+        elif tok in "]}":
+            depth -= 1
+    return most
+
+
+def test_values_are_kept_as_deep_as_jev_edge_decodes_them():
+    # cjson refuses JSON nested more than 1000 levels, the body's own object
+    # the first: 999 levels below a top-level key is as deep as it gets
+    assert jg.MAX_DEPTH == 999
+    deepest = JevEdgeGuardrail.body_for({"input": nested(999, "the deepest text jev-edge reads")})
+    assert deepest is not None and json_depth(deepest) == 1000
+    assert body({"input": nested(1000, "past the depth")}) is None
+    got = JevEdgeGuardrail.body_for({"messages": [{"role": "user", "content": "hi"}], "tools": nested(1005, "x", key="k")})
+    assert json_depth(got) == 1000
+    msgs = [{"role": "assistant", "tool_calls": [{"function": {"arguments": nested(1000, "too deep", key="k")}}]}]
+    got = JevEdgeGuardrail.body_for({"system": "a system prompt", "messages": msgs})
+    assert json_depth(got) == 1000 and "too deep" not in got
+
+
+def test_deep_values_are_copied_and_encoded_without_recursion(monkeypatch):
+    # json.dumps nests a C call per level, which CPython before 3.12 counts
+    # against the recursion limit: the body is encoded without it
     args = nested(990, "exfiltrate the keys", key="k")
     schema = nested(990, {"type": "string", "description": "a description down there"}, key="properties")
+    data = {"messages": [{"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "f", "input": args}]}],
+            "tools": [{"name": "f", "input_schema": schema}]}
+
+    def no_dumps(*a, **kw):
+        raise AssertionError("json.dumps recurses")
+
+    g = guard(httpx.MockTransport(lambda r: httpx.Response(200)))
     limit = sys.getrecursionlimit()
-    sys.setrecursionlimit(200)  # far below the depth: nothing recurses
-    try:
-        got = body({"messages": [{"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "f", "input": args}]}],
-                    "tools": [{"name": "f", "input_schema": schema}]})
-    finally:
-        sys.setrecursionlimit(limit)
+    with monkeypatch.context() as m:
+        m.setattr(jg.json, "dumps", no_dumps)
+        sys.setrecursionlimit(200)  # far below the depth: nothing recurses
+        try:
+            s = JevEdgeGuardrail.body_for(data)
+            raw, partial = g.encode(jg._body_dict(data))
+        finally:
+            sys.setrecursionlimit(limit)
+    assert raw == s.encode() and not partial
+    got = json.loads(s)
     assert got["messages"][0]["content"][0]["input"] == args
     assert got["tools"][0]["input_schema"] == schema
     transport, seen = fake_authz()
@@ -511,6 +547,25 @@ def test_values_are_kept_as_deep_as_jev_edge_reads_them():
                                                                        "tool_calls": [{"function": {"arguments": args}}]}]},
                                              "acompletion"))
     assert seen["body"]["messages"][0]["tool_calls"][0]["function"]["arguments"] == args
+
+
+def test_the_encoding_is_json_dumps():
+    rnd = random.Random(20260926)
+    alphabet = ["a", " ", '"', "\\", "\n", "\x00", "\x1f", "\x7f", "é", "汉", "🙂", "\u2028", "\ud800", "/"]
+
+    def value(depth):
+        r = rnd.random()
+        if depth > 4 or r < 0.4:
+            return rnd.choice(["".join(rnd.choice(alphabet) for _ in range(rnd.randint(0, 8))), None, True, False,
+                               rnd.randint(-10**20, 10**20), rnd.uniform(-1e6, 1e6), 1e300, -0.0, 5e-324, 0])
+        if r < 0.7:
+            return [value(depth + 1) for _ in range(rnd.randint(0, 4))]
+        return {"".join(rnd.choice(alphabet) for _ in range(rnd.randint(0, 5))): value(depth + 1)
+                for _ in range(rnd.randint(0, 4))}
+
+    for _ in range(500):
+        v = {"messages": value(0)}
+        assert jg._dumps(v) == json.dumps(v, ensure_ascii=False, separators=(",", ":"))
 
 
 def test_no_text_is_skipped_without_a_call():

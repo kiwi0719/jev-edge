@@ -115,12 +115,13 @@ MEDIA_KEYS = frozenset({"image_url", "input_audio", "file_data", "inline_data", 
 # is not worth a round trip.
 STRUCTURAL_KEYS = frozenset({"role", "type", "id", "call_id", "tool_call_id", "tool_use_id", "name",
                              "media_type", "status", "model", "cache_control"})
-# Containers nested deeper than this below a top-level key are dropped.
-# jev-edge reads tool definitions and tool-call arguments 1000 levels deep
-# (its DEEP_DEPTH, which is cjson's nesting limit: a body nested deeper is one
-# its decoder refuses, in-line too). The copy is made without recursion, so
-# the depth is not bounded by Python's recursion limit.
-MAX_DEPTH = 1000
+# Containers nested deeper than this below a top-level key are dropped:
+# jev-edge's decoder (cjson) refuses JSON nested more than 1000 levels, and
+# the body's own top-level object is the first of them. Below that, jev-edge
+# reads tool definitions and tool-call arguments to any depth its decoder
+# takes. The copy and its encoding are made without recursion, so no depth is
+# bounded by Python's recursion limit, on any Python LiteLLM runs on.
+MAX_DEPTH = 999
 
 # ---------------------------------------------------------------------------
 # call types (LiteLLM passes the route's call type to async_pre_call_hook,
@@ -285,6 +286,55 @@ def _clean(node: Any, media: bool = True) -> Any:
             if c is not _DROP:
                 out[k] = c
     return root
+
+
+def _dumps(node: Any) -> str:
+    """`node` (a copy _clean made) as compact JSON with non-ASCII text as it
+    is: what json.dumps(node, ensure_ascii=False, separators=(",", ":"))
+    writes, without recursion. json.dumps nests one C call per level, which
+    CPython before 3.12 counts against the recursion limit (1000), so a body
+    as deep as jev-edge's decoder takes would raise RecursionError there."""
+    enc = json.encoder.encode_basestring
+    out: list = []
+    stack: list = []
+
+    def value(v: Any) -> None:
+        if isinstance(v, str):
+            out.append(enc(v))
+        elif v is None:
+            out.append("null")
+        elif v is True:
+            out.append("true")
+        elif v is False:
+            out.append("false")
+        elif isinstance(v, int):
+            out.append(int.__repr__(v))
+        elif isinstance(v, float):
+            out.append(float.__repr__(v))
+        elif isinstance(v, dict):
+            out.append("{")
+            stack.append([iter(v.items()), True, True])
+        else:
+            out.append("[")
+            stack.append([iter(v), False, True])
+
+    value(node)
+    while stack:
+        frame = stack[-1]
+        item = next(frame[0], _DROP)
+        if item is _DROP:
+            stack.pop()
+            out.append("}" if frame[1] else "]")
+            continue
+        if not frame[2]:
+            out.append(",")
+        frame[2] = False
+        if frame[1]:
+            out.append(enc(item[0]) + ":")
+            value(item[1])
+        else:
+            value(item)
+    return "".join(out)
 
 
 def _has_text(node: Any) -> bool:
@@ -674,7 +724,7 @@ class JevEdgeGuardrail(_ApplyGuardrailBase):
         and Gemini `contents` joining `messages`, and media payloads removed.
         None when no value holds any text."""
         body = _body_dict(data, _parse_fields(extra_fields) if extra_fields else ())
-        return None if body is None else json.dumps(body, ensure_ascii=False, separators=(",", ":"))
+        return None if body is None else _dumps(body)
 
     def plan(self, data: dict, call_type: Any) -> tuple:
         """What to do with a call, by call type: ("judge", body or None),
@@ -882,7 +932,7 @@ class JevEdgeGuardrail(_ApplyGuardrailBase):
 
     def encode(self, body: dict) -> tuple:
         """The UTF-8 compact JSON body and whether it had to be cut."""
-        raw = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8", "replace")
+        raw = _dumps(body).encode("utf-8", "replace")
         if len(raw) <= self.max_body_bytes:
             return raw, False
         log.info("jev-edge: body of %d bytes sent as head and tail (%d max)", len(raw), self.max_body_bytes)

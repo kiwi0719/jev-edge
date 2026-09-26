@@ -91,19 +91,26 @@ TAIL_BYTES = 65536        # jev-edge's rules.TAIL_BYTES: the tail scanned with t
 # Tool definitions, sent first and unchanged: jev-edge judges them on their
 # own, apart from the conversation. The Responses API's `text` is one when it
 # is an object: its `format` is that API's response_format (a string `text`
-# elsewhere is text).
+# elsewhere is text). Gemini's `tools` (functionDeclarations) share the key.
 DEFINITION_KEYS = ("tools", "functions", "response_format")
 # Top-level keys that carry text, in the order they are sent: the
 # conversation last, so the newest turn is in the tail of a body that has to
 # be cut. `messages` / `input` keep their structure (roles, content parts,
 # tool_result / tool_use blocks, function_call_output items) so jev-edge's
 # untrusted judging finds tool results exactly as it does in-line. A system
-# prompt (Anthropic's top-level `system`, the Responses API's `instructions`,
-# Gemini's `systemInstruction`) is sent as the first `messages` entry, with
-# role system: every jev-edge version reads messages[*].content, none reads
-# a top-level `instructions`, and not every version reads `system`.
+# prompt (Anthropic's top-level `system`, the Responses API's `instructions`)
+# is sent as the first `messages` entry, with role system: every jev-edge
+# version reads messages[*].content, none reads a top-level `instructions`,
+# and not every version reads `system`.
 SYSTEM_KEYS = ("system", "instructions")
 TEXT_KEYS = ("query", "text", "prompt", "input", "messages")
+# A Gemini body (generateContent, and the /gemini and /vertex_ai
+# pass-through) is sent as it is: its system instruction after the tool
+# definitions, `contents` last. jev-edge reads systemInstruction.parts,
+# system_instruction.parts and contents[*].parts (contents.parts for one
+# content) with its default text_fields.
+GEMINI_SYSTEM_KEYS = ("systemInstruction", "system_instruction")
+GEMINI_CONTENTS = "contents"
 
 # Content parts that carry media: only their `type` (and any `text` or
 # `content`, which jev-edge would read in-line too) is sent.
@@ -396,34 +403,13 @@ def _has_text(node: Any) -> bool:
 
 def _system_messages(data: dict) -> list:
     """The request's system prompt as messages: Anthropic's top-level
-    `system` (a string or text blocks), the Responses API's `instructions`
-    and Gemini's `systemInstruction`, each with role system."""
+    `system` (a string or text blocks) and the Responses API's
+    `instructions`, each with role system."""
     msgs: list = []
     for key in SYSTEM_KEYS:
         v = data.get(key)
         if v is not None and v != "":
             msgs.append({"role": "system", "content": v})
-    si = data.get("systemInstruction", data.get("system_instruction"))
-    if isinstance(si, dict):
-        msgs.append({"role": "system", "content": si.get("parts")})
-    elif isinstance(si, str):
-        msgs.append({"role": "system", "content": si})
-    return msgs
-
-
-def _contents_as_messages(data: dict) -> list:
-    """Gemini `contents` (generate_content, pass-through) as messages: each
-    part's `text` is read by jev-edge's content-part rule."""
-    msgs: list = []
-    contents = data.get("contents")
-    if isinstance(contents, str):
-        contents = [contents]
-    if isinstance(contents, list):
-        for c in contents:
-            if isinstance(c, dict):
-                msgs.append({"role": c.get("role") or "user", "content": c.get("parts")})
-            elif isinstance(c, str):
-                msgs.append({"role": "user", "content": c})
     return msgs
 
 
@@ -449,7 +435,7 @@ def _is_definition(key: str, value: Any) -> bool:
 
 
 # Every top-level key the body is built from (with the extra fields).
-READ_KEYS = DEFINITION_KEYS + SYSTEM_KEYS + TEXT_KEYS + ("systemInstruction", "system_instruction", "contents")
+READ_KEYS = DEFINITION_KEYS + SYSTEM_KEYS + TEXT_KEYS + GEMINI_SYSTEM_KEYS + (GEMINI_CONTENTS,)
 
 
 def _body_dict(data: dict, extra_fields: tuple = ()) -> Optional[dict]:
@@ -460,19 +446,22 @@ def _body_dict(data: dict, extra_fields: tuple = ()) -> Optional[dict]:
             c = _clean(value, media=False)
             if c is not _DROP:
                 body[key] = c
+    for key in GEMINI_SYSTEM_KEYS:
+        value = data.get(key)
+        if value is not None and value != "":
+            c = _clean(value, key=key)
+            if c is not _DROP:
+                body[key] = c
     system = _system_messages(data)
     convo = data.get("messages")
     if convo is not None and not isinstance(convo, list):
         convo = [convo]
-    gemini = _contents_as_messages(data)
-    if gemini:
-        convo = (convo or []) + gemini
     if system and convo is None:
         # no conversation under `messages` (the Responses API): the system
         # prompt goes first, before the input
         body["messages"] = _clean(system, key="messages")
-    taken = DEFINITION_KEYS + SYSTEM_KEYS + TEXT_KEYS
-    for key in tuple(k for k in extra_fields if k not in taken) + TEXT_KEYS:
+    taken = READ_KEYS
+    for key in tuple(k for k in extra_fields if k not in taken) + TEXT_KEYS + (GEMINI_CONTENTS,):
         value = data.get(key)
         if key == "messages":
             if convo is None:
@@ -759,11 +748,11 @@ class JevEdgeGuardrail(_ApplyGuardrailBase):
         """The request's text as the compact JSON body jev-edge judges, in its
         original structure: the tool definitions (`tools`, `functions`,
         `response_format`, the Responses API's `text` object with its
-        `format`) unchanged, the `extra_fields`, `query`, `text`,
-        `prompt`, `input` and `messages`, with the system prompt (`system`,
-        `instructions`, Gemini's `systemInstruction`) as the first message
-        and Gemini `contents` joining `messages`, and media payloads removed.
-        None when no value holds any text."""
+        `format`) unchanged, Gemini's `systemInstruction`, the
+        `extra_fields`, `query`, `text`, `prompt`, `input` and `messages`,
+        with the system prompt (`system`, `instructions`) as the first
+        message, and Gemini's `contents`; media payloads removed outside
+        tool-call arguments. None when no value holds any text."""
         body = _body_dict(data, _parse_fields(extra_fields) if extra_fields else ())
         return None if body is None else _dumps(body)
 

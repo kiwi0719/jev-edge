@@ -447,12 +447,45 @@ def test_extra_fields_are_forwarded(monkeypatch):
     assert seen["body"]["documents"] == [{"text": ATTACK}]
 
 
-def test_gemini_contents_are_judged_as_messages():
-    data = {"contents": [{"role": "user", "parts": [{"text": ATTACK}, {"inlineData": {"mimeType": "image/png", "data": "AAAA"}}]}],
-            "systemInstruction": {"parts": [{"text": "Be brief."}]}}
+GEMINI_TOOLS = [{"functionDeclarations": [{"name": "fetch", "description": "Fetch a page",
+                                           "parameters": {"type": "OBJECT", "properties": {"url": {"type": "STRING"}}}}]}]
+
+
+def test_gemini_body_is_forwarded_as_it_is():
+    # jev-edge reads systemInstruction.parts, system_instruction.parts and
+    # contents[*].parts: the body goes in Gemini's own shape, the system
+    # instruction after the tool definitions and the contents last
+    contents = [{"role": "user", "parts": [{"text": ATTACK}, {"inlineData": {"mimeType": "image/png", "data": "AAAA"}}]},
+                {"role": "model", "parts": [{"functionCall": {"name": "fetch", "args": {"url": "https://x"}}}]},
+                {"role": "user", "parts": [{"functionResponse": {"name": "fetch", "response": {"content": ATTACK}}}]}]
+    data = {"contents": contents, "systemInstruction": {"parts": [{"text": "Be brief."}]}, "tools": GEMINI_TOOLS,
+            "generationConfig": {"temperature": 0.2}, "safetySettings": [], "model": "gemini-2.5-flash"}
     got = body(data)
-    assert got == {"messages": [{"role": "system", "content": [{"text": "Be brief."}]},
-                                {"role": "user", "content": [{"text": ATTACK}, {}]}]}
+    assert list(got) == ["tools", "systemInstruction", "contents"]
+    assert got["tools"] == GEMINI_TOOLS and got["systemInstruction"] == data["systemInstruction"]
+    assert got["contents"] == [dict(contents[0], parts=[{"text": ATTACK}, {}])] + contents[1:]  # inline data left out
+    # the REST API's snake_case, one content instead of a list, string parts
+    got = body({"system_instruction": {"parts": [{"text": ATTACK}]}, "contents": {"parts": ["a string part"]}})
+    assert got == {"system_instruction": {"parts": [{"text": ATTACK}]}, "contents": {"parts": ["a string part"]}}
+    # a system instruction alone is judged
+    assert body({"systemInstruction": {"parts": [{"text": ATTACK}]}, "contents": []}) is not None
+    assert body({"contents": [{"role": "user", "parts": [{"inlineData": {"data": "AAAA"}}]}]}) is None
+
+
+@pytest.mark.parametrize("call_type", ["agenerate_content", "agenerate_content_stream", "generate_content"])
+@pytest.mark.parametrize("route", ["/v1beta/models/gpt-4o:generateContent", "/models/gpt-4o:generateContent"])
+def test_generate_content_is_judged(call_type, route):
+    # LiteLLM 1.102's Google routes: the client's body with the proxy's keys
+    transport, seen = fake_authz(status=403, verdict="malicious", score="0.95")
+    data = {"contents": [{"role": "user", "parts": [{"text": ATTACK}]}], "systemInstruction": {"parts": [{"text": "hi"}]},
+            "model": "gpt-4o", "metadata": {"requester_ip_address": "203.0.113.6"},
+            "proxy_server_request": psr(route, **{"content-type": "application/json"})}
+    with pytest.raises(Exception) as ei:
+        run(guard(transport).async_pre_call_hook({}, None, data, call_type))
+    assert ei.value.status_code == 403
+    assert seen["body"] == {"systemInstruction": {"parts": [{"text": "hi"}]}, "contents": data["contents"]}
+    assert seen["xff"] == "203.0.113.6"
+    assert data["metadata"]["jev_verdict"]["verdict"] == "malicious"
 
 
 def test_tool_call_arguments_are_sent_whole():
@@ -483,10 +516,13 @@ def test_tool_call_arguments_are_sent_whole():
     assert body({"messages": odd})["messages"][0]["content"] == [{"type": "image", "input": args}]
     assert body({"input": [{"type": "input_image", "image_url": "data:x", "input": args}]}) == {
         "input": [{"type": "input_image", "input": args}]}
-    # Responses API items
+    # Responses API items, Gemini function calls
     items = [{"type": "function_call", "call_id": "c", "name": "f", "arguments": args},
              {"type": "custom_tool_call", "call_id": "d", "name": "g", "input": args}]
     assert body({"input": items}) == {"input": items}
+    contents = [{"role": "model", "parts": [{"functionCall": {"name": "f", "args": args}}]}]
+    assert body({"contents": contents}) == {"contents": contents}
+    assert body({"contents": contents[0]}) == {"contents": contents[0]}
     # the same keys anywhere else are media
     assert body({"messages": [{"role": "user", "content": "hi", "extra": args}]})["messages"][0]["extra"] == {"type": "image"}
     assert body({"messages": [{"role": "user", "content": "hi", "extra": dict(args, type="x")}]})["messages"][0]["extra"] == {
@@ -705,7 +741,7 @@ def test_generic_pass_through_body_is_judged_without_a_client_address():
     assert seen["xff"] is None
     run(guard(transport).async_pre_call_hook({}, None, {"contents": [{"parts": [{"text": ATTACK}]}],
                                                         "litellm_logging_obj": object()}, "pass_through_endpoint"))
-    assert seen["body"] == {"messages": [{"role": "user", "content": [{"text": ATTACK}]}]}
+    assert seen["body"] == {"contents": [{"parts": [{"text": ATTACK}]}]}
 
 
 def test_websocket_pass_through_is_unjudged():

@@ -307,6 +307,13 @@ rule("gateway-headers", function(r)
   if traefik:find("\n%s*maxBodySize:") then
     fail(r, "traefik.yml sets maxBodySize (Traefik denies past it instead of letting jev-edge judge)")
   end
+  -- trustForwardHeader true relays the client's X-Forwarded-Uri/Method from
+  -- a trusted peer, and jev-edge judges that path (audit openresty-edge#8)
+  for v in traefik:gmatch("\n%s*trustForwardHeader:%s*([^\n#]-)%s*[\n#]") do
+    if v ~= "false" then
+      fail(r, "traefik.yml sets trustForwardHeader: " .. v .. " (the client's X-Forwarded-Uri is judged)")
+    end
+  end
   local envoy = read("adapters/envoy/envoy-http.yaml") or ""
   if not envoy:find("exact:%s*content%-encoding") then fail(r, "envoy-http.yaml does not forward content-encoding") end
   for _, f in ipairs({ "adapters/envoy/envoy-http.yaml", "adapters/envoy/envoy-grpc.yaml" }) do
@@ -319,6 +326,56 @@ end)
 --    that only works on case-insensitive filesystems)
 rule("makefile", function(r)
   if (read("Makefile") or ""):find("%$%$%(PWD%)") then fail(r, "Makefile uses $$(PWD); use $(CURDIR)") end
+end)
+
+-- 9b. A Grafana state timeline with value mappings colours by them: with
+--     color mode "thresholds" it turns values into threshold ranges before
+--     the mappings, and the Breaker state panel drew closed, open and
+--     half-open as one green "-inf..+inf" bar (audit lead-github-ops#33)
+rule("grafana-state-timeline", function(r)
+  local f = "ops/grafana/jev-edge.json"
+  local n = 0
+  for panel in (read(f) or ""):gmatch("\n    {\n(.-)\n    }") do
+    if panel:find('"type"%s*:%s*"state%-timeline"') then
+      n = n + 1
+      if panel:find('"mappings"%s*:%s*%[%s*{') and panel:find('"color"%s*:%s*{%s*"mode"%s*:%s*"thresholds"') then
+        fail(r, f .. ": state timeline " .. (panel:match('"title"%s*:%s*"([^"]*)"') or "?")
+          .. " has value mappings and color mode thresholds; use fixed")
+      end
+    end
+  end
+  if n == 0 then fail(r, f .. ": no state-timeline panel found") end
+end)
+
+-- 9c. A legend's {{label}} is a label the query keeps: an aggregation
+--     without `by` drops every label, and the Subject reputation blocks
+--     legend read "Value" under {{instance}} (audit lead-github-ops#34)
+rule("grafana-legend", function(r)
+  local f = "ops/grafana/jev-edge.json"
+  local s = read(f) or ""
+  local aggs = { sum = true, max = true, min = true, avg = true, count = true, group = true,
+                 stddev = true, stdvar = true }
+  local n, seen = 0, 0
+  for _ in s:gmatch('"legendFormat"%s*:') do n = n + 1 end
+  for raw, legend in s:gmatch('"expr"%s*:%s*"(.-[^\\])"%s*,%s*"legendFormat"%s*:%s*"([^"]*)"') do
+    seen = seen + 1
+    local expr = raw:gsub('\\"', '"')
+    local agg, by = expr:match("^%s*(%a+)%s+by%s*(%b())")
+    if not agg then
+      agg = expr:match("^%s*(%a+)%s*%(")
+      by = agg and aggs[agg] and (expr:match("%)%s*by%s*(%b())%s*$") or "()")
+    end
+    if agg and aggs[agg] and by then
+      local kept = {}
+      for l in by:gmatch("[%w_]+") do kept[l] = true end
+      for l in legend:gmatch("{{%s*([%w_]+)%s*}}") do
+        if not kept[l] then
+          fail(r, f .. ": legend " .. legend .. " names " .. l .. ", which " .. agg .. " drops in " .. expr)
+        end
+      end
+    end
+  end
+  if seen ~= n then fail(r, f .. ": read " .. seen .. " of " .. n .. " targets with a legend") end
 end)
 
 -- 10. The shipped rule set is the same in Lua and TypeScript

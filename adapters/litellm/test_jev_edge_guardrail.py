@@ -1,6 +1,7 @@
 """Runs without LiteLLM: the hook is exercised against a fake /_jev/authz."""
 
 import asyncio
+import base64
 import enum
 import inspect
 import json
@@ -129,22 +130,59 @@ def test_pass_annotates_and_forwards_ip_and_path():
     assert v["reason"] == "injection 0.20"
 
 
-def test_xff_chain_is_forwarded_whole_not_its_forgeable_first_entry():
+def xff_sent(data: dict, call_type: str = "completion"):
     transport, seen = fake_authz()
-    g = guard(transport)
-    data = {"messages": CHAT["messages"], "proxy_server_request": {"headers": {"X-Forwarded-For": "6.6.6.6,  198.51.100.4"}}}
-    run(g.async_pre_call_hook({}, None, data, "completion"))
-    assert seen["xff"] == "6.6.6.6, 198.51.100.4"
+    run(guard(transport).async_pre_call_hook({}, None, data, call_type))
+    return seen["xff"]
 
 
-def test_xff_chain_wins_over_requester_ip_address():
-    # with use_x_forwarded_for on, requester_ip_address is the forgeable leftmost entry
-    transport, seen = fake_authz()
-    g = guard(transport)
-    data = {"messages": CHAT["messages"], "metadata": {"requester_ip_address": "6.6.6.6"},
-            "proxy_server_request": {"headers": {"x-forwarded-for": "6.6.6.6, 198.51.100.4"}}}
-    run(g.async_pre_call_hook({}, None, data, "completion"))
-    assert seen["xff"] == "6.6.6.6, 198.51.100.4"
+def test_the_peer_is_appended_to_the_chain_as_a_proxy_appends_it():
+    # python-adapters#6: the chain went as it came, so a client that reached
+    # LiteLLM directly chose the address jev-edge judged. The peer LiteLLM
+    # saw is appended, one hop, as nginx appends $remote_addr: behind N
+    # appending proxies trusted_hops = N+1 lands on the first one's entry
+    data = {"messages": CHAT["messages"], "metadata": {"requester_ip_address": "203.0.113.4"},
+            "proxy_server_request": psr("/v1/chat/completions", **{"X-Forwarded-For": "6.6.6.6,  198.51.100.4"})}
+    assert xff_sent(data) == "6.6.6.6, 198.51.100.4, 203.0.113.4"
+
+
+def test_a_forged_xff_on_direct_exposure_is_not_the_address_judged():
+    # reached directly (trusted_hops = 1): jev-edge takes the rightmost
+    # entry, the peer, whatever the client wrote before it
+    data = {"messages": CHAT["messages"], "metadata": {"requester_ip_address": "203.0.113.50"},
+            "proxy_server_request": psr("/v1/chat/completions", **{"x-forwarded-for": "6.6.6.6"})}
+    sent = xff_sent(data)
+    assert sent == "6.6.6.6, 203.0.113.50"
+    assert re.findall(r"[^,\s]+", sent)[-1] == "203.0.113.50"  # as jev-edge splits it, trusted_hops = 1
+
+
+def test_the_peer_appended_is_the_proxys_own_on_a_litellm_metadata_route():
+    # Responses: `metadata` is the client's (sent on to the provider), the
+    # proxy's own bag is litellm_metadata; a spoofed requester_ip_address in
+    # the client's metadata is never the hop appended
+    data = {"input": ATTACK, "metadata": {"requester_ip_address": "6.6.6.6"},
+            "litellm_metadata": {"requester_ip_address": "203.0.113.5"},
+            "proxy_server_request": psr("/v1/responses", **{"x-forwarded-for": "198.51.100.4"})}
+    assert xff_sent(data, "aresponses") == "198.51.100.4, 203.0.113.5"
+    # without the proxy's own peer, the placeholder, not the client's value
+    data["litellm_metadata"] = {}
+    assert xff_sent(data, "aresponses") == "198.51.100.4, unknown"
+
+
+@pytest.mark.parametrize("md", [{}, {"requester_ip_address": ""}, {"requester_ip_address": None},
+                                # use_x_forwarded_for on: the client's own header, several entries
+                                {"requester_ip_address": "6.6.6.6, 198.51.100.4"},
+                                {"requester_ip_address": "6.6.6.6 198.51.100.4"}])
+def test_a_chain_without_a_usable_peer_still_gets_exactly_one_hop(md):
+    # 1.80 records no peer without a premium licence: the hop appended is
+    # "unknown", so trusted_hops = N+1 never lands on an entry the client
+    # wrote, and the count never grows by more than one
+    data = {"messages": CHAT["messages"], "metadata": md,
+            "proxy_server_request": psr("/v1/chat/completions", **{"x-forwarded-for": "6.6.6.6, 198.51.100.4"})}
+    assert xff_sent(data) == "6.6.6.6, 198.51.100.4, unknown"
+    # no chain and no usable peer: no address at all, as before
+    data["proxy_server_request"] = psr("/v1/chat/completions")
+    assert xff_sent(data) is None
 
 
 def test_requester_ip_address_without_xff():
@@ -489,8 +527,12 @@ def test_generate_content_is_judged(call_type, route):
 
 
 def test_tool_call_arguments_are_sent_whole():
-    # jev-edge reads every key and string of a tool call's arguments: keys
-    # the media filter drops elsewhere are model-visible text there
+    # tool-call arguments are sent whole because they are model-visible
+    # text: keys the media filter drops elsewhere are text there. jev-edge's
+    # rules read OpenAI's, Anthropic's and the Responses API's arguments,
+    # every key and string; Bedrock's toolUse.input and Gemini's
+    # functionCall.args are sent as the model gets them, though no rule
+    # reads them
     args = {"bytes": ATTACK, "image_url": "https://x/a.png", "inline_data": {"note": "keep"}, "type": "image",
             "source": {"type": "base64", "data": "a string the model wrote", "media_type": "text/plain"}}
     msgs = [{"role": "assistant", "content": None,
@@ -817,6 +859,170 @@ def test_bedrock_pass_through_body_is_judged(bag):
                                                                 "system": ATTACK, "messages": [{"role": "user", "content": "hi"}]},
                                                                route="/bedrock/model/br-claude/invoke"), "allm_passthrough_route"))
     assert seen["body"] == {"messages": [{"role": "system", "content": ATTACK}, {"role": "user", "content": "hi"}]}
+
+
+def b64(text) -> str:
+    return base64.b64encode(text if isinstance(text, bytes) else text.encode()).decode()
+
+
+def test_bedrock_text_document_is_sent_as_text():
+    # A Converse document of a text format is text the model reads, but its
+    # source.bytes were dropped as media and jev-edge reads no document
+    # source: an attack in a .txt attachment, or in a .md a tool returned,
+    # was sent as no text at all. Now it follows its block as a text part
+    doc = {"document": {"format": "txt", "name": "notes", "source": {"bytes": b64(ATTACK)}}}
+    got = body({"messages": [{"role": "user", "content": [{"text": "Summarise the notes"}, doc]}]})
+    assert got["messages"][0]["content"] == [
+        {"text": "Summarise the notes"}, {"document": {"format": "txt", "name": "notes", "source": {}}}, {"text": ATTACK}]
+    result = {"toolResult": {"toolUseId": "t1", "content": [
+        {"text": "fetched"}, {"document": {"format": "md", "name": "page", "source": {"bytes": b64("# Page\n" + ATTACK)}}}]}}
+    got = body({"messages": [{"role": "user", "content": [result, {"text": "go on"}]}]})
+    assert got["messages"][0]["content"] == [
+        {"toolResult": {"toolUseId": "t1", "content": [
+            {"text": "fetched"}, {"document": {"format": "md", "name": "page", "source": {}}}]}},
+        {"text": "# Page\n" + ATTACK}, {"text": "go on"}]
+    # every text format; bytes that are not UTF-8 read with U+FFFD; source.text as it is
+    for fmt in ("txt", "md", "csv", "html", "TXT"):
+        d = {"document": {"format": fmt, "name": "d", "source": {"bytes": b64(b"\xff" + ATTACK.encode())}}}
+        assert body({"messages": [{"role": "user", "content": [d]}]})["messages"][0]["content"][1] == {"text": "\ufffd" + ATTACK}
+    d = {"document": {"format": "txt", "name": "d", "source": {"text": ATTACK}}}
+    assert body({"messages": [{"role": "user", "content": [d]}]})["messages"][0]["content"][1] == {"text": ATTACK}
+    # a binary format stays media: its bytes are left out, no text part
+    pdf = {"document": {"format": "pdf", "name": "q2", "source": {"bytes": b64(b"%PDF-1.7 " + ATTACK.encode())}}}
+    assert body({"messages": [{"role": "user", "content": [pdf]}]})["messages"][0]["content"] == [
+        {"document": {"format": "pdf", "name": "q2", "source": {}}}]
+    # the request LiteLLM sends on is not changed
+    msgs = [{"role": "user", "content": [doc]}]
+    body({"messages": msgs})
+    assert msgs == [{"role": "user", "content": [doc]}] and doc["document"]["source"]["bytes"] == b64(ATTACK)
+
+
+def test_bedrock_text_document_through_the_pass_through_is_judged():
+    transport, seen = fake_authz(status=403, verdict="malicious", score="0.95")
+    converse = {"messages": [{"role": "user", "content": [
+        {"text": "What does it say?"}, {"document": {"format": "txt", "name": "n", "source": {"bytes": b64(ATTACK)}}}]}]}
+    with pytest.raises(Exception) as ei:
+        run(guard(transport).async_pre_call_hook({}, None, bedrock(converse), "allm_passthrough_route"))
+    assert ei.value.status_code == 403
+    assert seen["body"]["messages"][0]["content"][-1] == {"text": ATTACK}
+
+
+UNREADABLE = [
+    ({"bytes": "not base64 @@"}, None),
+    ({"bytes": b64("x" * 2048)}, 1024),                        # past max_body_bytes
+    ({"s3Location": {"uri": "s3://bucket/notes.txt"}}, None),  # not in the request
+    ({}, None),
+]
+
+
+@pytest.mark.parametrize("source,limit", UNREADABLE)
+def test_bedrock_text_document_the_guardrail_cannot_read_leaves_the_rest_judged(source, limit):
+    # A document it cannot read is left out and noted; the text beside it
+    # is judged all the same, so attaching one hides nothing
+    kw = {"max_body_bytes": limit} if limit else {}
+    doc = {"document": {"format": "csv", "name": "n", "source": source}}
+    data = {"messages": [{"role": "user", "content": [{"text": "Summarise the notes"}, doc]}]}
+    unread: list = []
+    assert jg._body_dict(data, (), limit or jg.MAX_BODY_BYTES, unread) == {
+        "messages": [{"role": "user", "content": [{"text": "Summarise the notes"}]}]}
+    assert unread == ["csv"]
+    transport, seen = fake_authz()
+    out = run(guard(transport, **kw).async_pre_call_hook({}, None, dict(data), "acompletion"))
+    assert seen["calls"] == 1
+    assert seen["body"] == {"messages": [{"role": "user", "content": [{"text": "Summarise the notes"}]}]}
+    v = out[jg._metadata_key(out)]["jev_verdict"]
+    assert (v["verdict"], v["source"], v["action"], v["unjudged"]) == (
+        "safe", "l2", "pass", "unjudgeable: call type acompletion: bedrock document csv not readable")
+    # with JEV_EDGE_UNJUDGED=block the unread document blocks what jev-edge passed
+    with pytest.raises(Exception) as ei:
+        run(guard(transport, unjudged="block", **kw).async_pre_call_hook({}, None, dict(data), "acompletion"))
+    assert ei.value.status_code == 403 and seen["calls"] == 2
+    assert ei.value.detail["jev"]["verdict"] == "safe" and ei.value.detail["jev"]["unjudged"].endswith("csv not readable")
+    # in a toolResult: the document is left out of it, its text blocks stay
+    result = {"toolResult": {"toolUseId": "t", "status": "success", "content": [{"text": "fetched"}, doc]}}
+    got = jg._body_dict({"messages": [{"role": "user", "content": [result, {"text": "go on"}]}]}, (), limit or jg.MAX_BODY_BYTES)
+    assert got["messages"][0]["content"] == [
+        {"toolResult": {"toolUseId": "t", "status": "success", "content": [{"text": "fetched"}]}}, {"text": "go on"}]
+    # the request LiteLLM sends on is not changed
+    assert doc == {"document": {"format": "csv", "name": "n", "source": source}}
+    assert result["toolResult"]["content"][1] is doc
+
+
+@pytest.mark.parametrize("source,limit", UNREADABLE)
+def test_bedrock_text_document_alone_the_guardrail_cannot_read_is_unjudged(source, limit):
+    # nothing readable left: nobody can judge the request, `unjudged` decides
+    kw = {"max_body_bytes": limit} if limit else {}
+    doc = {"document": {"format": "csv", "name": "n", "source": source}}
+    for data, call_type in (({"messages": [{"role": "user", "content": [doc]}]}, "acompletion"),
+                            (bedrock({"messages": [{"role": "user", "content": [
+                                {"toolResult": {"toolUseId": "t", "content": [doc]}}]}]}), "allm_passthrough_route")):
+        transport, seen = fake_authz()
+        out = run(guard(transport, **kw).async_pre_call_hook({}, None, dict(data), call_type))
+        assert seen["calls"] == 0
+        v = out[jg._metadata_key(out)]["jev_verdict"]
+        assert (v["verdict"], v["action"], v["reason"]) == (
+            "skipped", "pass", f"unjudgeable: call type {call_type}: bedrock document csv not readable")
+        with pytest.raises(Exception) as ei:
+            run(guard(transport, unjudged="block", **kw).async_pre_call_hook({}, None, dict(data), call_type))
+        assert ei.value.status_code == 403 and seen["calls"] == 0
+
+
+@pytest.mark.parametrize("source,limit", UNREADABLE[1:3])
+@pytest.mark.parametrize("where", ["beside", "in a toolResult"])
+def test_bedrock_attack_beside_a_document_the_guardrail_cannot_read_is_blocked(source, limit, where):
+    # the probe: an attack in a text block next to a document over
+    # max_body_bytes (Bedrock takes up to 4.5 MB) or in S3 reaches jev-edge,
+    # which blocks it with 403, under the default JEV_EDGE_UNJUDGED=pass
+    kw = {"max_body_bytes": limit} if limit else {}
+    doc = {"document": {"format": "txt", "name": "n", "source": source}}
+    block = doc if where == "beside" else {"toolResult": {"toolUseId": "t", "content": [doc]}}
+    converse = {"messages": [{"role": "user", "content": [{"text": ATTACK}, block]}], "inferenceConfig": {"maxTokens": 10}}
+    transport, seen = fake_authz(status=403, verdict="malicious", score="0.95")
+    data = bedrock(converse)
+    with pytest.raises(Exception) as ei:
+        run(guard(transport, **kw).async_pre_call_hook({}, None, data, "allm_passthrough_route"))
+    assert ei.value.status_code == 403 and seen["calls"] == 1
+    assert seen["body"]["messages"][0]["content"][0] == {"text": ATTACK}
+    assert "document" not in json.dumps(seen["body"])
+    v = data["metadata"]["jev_verdict"]
+    assert (v["verdict"], v["action"], v["status"]) == ("malicious", "block", 403)
+    assert v["unjudged"] == "unjudgeable: call type allm_passthrough_route: bedrock document txt not readable"
+    assert ei.value.detail["jev"] == v
+    # monitor mode: noted, not blocked
+    transport, seen = fake_authz(status=403, verdict="malicious", score="0.95")
+    out = run(guard(transport, enforce=False, **kw).async_pre_call_hook({}, None, bedrock(converse), "allm_passthrough_route"))
+    v = out["metadata"]["jev_verdict"]
+    assert seen["calls"] == 1 and v["action"] == "block" and v["unjudged"].endswith("txt not readable")
+
+
+def test_bedrock_documents_the_guardrail_cannot_read_are_all_noted():
+    unread = [{"document": {"format": f, "name": "n", "source": {"s3Location": {"uri": "s3://b/" + f}}}} for f in ("csv", "txt", "csv")]
+    readable = {"document": {"format": "md", "name": "r", "source": {"bytes": b64(ATTACK)}}}
+    data = {"messages": [{"role": "user", "content": unread[:2] + [readable]},
+                         {"role": "user", "content": [{"toolResult": {"toolUseId": "t", "content": [unread[2]]}}]}]}
+    transport, seen = fake_authz()
+    out = run(guard(transport).async_pre_call_hook({}, None, data, "acompletion"))
+    # the readable one is judged
+    assert seen["body"]["messages"][0]["content"] == [
+        {"document": {"format": "md", "name": "r", "source": {}}}, {"text": ATTACK}]
+    assert seen["body"]["messages"][1]["content"] == [{"toolResult": {"toolUseId": "t", "content": []}}]
+    assert out["metadata"]["jev_verdict"]["unjudged"] == (
+        "unjudgeable: call type acompletion: 3 bedrock documents (csv, txt) not readable")
+
+
+def test_bedrock_document_the_guardrail_cannot_read_with_the_judge_unavailable():
+    # the text beside it fails open as any judged text does; the document
+    # nobody could read is passed or blocked as `unjudged` says all the same
+    data = {"messages": [{"role": "user", "content": [
+        {"text": "Summarise the notes"}, {"document": {"format": "txt", "name": "n", "source": {"s3Location": {"uri": "s3://b/n"}}}}]}]}
+    for transport in (httpx.MockTransport(lambda r: httpx.Response(503)),
+                      httpx.MockTransport(lambda r: (_ for _ in ()).throw(httpx.ConnectError("refused")))):
+        out = run(guard(transport).async_pre_call_hook({}, None, dict(data), "acompletion"))
+        v = out["metadata"]["jev_verdict"]
+        assert (v["verdict"], v["action"]) == ("error", "pass") and v["unjudged"].endswith("txt not readable")
+        with pytest.raises(Exception) as ei:
+            run(guard(transport, unjudged="block").async_pre_call_hook({}, None, dict(data), "acompletion"))
+        assert ei.value.status_code == 403 and ei.value.detail["jev"]["verdict"] == "error"
 
 
 @pytest.mark.parametrize("call_type,data", [
@@ -1209,7 +1415,7 @@ def test_batch_upload_is_left_to_litellms_per_line_scan(monkeypatch):
     assert sorted(seen["bodies"], key=json.dumps) == sorted([
         {"messages": [{"role": "user", "content": ATTACK}]},
         {"messages": [{"role": "system", "content": "Be brief."}], "input": ATTACK}], key=json.dumps)
-    assert seen["xff"] == "198.51.100.7"  # the uploader's address, not the proxy's
+    assert seen["xff"] == "198.51.100.7, 203.0.113.8"  # the upload's chain and peer, for every line
 
 
 @pytest.mark.parametrize("spec,expected", [(ModuleNotFoundError("No module named 'litellm'"), False), (None, False),
@@ -1530,7 +1736,7 @@ def test_the_test_endpoint_on_1_102_is_judged_once_with_the_callers_address():
 
     assert run(request()) == {"texts": [ATTACK]}
     assert seen["calls"] == 1
-    assert (seen["body"], seen["xff"]) == ({"input": [ATTACK], "messages": []}, "198.51.100.77")
+    assert (seen["body"], seen["xff"]) == ({"input": [ATTACK], "messages": []}, "198.51.100.77, 127.0.0.1")
     # a request that did not come through that hook is judged on its own
     run(g.apply_guardrail(inputs={"texts": [ATTACK]}, request_data={}, input_type="request"))
     assert seen["calls"] == 2

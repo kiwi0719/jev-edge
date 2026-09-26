@@ -1,12 +1,26 @@
 package main
 
 import (
+	"bytes"
+	"encoding/binary"
+	"errors"
+	"flag"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	spop "github.com/negasus/haproxy-spoe-go/client"
+	"github.com/negasus/haproxy-spoe-go/frame"
+	"github.com/negasus/haproxy-spoe-go/logger"
+	"github.com/negasus/haproxy-spoe-go/request"
+	"github.com/negasus/haproxy-spoe-go/varint"
 )
 
 func TestCopyHeadersDropsClientIPAndVerdict(t *testing.T) {
@@ -214,6 +228,70 @@ func TestMalformedPathIsBlockedWith400(t *testing.T) {
 	}
 }
 
+// The path is taken from the request target (spoe.conf's uri) as nginx
+// takes it. HAProxy's path fetch skips to the first '/' anywhere in the
+// target: "?x", "*" and "host:443" came as "" and were judged as "/", and
+// "?a/v1/chat/completions" as /v1/chat/completions, where nginx answers 400.
+// An absolute-form target (HTTP/2, a proxy request) gives the path after
+// its host, and "/" without one. Without uri (an older spoe.conf) the path
+// argument is read as before.
+func TestPathIsTakenFromTheRequestTargetAsNginxDoes(t *testing.T) {
+	var got string
+	authz(t, func(w http.ResponseWriter, r *http.Request) {
+		got = r.RequestURI
+		w.Header().Set("X-Jev-Verdict", "malicious")
+		w.WriteHeader(403)
+	})
+	for uri, want := range map[string]string{
+		"/v1/chat/completions?stream=true":                  "/v1/chat/completions",
+		"http://h/v1/chat/completions":                      "/v1/chat/completions",
+		"https://api.example:8443/v1/chat/completions?x=/y": "/v1/chat/completions",
+		"HTTP://h/v1/x/../chat/completions":                 "/v1/chat/completions",
+		"http://user@h//v1/chat/completions#f":              "/v1/chat/completions",
+		"http://h":                                          "/",
+		"http://h?a/v1/chat/completions":                    "/",
+		"http://h#/v1/chat/completions":                     "/",
+		"//v1/chat/completions":                             "/v1/chat/completions",
+	} {
+		for _, unj := range []string{"pass", "block"} {
+			*unjudged = unj
+			got = ""
+			// path: what HAProxy's path fetch gives, which uri overrides
+			if v := check(msg(map[string]string{"method": "POST", "uri": uri, "path": "/v1/chat/completions", "body": "{}"})); v["verdict"] != "malicious" || v["status"] != "403" {
+				t.Fatalf("-unjudged=%s uri %q: vars = %v", unj, uri, v)
+			}
+			if got != "/_jev/authz"+want {
+				t.Fatalf("uri %q: jev-edge saw %q, want %q", uri, got, "/_jev/authz"+want)
+			}
+		}
+	}
+	want := map[string]string{"verdict": "skipped", "score": "0.00", "source": "adapter",
+		"reason": "invalid+path", "action": "block", "rid": "", "status": "400"}
+	for uri, path := range map[string]string{
+		"?x": "", "?": "", "#frag": "", "*": "", "api.example:443": "", "?a/v1/chat/completions": "/v1/chat/completions",
+		"#/v1/chat/completions": "/v1/chat/completions", "h2c+x://h/v1/chat/completions": "/v1/chat/completions",
+		"://h/v1/chat/completions": "/v1/chat/completions", "v1/chat/completions": "",
+	} {
+		for _, unj := range []string{"pass", "block"} {
+			*unjudged = unj
+			got = ""
+			if v := check(msg(map[string]string{"method": "POST", "uri": uri, "path": path, "body": "{}"})); !reflect.DeepEqual(v, want) || got != "" {
+				t.Fatalf("-unjudged=%s uri %q: vars = %v, jev-edge saw %q", unj, uri, v, got)
+			}
+		}
+	}
+	// an older spoe.conf sends path only: read as before, "" as "/"
+	for path, want := range map[string]string{"/v1/chat/completions?x": "/v1/chat/completions", "": "/"} {
+		got = ""
+		if v := check(msg(map[string]string{"method": "POST", "path": path, "body": "{}"})); v["verdict"] != "malicious" {
+			t.Fatalf("path %q without uri: vars = %v", path, v)
+		}
+		if got != "/_jev/authz"+want {
+			t.Fatalf("path %q without uri: jev-edge saw %q, want %q", path, got, "/_jev/authz"+want)
+		}
+	}
+}
+
 // Well-formed escapes reach jev-edge as nginx reads them inline: UTF-8, an
 // escaped control character, and escapes of bytes that are not UTF-8 (the
 // overlong %C0%AE, %FF), which nginx and HAProxy take and jev-edge judges;
@@ -367,5 +445,273 @@ func TestMethodNetHTTPCannotSendIsRefusedWith400(t *testing.T) {
 		if v := check(msg(map[string]string{"method": m, "path": "/v1/chat/completions", "body": "{}"})); v["verdict"] != "safe" || method != m {
 			t.Fatalf("%q: vars = %v, jev-edge saw %q", m, v, method)
 		}
+	}
+}
+
+// envoy-haproxy-fwdauth#4: the agent used net/http's default transport,
+// which keeps 2 idle connections per host, and drained 4 KiB of an answer:
+// with 32 checks in flight nearly every one opened a new connection to
+// jev-edge, and so did every answer with a body past 4 KiB. The client
+// keeps -max-idle (64) and drains up to 64 KiB.
+func TestChecksReuseConnectionsToJevEdge(t *testing.T) {
+	for _, bodySize := range []int{0, 16 << 10} {
+		var opened atomic.Int64
+		ts := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("X-Jev-Verdict", "malicious")
+			w.WriteHeader(403)
+			w.Write(bytes.Repeat([]byte("x"), bodySize))
+		}))
+		ts.Config.ConnState = func(_ net.Conn, s http.ConnState) {
+			if s == http.StateNew {
+				opened.Add(1)
+			}
+		}
+		ts.Start()
+		oldUp, oldClient := *upstream, client
+		*upstream, client = ts.URL+"/_jev/authz", newClient(5*time.Second, 64)
+		var wg sync.WaitGroup
+		var blocked atomic.Int64
+		jobs := make(chan struct{})
+		for w := 0; w < 32; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for range jobs {
+					v := check(msg(map[string]string{"method": "POST", "path": "/v1/chat/completions", "body": "{}"}))
+					if v["action"] == "block" {
+						blocked.Add(1)
+					}
+				}
+			}()
+		}
+		for i := 0; i < 1600; i++ {
+			jobs <- struct{}{}
+		}
+		close(jobs)
+		wg.Wait()
+		*upstream, client = oldUp, oldClient
+		ts.Close()
+		if blocked.Load() != 1600 {
+			t.Fatalf("body %d: %d of 1600 checks blocked", bodySize, blocked.Load())
+		}
+		if n := opened.Load(); n > 64 {
+			t.Fatalf("body %d: 1600 checks at 32 in flight opened %d connections, want at most 64", bodySize, n)
+		}
+	}
+}
+
+func TestNewClientPool(t *testing.T) {
+	tr := newClient(time.Second, 64).Transport.(*http.Transport)
+	if tr.MaxIdleConnsPerHost != 64 || tr.MaxIdleConns != 256 || tr.IdleConnTimeout != 90*time.Second {
+		t.Fatalf("pool: per host %d, total %d, idle timeout %s", tr.MaxIdleConnsPerHost, tr.MaxIdleConns, tr.IdleConnTimeout)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// lead-gateways-live#22: the SPOP listener. It bound every interface by
+// default, and haproxy-spoe-go allocates a frame's declared length before
+// reading it, with no deadline and no cap on connections.
+// ---------------------------------------------------------------------------
+
+// agentOn serves the SPOP worker behind the guard on a loopback port; h
+// sees every NOTIFY's request.
+func agentOn(t *testing.T, maxConns int64, maxFrame uint32, ttl time.Duration, h func(*request.Request)) *guardListener {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gl := &guardListener{Listener: ln, max: maxConns, frame: maxFrame, ttl: ttl}
+	t.Cleanup(func() { ln.Close() })
+	go serve(gl, h, logger.NewNop())
+	return gl
+}
+
+func dial(t *testing.T, gl *guardListener) net.Conn {
+	t.Helper()
+	c, err := net.Dial("tcp", gl.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Close() })
+	return c
+}
+
+// hello does the HAPROXY-HELLO / AGENT-HELLO exchange; nil when the agent answered.
+func hello(c net.Conn) error {
+	cl := spop.NewClient(c)
+	c.SetDeadline(time.Now().Add(2 * time.Second))
+	defer c.SetDeadline(time.Time{})
+	return cl.Init()
+}
+
+// notify sends one NOTIFY frame carrying message check-request with a body
+// argument, and returns the type of the frame the agent answered with.
+func notify(c net.Conn, body []byte) (frame.Type, error) {
+	var p []byte
+	p = append(p, byte(frame.TypeNotify), 0, 0, 0, 1, 1, 1) // FIN, stream 1, frame 1
+	p = appendVarint(p, uint64(len("check-request")))
+	p = append(p, "check-request"...)
+	p = append(p, 1) // one argument
+	p = appendVarint(p, 4)
+	p = append(p, "body"...)
+	p = append(p, 9) // binary
+	p = appendVarint(p, uint64(len(body)))
+	p = append(p, body...)
+	var hdr [4]byte
+	binary.BigEndian.PutUint32(hdr[:], uint32(len(p)))
+	c.SetDeadline(time.Now().Add(2 * time.Second))
+	defer c.SetDeadline(time.Time{})
+	if _, err := c.Write(append(hdr[:], p...)); err != nil {
+		return 0, err
+	}
+	f := frame.AcquireFrame()
+	defer frame.ReleaseFrame(f)
+	if _, err := io.ReadFull(c, hdr[:]); err != nil {
+		return 0, err
+	}
+	rest := make([]byte, binary.BigEndian.Uint32(hdr[:]))
+	if _, err := io.ReadFull(c, rest); err != nil {
+		return 0, err
+	}
+	return frame.Type(rest[0]), nil
+}
+
+func appendVarint(p []byte, n uint64) []byte {
+	var b [10]byte
+	return append(p, b[:varint.PutUvarint(b[:], n)]...)
+}
+
+// closedWithin reports whether the agent closes c within d.
+func closedWithin(c net.Conn, d time.Duration) bool {
+	c.SetReadDeadline(time.Now().Add(d))
+	_, err := io.ReadAll(c)
+	var ne net.Error
+	return !(errors.As(err, &ne) && ne.Timeout())
+}
+
+// The length is refused before haproxy-spoe-go sees it: the frameConn
+// returns no byte of it, so nothing is allocated for it.
+func TestFrameConnRefusesALengthBeforeTheLibraryReadsIt(t *testing.T) {
+	for _, l := range []uint32{0, 1, 4, 6, 1025, 1 << 31, 0xFFFFFFFF} {
+		a, b := net.Pipe()
+		fc := &frameConn{Conn: b, max: 1024, ttl: time.Second, release: func() {}}
+		var hdr [4]byte
+		binary.BigEndian.PutUint32(hdr[:], l)
+		go a.Write(append(hdr[:], 1, 0, 0, 0, 0))
+		buf := make([]byte, 64)
+		n, err := fc.Read(buf)
+		if !errors.Is(err, errFrameSize) || n != 0 {
+			t.Fatalf("length %d: read %d bytes, err %v; want 0 and errFrameSize", l, n, err)
+		}
+		if _, err := fc.Read(buf); !errors.Is(err, errFrameSize) {
+			t.Fatalf("length %d: a second read went through: %v", l, err)
+		}
+		a.Close()
+	}
+}
+
+func TestOversizedOrShortFramesCloseTheConnectionAndTheAgentServesOn(t *testing.T) {
+	var got atomic.Int64
+	gl := agentOn(t, 16, 131072, time.Second, func(r *request.Request) {
+		if m, err := r.Messages.GetByName("check-request"); err == nil {
+			if v, ok := m.KV.Get("body"); ok {
+				got.Store(int64(len(str(v))))
+			}
+		}
+	})
+	for _, l := range []uint32{0xFFFFFFF0, 131073, 0, 3, 6} {
+		c := dial(t, gl)
+		var hdr [4]byte
+		binary.BigEndian.PutUint32(hdr[:], l)
+		c.Write(append(hdr[:], byte(frame.TypeHaproxyHello)))
+		if !closedWithin(c, time.Second) {
+			t.Fatalf("length %d: connection left open", l)
+		}
+	}
+	// a frame haproxy-spoe-go panics on (a stream id varint cut short) closes
+	// that connection, not the agent
+	c := dial(t, gl)
+	c.Write([]byte{0, 0, 0, 7, byte(frame.TypeHaproxyHello), 0, 0, 0, 1, 0xF0, 0x80})
+	if !closedWithin(c, time.Second) {
+		t.Fatal("malformed frame: connection left open")
+	}
+	// and a frame as large as the reference tune.bufsize allows is served
+	c = dial(t, gl)
+	if err := hello(c); err != nil {
+		t.Fatalf("hello after the refused frames: %v", err)
+	}
+	body := bytes.Repeat([]byte("a"), 120<<10)
+	if typ, err := notify(c, body); err != nil || typ != frame.TypeAgentAck {
+		t.Fatalf("120 KiB notify: %v %v", typ, err)
+	}
+	if got.Load() != int64(len(body)) {
+		t.Fatalf("handler saw a %d-byte body, want %d", got.Load(), len(body))
+	}
+}
+
+func TestAStalledFrameIsClosedAndAnIdleConnectionIsNot(t *testing.T) {
+	gl := agentOn(t, 16, 131072, 200*time.Millisecond, func(*request.Request) {})
+	// idle between frames, well past the frame timeout: still served
+	idle := dial(t, gl)
+	if err := hello(idle); err != nil {
+		t.Fatal(err)
+	}
+	// a frame that stops arriving: closed once its time is up
+	stalled := dial(t, gl)
+	start := time.Now()
+	stalled.Write([]byte{0, 0, 0, 100, byte(frame.TypeHaproxyHello), 0, 0, 0, 1})
+	if !closedWithin(stalled, 3*time.Second) {
+		t.Fatal("stalled frame: connection left open")
+	}
+	if d := time.Since(start); d < 150*time.Millisecond || d > 2*time.Second {
+		t.Fatalf("stalled frame closed after %s, want about 200ms", d)
+	}
+	// so is one whose length never finishes
+	cut := dial(t, gl)
+	cut.Write([]byte{0, 0})
+	if !closedWithin(cut, 3*time.Second) {
+		t.Fatal("cut length: connection left open")
+	}
+	time.Sleep(600 * time.Millisecond)
+	for i := 0; i < 3; i++ {
+		if typ, err := notify(idle, []byte("{}")); err != nil || typ != frame.TypeAgentAck {
+			t.Fatalf("idle connection, notify %d: %v %v", i, typ, err)
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+}
+
+func TestConnectionsPastTheCapAreClosed(t *testing.T) {
+	gl := agentOn(t, 2, 131072, time.Second, func(*request.Request) {})
+	c1, c2 := dial(t, gl), dial(t, gl)
+	for _, c := range []net.Conn{c1, c2} {
+		if err := hello(c); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c3 := dial(t, gl)
+	if !closedWithin(c3, time.Second) {
+		t.Fatal("a third connection was served with -max-conns 2")
+	}
+	if gl.refused.Load() != 1 {
+		t.Fatalf("refused = %d", gl.refused.Load())
+	}
+	c1.Close()
+	deadline := time.Now().Add(2 * time.Second)
+	for atomic.LoadInt64(&gl.active) > 1 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := hello(dial(t, gl)); err != nil {
+		t.Fatalf("a connection after one closed: %v", err)
+	}
+	if typ, err := notify(c2, []byte("{}")); err != nil || typ != frame.TypeAgentAck {
+		t.Fatalf("c2: %v %v", typ, err)
+	}
+}
+
+func TestListenDefaultsToLoopback(t *testing.T) {
+	if f := flag.Lookup("listen"); f.DefValue != "127.0.0.1:9000" {
+		t.Fatalf("-listen defaults to %q", f.DefValue)
 	}
 }

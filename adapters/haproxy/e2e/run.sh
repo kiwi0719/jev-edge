@@ -63,7 +63,7 @@ check "one 9 KiB header: attack still judged" "403" \
   "$(http_code -H 'Content-Type: application/json' -H "X-Pad: $(pad 9216 a)" -H 'X-Jev-Mock-Score: 0.97' -d "$ATTACK" $base/v1/chat/completions)"
 check "8 KB watched path: attack still judged" "403" "$(http_code -H 'Content-Type: application/json' -H 'X-Jev-Mock-Score: 0.97' -d "$ATTACK" "$base$P8")"
 
-# Partial body: past the 96 KiB spoe.conf sends (and past tune.bufsize) the
+# Partial body: past the 88 KiB spoe.conf sends (and past tune.bufsize) the
 # agent sees req.body_size > len(req.body) and sets X-Jev-Body-Partial: 1,
 # and jev-edge scans the cut body as a head. Content-Length and chunked both.
 PAD=$(yes 'The quarterly report covers revenue, costs and hiring across all regions.' | head -n 2500 | tr '\n' ' ')
@@ -157,6 +157,25 @@ for p in '/../v1/chat/completions' '/v1/%2e%2e/%2e%2e/_jev/metrics'; do
     check "path above the root $p (${b##*:}): 400" '400 {"error":"request rejected"}' "$code $(cat /tmp/jev-haproxy-body)"
   done
 done
+# The path comes from the request target (spoe.conf's uri). HAProxy's path
+# fetch skips to the first '/' anywhere in it, so a target HAProxy takes and
+# nginx refuses with 400 came as "" and was judged as "/": "OPTIONS *" is one.
+# HAProxy 3.1 refuses "?x", "?a/v1/..." and "host:443" itself with 400. An
+# absolute-form target is judged on the path after its host, "/" without one.
+for b in $base $bbase; do
+  code=$(curl -s -X OPTIONS --request-target '*' -o /tmp/jev-haproxy-body -w '%{http_code}' -H 'Content-Type: application/json' -d "$ATTACK" "$b/")
+  check "request target * (${b##*:}): 400" '400 {"error":"request rejected"}' "$code $(cat /tmp/jev-haproxy-body)"
+done
+for p in '?a/v1/chat/completions' '?x'; do
+  check "request target $p: 400" "400" \
+    "$(curl -s --request-target "$p" -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' -d "$ATTACK" "$base/")"
+done
+code=$(curl -s --request-target 'http://api.example/v1/chat/completions?x=/y' -o /dev/null -w '%{http_code}' -H 'Host: api.example' \
+       -H 'Content-Type: application/json' -H 'X-Jev-Mock-Score: 0.97' -d "$ATTACK" "$base/")
+check "absolute-form target is judged on its path" "403 /_jev/authz/v1/chat/completions" "$code $(authz_uri)"
+code=$(curl -s --request-target 'http://api.example' -o /dev/null -w '%{http_code}' -H 'Host: api.example' \
+       -H 'Content-Type: application/json' -H 'X-Jev-Mock-Score: 0.97' -d "$ATTACK" "$base/")
+check "absolute-form target without a path is judged as /" "403 /_jev/authz/" "$code $(authz_uri)"
 
 # A header net/http cannot send failed the agent open. HAProxy passes a
 # control character in a value (nginx takes it inline too; left out, a

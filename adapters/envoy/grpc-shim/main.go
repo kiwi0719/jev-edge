@@ -8,7 +8,8 @@
 //
 // Contract: only an answer that carries X-Jev-Verdict is trusted. 200 with the
 // header is a decision (OK, headers copied upstream); status >= 400 with the
-// header is a block (PermissionDenied with that status, body and headers).
+// header is a block (PermissionDenied with that status and body, and only
+// Content-Type, X-Jev-Verdict and X-Jev-Request-Id for the client).
 // An answer without the header below 500 (nginx refusing the request before
 // jev-edge runs: 400, 413, 414; a 404 from something that is not jev-edge)
 // means nobody judged it: X-Jev-Verdict: skipped with reason
@@ -72,13 +73,16 @@ func (s *server) Check(ctx context.Context, req *authv3.CheckRequest) (*authv3.C
 		method = http.MethodGet
 	}
 	path := httpReq.GetPath()
-	// the query, and a fragment: nginx ends $uri at a '#' (net/url would
-	// have taken the rest for the URL's fragment and not sent it)
-	if i := strings.IndexAny(path, "?#"); i >= 0 {
-		path = path[:i]
-	}
 	if path == "" {
 		path = "/"
+	}
+	// the query, and a fragment: nginx ends $uri at a '#' (net/url would
+	// have taken the rest for the URL's fragment and not sent it). A :path
+	// of "?x" leaves nothing, which normalizePath refuses with 400, as nginx
+	// refuses a target that does not start with '/' (Envoy itself answers
+	// such a :path with 404 before ext_authz runs)
+	if i := strings.IndexAny(path, "?#"); i >= 0 {
+		path = path[:i]
 	}
 	// a dot segment, an encoded dot or a doubled slash (Istio, for one, does
 	// not merge slashes by default) is judged the way nginx reads it inline,
@@ -163,19 +167,35 @@ func (s *server) Check(ctx context.Context, req *authv3.CheckRequest) (*authv3.C
 		return failOpen(fmt.Sprintf("adapter answered %d", resp.StatusCode)), nil
 	}
 
-	if ct := resp.Header.Get("Content-Type"); ct != "" {
-		headers = append(headers, overwrite("Content-Type", ct))
-	}
 	return &authv3.CheckResponse{
 		Status: &rpcstatus.Status{Code: int32(codes.PermissionDenied)},
 		HttpResponse: &authv3.CheckResponse_DeniedResponse{
 			DeniedResponse: &authv3.DeniedHttpResponse{
 				Status:  &typev3.HttpStatus{Code: typev3.StatusCode(resp.StatusCode)},
-				Headers: headers,
+				Headers: clientHeaders(resp.Header),
 				Body:    string(respBody),
 			},
 		},
 	}, nil
+}
+
+// clientHeaders are the headers a block hands to the client: Envoy puts
+// DeniedHttpResponse.Headers on its local reply as they are, so only
+// Content-Type, X-Jev-Verdict and X-Jev-Request-Id (jev-edge's client
+// contract, verdict.client_headers). X-Jev-Score, X-Jev-Reason and
+// X-Jev-Source stay in jev-edge's log: on a block they would tell the
+// client how far over the threshold it is, which question fired and
+// whether the answer came from the cache, a score oracle to walk a prompt
+// under block_threshold. (envoy-http.yaml's allowed_client_headers hands
+// on Content-Type alone.)
+func clientHeaders(h http.Header) []*corev3.HeaderValueOption {
+	out := make([]*corev3.HeaderValueOption, 0, 3)
+	for _, k := range []string{"Content-Type", "X-Jev-Verdict", "X-Jev-Request-Id"} {
+		if v := h.Get(k); v != "" {
+			out = append(out, overwrite(k, v))
+		}
+	}
+	return out
 }
 
 // normalizePath returns the path nginx reads from p into $uri, the path

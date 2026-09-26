@@ -101,6 +101,42 @@ local cases = {
   { "rockspec: does not load", { [spec] = edit(rs, "\nbuild = {", "\nbuild = {{") },
     "rockspec-modules", "does not load" },
 
+  -- grafana-state-timeline (audit lead-github-ops#33)
+  { "grafana: the breaker panel colours by thresholds again",
+    { ["ops/grafana/jev-edge.json"] = edit(read("ops/grafana/jev-edge.json"),
+        '("title": "Breaker state".-"color": {%s*"mode": )"fixed"', '%1"thresholds"') },
+    "grafana-state-timeline", "state timeline Breaker state has value mappings and color mode thresholds" },
+  { "grafana: no state timeline left to check",
+    { ["ops/grafana/jev-edge.json"] = edit(read("ops/grafana/jev-edge.json"),
+        '"type": "state%-timeline"', '"type": "timeseries"') },
+    "grafana-state-timeline", "no state-timeline panel found" },
+
+  -- grafana-legend (audit lead-github-ops#34)
+  { "grafana: the subject blocks panel sums the instance away again",
+    { ["ops/grafana/jev-edge.json"] = edit(read("ops/grafana/jev-edge.json"),
+        '"sum by %(instance%) %((rate%(jev_subject_blocks_total)', '"sum(%1') },
+    "grafana-legend", "legend {{instance}} names instance, which sum drops" },
+  { "grafana: a by clause that keeps another label",
+    { ["ops/grafana/jev-edge.json"] = edit(read("ops/grafana/jev-edge.json"),
+        '"sum by %(action%)', '"sum by (verdict)') },
+    "grafana-legend", "legend {{action}} names action, which sum drops" },
+  { "grafana: max by after the parentheses keeps the label",
+    { ["ops/grafana/jev-edge.json"] = edit(read("ops/grafana/jev-edge.json"),
+        '"max by %(instance%) %((jev_breaker_state{[^}]*})%)', '"max(%1) by (instance)') } },
+
+  -- gateway-headers: Traefik must not relay the client's X-Forwarded-Uri (audit openresty-edge#8)
+  { "traefik: trustForwardHeader true",
+    { ["adapters/forward-auth/traefik.yml"] = edit(read("adapters/forward-auth/traefik.yml"),
+        "trustForwardHeader: false", "trustForwardHeader: true") },
+    "gateway-headers", "traefik.yml sets trustForwardHeader: true" },
+  { "traefik: trustForwardHeader true with a comment",
+    { ["adapters/forward-auth/traefik.yml"] = edit(read("adapters/forward-auth/traefik.yml"),
+        "trustForwardHeader: false", "trustForwardHeader: true  # behind the LB") },
+    "gateway-headers", "traefik.yml sets trustForwardHeader: true" },
+  { "traefik: trustForwardHeader left to Traefik's default (false)",
+    { ["adapters/forward-auth/traefik.yml"] = edit(read("adapters/forward-auth/traefik.yml"),
+        "\n%s*trustForwardHeader: false", "") } },
+
   -- ci-ok: every job, whatever the jobs: line looks like (audit ci-release#5)
   { "ci.yml: new job not in needs", { [CI] = with_newjob(ci) }, "ci-ok", "ci-ok does not need job newjob" },
   { "ci.yml: jobs: with a comment, new job not in needs",

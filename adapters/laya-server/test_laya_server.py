@@ -143,6 +143,183 @@ class Windows(unittest.TestCase):
         self.assertGreater(usage["windows"], 1)
 
 
+class Expanding(L.MockBackend):
+    """The mock with an NFKC normalizer's worst character: U+FDFA becomes
+    18 characters, each a token here, and every one of them maps back to
+    the one character's span, as tokenizers report offsets."""
+
+    N = 18
+
+    def spans(self, text):
+        out = []
+        for a, b in super().spans(text):
+            i = a
+            for j in range(a, b):
+                if text[j] == "\ufdfa":
+                    if j > i:
+                        out.append((i, j))
+                    out.extend([(j, j + 1)] * self.N)
+                    i = j + 1
+            if b > i:
+                out.append((i, b))
+        return out
+
+
+class ExpandingWindows(unittest.TestCase):
+    """python-adapters#11: windows were sliced on character spans, which
+    cannot split a character, and never counted again: a window that began
+    or ended inside U+FDFA took all 18 of its tokens, past the room, and a
+    pair of 1027 tokens broke a model of 1024 positions (500, fail open)."""
+
+    def setUp(self):
+        self.s = L.Scorer(Expanding(), max_tokens=64, overlap=8, max_windows=8)
+        self.room = 64 - 3 - 1 - L.SLACK  # question "q": one token
+
+    def placed(self, text, ws):
+        """Each window's (start, end) in text, in order."""
+        out, pos = [], 0
+        for w in ws:
+            pos = text.find(w, pos)
+            self.assertGreaterEqual(pos, 0, w)
+            out.append((pos, pos + len(w)))
+        return out
+
+    def test_every_window_fits_and_the_text_is_covered_with_overlap(self):
+        text = " ".join(f"w{i}" + "\ufdfa" * (i % 3) for i in range(24))
+        self.assertGreater(self.s.b.count(text), 4 * self.room)
+        self.s.max_windows = 32
+        counts = {}
+        ws = self.s.windows("q", text, counts=counts)
+        self.assertGreater(len(ws), 1)
+        for w in ws:
+            self.assertLessEqual(self.s.b.count(w), self.room, w)
+            self.assertEqual(counts[w], self.s.b.count(w))
+        at = self.placed(text, ws)
+        self.assertEqual(at[0][0], 0)
+        self.assertEqual(at[-1][1], len(text))
+        for (a0, a1), (b0, _) in zip(at, at[1:]):
+            self.assertLess(a0, b0)  # it moves on
+            self.assertLess(b0, a1)  # and overlaps the one before: nothing between them is skipped
+            self.assertGreaterEqual(self.s.b.count(text[b0:a1]), 8)  # by at least LAYA_WINDOW_OVERLAP
+
+    def test_a_run_of_the_character_alone(self):
+        # 6 of it (108 tokens) needs windows of 2 (36): the next holds one
+        # back for the overlap, so 5, each well inside the model
+        text = "\ufdfa" * 6
+        ws = self.s.windows("q", text)
+        self.assertEqual(ws, ["\ufdfa" * 2] * 5)
+        pair = self.s.b.pair_overhead + self.s.b.count("q") + max(self.s.b.count(w) for w in ws)
+        self.assertLessEqual(pair, 64)
+
+    def test_more_than_max_windows_is_refused_not_cut(self):
+        with self.assertRaises(L.Refused) as cm:
+            self.s.windows("q", "\ufdfa" * 12)  # 216 tokens: 11 windows of 2
+        self.assertEqual((cm.exception.status, cm.exception.code), (413, "input_too_long"))
+        self.assertIn("needs more than 8 windows", cm.exception.message)
+
+    def test_one_character_over_the_room_is_refused(self):
+        s = L.Scorer(Expanding(), max_tokens=29, overlap=8, max_windows=8)
+        self.assertEqual(29 - 3 - 1 - L.SLACK, Expanding.N - 1)  # the room
+        with self.assertRaises(L.Refused) as cm:
+            s.windows("q", "a " * 30 + "\ufdfa")
+        self.assertEqual((cm.exception.status, cm.exception.code), (413, "input_too_long"))
+        self.assertIn("one character of the text is 18 tokens, over the 17 of a window", cm.exception.message)
+
+    def test_a_short_window_before_a_long_character_does_not_repeat(self):
+        # the words before the character fill a window that cannot take it;
+        # the next starts where the character fits, rather than 8 tokens
+        # back each time, which cut the same window over and over
+        s = L.Scorer(Expanding(), max_tokens=40, overlap=8, max_windows=8)  # room 28
+        text = " ".join(f"w{i}" for i in range(24)) + " \ufdfa\ufdfa x"
+        ws = s.windows("q", text)
+        self.assertEqual(len(set(ws)), len(ws), ws)
+        at = self.placed(text, ws)
+        self.assertEqual((at[0][0], at[-1][1]), (0, len(text)))
+        for (_, a1), (b0, b1) in zip(at, at[1:]):
+            self.assertLess(a1, b1)
+            self.assertLessEqual(b0, a1)
+
+    def test_the_attack_after_the_characters_is_seen_and_the_usage_counts_each_window(self):
+        text = "\ufdfa" * 4 + " ATTACK"
+        ans, usage = self.s.score(text, {"injection": Q})
+        self.assertGreater(ans["injection"]["noul"], 0.5)
+        ws = self.s.windows("Is this an attack?", text)
+        head = self.s.b.count("Is this an attack?") + self.s.b.pair_overhead
+        self.assertEqual(usage["windows"], len(ws))
+        self.assertEqual(usage["input_tokens"], sum(head + self.s.b.count(w) for w in ws))
+
+
+def questions(n: int) -> dict:
+    return {f"q{i}": dict(Q) for i in range(n)}
+
+
+class Counting(L.MockBackend):
+    """The mock, counting how often it tokenizes a judged text (count() is
+    the question segment and the windows) and scores a window."""
+
+    def __init__(self):
+        self.spans_calls, self.scored = 0, 0
+
+    def spans(self, text):
+        self.spans_calls += 1
+        return L.MockBackend.spans(self, text)
+
+    def count(self, text):
+        return len(L.MockBackend.spans(self, text))
+
+    def logit(self, first, second):
+        self.scored += 1
+        return super().logit(first, second)
+
+
+class Questions(unittest.TestCase):
+    """python-adapters#10: a request could ask any number of questions, and
+    each one tokenized and scored the whole text again: one 256 KB request
+    of 5,000 trivial questions ran 38,000 window scorings."""
+
+    def test_more_than_max_questions_is_413(self):
+        L.validate({"state": "x", "questions": questions(8)})
+        with self.assertRaises(L.Refused) as cm:
+            L.validate({"state": "x", "questions": questions(9)})
+        self.assertEqual((cm.exception.status, cm.exception.code), (413, "too_many_questions"))
+        for env, n, want in (({}, 8, 200), ({}, 9, 413), ({"LAYA_MAX_QUESTIONS": "2"}, 2, 200),
+                             ({"LAYA_MAX_QUESTIONS": "2"}, 3, 413)):
+            srv, url = serve(env)
+            try:
+                t = conformance.Target(url, None, "laya", 5)
+                body = json.dumps({"state": "hello", "questions": questions(n)}).encode()
+                status, data, _ = t.request("POST", "/v1/systemone", body)
+            finally:
+                stop(srv)
+            self.assertEqual(status, want, (env, n, data))
+            if want == 413:
+                self.assertEqual(json.loads(data)["error"]["code"], "too_many_questions")
+                self.assertIsNone(conformance.check_error_body(data))
+
+    def test_the_text_is_tokenized_once_per_request(self):
+        b = Counting()
+        s = L.Scorer(b, max_tokens=64, overlap=8, max_windows=8)
+        text = " ".join(["benign"] * 150) + " ATTACK"
+        per_question = len(s.windows("x", text))
+        self.assertGreater(per_question, 1)
+        b.spans_calls = 0
+        ans, usage = s.score(text, questions(3))
+        self.assertEqual(b.spans_calls, 1)
+        self.assertEqual(usage["windows"], 3 * per_question)
+        self.assertEqual(b.scored, 3 * per_question)
+        self.assertTrue(all(a["noul"] > 0.5 for a in ans.values()), ans)
+
+    def test_a_question_refused_413_costs_the_request_no_scoring(self):
+        b = Counting()
+        s = L.Scorer(b, max_tokens=64, overlap=8, max_windows=8)
+        qs = questions(2)
+        qs["q1"]["instructions"] = " ".join(["q"] * 60)  # fills the model: question_too_long
+        with self.assertRaises(L.Refused) as cm:
+            s.score("hello there", qs)
+        self.assertEqual(cm.exception.code, "question_too_long")
+        self.assertEqual(b.scored, 0)
+
+
 class Temperature(unittest.TestCase):
     def test_noul_is_sigmoid_of_logit_over_t(self):
         for t in (0.5, 1.0, 2.0):
@@ -187,6 +364,47 @@ class Temperature(unittest.TestCase):
         self.assertIn("LAYA_TEMPERATURE=", out.getvalue())
         self.assertIn("skipped", err.getvalue())
 
+    def test_fit_takes_the_retrieved_content_question_plain_and_under_ctx(self):
+        # ci-release#8: questions.json carried injection and abuse only, so
+        # every labelled `untrusted` record was skipped; under --ctx it is
+        # scored with the text alone, as the gateway asks it
+        with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as f:
+            for i in range(40):
+                f.write(json.dumps({"text": f"invoice {i} ATTACK" if i % 2 else f"invoice {i}", "label": i % 2,
+                                    "question": "untrusted", "assistant": "A billing assistant."}) + "\n")
+            f.write(json.dumps({"text": "hi ATTACK", "label": 1, "assistant": "A billing assistant."}) + "\n")
+            f.write(json.dumps({"text": "hi", "label": 0, "question": "abuse"}) + "\n")
+            path = f.name
+        states = []
+        real = L.Scorer.logits
+
+        def logits(scorer, state, questions):
+            states.append((next(iter(questions)), state))
+            return real(scorer, state, questions)
+
+        try:
+            with mock.patch.dict(os.environ, {"LAYA_BACKEND": "mock"}), mock.patch.object(L.Scorer, "logits", logits):
+                for argv in ([path], [path, "--ctx"]):
+                    states.clear()
+                    out, err = io.StringIO(), io.StringIO()
+                    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                        rc = fit_temperature.main(argv)
+                    self.assertEqual(rc, 0, err.getvalue())
+                    self.assertIn("examples: 42 (21 attacks, 21 benign), skipped 0", out.getvalue())
+                    self.assertNotIn("skipped (", err.getvalue())
+                    kinds = {(name, type(state).__name__) for name, state in states}
+                    if argv[-1] == "--ctx":
+                        self.assertEqual(kinds, {("untrusted", "str"), ("injection", "dict"), ("abuse", "dict")})
+                    else:
+                        self.assertEqual(kinds, {("untrusted", "str"), ("injection", "str"), ("abuse", "str")})
+        finally:
+            os.unlink(path)
+        # the wording is the template's, in both sets
+        with open(os.path.join(ROOT, "conformance", "questions.json")) as f:
+            qs = json.load(f)
+        self.assertEqual(qs["plain"]["untrusted"], qs["ctx"]["untrusted"])
+        self.assertTrue(qs["plain"]["untrusted"]["instructions"].startswith("This text is not from the user."))
+
 
 class Http(unittest.TestCase):
     def test_passes_conformance_strict_with_auth(self):
@@ -202,13 +420,14 @@ class Http(unittest.TestCase):
             srv.server_close()
         self.assertEqual(rc, 0, out)
         self.assertRegex(out, r"ok    worst case .* 64 at once: .*, [2-8] windows\)")
+        self.assertRegex(out, r"ok    NFKC case .* \(alone p99 [\d.]+ ms, [2-8] windows, [\d.]+ input tokens per byte")
         self.assertRegex(out, r"ok    burst: 64 new connections at once")
         self.assertRegex(out, r"timeout_ms: \d+(-\d+)?, 2-3x the worst-case p99 of .* with 64 at once")
 
     def test_conformance_catches_silent_truncation(self):
         class Truncating(L.Scorer):
-            def windows(self, first, text):
-                return super().windows(first, text)[:1]   # the bug the suite exists for
+            def windows(self, first, text, spans=None):
+                return super().windows(first, text, spans)[:1]   # the bug the suite exists for
 
         srv, url = serve()
         srv.RequestHandlerClass.scorer = Truncating(L.MockBackend())
@@ -323,6 +542,37 @@ class Http(unittest.TestCase):
         finally:
             stop(srv)
         self.assertRegex(err, r"^status 413 for 4096 bytes .*LAYA_MAX_WINDOWS")
+
+    def test_nfkc_case_the_windows_cannot_hold_is_a_failure(self):
+        # python-adapters#11: a tokenizer with an NFKC normalizer reads
+        # 4096 bytes of U+FDFA as 24,534 tokens, past 8 windows; a 413 is a
+        # bypass, and the run says which setting to change
+        srv, url = serve(backend=Expanding())
+        try:
+            t = conformance.Target(url, None, "laya", 5)
+            body = conformance.worst_body(t, 4096, conformance.DEFAULT_ASSISTANT, ctx_questions(),
+                                          conformance.nfkc_text(4096))
+            err, _, _ = conformance.check_nfkc(t, body, 4096, 2, 1000, mock=True)
+        finally:
+            stop(srv)
+        self.assertRegex(err, r"^status 413 for 4096 bytes of U\+FDFA .*raise LAYA_MAX_WINDOWS")
+        # with the windows to hold it, it is judged whole and priced per byte
+        srv, url = serve({"LAYA_MAX_WINDOWS": "40"}, backend=Expanding())
+        try:
+            t = conformance.Target(url, None, "laya", 5)
+            err, info, _ = conformance.check_nfkc(t, body, 4096, 2, 1000, mock=True)
+        finally:
+            stop(srv)
+        self.assertIsNone(err, err)
+        tpb = float(re.search(r", ([\d.]+) input tokens per byte", info).group(1))
+        self.assertGreater(tpb, 5.0)  # 18 tokens per 3 bytes, and the question per window
+
+    def test_nfkc_text_is_the_asked_size(self):
+        for n in (4096, 4095, 4094, 7):
+            text = conformance.nfkc_text(n)
+            self.assertEqual(len(text.encode()), n)
+            self.assertTrue(text.endswith(" ATTACK"))
+        self.assertEqual(conformance.nfkc_text(4096).count("\ufdfa"), 1363)
 
     def test_worst_text_is_fixed_ascii_of_the_asked_size(self):
         a, b = conformance.worst_text(4096), conformance.worst_text(4096)
@@ -615,6 +865,7 @@ class Pool(unittest.TestCase):
     def test_cost_is_learned_per_size_class(self):
         c = L.CostModel()
         self.assertEqual(c.estimate(100), 0.0)  # nothing scored yet
+        self.assertEqual(c.estimate(100, unknown=250.0), 250.0)  # what Workers asks with
         c.observe(100, 5.0)     # a short text: 0.05 ms per unit
         c.observe(6000, 420.0)  # the worst case: 0.07 ms per unit
         self.assertAlmostEqual(c.estimate(120), 6.0)
@@ -625,6 +876,70 @@ class Pool(unittest.TestCase):
         self.assertAlmostEqual(c.estimate(100), 10.0)
         c.observe(100, 5.0)   # a faster one a tenth of the way
         self.assertAlmostEqual(c.estimate(100), 9.5)
+
+    def test_before_any_scoring_a_request_waits_for_no_one(self):
+        # r5 fix/audit-high-laya: with no rate, estimate() gave 0 ms, so
+        # every request of a first burst queued, waited out the answer time
+        # and timed out at the gateway together. Now one that finds every
+        # worker busy is refused at once, before the gateway stops reading
+        w = L.Workers(1, 1000)
+        held = w.slot(100)
+        held.__enter__()  # scoring, nothing learned yet
+        try:
+            t0 = time.perf_counter()
+            with self.assertRaises(L.Refused) as cm:
+                with w.slot(100):
+                    pass
+            self.assertLess((time.perf_counter() - t0) * 1000, 50)
+            self.assertEqual((cm.exception.status, cm.exception.code), (503, "overloaded"))
+        finally:
+            held.__exit__(None, None, None)
+        self.assertTrue(w.cost.rate)  # the scoring that ran taught it a rate
+        with w.slot(100):  # a free worker is taken whatever the estimate
+            pass
+
+    def test_warm_up_prices_a_first_burst_before_the_server_listens(self):
+        log = io.StringIO()
+        env = {"LAYA_HOST": "127.0.0.1", "LAYA_PORT": "0", "LAYA_ACCESS_LOG": "0"}
+        srv = L.start(env, backend=SlowBatch(60, short_ms=5), log=log)
+        try:
+            cost = srv.RequestHandlerClass.workers.cost
+            self.assertEqual(len(cost.rate), 2, log.getvalue())  # a short text and the worst case
+            short = L.cost_units({"assistant": L.WARM_ASSISTANT, "user_message": L.WARM_SHORT},
+                                 {"injection": L.WARM_QUESTION})
+            self.assertLess(cost.estimate(short), 30)
+            t = conformance.Target(f"http://127.0.0.1:{srv.server_address[1]}/v1/systemone", None, "laya", 5)
+            worst = json.loads(conformance.worst_body(t, 4096, conformance.DEFAULT_ASSISTANT, ctx_questions()))
+            self.assertGreater(cost.estimate(L.cost_units(worst["state"], worst["questions"])), 40)
+            out = log.getvalue()
+            self.assertRegex(out, r"warm-up: short text \(\d+ units\) scored in [\d.]+ ms")
+            self.assertRegex(out, r"warm-up: worst case \(4096 bytes, \d+ units\) scored in [\d.]+ ms")
+            self.assertLess(out.index("warm-up"), out.index("laya-server on 127.0.0.1:"))
+            self.assertNotIn("127.0.0.1:0/", out)  # the line comes after the bind, with the real port
+            run = threading.Thread(target=srv.serve_forever, daemon=True)
+            run.start()
+            self.assertEqual(post(f"http://127.0.0.1:{srv.server_address[1]}/v1/systemone")[0], 200)
+        finally:
+            stop(srv)
+
+    def test_warm_up_halves_a_worst_case_the_server_refuses_and_logs_a_failure(self):
+        srv = L.make_server({"LAYA_HOST": "127.0.0.1", "LAYA_PORT": "0", "LAYA_MAX_WINDOWS": "2"},
+                            backend=Hostile(), activate=False)
+        self.addCleanup(srv.server_close)
+        lines = L.warm_up(srv)
+        self.assertRegex(lines[1], r"warm-up: worst case \((1024|2048) bytes, ")
+        self.assertEqual(len(srv.RequestHandlerClass.workers.cost.rate), 2)
+
+        class Broken(L.MockBackend):
+            def logit(self, first, second):
+                raise RuntimeError("no model")
+
+        srv = L.make_server({"LAYA_HOST": "127.0.0.1", "LAYA_PORT": "0"}, backend=Broken(), activate=False)
+        self.addCleanup(srv.server_close)
+        lines = L.warm_up(srv)
+        self.assertEqual(len(lines), 2)
+        self.assertIn("warm-up: scoring the short text failed: RuntimeError('no model')", lines[0])
+        self.assertFalse(srv.RequestHandlerClass.workers.cost.rate)  # the answer-time fallback then applies
 
     def test_queue_takes_what_fits_in_order_and_refuses_the_rest_at_once(self):
         cost = L.CostModel()
@@ -757,6 +1072,185 @@ class ClientGone(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertNotIn("backend error", log)
         self.assertRegex(log, r"client gone mid-request: hung up after \d+ of \d+ body bytes")
+
+
+class ContentLength(unittest.TestCase):
+    """python-adapters#8: Content-Length went through int(), which takes
+    "-1" (rfile.read(-1) then read until the client closed, past
+    LAYA_MAX_BODY_BYTES), "+5" and "1_0"; a length int() refused raised out
+    of the 401 path as a 500 backend_error, and out of do_PUT."""
+
+    def exchange(self, head: str, body: bytes = b"", env=None):
+        """One raw request on a fresh connection, left open for writing (no
+        EOF from the client): the answer's status and bytes, the status of a
+        good request after it, and what the server wrote on stderr."""
+        e = {"LAYA_MAX_BODY_BYTES": "1000", "LAYA_ACCESS_LOG": "1", "LAYA_IDLE_TIMEOUT_S": "30"}
+        e.update(env or {})
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            srv, url = serve(e)
+            try:
+                s = socket.create_connection(("127.0.0.1", srv.server_address[1]), timeout=3)
+                got = b""
+                try:
+                    s.sendall(head.encode("latin-1") + b"\r\n" + body)
+                    while True:
+                        chunk = s.recv(65536)
+                        if not chunk:
+                            break
+                        got += chunk
+                except ConnectionResetError:
+                    pass  # the server closed with our unread body: what it sent is in `got`
+                finally:
+                    s.close()
+                after = post(url)[0]
+            finally:
+                stop(srv)
+        self.assertTrue(got.startswith(b"HTTP/1.1 "), got)
+        return int(got.split(b" ", 2)[1]), got, after, err.getvalue()
+
+    @staticmethod
+    def head(length: str, method: str = "POST", extra: str = "") -> str:
+        return (f"{method} /v1/systemone HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+                f"Content-Length: {length}\r\n{extra}")
+
+    def test_a_negative_length_is_411_without_reading_to_eof(self):
+        # before: 200 with a score for a body past the limit, once the
+        # client closed; here the client never closes, and the answer
+        # comes at once
+        body = json.dumps({"state": "x " * 1000, "questions": {"q": Q}}).encode()[:2048]
+        status, got, after, log = self.exchange(self.head("-1"), body)
+        self.assertEqual(status, 411, got)
+        self.assertIn(b"Connection: close", got)
+        self.assertIn(b"length_required", got)
+        self.assertEqual(after, 200)
+        self.assertNotIn("Traceback", log)
+
+    def test_lengths_int_takes_and_no_gateway_sends_are_411(self):
+        for length in ["+5", "1_0", " -0", "5 5", "0x5", "5.0", "\xb2", "\xb3\xb9", ""]:
+            status, got, after, log = self.exchange(self.head(length), b'{"a":1}')
+            self.assertEqual(status, 411, (length, got))
+            self.assertEqual(after, 200)
+            self.assertNotIn("Traceback", log)
+        # two different lengths: which one frames the body is anyone's guess
+        status, got, _, _ = self.exchange(self.head("7", extra="Content-Length: 70\r\n"), b'{"a":1}')
+        self.assertEqual(status, 411, got)
+
+    def test_an_honest_length_is_read_and_one_over_the_limit_is_413(self):
+        body = json.dumps({"state": "hello", "questions": {"q": Q}}).encode()
+        status, got, _, _ = self.exchange(self.head(f" {len(body)}\t", extra="Connection: close\r\n"), body)
+        self.assertEqual(status, 200, got)
+        status, got, _, _ = self.exchange(self.head(str(len(body)), extra=f"Content-Length: {len(body)}\r\n"
+                                                                          "Connection: close\r\n"), body)
+        self.assertEqual(status, 200, got)  # the same length twice frames it the same way
+        status, got, _, _ = self.exchange(self.head("5000"), b"x" * 100)
+        self.assertEqual(status, 413, got)
+
+    def test_a_bad_length_on_a_refused_request_is_that_refusal_not_a_500(self):
+        status, got, after, log = self.exchange(self.head("abc"), b"xyz", env={"LAYA_API_KEY": "k"})
+        self.assertEqual(status, 401, got)
+        self.assertIn(b"Connection: close", got)  # the body's end is unknown: the stream is not reused
+        self.assertEqual(after, 401)  # post() sends no key
+        self.assertNotIn("backend error", log)
+        for method in ("PUT", "DELETE", "PATCH"):
+            status, got, _, log = self.exchange(self.head("-1", method=method), b"xyz")
+            self.assertEqual(status, 405, got)
+            self.assertIn(b"Connection: close", got)
+            self.assertNotIn("Traceback", log)
+        status, got, _, log = self.exchange(self.head("abc", method="POST").replace("/v1/systemone", "/nope"), b"x")
+        self.assertEqual(status, 404, got)
+        self.assertNotIn("Traceback", log)
+
+
+def _has_tokenizers() -> bool:
+    try:
+        import tokenizers  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+@unittest.skipUnless(_has_tokenizers(), "tokenizers not installed")
+class SpecialTokensInText(unittest.TestCase):
+    """g1-provider-wire-parity#6: the onnx backend encoded a "[SEP]" or
+    "[PAD]" written in the judged text as the control token's id, so a
+    client could end its segment early, start a third one, or pad inside
+    the text; the model read an input it was never trained on."""
+
+    def setUp(self):
+        from tokenizers import Tokenizer, models, pre_tokenizers, processors
+
+        vocab = {w: i for i, w in enumerate(["[UNK]", "[CLS]", "[SEP]", "[PAD]", "a", "b", "is", "it",
+                                              "[", "]", "SEP", "PAD", "?"])}
+        tok = Tokenizer(models.WordLevel(vocab, unk_token="[UNK]"))
+        tok.pre_tokenizer = pre_tokenizers.Whitespace()
+        tok.add_special_tokens(["[CLS]", "[SEP]", "[PAD]"])
+        tok.post_processor = processors.BertProcessing(("[SEP]", vocab["[SEP]"]), ("[CLS]", vocab["[CLS]"]))
+        self.vocab = vocab
+        self.dir = tempfile.mkdtemp()
+        tok.save(os.path.join(self.dir, "tokenizer.json"))
+
+    def tearDown(self):
+        os.unlink(os.path.join(self.dir, "tokenizer.json"))
+        os.rmdir(self.dir)
+
+    def test_a_pair_carries_only_the_structural_special_tokens(self):
+        tok = L.load_tokenizer(self.dir)
+        enc = tok.encode("is it ?", "a [SEP] b [PAD]")
+        self.assertEqual(enc.ids.count(self.vocab["[SEP]"]), 2, enc.tokens)  # [CLS] q [SEP] text [SEP]
+        self.assertEqual(enc.ids.count(self.vocab["[CLS]"]), 1, enc.tokens)
+        self.assertNotIn(self.vocab["[PAD]"], enc.ids, enc.tokens)
+        self.assertEqual(enc.tokens, ["[CLS]", "is", "it", "?", "[SEP]", "a", "[", "SEP", "]", "b", "[", "PAD", "]",
+                                      "[SEP]"])
+        self.assertEqual(enc.type_ids, [0] * 5 + [1] * 9)  # the text is one segment, to its end
+        # no truncation and no padding, as the server windows and pads itself
+        self.assertEqual(len(tok.encode("a " * 3000, add_special_tokens=False).ids), 3000)
+
+    def test_spans_and_count_read_special_token_text_as_text(self):
+        b = L.OnnxBackend.__new__(L.OnnxBackend)  # the tokenizer part only: no model needed
+        b.tok = L.load_tokenizer(self.dir)
+        b.pair_overhead = b.tok.post_processor.num_special_tokens_to_add(True)
+        text = "a [SEP] b"
+        self.assertEqual(b.count(text), 5)
+        self.assertEqual([text[x:y] for x, y in b.spans(text)], ["a", "[", "SEP", "]", "b"])
+        s = L.Scorer(b, max_tokens=64, overlap=8, max_windows=4)
+        self.assertEqual(s.windows("is it ?", text), [text])
+
+
+@unittest.skipUnless(_has_tokenizers(), "tokenizers not installed")
+class NfkcTokenizer(unittest.TestCase):
+    """python-adapters#11 with a real tokenizers tokenizer: an NFKC
+    normalizer turns U+FDFA into 18 characters, 15 tokens here, all with
+    the one character's offsets."""
+
+    def test_windows_fit_the_model_after_expansion(self):
+        import unicodedata
+
+        from tokenizers import Regex, Tokenizer, models, normalizers, pre_tokenizers, processors
+
+        chars = sorted(set(unicodedata.normalize("NFKC", "\ufdfa") + "abcdefghijklmnopqrstuvwxyz?ATCK") - {" "})
+        vocab = {w: i for i, w in enumerate(["[UNK]", "[CLS]", "[SEP]", "[PAD]"] + chars)}
+        tok = Tokenizer(models.WordLevel(vocab, unk_token="[UNK]"))
+        tok.normalizer = normalizers.NFKC()
+        tok.pre_tokenizer = pre_tokenizers.Sequence([pre_tokenizers.WhitespaceSplit(),
+                                                     pre_tokenizers.Split(Regex("."), "isolated")])
+        tok.post_processor = processors.BertProcessing(("[SEP]", vocab["[SEP]"]), ("[CLS]", vocab["[CLS]"]))
+        d = tempfile.mkdtemp()
+        self.addCleanup(os.rmdir, d)
+        tok.save(os.path.join(d, "tokenizer.json"))
+        self.addCleanup(os.unlink, os.path.join(d, "tokenizer.json"))
+        b = L.OnnxBackend.__new__(L.OnnxBackend)  # the tokenizer part only: no model needed
+        b.tok = L.load_tokenizer(d)
+        b.pair_overhead = b.tok.post_processor.num_special_tokens_to_add(True)
+        self.assertEqual(b.count("\ufdfa"), 15)
+        s = L.Scorer(b, max_tokens=128, overlap=16, max_windows=8)
+        text = "is it " + "\ufdfa" * 20 + " ATTACK"
+        ws = s.windows("q?", text)
+        self.assertGreater(len(ws), 1)
+        for w in ws:  # before: pairs up to 14 tokens past the room, past the model
+            self.assertLessEqual(len(b.tok.encode("q?", w).ids), 128 - L.SLACK, w)
+        self.assertTrue(ws[0].startswith("is it "))
+        self.assertTrue(ws[-1].endswith(" ATTACK"))
 
 
 class Cpus(unittest.TestCase):

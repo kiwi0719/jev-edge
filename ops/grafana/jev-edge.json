@@ -745,16 +745,7 @@
             }
           ],
           "color": {
-            "mode": "thresholds"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              }
-            ]
+            "mode": "fixed"
           }
         },
         "overrides": []
@@ -1099,7 +1090,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sum(rate(jev_subject_blocks_total{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval]))",
+          "expr": "sum by (instance) (rate(jev_subject_blocks_total{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval]))",
           "legendFormat": "{{instance}}",
           "refId": "A",
           "range": true

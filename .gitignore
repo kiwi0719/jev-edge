@@ -49,3 +49,4 @@ adapters/*/e2e/.gen/
 
 # suite v1 sources (bench/suite/fetch.sh)
 bench/suite/raw/
+bench/tools/raw/

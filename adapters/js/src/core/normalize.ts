@@ -1344,7 +1344,8 @@ export function fieldKeys(fields: string[] | undefined): Set<string> {
 /**
  * Port of deep_keys: the last key of each "**" text-field path, folded, for
  * scanStrings: "any", or "object" when a path without "**" ends at the same
- * key too ("input": a tool_use input, and the Responses input list).
+ * key too ("input": a tool_use input, and the Responses input list, whose
+ * images and files the scan leaves out).
  */
 export function deepKeys(fields: string[] | undefined): Map<string, "any" | "object"> {
   const deep = new Set<string>();
@@ -1403,8 +1404,10 @@ function endsValue(s: string, i: number): boolean {
  * truncated JSON (port of scan_strings). Keys match the way walk() matches
  * them: decoded and folded. With `deep` (from deepKeys), the value of a "**"
  * path's key is read as the walk reads it, every key and string in it in
- * the order they come: an object, and an array when no other path ends at
- * that key; otherwise the scan goes on inside it, as for any other key. With
+ * the order they come: an object or an array. An array under a key a plain
+ * path ends at too ("object"), which may be the Responses input list, is read
+ * whole all the same, its base64 data URLs (the list's images and files)
+ * left out. With
  * `seen`, seen.tokenIds is set when one of `keys` holds an array that starts
  * with a number: token ids. With `opts.tail`, the text before the first
  * unescaped '"' is the end of a value cut at its start: kept when that quote
@@ -1436,7 +1439,8 @@ export function scanStrings(
     } else {
       if (seen && s[at] === "[" && keys.has(k.key) && startsWithNumber(s, at + 1)) seen.tokenIds = true;
       const d = deep?.get(k.key);
-      q = nextQuote(s, d !== undefined && (s[at] === "{" || d === "any") ? scanValue(s, at, out, false) : at);
+      q = nextQuote(s, d !== undefined && (s[at] === "{" || s[at] === "[")
+        ? scanValue(s, at, out, false, d === "object" && s[at] === "[") : at);
     }
   }
   return out;
@@ -1493,7 +1497,11 @@ function typeNames(s: string, i: number): number | undefined {
 // `i` (a `{` or `[`), to its end or the end of `s`; with `schema` (tool
 // definitions) a "type" key whose value is a JSON Schema type name is left
 // out with it. Returns the index after it.
-function scanValue(s: string, i: number, out: string[], schema: boolean): number {
+// Port of data_url: a base64 data URL (data:image/png;base64,...), an image
+// or a file, not text. ASCII only, so both cores read the same strings as one.
+const DATA_URL = /^data:[A-Za-z0-9!#$&\-^_.+/=;]*;base64,/i;
+
+function scanValue(s: string, i: number, out: string[], schema: boolean, nodata = false): number {
   let depth = 0;
   const re = /[{}[\]"]/g;
   for (;;) {
@@ -1509,7 +1517,7 @@ function scanValue(s: string, i: number, out: string[], schema: boolean): number
       if (skip !== undefined) {
         i = skip;
       } else {
-        if (v !== "") out.push(v);
+        if (v !== "" && !(nodata && DATA_URL.test(v))) out.push(v);
         i = next;
       }
     } else if (c === "{" || c === "[") {

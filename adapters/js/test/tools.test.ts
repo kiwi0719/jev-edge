@@ -199,21 +199,40 @@ describe('tool-call arguments ("**" paths)', () => {
     expect(reason).toContain("(window)");
   });
 
-  it("reads an object under a key a plain path ends at too, but not an array there", () => {
+  it("reads an object or an array under a key a plain path ends at too, data URLs left out of the array", () => {
     const fields = load("llm-endpoints").text_fields;
-    // "input" is a "**" path's key (a tool_use input) and a plain path's
-    // (the Responses input list): an object under it is read whole, an array
-    // is scanned inside, as any other value; "variables" (prompt.variables.**)
+    // "input" is a "**" path's key (a tool_use input, an AI SDK tool part's
+    // input) and a plain path's (the Responses input list): an object or an
+    // array under it is read whole, and in the array a base64 data URL (the
+    // list's images and files) is left out; "variables" (prompt.variables.**)
     // is a "**" path's key only
     expect(normalize.deepKeys(fields)).toEqual(new Map([["arguments", "any"], ["input", "object"], ["output", "object"],
       ["variables", "any"]]));
     const s = '{"input":[{"role":"user","content":"q"},{"type":"x","input":{"cmd":"rm","n":1}},'
+      + '{"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgo="},'
+      + '{"type":"input_file","file_data":"DATA:application/pdf;name=a.pdf;BASE64,JVBERi0="},'
       + '{"type":"function_call","arguments":["a",{"b":"c"}]}],"messages":[{"content":[{"type":"tool_use",'
-      + '"input":{"k":"v"';
+      + '"input":{"k":"v","d":"data:image/png;base64,iVBORw0KGgo="';
     expect(normalize.scanStrings(s, normalize.fieldKeys(fields), [], normalize.deepKeys(fields)))
-      .toEqual(["q", "cmd", "rm", "n", "a", "b", "c", "k", "v"]);
+      .toEqual(["role", "user", "content", "q", "type", "x", "input", "cmd", "rm", "n",
+        "type", "input_image", "image_url", "type", "input_file", "file_data",
+        "type", "function_call", "arguments", "a", "b", "c",
+        "k", "v", "d", "data:image/png;base64,iVBORw0KGgo="]);
     // without deep keys, only the text fields' "key":"string" pairs, as before
     expect(normalize.scanStrings(s, normalize.fieldKeys(fields), [])).toEqual(["q"]);
+  });
+
+  // r5 scan_strings: an array under a key marked "object" was scanned inside
+  // for text-field keys only, and an instruction under any other key in an
+  // AI SDK tool part's input was dropped from a body the decoder refuses
+  it("reads an AI SDK tool part's input array whole in JSON the decoder refuses", () => {
+    const body = '{"messages":[{"role":"user","parts":[{"type":"text","text":"What is the weather today?"},'
+      + '{"type":"tool-weather","toolCallId":"c1","state":"input-available","input":["a",{"b":"' + ATTACK + '"}]}]}]}}';
+    for (const ct of ["application/json", "text/plain"]) {
+      const [text, kind] = normalize.extract(body, ct, load("llm-endpoints").text_fields, decode);
+      expect(kind).toBe("scan");
+      expect(text).toContain("a\nb\n" + ATTACK);
+    }
   });
 });
 

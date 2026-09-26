@@ -1297,7 +1297,8 @@ end
 --- The last key of each "**" text-field path, folded, for scan_strings:
 -- "messages[*].tool_calls[*].function.arguments.**" -> arguments = "any";
 -- "object" instead when a path without "**" ends at the same key too
--- ("input": a tool_use input, and the Responses input list).
+-- ("input": a tool_use input, and the Responses input list, whose images and
+-- files the scan leaves out).
 function _M.deep_keys(fields)
   local deep, plain = {}, {}
   for _, f in ipairs(fields or {}) do
@@ -1351,9 +1352,12 @@ local scan_value
 -- folded, so every spelling a case-insensitive backend reads is collected.
 -- With `deep` (from deep_keys), the value of a "**" path's key is read as
 -- the walk reads it, every key and string in it, in the order they come: an
--- object (Ollama and Anthropic tool-call arguments), and an array when no
--- other path ends at that key; otherwise the scan goes on inside it, as for
--- any other key. With `seen`, seen.token_ids is set when one of `keys` holds
+-- object (Ollama and Anthropic tool-call arguments) or an array (an AI SDK
+-- tool part's input or output). The scanner cannot tell such an array from
+-- the Responses input list when a plain path ends at the key too ("object"):
+-- that array is read whole all the same, its base64 data URLs (the list's
+-- images and files) left out, since scanning inside it for text-field keys
+-- dropped an instruction under any other key. With `seen`, seen.token_ids is set when one of `keys` holds
 -- an array that starts with a number ("prompt":[40 or "prompt":[[40): token
 -- ids. With `opts.tail` (`s` is the end of a body whose middle was not
 -- read), the bytes before the first unescaped '"' are the end of a value
@@ -1384,8 +1388,8 @@ function _M.scan_strings(s, keys, out, deep, seen, opts)
           seen.token_ids = true
         end
         local d = deep and deep[key]
-        if d and (c == 123 or d == "any") then
-          q = next_quote(s, scan_value(s, b, out, false))
+        if d and (c == 123 or c == 91) then
+          q = next_quote(s, scan_value(s, b, out, false, d == "object" and c == 91))
         else
           q = next_quote(s, b)
         end
@@ -1428,11 +1432,18 @@ local function type_names(s, i)
   end
 end
 
+-- A base64 data URL (data:image/png;base64,...): an image or a file, not
+-- text. ASCII only, so both cores read the same strings as one.
+local function data_url(v)
+  return v:find("^[Dd][Aa][Tt][Aa]:[%w!#$&%-%^_%.%+/=;]*;[Bb][Aa][Ss][Ee]64,") ~= nil
+end
+
 -- Every key and string of the JSON value that starts at `i` (a `{` or `[`),
 -- to its end or the end of `s`, in the order they come; with `schema` (tool
 -- definitions) a "type" key whose value is a JSON Schema type name is left
--- out with it, as tool_leaf does. Returns the index after the value.
-scan_value = function(s, i, out, schema)
+-- out with it, as tool_leaf does; with `nodata`, base64 data URLs are left
+-- out. Returns the index after the value.
+scan_value = function(s, i, out, schema, nodata)
   local depth, n = 0, #s
   while true do
     local j = s:find('[{}%[%]"]', i)
@@ -1445,7 +1456,7 @@ scan_value = function(s, i, out, schema)
       if skip then
         i = skip
       else
-        if v ~= "" then out[#out + 1] = v end
+        if v ~= "" and not (nodata and data_url(v)) then out[#out + 1] = v end
         i = nexti
       end
     elseif c == 123 or c == 91 then

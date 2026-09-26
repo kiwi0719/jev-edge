@@ -116,6 +116,12 @@ code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json
 check "subject.reputation: that subject is then refused" "403" "$code"
 check "subject.reputation: another subject is not" "app verdict=safe score=0.20 source=l2" \
   "$(curl -s -H 'Content-Type: application/json' -H 'X-User: bob' -d "$LONG" $base/rep/chat/completions)"
+code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' -H 'X-User: dave' -H 'X-Jev-Mock-Score: 0.95' -d "$ATTACK" $base/saltmiss/chat/completions)
+check "an unresolved salt reference: an injection is still judged and blocked" "403" "$code"
+check "an unresolved salt reference: no subject, so no reputation block after it" "app verdict=safe score=0.20" \
+  "$(curl -s -H 'Content-Type: application/json' -H 'X-User: dave' -d '{"messages":[{"role":"user","content":"Please write a short friendly note to thank my neighbour for the plants."}]}' $base/saltmiss/chat/completions | sed 's/ source=.*//')"
+check "an unresolved salt reference is reported" "yes" \
+  "$(docker compose logs apisix 2>/dev/null | grep -q 'subject.salt reference \$env://JEV_E2E_NO_SUCH_SALT did not resolve: subject tracking' && echo yes || echo no)"
 check "provider laya judges" "app verdict=safe score=0.10 source=l2" "$(post /laya/chat/completions '' "$LONG")"
 check "provider laya blocks an injection" "403" \
   "$(curl -s -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' -d "$ATTACK" $base/laya/chat/completions)"

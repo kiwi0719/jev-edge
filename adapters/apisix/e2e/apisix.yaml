@@ -157,6 +157,25 @@ routes:
           reputation: { block_at: 3, window_s: 60, block_ttl: 60, suspicious: 1, malicious: 3 }
         cache: { fp_ttl: 0.001 }
         async: { enabled: false }
+  # The same with a salt reference that does not resolve: subject tracking is
+  # off (never a salt anyone can read in the conf), and the log says so.
+  - uri: /saltmiss/*
+    upstream:
+      nodes:
+        "app:8081": 1
+      type: roundrobin
+    plugins:
+      jev-edge:
+        jev: { provider: mock, mock_score: 0.2, mock_header: x-jev-mock-score, timeout_ms: 300 }
+        rules: [{ id: saltmiss, extends: llm-endpoints, watch_paths: ["^/saltmiss/"] }]
+        policy: { mode: enforce }
+        subject:
+          enabled: true
+          from: header
+          name: x-user
+          salt: "$env://JEV_E2E_NO_SUCH_SALT"
+          reputation: { block_at: 3, window_s: 60, block_ttl: 60, suspicious: 1, malicious: 3 }
+        async: { enabled: false }
   - uri: /laya/*
     upstream:
       nodes:

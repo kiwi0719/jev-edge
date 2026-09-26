@@ -415,8 +415,15 @@ local function runtime_for(conf)
     core.log.error("jev-edge: jev.api_key reference ", cfg.jev.api_key, " did not resolve")
     cfg.jev.api_key = nil
   end
+  -- nor is it ever the salt: the reference string is in the conf for anyone
+  -- who reads it, and ids hashed with it could be matched to the raw values.
+  -- Subject tracking is off for this conf until the reference resolves (the
+  -- runtime is rebuilt when it does).
   if cfg.subject and is_ref(cfg.subject.salt) then
-    core.log.error("jev-edge: subject.salt reference ", cfg.subject.salt, " did not resolve")
+    core.log.error("jev-edge: subject.salt reference ", cfg.subject.salt,
+      " did not resolve: subject tracking and subject reputation are off for this conf")
+    cfg.subject = defaults.merge(cfg.subject, { enabled = false })
+    cfg.subject.salt = nil
   end
   if not cfg.jev.api_key and cfg.jev.provider ~= "mock" and cfg.jev.api_key_env then
     cfg.jev.api_key = os.getenv(cfg.jev.api_key_env)

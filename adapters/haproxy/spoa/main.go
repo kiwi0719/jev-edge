@@ -21,7 +21,11 @@
 // %00) or that Go cannot put in a URL (a control character) is blocked
 // with 400 (verdict=skipped, reason "invalid path"), as nginx answers it
 // inline, whatever -unjudged says: it is the client's error, so it never
-// fails open. Paths containing "..", "%2e" or "//" are never forwarded
+// fails open. So is a header value or a method net/http cannot send (a
+// control character in the value; a method that is not a token), blocked
+// with 400 and reason "invalid header" / "invalid method"; a header name
+// that is not a token is left out, as nginx leaves it out, and the request
+// is judged. Paths containing "..", "%2e" or "//" are never forwarded
 // (they could reach the adapter's admin endpoints next to /_jev/authz) and
 // fail open.
 package main
@@ -124,13 +128,42 @@ func wellFormedPath(p string) bool {
 	return !strings.Contains(p, "%00")
 }
 
-// badPath blocks a request whose path is not well formed with 400, the
-// status nginx gives it inline (haproxy.cfg needs its deny_status 400 line
-// for that; without it the catch-all denies with 403). The client's error,
-// not jev-edge's: never fail-open, whatever -unjudged says.
-func badPath() map[string]string {
+// refuse blocks with 400 a request the agent cannot relay because of what
+// the client sent (a malformed path, a header value or a method Go cannot
+// send), the status nginx gives a malformed path inline (haproxy.cfg needs
+// its deny_status 400 line for that; without it the catch-all denies with
+// 403). The client's error, not jev-edge's: never fail-open, whatever
+// -unjudged says.
+func refuse(reason string) map[string]string {
 	return map[string]string{"verdict": "skipped", "score": "0.00", "source": "adapter",
-		"reason": url.QueryEscape("invalid path"), "action": "block", "rid": "", "status": "400"}
+		"reason": url.QueryEscape(reason), "action": "block", "rid": "", "status": "400"}
+}
+
+// validToken reports whether s is an RFC 9110 token, what net/http takes as
+// a method or a header name (httpguts.ValidHeaderFieldName).
+func validToken(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !('a' <= c && c <= 'z' || 'A' <= c && c <= 'Z' || '0' <= c && c <= '9' ||
+			strings.IndexByte("!#$%&'*+-.^_`|~", c) >= 0) {
+			return false
+		}
+	}
+	return true
+}
+
+// validHeaderValue reports whether net/http sends v as a header value
+// (httpguts.ValidHeaderFieldValue): no control character but a tab.
+func validHeaderValue(v string) bool {
+	for i := 0; i < len(v); i++ {
+		if c := v[i]; (c < ' ' && c != '\t') || c == 0x7f {
+			return false
+		}
+	}
+	return true
 }
 
 // headers HAProxy or the HTTP client own; never copied from req.hdrs.
@@ -151,8 +184,17 @@ var skipHeader = map[string]bool{
 }
 
 // copyHeaders adds each "Name: value" line of a raw header block to dst,
-// minus skipHeader.
-func copyHeaders(dst http.Header, hdrs string) {
+// minus skipHeader. net/http refuses to send a header whose name is not a
+// token or whose value has a control character in it, and that error used
+// to fail the agent open: a client could turn judging off with one such
+// header. A name that is not a token is left out, as nginx leaves out a
+// header name it does not take (ignore_invalid_headers), so jev-edge
+// inline never reads it either. A value with a control character is one
+// nginx takes and jev-edge reads inline; leaving it out could hide the
+// Content-Type or the subject header jev-edge judges by, so copyHeaders
+// stops and returns that header's name for check to refuse the request.
+// It returns "" when every header was copied or left out.
+func copyHeaders(dst http.Header, hdrs string) (badValue string) {
 	for _, line := range strings.Split(hdrs, "\n") {
 		line = strings.TrimRight(line, "\r")
 		i := strings.IndexByte(line, ':')
@@ -160,11 +202,16 @@ func copyHeaders(dst http.Header, hdrs string) {
 			continue
 		}
 		name := strings.TrimSpace(line[:i])
-		if skipHeader[strings.ToLower(name)] {
+		if skipHeader[strings.ToLower(name)] || !validToken(name) {
 			continue
 		}
-		dst.Add(name, strings.TrimSpace(line[i+1:]))
+		value := strings.TrimSpace(line[i+1:])
+		if !validHeaderValue(value) {
+			return name
+		}
+		dst.Add(name, value)
 	}
+	return ""
 }
 
 func setVars(req *request.Request, vars map[string]string) {
@@ -203,11 +250,17 @@ func check(get func(string) string) map[string]string {
 	if method == "" {
 		method = "POST"
 	}
+	// net/http cannot send a method that is not a token (nginx refuses it
+	// inline with 400 too)
+	if !validToken(method) {
+		log.Printf("jev-spoa: refusing method %.64q with 400", method)
+		return refuse("invalid method")
+	}
 	// before safePath: a malformed path is refused even when it also has a
 	// dot segment or a doubled slash
 	if !wellFormedPath(path) {
 		log.Printf("jev-spoa: refusing malformed path %.256q with 400", path)
-		return badPath()
+		return refuse("invalid path")
 	}
 	if !safePath(path) {
 		log.Printf("jev-spoa: refusing path %q, failing open", path)
@@ -223,7 +276,10 @@ func check(get func(string) string) map[string]string {
 	// forward the original headers (req.hdrs is the raw header block) so
 	// jev-edge sees the same request Envoy or nginx would; hop-by-hop and
 	// framing headers are recomputed by the client
-	copyHeaders(hreq.Header, hdrs)
+	if name := copyHeaders(hreq.Header, hdrs); name != "" {
+		log.Printf("jev-spoa: refusing header %.64q with a control character in its value with 400", name)
+		return refuse("invalid header")
+	}
 	if ip != "" {
 		hreq.Header.Set("X-Forwarded-For", ip)
 	}

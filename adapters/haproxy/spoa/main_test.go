@@ -179,3 +179,92 @@ func TestWellFormedEscapesAreForwardedAsSent(t *testing.T) {
 		}
 	}
 }
+
+// net/http refuses to send a header whose name is not a token or whose
+// value has a control character in it, and that error failed the agent
+// open (verdict=error, action=pass): one crafted header turned judging off.
+// A name that is not a token is left out, as nginx leaves it out inline,
+// and the request is judged.
+func TestHeaderNameNetHTTPCannotSendIsLeftOut(t *testing.T) {
+	var got http.Header
+	authz(t, func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+		w.Header().Set("X-Jev-Verdict", "malicious")
+		w.WriteHeader(403)
+	})
+	for _, name := range []string{"x(bad)", "x-bad\"", "x-\xffa", "x\x01a", "x/a", "x a"} {
+		got = nil
+		v := check(msg(map[string]string{"method": "POST", "path": "/v1/chat/completions", "body": "{}",
+			"hdrs": "content-type: application/json\r\n" + name + ": 1\r\nx-ok: a\tb\r\n\r\n"}))
+		if v["verdict"] != "malicious" || v["action"] != "block" || v["status"] != "403" {
+			t.Fatalf("%q: vars = %v, want jev-edge's verdict", name, v)
+		}
+		if got.Get("Content-Type") != "application/json" || got.Get("X-Ok") != "a\tb" {
+			t.Fatalf("%q: headers at jev-edge = %v", name, got)
+		}
+		for k := range got {
+			if !validToken(k) {
+				t.Fatalf("%q: forwarded as %q", name, k)
+			}
+		}
+	}
+}
+
+// A header value with a control character is one nginx takes and jev-edge
+// reads inline; left out, it could hide the Content-Type or the subject
+// header jev-edge judges by. It is refused with 400, whatever -unjudged
+// says, and jev-edge is not asked. A skipped header is never forwarded, so
+// a control character in it changes nothing.
+func TestHeaderValueNetHTTPCannotSendIsRefusedWith400(t *testing.T) {
+	called := false
+	authz(t, func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.Header().Set("X-Jev-Verdict", "safe")
+	})
+	want := map[string]string{"verdict": "skipped", "score": "0.00", "source": "adapter",
+		"reason": "invalid+header", "action": "block", "rid": "", "status": "400"}
+	for _, unj := range []string{"pass", "block"} {
+		*unjudged = unj
+		for _, h := range []string{"content-type: application/json\x01", "x-a: a\x01b", "x-a: a\x7fb", "x-a: \x1b[31mred",
+			"authorization: Bearer t\x0bu", "x-a: a\x00b"} {
+			v := check(msg(map[string]string{"method": "POST", "path": "/v1/chat/completions", "body": "{}",
+				"hdrs": "content-type: application/json\r\n" + h + "\r\n\r\n"}))
+			if !reflect.DeepEqual(v, want) {
+				t.Fatalf("-unjudged=%s %q: vars = %v, want %v", unj, h, v, want)
+			}
+		}
+	}
+	if called {
+		t.Fatal("jev-edge was asked about a header net/http cannot send")
+	}
+	*unjudged = "pass"
+	v := check(msg(map[string]string{"method": "POST", "path": "/v1/chat/completions", "body": "{}",
+		"hdrs": "x-forwarded-for: 6.6.6.6\x01\r\nhost: a\x01\r\nx-jev-verdict: \x01\r\n\r\n"}))
+	if v["verdict"] != "safe" || !called {
+		t.Fatalf("control character in a skipped header: vars = %v", v)
+	}
+}
+
+// A method net/http cannot send (not a token; nginx refuses it with 400
+// too) is refused with 400 instead of failing open. One that is a token
+// goes to jev-edge as before.
+func TestMethodNetHTTPCannotSendIsRefusedWith400(t *testing.T) {
+	var method string
+	authz(t, func(w http.ResponseWriter, r *http.Request) {
+		method = r.Method
+		w.Header().Set("X-Jev-Verdict", "safe")
+	})
+	want := map[string]string{"verdict": "skipped", "score": "0.00", "source": "adapter",
+		"reason": "invalid+method", "action": "block", "rid": "", "status": "400"}
+	for _, m := range []string{"GE(T", "GET POST", "G\x01T", "P\xffST", "GET/1"} {
+		method = ""
+		if v := check(msg(map[string]string{"method": m, "path": "/v1/chat/completions", "body": "{}"})); !reflect.DeepEqual(v, want) || method != "" {
+			t.Fatalf("%q: vars = %v, jev-edge saw %q", m, v, method)
+		}
+	}
+	for _, m := range []string{"PATCH", "get", "M-SEARCH"} {
+		if v := check(msg(map[string]string{"method": m, "path": "/v1/chat/completions", "body": "{}"})); v["verdict"] != "safe" || method != m {
+			t.Fatalf("%q: vars = %v, jev-edge saw %q", m, v, method)
+		}
+	}
+}

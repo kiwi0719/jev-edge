@@ -1311,21 +1311,58 @@ function _M.field_keys(fields)
   return keys
 end
 
+-- The depth of the key text-field path `f` ends at (`last`, folded): the
+-- objects and arrays around that key in a body whose root is an object,
+-- "input" 1, "input[*].output" 3, "messages[*].parts[*].input.**" 5, as
+-- the walk goes down them; nil when the path's segments end at another key.
+local function key_depth(f, last)
+  local segs = split_path((f:gsub("%.%*%*$", "")))
+  local n = #segs
+  -- "[*]" alone steps into an array without a key
+  while n > 0 and segs[n].key == "" do n = n - 1 end
+  if n == 0 or fold(segs[n].key) ~= last then return nil end
+  local depth = 1
+  for i = 1, n - 1 do
+    depth = depth + ((segs[i].each and segs[i].key ~= "") and 2 or 1)
+  end
+  return depth
+end
+
 --- The last key of each "**" text-field path, folded, for scan_strings:
--- "messages[*].tool_calls[*].function.arguments.**" -> arguments = "any";
--- "object" instead when a path without "**" ends at the same key too
--- ("input": a tool_use input, and the Responses input list, whose images and
--- files the scan leaves out).
+-- "messages[*].tool_calls[*].function.arguments.**" -> arguments = "any".
+-- When a path without "**" ends at the same key too ("input": a tool_use
+-- input and an AI SDK tool part's input, and the Responses input list), the
+-- key maps to the set of depths (see key_depth) at which only such plain
+-- paths end: an array there is a list the walk reads item by item (the
+-- Responses input list at 1, a function_call_output's output at 3), not a
+-- "**" value. A path whose depth is unknown leaves the set empty for a "**"
+-- path, and adds nothing to it for a plain one.
 function _M.deep_keys(fields)
   local deep, plain = {}, {}
   for _, f in ipairs(fields or {}) do
     local last = f:gsub("%.%*%*$", ""):match("([^%.%[%]%*]+)[%[%]%*]*$")
     if last then
-      if f:find("%.%*%*$") then deep[fold(last)] = true else plain[fold(last)] = true end
+      last = fold(last)
+      local set = f:find("%.%*%*$") and deep or plain
+      local depths = set[last] or {}
+      set[last] = depths
+      depths[key_depth(f, last) or "unknown"] = true
     end
   end
   local out = {}
-  for k in pairs(deep) do out[k] = plain[k] and "object" or "any" end
+  for k, at in pairs(deep) do
+    if plain[k] then
+      local lists = {}
+      if not at.unknown then
+        for d in pairs(plain[k]) do
+          if d ~= "unknown" and not at[d] then lists[d] = true end
+        end
+      end
+      out[k] = lists
+    else
+      out[k] = "any"
+    end
+  end
   return out
 end
 
@@ -1362,6 +1399,84 @@ local function key_at(s, q, start)
   return fold((read_string(s, q + 1))), b
 end
 
+-- The brackets outside strings from `i` (outside any string) up to `to`
+-- (not included), counted +1 for { and [ and -1 for } and ]: the count, and
+-- the lowest it went (0 or less); nil when a string runs on past `to`.
+local function brackets(s, i, to)
+  local n, low = 0, 0
+  while true do
+    local j = s:find('[{}%[%]"]', i)
+    if not j or j >= to then return n, low end
+    local c = s:byte(j)
+    if c == 34 then
+      local e = next_quote(s, j + 1)
+      if not e or e >= to then return nil end
+      i = e + 1
+    else
+      if c == 123 or c == 91 then
+        n = n + 1
+      else
+        n = n - 1
+        if n < low then low = n end
+      end
+      i = j + 1
+    end
+  end
+end
+
+-- The depth at `b`, the first byte of a key's value (see key_depth), from
+-- cursor `cur`: { s = s, pos = 1, depth = 0 } counts from the start of a
+-- body (a head, or all of it), and moves on with each call, since `b` only
+-- grows. A tail ({ s = s }) starts at a depth it cannot know, but ends where
+-- the body does, at depth 0: the first call counts from `b` to the end, and
+-- the depth at `b` is how far below 0 that count ends. The count must end at
+-- its lowest, as the root's closing bracket leaves it: bytes after the root
+-- (which Go's decoder never reads) can then only make the depth deeper,
+-- never shallower. nil once the count fails (a string that does not end, a
+-- tail that ends above its lowest): the depth is unknown.
+local function depth_at(cur, b)
+  if cur.bad then return nil end
+  if not cur.pos then
+    local n, low = brackets(cur.s, b, #cur.s + 1)
+    if not n or n >= 0 or n ~= low then cur.bad = true; return nil end
+    cur.pos, cur.depth = b, -n
+    return cur.depth
+  end
+  local n = brackets(cur.s, cur.pos, b)
+  if not n then cur.bad = true; return nil end
+  cur.pos, cur.depth = b, cur.depth + n
+  return cur.depth
+end
+
+-- The strings of the array that starts at `i`, to its end or the end of `s`,
+-- that are its items or items of arrays in it, with no object between (the
+-- strings collect reads there without a key: ["a", ["b"]]); the keys of its
+-- objects are for the scan to find.
+local function list_items(s, i, out)
+  local depth, objects = 0, 0
+  while true do
+    local j = s:find('[{}%[%]"]', i)
+    if not j then return end
+    local c = s:byte(j)
+    if c == 34 then
+      local v, nexti = read_string(s, j + 1)
+      if objects == 0 and v ~= "" then out[#out + 1] = v end
+      i = nexti
+    else
+      if c == 123 then
+        depth, objects = depth + 1, objects + 1
+      elseif c == 91 then
+        depth = depth + 1
+      else
+        depth = depth - 1
+        if c == 125 and objects > 0 then objects = objects - 1 end
+        if depth <= 0 then return end
+      end
+      i = j + 1
+    end
+  end
+end
+
 local scan_value
 
 --- Collect the string values of `keys` (from field_keys) from possibly
@@ -1370,26 +1485,32 @@ local scan_value
 -- With `deep` (from deep_keys), the value of a "**" path's key is read as
 -- the walk reads it, every key and string in it, in the order they come: an
 -- object (Ollama and Anthropic tool-call arguments) or an array (an AI SDK
--- tool part's input or output). The scanner cannot tell such an array from
--- the Responses input list when a plain path ends at the key too ("object"):
--- that array is read whole all the same, its base64 data URLs (the list's
--- images and files) left out, since scanning inside it for text-field keys
--- dropped an instruction under any other key. With `seen`, seen.token_ids is set when one of `keys` holds
--- an array that starts with a number ("prompt":[40 or "prompt":[[40): token
--- ids. With `opts.tail` (`s` is the end of a body whose middle was not
--- read), the bytes before the first unescaped '"' are the end of a value
--- cut at its start: kept when that quote ends a value (a comma or a closing
--- bracket follows, or nothing) and they read as natural text (white space in
--- them, and is_text), so the end of an instruction in a long message is
--- judged and the end of a base64 data URL is not. The value of a key that
--- is not one of `keys` is not read: the scan goes on at its first byte, as
--- from any other string (see key_at).
+-- tool part's input or output). A plain path may end at that key too
+-- (deep_keys gives the depths where only plain paths end): an array there,
+-- the Responses input list at the root, is a list the walk reads item by
+-- item for its text, so its string items are read (list_items) and the scan
+-- goes on inside it for text-field keys, as for any other value: the list's
+-- type and role words are no text. The depth comes from the start of `s`,
+-- or from its end with `opts.tail` (see depth_at); where it is unknown the
+-- array is read whole, its base64 data URLs (data_url) left out. With
+-- `seen`, seen.token_ids is set when one of `keys` holds an array that
+-- starts with a number ("prompt":[40 or "prompt":[[40): token ids. With
+-- `opts.tail` (`s` is the end of a body whose middle was not read), the
+-- bytes before the first unescaped '"' are the end of a value cut at its
+-- start: kept when that quote ends a value (a comma or a closing bracket
+-- follows, or nothing) and they read as natural text (white space in them,
+-- and is_text), so the end of an instruction in a long message is judged
+-- and the end of a base64 data URL is not. The value of a key that is not
+-- one of `keys` is not read: the scan goes on at its first byte, as from
+-- any other string (see key_at).
 function _M.scan_strings(s, keys, out, deep, seen, opts)
   local q = next_quote(s, 1)
-  if q and opts and opts.tail and (s:find("^%s*[,}%]]", q + 1) or s:find("^%s*$", q + 1)) then
+  local tail = opts and opts.tail
+  if q and tail and (s:find("^%s*[,}%]]", q + 1) or s:find("^%s*$", q + 1)) then
     local v = read_string(s, 1)
     if v:find("%s") and _M.is_text(v) then out[#out + 1] = v end
   end
+  local cur
   while q do
     local key, b, nq = key_at(s, q, true)
     if not key then
@@ -1405,8 +1526,17 @@ function _M.scan_strings(s, keys, out, deep, seen, opts)
           seen.token_ids = true
         end
         local d = deep and deep[key]
-        if d and (c == 123 or c == 91) then
-          q = next_quote(s, scan_value(s, b, out, false, d == "object" and c == 91))
+        local list = false
+        if d and d ~= "any" and c == 91 then
+          cur = cur or (tail and { s = s } or { s = s, pos = 1, depth = 0 })
+          local depth = depth_at(cur, b)
+          list = depth ~= nil and d[depth] == true
+        end
+        if list then
+          list_items(s, b, out)
+          q = next_quote(s, b)
+        elseif d and (c == 123 or c == 91) then
+          q = next_quote(s, scan_value(s, b, out, false, d ~= "any" and c == 91))
         else
           q = next_quote(s, b)
         end
@@ -1449,19 +1579,28 @@ local function type_names(s, i)
   end
 end
 
--- A base64 data URL (data:image/png;base64,...): an image or a file, not
--- text. ASCII only, so both cores read the same strings as one.
+-- The keys an image or a file is sent under as a data URL: a Responses
+-- input_image's image_url and input_file's file_data, and the url of an
+-- image_url object or an AI SDK file part.
+local DATA_KEYS = { image_url = true, url = true, file_data = true }
+
+-- A base64 data URL (data:image/png;base64,iVBORw0...): an image or a file,
+-- not text, when every byte after "base64," is a base64 one (a string that
+-- only starts so is text: "data:text/plain;base64,Ignore all ..."). ASCII
+-- only, so both cores read the same strings as one.
 local function data_url(v)
-  return v:find("^[Dd][Aa][Tt][Aa]:[%w!#$&%-%^_%.%+/=;]*;[Bb][Aa][Ss][Ee]64,") ~= nil
+  local b = v:match("^[Dd][Aa][Tt][Aa]:[%w!#$&%-%^_%.%+/=;]*;[Bb][Aa][Ss][Ee]64,()")
+  return b ~= nil and v:find("^[%w%+/=]*$", b) ~= nil
 end
 
 -- Every key and string of the JSON value that starts at `i` (a `{` or `[`),
 -- to its end or the end of `s`, in the order they come; with `schema` (tool
 -- definitions) a "type" key whose value is a JSON Schema type name is left
--- out with it, as tool_leaf does; with `nodata`, base64 data URLs are left
--- out. Returns the index after the value.
+-- out with it, as tool_leaf does; with `nodata`, a base64 data URL that is
+-- the value of one of DATA_KEYS is left out. Returns the index after the
+-- value.
 scan_value = function(s, i, out, schema, nodata)
-  local depth, n = 0, #s
+  local depth, n, key = 0, #s, nil
   while true do
     local j = s:find('[{}%[%]"]', i)
     if not j then return n + 1 end
@@ -1469,17 +1608,20 @@ scan_value = function(s, i, out, schema, nodata)
     if c == 34 then
       local v, nexti = read_string(s, j + 1)
       local k = s:find("[^ \t\n\r]", nexti)
-      local skip = schema and v == "type" and k and s:byte(k) == 58 and type_names(s, k + 1)
+      local colon = k and s:byte(k) == 58
+      local skip = schema and v == "type" and colon and type_names(s, k + 1)
       if skip then
-        i = skip
+        i, key = skip, nil
       else
-        if v ~= "" and not (nodata and data_url(v)) then out[#out + 1] = v end
-        i = nexti
+        if v ~= "" and not (nodata and not colon and key and DATA_KEYS[key] and data_url(v)) then
+          out[#out + 1] = v
+        end
+        i, key = nexti, colon and v or nil
       end
     elseif c == 123 or c == 91 then
-      depth, i = depth + 1, j + 1
+      depth, i, key = depth + 1, j + 1, nil
     else
-      depth, i = depth - 1, j + 1
+      depth, i, key = depth - 1, j + 1, nil
       if depth <= 0 then return i end
     end
   end

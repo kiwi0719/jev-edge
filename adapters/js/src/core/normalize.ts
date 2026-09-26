@@ -1412,21 +1412,56 @@ export function fieldKeys(fields: string[] | undefined): Set<string> {
   return keys;
 }
 
+// Port of key_depth: the depth of the key text-field path `f` ends at
+// (`last`, folded): the objects and arrays around that key in a body whose
+// root is an object, "input" 1, "input[*].output" 3,
+// "messages[*].parts[*].input.**" 5; undefined when the path's segments end
+// at another key.
+function keyDepth(f: string, last: string): number | undefined {
+  const segs = splitPath(f.endsWith(".**") ? f.slice(0, -3) : f);
+  let n = segs.length;
+  // "[*]" alone steps into an array without a key
+  while (n > 0 && segs[n - 1].key === "") n--;
+  if (n === 0 || fold(segs[n - 1].key) !== last) return undefined;
+  let depth = 1;
+  for (let i = 0; i < n - 1; i++) depth += segs[i].each && segs[i].key !== "" ? 2 : 1;
+  return depth;
+}
+
 /**
  * Port of deep_keys: the last key of each "**" text-field path, folded, for
- * scanStrings: "any", or "object" when a path without "**" ends at the same
- * key too ("input": a tool_use input, and the Responses input list, whose
- * images and files the scan leaves out).
+ * scanStrings: "any"; or, when a path without "**" ends at the same key too
+ * ("input": a tool_use input and an AI SDK tool part's input, and the
+ * Responses input list), the set of depths (see keyDepth) at which only such
+ * plain paths end: an array there is a list the walk reads item by item (the
+ * Responses input list at 1, a function_call_output's output at 3), not a
+ * "**" value. A path whose depth is unknown leaves the set empty for a "**"
+ * path, and adds nothing to it for a plain one.
  */
-export function deepKeys(fields: string[] | undefined): Map<string, "any" | "object"> {
-  const deep = new Set<string>();
-  const plain = new Set<string>();
+export function deepKeys(fields: string[] | undefined): Map<string, "any" | Set<number>> {
+  const deep = new Map<string, Set<number | "unknown">>();
+  const plain = new Map<string, Set<number | "unknown">>();
   for (const f of fields ?? []) {
     const k = lastKey(f);
-    if (k !== undefined) (f.endsWith(".**") ? deep : plain).add(k);
+    if (k === undefined) continue;
+    const set = f.endsWith(".**") ? deep : plain;
+    let depths = set.get(k);
+    if (!depths) set.set(k, depths = new Set());
+    depths.add(keyDepth(f, k) ?? "unknown");
   }
-  const out = new Map<string, "any" | "object">();
-  for (const k of deep) out.set(k, plain.has(k) ? "object" : "any");
+  const out = new Map<string, "any" | Set<number>>();
+  for (const [k, at] of deep) {
+    const p = plain.get(k);
+    if (!p) {
+      out.set(k, "any");
+      continue;
+    }
+    const lists = new Set<number>();
+    if (!at.has("unknown")) {
+      for (const d of p) if (d !== "unknown" && !at.has(d)) lists.add(d);
+    }
+    out.set(k, lists);
+  }
   return out;
 }
 
@@ -1470,31 +1505,127 @@ function endsValue(s: string, i: number): boolean {
   return i >= s.length || s[i] === "," || s[i] === "}" || s[i] === "]";
 }
 
+// Port of brackets: the brackets outside strings from `i` (outside any
+// string) up to `to` (not included), counted +1 for { and [ and -1 for }
+// and ]: the count and the lowest it went (0 or less); undefined when a
+// string runs on past `to`.
+function brackets(s: string, i: number, to: number): [number, number] | undefined {
+  let n = 0;
+  let low = 0;
+  const re = /[{}[\]"]/g;
+  for (;;) {
+    re.lastIndex = i;
+    const m = re.exec(s);
+    if (!m || m.index >= to) return [n, low];
+    const j = m.index;
+    const c = s[j];
+    if (c === '"') {
+      const e = nextQuote(s, j + 1);
+      if (e === -1 || e >= to) return undefined;
+      i = e + 1;
+    } else {
+      if (c === "{" || c === "[") n++;
+      else if (--n < low) low = n;
+      i = j + 1;
+    }
+  }
+}
+
+// Port of depth_at: the depth at `b`, the first character of a key's value
+// (see keyDepth). A cursor with `pos` counts from the start of a body (a
+// head, or all of it) and moves on with each call, since `b` only grows. A
+// tail's cursor (no `pos`) starts at a depth it cannot know, but ends where
+// the body does, at depth 0: the first call counts from `b` to the end, and
+// the depth at `b` is how far below 0 that count ends, which must be its
+// lowest (bytes after the root can then only make the depth deeper).
+// undefined once the count fails: the depth is unknown.
+interface DepthCursor { s: string; pos?: number; depth: number; bad?: boolean }
+function depthAt(cur: DepthCursor, b: number): number | undefined {
+  if (cur.bad) return undefined;
+  if (cur.pos === undefined) {
+    const r = brackets(cur.s, b, cur.s.length);
+    if (!r || r[0] >= 0 || r[0] !== r[1]) {
+      cur.bad = true;
+      return undefined;
+    }
+    cur.pos = b;
+    cur.depth = -r[0];
+    return cur.depth;
+  }
+  const r = brackets(cur.s, cur.pos, b);
+  if (!r) {
+    cur.bad = true;
+    return undefined;
+  }
+  cur.pos = b;
+  cur.depth += r[0];
+  return cur.depth;
+}
+
+// Port of list_items: the strings of the array that starts at `i`, to its
+// end or the end of `s`, that are its items or items of arrays in it, with
+// no object between (the strings collect reads there without a key).
+function listItems(s: string, i: number, out: string[]): void {
+  let depth = 0;
+  let objects = 0;
+  const re = /[{}[\]"]/g;
+  for (;;) {
+    re.lastIndex = i;
+    const m = re.exec(s);
+    if (!m) return;
+    const j = m.index;
+    const c = s[j];
+    if (c === '"') {
+      const [v, next] = readString(s, j + 1);
+      if (objects === 0 && v !== "") out.push(v);
+      i = next;
+    } else {
+      if (c === "{") {
+        depth++;
+        objects++;
+      } else if (c === "[") {
+        depth++;
+      } else {
+        depth--;
+        if (c === "}" && objects > 0) objects--;
+        if (depth <= 0) return;
+      }
+      i = j + 1;
+    }
+  }
+}
+
 /**
  * Collect the string values of `keys` (from fieldKeys) from possibly
  * truncated JSON (port of scan_strings). Keys match the way walk() matches
  * them: decoded and folded. With `deep` (from deepKeys), the value of a "**"
  * path's key is read as the walk reads it, every key and string in it in
- * the order they come: an object or an array. An array under a key a plain
- * path ends at too ("object"), which may be the Responses input list, is read
- * whole all the same, its base64 data URLs (the list's images and files)
- * left out. With
- * `seen`, seen.tokenIds is set when one of `keys` holds an array that starts
- * with a number: token ids. With `opts.tail`, the text before the first
- * unescaped '"' is the end of a value cut at its start: kept when that quote
- * ends a value and it reads as natural text (white space in it, and isText).
- * The value of a key that is not one of `keys` is not read: the scan goes on
- * at its first character, as from any other string (see keyAt).
+ * the order they come: an object or an array. A plain path may end at that
+ * key too (deepKeys gives the depths where only plain paths end): an array
+ * there, the Responses input list at the root, is a list the walk reads
+ * item by item, so its string items are read (listItems) and the scan goes
+ * on inside it for text-field keys: the list's type and role words are no
+ * text. The depth comes from the start of `s`, or from its end with
+ * `opts.tail` (see depthAt); where it is unknown the array is read whole,
+ * its base64 data URLs left out. With `seen`, seen.tokenIds is set when one
+ * of `keys` holds an array that starts with a number: token ids. With
+ * `opts.tail`, the text before the first unescaped '"' is the end of a value
+ * cut at its start: kept when that quote ends a value and it reads as
+ * natural text (white space in it, and isText). The value of a key that is
+ * not one of `keys` is not read: the scan goes on at its first character, as
+ * from any other string (see keyAt).
  */
 export function scanStrings(
-  s: string, keys: Set<string>, out: string[], deep?: Map<string, "any" | "object">, seen?: { tokenIds?: boolean },
+  s: string, keys: Set<string>, out: string[], deep?: Map<string, "any" | Set<number>>, seen?: { tokenIds?: boolean },
   opts?: { tail?: boolean },
 ): string[] {
   let q = nextQuote(s, 0);
-  if (q !== -1 && opts?.tail && endsValue(s, q + 1)) {
+  const tail = opts?.tail === true;
+  if (q !== -1 && tail && endsValue(s, q + 1)) {
     const [v] = readString(s, 0);
     if (/[ \t\n\v\f\r]/.test(v) && isText(v)) out.push(v);
   }
+  let cur: DepthCursor | undefined;
   while (q !== -1) {
     const k = keyAt(s, q, true);
     if (k === null) break;
@@ -1510,8 +1641,20 @@ export function scanStrings(
     } else {
       if (seen && s[at] === "[" && keys.has(k.key) && startsWithNumber(s, at + 1)) seen.tokenIds = true;
       const d = deep?.get(k.key);
-      q = nextQuote(s, d !== undefined && (s[at] === "{" || s[at] === "[")
-        ? scanValue(s, at, out, false, d === "object" && s[at] === "[") : at);
+      let list = false;
+      if (d !== undefined && d !== "any" && s[at] === "[") {
+        cur ??= tail ? { s, depth: 0 } : { s, pos: 0, depth: 0 };
+        const depth = depthAt(cur, at);
+        list = depth !== undefined && d.has(depth);
+      }
+      if (list) {
+        listItems(s, at, out);
+        q = nextQuote(s, at);
+      } else if (d !== undefined && (s[at] === "{" || s[at] === "[")) {
+        q = nextQuote(s, scanValue(s, at, out, false, d !== "any" && s[at] === "["));
+      } else {
+        q = nextQuote(s, at);
+      }
     }
   }
   return out;
@@ -1564,16 +1707,25 @@ function typeNames(s: string, i: number): number | undefined {
   }
 }
 
+// Port of DATA_KEYS: the keys an image or a file is sent under as a data URL
+// (a Responses input_image's image_url and input_file's file_data, the url
+// of an image_url object or an AI SDK file part).
+const DATA_KEYS = new Set(["image_url", "url", "file_data"]);
+
+// Port of data_url: a base64 data URL (data:image/png;base64,iVBORw0...),
+// an image or a file, not text, when every character after "base64," is a
+// base64 one ("data:text/plain;base64,Ignore all ..." is text). ASCII only,
+// so both cores read the same strings as one.
+const DATA_URL = /^data:[A-Za-z0-9!#$&\-^_.+/=;]*;base64,[A-Za-z0-9+/=]*$/i;
+
 // Port of scan_value: every key and string of the JSON value that starts at
 // `i` (a `{` or `[`), to its end or the end of `s`; with `schema` (tool
 // definitions) a "type" key whose value is a JSON Schema type name is left
-// out with it. Returns the index after it.
-// Port of data_url: a base64 data URL (data:image/png;base64,...), an image
-// or a file, not text. ASCII only, so both cores read the same strings as one.
-const DATA_URL = /^data:[A-Za-z0-9!#$&\-^_.+/=;]*;base64,/i;
-
+// out with it; with `nodata`, a base64 data URL that is the value of one of
+// DATA_KEYS is left out. Returns the index after it.
 function scanValue(s: string, i: number, out: string[], schema: boolean, nodata = false): number {
   let depth = 0;
+  let key: string | undefined;
   const re = /[{}[\]"]/g;
   for (;;) {
     re.lastIndex = i;
@@ -1584,19 +1736,24 @@ function scanValue(s: string, i: number, out: string[], schema: boolean, nodata 
     if (c === '"') {
       const [v, next] = readString(s, j + 1);
       const k = nonSpace(s, next);
-      const skip = schema && v === "type" && k !== -1 && s[k] === ":" ? typeNames(s, k + 1) : undefined;
+      const colon = k !== -1 && s[k] === ":";
+      const skip = schema && v === "type" && colon ? typeNames(s, k + 1) : undefined;
       if (skip !== undefined) {
         i = skip;
+        key = undefined;
       } else {
-        if (v !== "" && !(nodata && DATA_URL.test(v))) out.push(v);
+        if (v !== "" && !(nodata && !colon && key !== undefined && DATA_KEYS.has(key) && DATA_URL.test(v))) out.push(v);
         i = next;
+        key = colon ? v : undefined;
       }
     } else if (c === "{" || c === "[") {
       depth++;
       i = j + 1;
+      key = undefined;
     } else {
       depth--;
       i = j + 1;
+      key = undefined;
       if (depth <= 0) return i;
     }
   }

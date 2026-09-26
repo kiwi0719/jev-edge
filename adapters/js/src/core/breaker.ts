@@ -34,6 +34,10 @@ export interface Store {
   incr?(key: string, by: number, ttl: number): number | Promise<number>;
   /** Optional: reset a key's ttl without rewriting it. */
   expire?(key: string, ttl: number): void | Promise<void>;
+  /** Optional: the values of several keys, in key order (undefined for a
+   *  missing one), in fewer round trips than a get each. The subject ring
+   *  reads its slots with it (Deno KV's getMany). */
+  getMany?(keys: string[]): unknown[] | Promise<unknown[]>;
 }
 
 interface StateRec { state?: number; until_ts?: number }

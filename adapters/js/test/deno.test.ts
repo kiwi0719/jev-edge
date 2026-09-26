@@ -33,20 +33,37 @@ function captureUpstream(): Request[] {
 
 const tick = () => new Promise<void>((r) => setTimeout(r, 0));
 
-/** A fake Deno KV: versionstamps, expireIn recorded, atomic check-and-set. */
-function fakeKv(): DenoKvLike & { map: Map<string, { value: unknown; versionstamp: string; expireIn?: number }>; conflicts: number } {
+/** One read the fake served: the op, the keys and the consistency asked for. */
+interface Read { op: "get" | "getMany"; keys: DenoKvKey[]; consistency?: string }
+
+/** A fake Deno KV: versionstamps, expireIn recorded, atomic check-and-set,
+ *  and every read recorded (`reads`). */
+function fakeKv(): DenoKvLike & {
+  map: Map<string, { value: unknown; versionstamp: string; expireIn?: number }>; conflicts: number; reads: Read[];
+} {
   const map = new Map<string, { value: unknown; versionstamp: string; expireIn?: number }>();
   let vs = 0;
   const id = (k: DenoKvKey) => JSON.stringify(k);
   const put = (k: DenoKvKey, value: unknown, opts?: { expireIn?: number }) =>
     map.set(id(k), { value: structuredClone(value), versionstamp: String(++vs).padStart(20, "0"), expireIn: opts?.expireIn });
+  const entry = (k: DenoKvKey) => {
+    const e = map.get(id(k));
+    return e ? { value: structuredClone(e.value), versionstamp: e.versionstamp } : { value: null, versionstamp: null };
+  };
   const kv = {
     map,
     conflicts: 0,
-    async get(k: DenoKvKey) {
+    reads: [] as Read[],
+    async get(k: DenoKvKey, opts?: { consistency?: string }) {
+      kv.reads.push({ op: "get", keys: [k], consistency: opts?.consistency });
       await tick();
-      const e = map.get(id(k));
-      return e ? { value: structuredClone(e.value), versionstamp: e.versionstamp } : { value: null, versionstamp: null };
+      return entry(k);
+    },
+    async getMany(ks: DenoKvKey[], opts?: { consistency?: string }) {
+      if (ks.length > 10) throw new TypeError("Too many ranges (max 10)");
+      kv.reads.push({ op: "getMany", keys: ks, consistency: opts?.consistency });
+      await tick();
+      return ks.map(entry);
     },
     async set(k: DenoKvKey, v: unknown, opts?: { expireIn?: number }) {
       await tick();
@@ -204,6 +221,35 @@ describe("denoHandler", () => {
     }
   });
 
+  // lead-js-runtimes#11: the verdict cache reads the nearest replica; the
+  // breaker state and the subject store, whose check-and-set loops need the
+  // current versionstamp, read strong; the ring's slots come in getMany calls
+  it("reads the cache eventually consistent, state and subject strong, the ring's slots in getMany calls", async () => {
+    captureUpstream();
+    const kv = fakeKv();
+    const cfg = mockConfig({ subject: { enabled: true, from: "ip", salt: "pepper" } });
+    const h = denoHandler({ upstream: UPSTREAM, config: cfg, kv });
+    const ringN = () => [...kv.map.entries()].find(([k]) => k.startsWith('["jev","subject","subj:ip:') && k.endsWith(':n"]'))?.[1].value;
+    for (let i = 0; i < 12; i++) {
+      await h(chat(`{"messages":[{"role":"user","content":"Please summarise quarterly report number ${i} in detail."}]}`), PEER);
+      // the fire-and-forget subject write lands before the next request
+      for (let t = 0; t < 50 && (ringN() as { v?: number } | undefined)?.v !== i + 1; t++) await tick();
+    }
+    expect((ringN() as { v: number }).v).toBe(12);
+    kv.reads.length = 0;
+    await h(chat('{"messages":[{"role":"user","content":"And one more summary of the annual report, please."}]}'), PEER);
+    const under = (r: Read, part: string) => r.keys.every((k) => k[1] === part);
+    const cache = kv.reads.filter((r) => under(r, "cache"));
+    expect(cache.length).toBeGreaterThan(0);
+    expect(cache.every((r) => r.consistency === "eventual")).toBe(true);
+    const other = kv.reads.filter((r) => !under(r, "cache"));
+    expect(other.some((r) => under(r, "state"))).toBe(true);
+    expect(other.every((r) => r.consistency === undefined)).toBe(true);
+    // the ring: its counter, then 12 slots in two getMany calls (at most 10 keys each), no get per slot
+    const slots = kv.reads.filter((r) => under(r, "subject") && r.keys.some((k) => /:\d+$/.test(k[2])));
+    expect(slots.map((r) => [r.op, r.keys.length])).toEqual([["getMany", 10], ["getMany", 2]]);
+  });
+
   it("requires an upstream", () => {
     expect(() => denoHandler({ upstream: "" })).toThrow(/upstream/);
   });
@@ -243,6 +289,34 @@ describe("denoKvStore", () => {
     const h = (await subject.loadHistory(s, "ip:x", 20)) as subject.Entry[];
     expect(h).toHaveLength(20);
     expect(h.map((e) => e.score).sort((a, b) => a - b)).toEqual(Array.from({ length: 20 }, (_, i) => i + 1));
+  });
+
+  it("getMany reads in batches of 10, in key order, expiry honoured; a KV without it gets each key", async () => {
+    let now = 100;
+    const kv = fakeKv();
+    const s = denoKvStore(kv, ["t"], () => now, { consistency: "eventual" });
+    for (let i = 0; i < 23; i++) await s.set("k" + i, i, i === 5 ? 10 : 0);
+    now = 111; // k5 expired
+    kv.reads.length = 0;
+    const keys = Array.from({ length: 23 }, (_, i) => "k" + i).concat(["missing"]);
+    const want = keys.map((k, i) => (k === "k5" || k === "missing" ? undefined : i));
+    expect(await s.getMany!(keys)).toEqual(want);
+    expect(kv.reads.map((r) => [r.op, r.keys.length, r.consistency])).toEqual([
+      ["getMany", 10, "eventual"], ["getMany", 10, "eventual"], ["getMany", 4, "eventual"]]);
+    expect(await s.get("k1")).toBe(1);
+    expect(kv.reads.at(-1)).toEqual({ op: "get", keys: [["t", "k1"]], consistency: "eventual" });
+    // incr's check-and-set reads strong whatever the option
+    kv.reads.length = 0;
+    await s.incr!("c", 1, 0);
+    expect(kv.reads.every((r) => r.consistency === undefined)).toBe(true);
+    // a KV-like without getMany: one get per key
+    const bare = fakeKv();
+    delete (bare as Partial<DenoKvLike>).getMany;
+    const b = denoKvStore(bare, ["t"]);
+    await b.set("a", 1, 0);
+    bare.reads.length = 0;
+    expect(await b.getMany!(["a", "b"])).toEqual([1, undefined]);
+    expect(bare.reads.map((r) => r.op)).toEqual(["get", "get"]);
   });
 
   it("incr keeps the original expiry; expire resets it", async () => {

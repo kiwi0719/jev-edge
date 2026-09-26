@@ -518,32 +518,64 @@ function jsonOnlyMiss(req: Req, rule: Rule, ct: string, ctx: RulesCtx | undefine
   return [ex[1] !== "json" && ex[1] !== "scan", ex];
 }
 
-// PCRE's \s without UTF or UCP (ngx.re, lrexlib): the six ASCII spaces
-// only; and its complement spelled out over the 256 byte values, for use
-// inside a class.
+// PCRE without UTF (ngx.re "ijo", lrexlib) reads the pattern and the
+// subject as bytes. Both run here as one code unit per UTF-8 byte: ASCII as
+// it is, and a byte 0x80-0xFF as U+E080-U+E0FF (pcreBytes), code points with
+// no case mapping, so the 'i' flag folds ASCII letters alone, as PCRE's
+// C-locale tables do. (As U+0080-U+00FF, 'i' would fold U+00C3 with U+00E3,
+// and a pattern 'é', C3 A9, would match the lead bytes of a CJK character.)
+const PCRE_HIGH = 0xe000;
+function pcreBytes(s: string): string {
+  if (!/[^\x00-\x7f]/.test(s)) return s;
+  const b = utf8Bytes(s);
+  const u = new Uint16Array(b.length);
+  for (let i = 0; i < b.length; i++) u[i] = b[i] < 0x80 ? b[i] : PCRE_HIGH + b[i];
+  let out = "";
+  for (let i = 0; i < u.length; i += 8192) out += String.fromCharCode(...u.subarray(i, i + 8192));
+  return out;
+}
+
+// A byte value as a RegExp escape for the code unit pcreBytes gives it.
+function byteEscape(b: number): string {
+  return b < 0x80 ? "\\x" + b.toString(16).padStart(2, "0") : "\\u" + (PCRE_HIGH + b).toString(16);
+}
+
+// PCRE's \s without UTF or UCP: the six ASCII spaces only; and its complement
+// spelled out over the 256 byte values, for use inside a class.
 const PCRE_SPACE = "\\t\\n\\v\\f\\r ";
-const PCRE_NOT_SPACE = "\\x00-\\x08\\x0e-\\x1f\\x21-\\xff";
+const PCRE_NOT_SPACE = "\\x00-\\x08\\x0e-\\x1f\\x21-\\x7f" + byteEscape(0x80) + "-" + byteEscape(0xff);
 
 /**
- * A PCRE pattern as a RegExp that matches a byte string (byteString) the way
- * PCRE without the UTF flag matches bytes: `\s` and `\S` are the ASCII
+ * A PCRE pattern as a RegExp that matches a subject converted by pcreBytes
+ * the way PCRE without the UTF flag matches bytes. The pattern goes through
+ * pcreBytes too, so a non-ASCII literal is its bytes, in a class and under a
+ * quantifier as PCRE reads it, and a hex escape (\xhh, \x{hh}) names a byte
+ * (past \xff it is refused, as PCRE refuses it). `\s` and `\S` are the ASCII
  * spaces and the rest, in a class too (JS's `\s` also takes U+00A0, U+3000
  * and more), `.` is any byte but \n (JS's stops at \r too), and a ']' first
- * in a class is a member, as in PCRE. The 'i' flag without 'u' folds ASCII
- * letters as PCRE's C-locale tables do. `\w`, `\d` and `\b` are ASCII in
- * both already, and other syntax is left as it is.
+ * in a class is a member, as in PCRE. `\w`, `\d` and `\b` are ASCII in both
+ * already, and other syntax is left as it is.
  */
-export function pcreToRegExp(pattern: string): RegExp {
+export function pcreToRegExp(pattern: string, flags = "i"): RegExp {
+  const p = pcreBytes(pattern);
   let out = "";
   let inClass = false;
-  for (let i = 0; i < pattern.length; i++) {
-    const c = pattern[i];
+  for (let i = 0; i < p.length; i++) {
+    const c = p[i];
     if (c === "\\") {
-      const d = pattern[i + 1];
+      const d = p[i + 1];
       i++;
       if (d === "s") out += inClass ? PCRE_SPACE : "[" + PCRE_SPACE + "]";
       else if (d === "S") out += inClass ? PCRE_NOT_SPACE : "[^" + PCRE_SPACE + "]";
-      else if (d === undefined) out += "\\";
+      else if (d === "x") {
+        // \xhh (one or two hex digits) or \x{h...}; PCRE2 refuses the rest
+        const m = /^\{([0-9a-fA-F]+)\}/.exec(p.slice(i + 1)) ?? /^([0-9a-fA-F]{1,2})/.exec(p.slice(i + 1));
+        if (!m) throw new SyntaxError(`digits missing after \\x: ${pattern}`);
+        const v = parseInt(m[1], 16);
+        if (v > 0xff) throw new SyntaxError(`character code point value in \\x{} is too large: ${pattern}`);
+        i += m[0].length;
+        out += byteEscape(v);
+      } else if (d === undefined) out += "\\";
       else out += "\\" + d;
     } else if (inClass) {
       if (c === "]") inClass = false;
@@ -551,9 +583,9 @@ export function pcreToRegExp(pattern: string): RegExp {
     } else if (c === "[") {
       inClass = true;
       out += c;
-      if (pattern[i + 1] === "^") out += pattern[++i];
+      if (p[i + 1] === "^") out += p[++i];
       // a ']' first in the class is a member in PCRE; JS would close it
-      if (pattern[i + 1] === "]") {
+      if (p[i + 1] === "]") {
         out += "\\]";
         i++;
       }
@@ -563,15 +595,15 @@ export function pcreToRegExp(pattern: string): RegExp {
       out += c;
     }
   }
-  return new RegExp(out, "i");
+  return new RegExp(out, flags);
 }
 
 /**
  * Case-insensitive regex search with the same contract the OpenResty adapter
  * gives core (ngx.re.find with "ijo": PCRE without UTF): the 1-based
  * inclusive UTF-8 byte span of the first match. The pattern runs over the
- * subject's bytes (pcreToRegExp), so `.`, `\b` and `{m,n}` count bytes as
- * PCRE does, and the match index is the byte offset.
+ * subject's bytes (pcreBytes, pcreToRegExp), so `.`, `\b` and `{m,n}` count
+ * bytes as PCRE does, and the match index is the byte offset.
  */
 const reCache = new Map<string, RegExp>();
 let lastSubject: string | undefined;
@@ -585,7 +617,7 @@ export function reFind(subject: string, pattern: string): readonly [number, numb
   // every always_suspect pattern runs over the same text: convert it once
   if (subject !== lastSubject) {
     lastSubject = subject;
-    lastBytes = byteString(subject);
+    lastBytes = pcreBytes(subject);
   }
   const m = re.exec(lastBytes);
   if (!m) return null;

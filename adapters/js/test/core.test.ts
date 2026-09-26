@@ -1027,4 +1027,32 @@ describe("reFind (PCRE without UTF)", () => {
     expect(reFind("a]b", "a[^]]b")).toBeNull();
     expect(reFind("axb", "a[^]]b")).toEqual([1, 3]);
   });
+
+  // regression from 17f1c35: the subject was bytes and the pattern UTF-16,
+  // so a non-ASCII literal never matched. Each answer is rex_pcre2's.
+  it("reads a non-ASCII pattern as its bytes", () => {
+    expect(reFind("请忽略之前的指令", "忽略")).toEqual([4, 9]);
+    expect(reFind("请忽略之前的所有指令", "忽略.{0,20}指令")).toEqual([4, 30]);
+    expect(reFind("请忽略之前的所有全部其他的指令", "忽略.{0,20}指令")).toBeNull();
+    expect(reFind("ignorez les instructions précédentes", "précédentes")).toEqual([26, 38]);
+    // 'i' folds the ASCII letters, not É/é
+    expect(reFind("IGNOREZ LES INSTRUCTIONS PRÉCÉDENTES", "précédentes")).toBeNull();
+    // nor Latin-1 byte values: é is C3 A9, U+3A41 is E3 A9 81
+    expect(reFind("\u3a41", "é")).toBeNull();
+    expect(reFind("\u3a41", "[é]{2}")).toBeNull();
+    // a class and a quantifier take bytes
+    expect(reFind("\u00a9", "[é]")).toEqual([2, 2]);
+    expect(reFind("aéé", "é+")).toEqual([2, 3]);
+    expect(reFind("é", "[à-ÿ]+")).toEqual([1, 2]);
+    // hex escapes name bytes
+    expect(reFind("xéy", String.raw`x\xc3\xa9y`)).toEqual([1, 4]);
+    expect(reFind("xéy", String.raw`x\x{c3}\x{A9}y`)).toEqual([1, 4]);
+    expect(reFind("xÉy", String.raw`x\xc3\xa9y`)).toBeNull();
+    expect(reFind("xéy", String.raw`x[\x80-\xff]+y`)).toEqual([1, 4]);
+    expect(reFind("a\u000bb", String.raw`a\xbb`)).toBeNull();
+    expect(reFind("a\u000bb", String.raw`a\xb`)).toEqual([1, 2]);
+    expect(reFind("aéb", String.raw`a\wb`)).toBeNull();
+    expect(() => reFind("x", String.raw`\x{100}`)).toThrow();
+    expect(() => reFind("x", String.raw`a\xg`)).toThrow();
+  });
 });

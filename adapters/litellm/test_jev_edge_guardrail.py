@@ -129,22 +129,59 @@ def test_pass_annotates_and_forwards_ip_and_path():
     assert v["reason"] == "injection 0.20"
 
 
-def test_xff_chain_is_forwarded_whole_not_its_forgeable_first_entry():
+def xff_sent(data: dict, call_type: str = "completion"):
     transport, seen = fake_authz()
-    g = guard(transport)
-    data = {"messages": CHAT["messages"], "proxy_server_request": {"headers": {"X-Forwarded-For": "6.6.6.6,  198.51.100.4"}}}
-    run(g.async_pre_call_hook({}, None, data, "completion"))
-    assert seen["xff"] == "6.6.6.6, 198.51.100.4"
+    run(guard(transport).async_pre_call_hook({}, None, data, call_type))
+    return seen["xff"]
 
 
-def test_xff_chain_wins_over_requester_ip_address():
-    # with use_x_forwarded_for on, requester_ip_address is the forgeable leftmost entry
-    transport, seen = fake_authz()
-    g = guard(transport)
-    data = {"messages": CHAT["messages"], "metadata": {"requester_ip_address": "6.6.6.6"},
-            "proxy_server_request": {"headers": {"x-forwarded-for": "6.6.6.6, 198.51.100.4"}}}
-    run(g.async_pre_call_hook({}, None, data, "completion"))
-    assert seen["xff"] == "6.6.6.6, 198.51.100.4"
+def test_the_peer_is_appended_to_the_chain_as_a_proxy_appends_it():
+    # python-adapters#6: the chain went as it came, so a client that reached
+    # LiteLLM directly chose the address jev-edge judged. The peer LiteLLM
+    # saw is appended, one hop, as nginx appends $remote_addr: behind N
+    # appending proxies trusted_hops = N+1 lands on the first one's entry
+    data = {"messages": CHAT["messages"], "metadata": {"requester_ip_address": "203.0.113.4"},
+            "proxy_server_request": psr("/v1/chat/completions", **{"X-Forwarded-For": "6.6.6.6,  198.51.100.4"})}
+    assert xff_sent(data) == "6.6.6.6, 198.51.100.4, 203.0.113.4"
+
+
+def test_a_forged_xff_on_direct_exposure_is_not_the_address_judged():
+    # reached directly (trusted_hops = 1): jev-edge takes the rightmost
+    # entry, the peer, whatever the client wrote before it
+    data = {"messages": CHAT["messages"], "metadata": {"requester_ip_address": "203.0.113.50"},
+            "proxy_server_request": psr("/v1/chat/completions", **{"x-forwarded-for": "6.6.6.6"})}
+    sent = xff_sent(data)
+    assert sent == "6.6.6.6, 203.0.113.50"
+    assert re.findall(r"[^,\s]+", sent)[-1] == "203.0.113.50"  # as jev-edge splits it, trusted_hops = 1
+
+
+def test_the_peer_appended_is_the_proxys_own_on_a_litellm_metadata_route():
+    # Responses: `metadata` is the client's (sent on to the provider), the
+    # proxy's own bag is litellm_metadata; a spoofed requester_ip_address in
+    # the client's metadata is never the hop appended
+    data = {"input": ATTACK, "metadata": {"requester_ip_address": "6.6.6.6"},
+            "litellm_metadata": {"requester_ip_address": "203.0.113.5"},
+            "proxy_server_request": psr("/v1/responses", **{"x-forwarded-for": "198.51.100.4"})}
+    assert xff_sent(data, "aresponses") == "198.51.100.4, 203.0.113.5"
+    # without the proxy's own peer, the placeholder, not the client's value
+    data["litellm_metadata"] = {}
+    assert xff_sent(data, "aresponses") == "198.51.100.4, unknown"
+
+
+@pytest.mark.parametrize("md", [{}, {"requester_ip_address": ""}, {"requester_ip_address": None},
+                                # use_x_forwarded_for on: the client's own header, several entries
+                                {"requester_ip_address": "6.6.6.6, 198.51.100.4"},
+                                {"requester_ip_address": "6.6.6.6 198.51.100.4"}])
+def test_a_chain_without_a_usable_peer_still_gets_exactly_one_hop(md):
+    # 1.80 records no peer without a premium licence: the hop appended is
+    # "unknown", so trusted_hops = N+1 never lands on an entry the client
+    # wrote, and the count never grows by more than one
+    data = {"messages": CHAT["messages"], "metadata": md,
+            "proxy_server_request": psr("/v1/chat/completions", **{"x-forwarded-for": "6.6.6.6, 198.51.100.4"})}
+    assert xff_sent(data) == "6.6.6.6, 198.51.100.4, unknown"
+    # no chain and no usable peer: no address at all, as before
+    data["proxy_server_request"] = psr("/v1/chat/completions")
+    assert xff_sent(data) is None
 
 
 def test_requester_ip_address_without_xff():
@@ -1186,7 +1223,7 @@ def test_batch_upload_is_left_to_litellms_per_line_scan(monkeypatch):
     assert sorted(seen["bodies"], key=json.dumps) == sorted([
         {"messages": [{"role": "user", "content": ATTACK}]},
         {"messages": [{"role": "system", "content": "Be brief."}], "input": ATTACK}], key=json.dumps)
-    assert seen["xff"] == "198.51.100.7"  # the uploader's address, not the proxy's
+    assert seen["xff"] == "198.51.100.7, 203.0.113.8"  # the upload's chain and peer, for every line
 
 
 @pytest.mark.parametrize("spec,expected", [(ModuleNotFoundError("No module named 'litellm'"), False), (None, False),
@@ -1507,7 +1544,7 @@ def test_the_test_endpoint_on_1_102_is_judged_once_with_the_callers_address():
 
     assert run(request()) == {"texts": [ATTACK]}
     assert seen["calls"] == 1
-    assert (seen["body"], seen["xff"]) == ({"input": [ATTACK], "messages": []}, "198.51.100.77")
+    assert (seen["body"], seen["xff"]) == ({"input": [ATTACK], "messages": []}, "198.51.100.77, 127.0.0.1")
     # a request that did not come through that hook is judged on its own
     run(g.apply_guardrail(inputs={"texts": [ATTACK]}, request_data={}, input_type="request"))
     assert seen["calls"] == 2

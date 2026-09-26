@@ -701,6 +701,11 @@ def _metadata_key(data: dict) -> str:
     return "litellm_metadata" if isinstance(data.get("litellm_metadata"), dict) else "metadata"
 
 
+# an X-Forwarded-For entry as jev-edge reads one, and the hop appended for a
+# peer LiteLLM did not record
+_HOP_RE = re.compile(r"[^,\s]+")
+UNKNOWN_HOP = "unknown"
+
 # The client address of the proxy request being handled, for work LiteLLM
 # does on its behalf without the request's data: a batch file's lines,
 # realtime messages. Context-local, so it never crosses requests.
@@ -912,18 +917,20 @@ class JevEdgeGuardrail(_ApplyGuardrailBase):
 
     @staticmethod
     def client_ip(data: dict) -> Optional[str]:
-        """What jev-edge gets as X-Forwarded-For: the request's whole
-        X-Forwarded-For chain as LiteLLM's proxy received it (from the
-        proxy_server_request the proxy builds; never a field of the body or
-        of the client's metadata) when it has one, else the proxy's own
-        ``requester_ip_address`` (the peer's address on 1.102; empty on 1.80
-        without a premium licence). The chain is only as trustworthy as what
-        is in front of LiteLLM: a proxy there that appends the address it saw
-        makes the rightmost entry real, and jev-edge's
-        ``client_ip.trusted_hops`` picks it; a client that reaches LiteLLM
-        directly writes the whole chain itself. It wins over
-        requester_ip_address because with ``use_x_forwarded_for`` on, that is
-        the client's own header too."""
+        """What jev-edge gets as X-Forwarded-For: the X-Forwarded-For chain
+        LiteLLM's proxy received (from the proxy_server_request the proxy
+        builds; never a field of the body or of the client's metadata) with
+        the peer LiteLLM saw appended, as nginx appends $remote_addr; the
+        bare peer when no chain came in. The peer is the proxy's own
+        ``requester_ip_address``, read from its own metadata bag only.
+        Exactly one hop is appended, so jev-edge's ``client_ip.trusted_hops``
+        is 1 when clients reach LiteLLM directly and N+1 behind N proxies
+        that append: it never lands on an entry the client wrote. With no
+        usable peer (1.80 records none without a premium licence; with
+        ``use_x_forwarded_for`` on, it is the client's own header, which may
+        hold several entries) the hop appended is ``unknown``. Before, the
+        chain went as it came, and a client that reached LiteLLM directly
+        chose the address jev-edge judged."""
         psr = data.get("proxy_server_request")
         if not isinstance(psr, dict):
             return None
@@ -931,11 +938,14 @@ class JevEdgeGuardrail(_ApplyGuardrailBase):
         headers = headers if isinstance(headers, dict) else {}
         xff = next((v for k, v in headers.items() if str(k).lower() == "x-forwarded-for"), None)
         chain = ", ".join(p.strip() for p in str(xff).split(",") if p.strip()) if xff else ""
-        if chain:
-            return chain
         md = data.get(_metadata_key(data))
         ip = md.get("requester_ip_address") if isinstance(md, dict) else None
-        return str(ip) if ip else None
+        # one entry as jev-edge splits the header (on commas and spaces)
+        entries = _HOP_RE.findall(str(ip)) if ip else []
+        peer = entries[0] if len(entries) == 1 else None
+        if chain:
+            return chain + ", " + (peer or UNKNOWN_HOP)
+        return peer
 
     # ------------------------------------------------------------------
     # LiteLLM hooks

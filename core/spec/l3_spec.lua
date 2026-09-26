@@ -130,9 +130,9 @@ describe("L3", function()
   end)
 
   it("charges the client's own text, not retrieved content (IP reputation counts res.charge)", function()
-    local ctx = H.ctx({ config = { untrusted = { enabled = true, fields = { "documents[*].text" } } } })
+    local ctx = H.ctx({ config = { untrusted = { enabled = true, fields = { "context[*].text" } } } })
     local req = body_req({ model = "m", messages = { { role = "user", content = TEXT } },
-      documents = { { text = "Retrieved: " .. DESC } } })
+      context = { { text = "Retrieved: " .. DESC } } })
     local job = assert(core.l3_job(req, l3ctx(ctx)))
     assert.equals(2, #job.parts)
     assert.is_nil(job.parts[1].rep)

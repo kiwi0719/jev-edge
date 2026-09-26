@@ -1584,10 +1584,10 @@ eval_case("untrusted: a rule's own untrusted table turns it on for that rule", {
 -- one score cannot say which of the two it is for. Off, the text is charged
 -- whole, tool results included, as it always was.
 local U_REP = { untrusted = { enabled = true }, policy = { mode = "enforce" }, subject = REP.subject }
-local U_REP_FIELD = { untrusted = { enabled = true, fields = { "documents[*].text" } }, policy = { mode = "enforce" },
+local U_REP_FIELD = { untrusted = { enabled = true, fields = { "context[*].text" } }, policy = { mode = "enforce" },
                       subject = REP.subject }
 -- the user's own question, and retrieved content outside the text fields
-local U_OWN = '{"messages":[{"role":"user","content":' .. escape(U_ASK) .. '}],"documents":[{"text":'
+local U_OWN = '{"messages":[{"role":"user","content":' .. escape(U_ASK) .. '}],"context":[{"text":'
   .. escape(U_EMAIL) .. '}]}'
 eval_case("untrusted: a malicious score on retrieved content does not count toward the subject's reputation", {
   req = raw_req(U_TOOL), config = U_REP, subject = { id = "u-6" },

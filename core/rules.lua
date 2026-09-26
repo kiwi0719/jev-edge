@@ -197,8 +197,8 @@ end
 -- own part: all of them scanned by always_suspect, cut to their own judging
 -- window, so they never take the room of the messages. From a body parsed
 -- whole they are walked (normalize.extract_tools); past max_body_bytes, and
--- in declared JSON the decoder refused, the bytes are scanned for them
--- (normalize.scan_tools) and the part is a window.
+-- in JSON the decoder refused (normalize.extract's kind "scan"), the bytes
+-- are scanned for them (normalize.scan_tools) and the part is a window.
 -- @param values the strings read, in order
 -- @param cut    true when a bound, or the body's size, left some out
 -- @return { text, windowed, hit } or nil
@@ -271,9 +271,9 @@ local function judged(req, rule, ctx, ct, size)
       tools = tools_part(tvalues, tcut, rule, ctx)
       if tcut then bound = true end
     elseif has_tool_fields(rule) and kind == "scan" then
-      -- declared JSON the decoder refused (nesting past 1000, bytes after
-      -- the value), which the backend's parser may take: scanned for the
-      -- tool definitions as past max_body_bytes
+      -- JSON the decoder refused (nesting past 1000, bytes after the
+      -- value), declared or not, which the backend's parser may take:
+      -- scanned for the tool definitions as past max_body_bytes
       tools = tools_part(normalize.scan_tools(req.body, normalize.field_keys(rule.tool_fields), {}), true, rule, ctx)
     end
   end

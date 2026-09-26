@@ -196,8 +196,18 @@ describe("normalize.extract: JSON the decoder refuses", function()
     assert.same({ "", "none" }, { ex('"just a string"') })
   end)
 
-  it("reads undeclared JSON it cannot decode as text, as before", function()
-    assert.same({ BODY .. "} ]", "text" }, { ex(BODY .. "} ]", "") })
+  it("scans undeclared JSON it cannot decode, as Ollama reads it whatever the header says", function()
+    assert.same({ ATTACK, "scan" }, { ex(BODY .. "} ]", "") })
+    assert.same({ ATTACK, "scan" }, { ex(BODY .. ',"x":' .. string.rep("[", 1001) .. string.rep("]", 1001) .. "}",
+      "text/plain") })
+    -- with nothing to scan it is text, as before
+    assert.same({ "[INST] " .. ATTACK, "text" }, { ex("[INST] " .. ATTACK, "") })
+    -- under a form type (curl -d) or multipart, that reading follows the scan
+    assert.same({ ATTACK .. "\na b", "scan" }, { ex(BODY .. "} ]&q=a+b", "application/x-www-form-urlencoded") })
+    local mp = BODY .. "} ]\r\n--B\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nfield\r\n--B--\r\n"
+    assert.same({ ATTACK .. "\nfield", "scan" }, { ex(mp, "multipart/form-data; boundary=B") })
+    -- and with nothing to scan it is read that way alone, as before
+    assert.same({ "a b", "form" }, { ex("[1] ]&q=a+b", "application/x-www-form-urlencoded") })
   end)
 
   it("does not take json in a Content-Type parameter for declared JSON", function()

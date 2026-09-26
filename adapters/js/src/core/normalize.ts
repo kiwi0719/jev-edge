@@ -668,9 +668,11 @@ function formDecode(v: string): string {
 
 // ---------------------------------------------------------------------------
 // Format detection (port of normalize.extract in core/normalize.lua): the
-// body decides, the Content-Type is a hint. JSON when it parses as JSON, form
-// or multipart when declared (or form-shaped with no header), text when it
-// reads as text, "binary" otherwise.
+// body decides, the Content-Type is a hint. JSON when it parses as JSON,
+// scanned when it starts like JSON and the decoder refuses it (under a form
+// or multipart type read that way as well), form or multipart when declared
+// (or form-shaped with no header), text when it reads as text, "binary"
+// otherwise.
 // ---------------------------------------------------------------------------
 
 /** Lua is_text: no NUL, control bytes other than \t \n \r under 1% of the bytes. */
@@ -803,6 +805,8 @@ export function extract(
   // application/*+json), not "json" in a parameter such as a multipart
   // boundary or "text/plain; profile=json"
   const declaredJson = ct.split(";")[0].includes("json");
+  const form = ct.includes("application/x-www-form-urlencoded") || (ct === "" && /^[A-Za-z0-9._~%+[\]-]+=[^ \t\n\v\f\r]*$/.test(body));
+  const multipart = ct.includes("multipart/form-data");
   const first = /^[ \t\n\v\f\r]*([\s\S])/.exec(body)?.[1];
   if (first === "{" || first === "[" || declaredJson) {
     let decoded: JsonValue | undefined;
@@ -817,25 +821,31 @@ export function extract(
       const st = extractJsonState(decoded as JsonValue, fields, jsonDecode);
       return [st.out.join("\n"), "json", st.out, decoded as JsonValue, st.capped];
     }
-    if (declaredJson) {
-      // a JSON scalar has no text fields
-      if (ok && decoded !== undefined) return ["", "none", []];
-      // The decoder refused it; the backend's parser may not (cjson refuses
-      // nesting past 1000 and bytes after the value, Go and Node do not).
-      // The text fields' string values, read by the tolerant scanner past
-      // max_body_bytes uses, are judged; a body with none is unjudgeable,
-      // never "no text".
-      const out = scanStrings(body, fieldKeys(fields), [], deepKeys(fields));
-      if (out.length === 0) return ["", "invalid", []];
+    // a JSON scalar has no text fields
+    if (declaredJson && ok && decoded !== undefined) return ["", "none", []];
+    // The decoder refused it; the backend's parser may not (cjson refuses
+    // nesting past 1000 and bytes after the value, Go and Node do not, and
+    // Ollama decodes JSON whatever the Content-Type says: curl -d sends
+    // form-urlencoded). So the tolerant scanner past max_body_bytes uses
+    // reads it, declared JSON or not: the text fields' string values and the
+    // objects under a "**" path's key. Under a form or multipart type the
+    // values that reading gives follow, since a backend of that kind reads
+    // the body so. Declared JSON with nothing to scan is unjudgeable, never
+    // "no text"; any other body with nothing to scan is read as before.
+    const out = scanStrings(body, fieldKeys(fields), [], deepKeys(fields));
+    if (out.length > 0) {
+      if (form && !declaredJson) formValues(body, out);
+      else if (multipart && !declaredJson) multipartValues(body, rawCt, out);
       return [out.join("\n"), "scan", out];
     }
+    if (declaredJson) return ["", "invalid", []];
   }
   const out: string[] = [];
-  if (ct.includes("application/x-www-form-urlencoded") || (ct === "" && /^[A-Za-z0-9._~%+[\]-]+=[^ \t\n\v\f\r]*$/.test(body))) {
+  if (form) {
     formValues(body, out);
     return [out.join("\n"), "form", out];
   }
-  if (ct.includes("multipart/form-data")) {
+  if (multipart) {
     multipartValues(body, rawCt, out);
     return [out.join("\n"), "multipart", out];
   }

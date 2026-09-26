@@ -405,8 +405,17 @@ describe("normalize.extract: JSON the Lua decoder refuses", () => {
     expect(ex('"just a string"')).toEqual(["", "none"]);
   });
 
-  it("reads undeclared JSON it cannot decode as text, as before", () => {
-    expect(ex(BODY + "} ]", "")).toEqual([BODY + "} ]", "text"]);
+  it("scans undeclared JSON it cannot decode, as Ollama reads it whatever the header says", () => {
+    expect(ex(BODY + "} ]", "")).toEqual([ATTACK, "scan"]);
+    expect(ex(BODY + ',"x":' + "[".repeat(1001) + "]".repeat(1001) + "}", "text/plain")).toEqual([ATTACK, "scan"]);
+    // with nothing to scan it is text, as before
+    expect(ex("[INST] " + ATTACK, "")).toEqual(["[INST] " + ATTACK, "text"]);
+    // under a form type (curl -d) or multipart, that reading follows the scan
+    expect(ex(BODY + "} ]&q=a+b", "application/x-www-form-urlencoded")).toEqual([ATTACK + "\na b", "scan"]);
+    const mp = BODY + '} ]\r\n--B\r\nContent-Disposition: form-data; name="prompt"\r\n\r\nfield\r\n--B--\r\n';
+    expect(ex(mp, "multipart/form-data; boundary=B")).toEqual([ATTACK + "\nfield", "scan"]);
+    // and with nothing to scan it is read that way alone, as before
+    expect(ex("[1] ]&q=a+b", "application/x-www-form-urlencoded")).toEqual(["a b", "form"]);
   });
 
   it("does not take json in a Content-Type parameter for declared JSON", () => {

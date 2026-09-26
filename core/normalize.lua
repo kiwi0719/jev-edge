@@ -619,9 +619,11 @@ end
 -- Format detection. The Content-Type a client sends is a hint, not a fact:
 -- Ollama decodes JSON whatever the header says, and FastAPI parses a body
 -- without one as JSON. So the body decides: JSON when it parses as JSON,
--- form or multipart when declared (or form-shaped with no header), text when
--- it reads as text, and "binary" otherwise, which L1 reports as unjudgeable
--- instead of letting it through as "no text".
+-- scanned when it starts like JSON and the decoder refuses it (under a form
+-- or multipart type read that way as well), form or multipart when declared
+-- (or form-shaped with no header), text when it reads as text, and "binary"
+-- otherwise, which L1 reports as unjudgeable instead of letting it through
+-- as "no text".
 -- ---------------------------------------------------------------------------
 
 local BOM = "\239\187\191"
@@ -737,6 +739,9 @@ function _M.extract(body, content_type, fields, json_decode)
   -- application/*+json), not "json" in a parameter such as a multipart
   -- boundary or "text/plain; profile=json"
   local declared_json = ct:match("^[^;]*"):find("json", 1, true) ~= nil
+  local form = ct:find("application/x-www-form-urlencoded", 1, true)
+    or (ct == "" and body:find("^[%w%.%-_~%%%+%[%]]+=[^%s]*$"))
+  local multipart = ct:find("multipart/form-data", 1, true)
   local first = body:match("^%s*(.)")
   if first == "{" or first == "[" or declared_json then
     if not json_decode then return "", "none", {} end
@@ -745,26 +750,34 @@ function _M.extract(body, content_type, fields, json_decode)
       local text, out, capped = _M.extract_json(decoded, fields, json_decode)
       return text, "json", out, decoded, capped
     end
-    if declared_json then
-      -- a JSON scalar has no text fields
-      if ok and decoded ~= nil then return "", "none", {} end
-      -- The decoder refused it; the backend's parser may not (cjson refuses
-      -- nesting past 1000 and bytes after the value, Go and Node do not).
-      -- The text fields' string values, read by the tolerant scanner past
-      -- max_body_bytes uses, are judged; a body with none is unjudgeable,
-      -- never "no text".
-      local out = _M.scan_strings(body, _M.field_keys(fields), {}, _M.deep_keys(fields))
-      if #out == 0 then return "", "invalid", {} end
+    -- a JSON scalar has no text fields
+    if declared_json and ok and decoded ~= nil then return "", "none", {} end
+    -- The decoder refused it; the backend's parser may not (cjson refuses
+    -- nesting past 1000 and bytes after the value, Go and Node do not, and
+    -- Ollama decodes JSON whatever the Content-Type says: curl -d sends
+    -- form-urlencoded). So the tolerant scanner past max_body_bytes uses
+    -- reads it, declared JSON or not: the text fields' string values and the
+    -- objects under a "**" path's key. Under a form or multipart type the
+    -- values that reading gives follow, since a backend of that kind reads
+    -- the body so. Declared JSON with nothing to scan is unjudgeable, never
+    -- "no text"; any other body with nothing to scan is read as before.
+    local out = _M.scan_strings(body, _M.field_keys(fields), {}, _M.deep_keys(fields))
+    if #out > 0 then
+      if form and not declared_json then
+        form_values(body, out)
+      elseif multipart and not declared_json then
+        multipart_values(body, raw_ct, out)
+      end
       return table.concat(out, "\n"), "scan", out
     end
+    if declared_json then return "", "invalid", {} end
   end
   local out = {}
-  if ct:find("application/x-www-form-urlencoded", 1, true)
-     or (ct == "" and body:find("^[%w%.%-_~%%%+%[%]]+=[^%s]*$")) then
+  if form then
     form_values(body, out)
     return table.concat(out, "\n"), "form", out
   end
-  if ct:find("multipart/form-data", 1, true) then
+  if multipart then
     multipart_values(body, raw_ct, out)
     return table.concat(out, "\n"), "multipart", out
   end

@@ -451,9 +451,9 @@ async function judged(
       tools = toolsPart(tvalues, tcut, rule, ctx);
       if (tcut) bound = true;
     } else if (hasToolFields(rule) && kind === "scan") {
-      // declared JSON the decoder refused (nesting past 1000, bytes after
-      // the value), which the backend's parser may take: scanned for the
-      // tool definitions as past max_body_bytes
+      // JSON the decoder refused (nesting past 1000, bytes after the
+      // value), declared or not, which the backend's parser may take:
+      // scanned for the tool definitions as past max_body_bytes
       tools = toolsPart(scanTools(req.body as string, fieldKeys(rule.tool_fields), []), true, rule, ctx);
     }
   }

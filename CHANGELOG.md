@@ -152,9 +152,11 @@ What L1 reads:
   measured: this is not a tool-poisoning defence.
 - **More model-visible shapes are read**: Anthropic `document` blocks,
   Responses `file_search_call` results and every `*_call_output`, Cohere
-  documents, Gemini function responses, a tool or function message whose
-  content is an object, a Gemini `parts` object by its keys, and, as
-  retrieved content with `untrusted` on, the same results.
+  documents, Gemini function responses, a Bedrock Converse `toolResult`
+  (its text and json blocks), a tool or function message whose content is
+  an object, a Gemini `parts` object by its keys, and, as retrieved content
+  with `untrusted` on, the same results. Converse `toolUse.input` and Gemini
+  `functionCall.args` are read as tool-call arguments.
 - **Multipart bodies are read as RFC 2046, Go and Starlette read them**: the
   delimiter only at a line start, every part read, the `boundary` parameter
   by name, a file only with a `filename` parameter. A file part typed
@@ -185,12 +187,17 @@ What L1 reads:
   of what is left; a request left with too little to judge is `unjudgeable:
   json over the walk bounds`, and a cut part says `(window)`.
 - **Every `always_suspect` hit places the judging window**, not the first
-  pattern's first match, so a harmless decoy no longer pushes the attack out.
+  pattern's first match, so a harmless decoy no longer pushes the attack out;
+  a hit that starts inside a character takes the whole character, in both
+  cores alike.
   A matcher that fails (PCRE's JIT stack limit, a pattern that does not
   compile) counts as a hit, logged once. The shipped base64 pattern is one
   class run the JIT matches at any size. The TS core runs patterns as PCRE
   without UTF over bytes (`\s` ASCII, `.` one byte, non-ASCII literals as
-  their bytes, `i` folding ASCII only), as `ngx.re` with `ijo` does.
+  their bytes, `i` folding ASCII only), as `ngx.re` with `ijo` does, and
+  translates the inline options `(?i)`, `(?s)`, `(?m)` and `(?x)` (and
+  `(?-i)` where the engine has RegExp modifiers) instead of counting such a
+  pattern as a hit on every text.
 - **Chunks overlap by 1 KiB**, text within `max_judge_chunks` capacity is
   judged in full by bytes, and a hit no chunk holds whole is judged as a part
   of its own.
@@ -200,7 +207,9 @@ What L1 reads:
   U+FFFD in both cores, so a 0xFF byte cannot make a strict judge answer 400.
 - **Linear time where a client chose the input**: form bodies (a 1 MiB body
   held a worker for an hour), a chunk cut over continuation bytes, and
-  trimming Content-Type and subject values.
+  trimming Content-Type and subject values. The scanner reads strings in
+  byte loops LuaJIT compiles: a crafted 1 MiB body costs about 65 ms of
+  worker CPU in L1, an ordinary one about 15 ms.
 
 Judging, breaker and cache:
 - **Only a failing provider counts against the breaker.** A judge error
@@ -225,7 +234,7 @@ Judging, breaker and cache:
   digits.
 - **A typo in `untrusted.templates` is refused at load**, and a part whose
   prompt cannot be built is left out instead of failing every agent request
-  open.
+  open; the verdict's reason then ends in "(a part not judged)".
 - **An in-flight slot a killed thread held comes back** after a lease;
   before, `max_inflight` such calls refused every L2 call for good.
 
@@ -288,7 +297,9 @@ Gateways:
   (priority 1000), once per request when a global rule and a route both
   carry the plugin, and not at all for a request that matched no route; keeps
   `jev.api_key` and `subject.salt` encrypted in etcd and resolves `$env://`
-  and `$secret://` references; builds the runtime inside the fail-open path.
+  and `$secret://` references, and never uses one that does not resolve as
+  the salt (subject tracking is off for that conf until it does); builds the
+  runtime inside the fail-open path.
 - **Kong**: picks up a rotated vault secret for the judge key and the salt;
   shares a breaker only between routes with the same key and tuning; keys a
   header subject an auth plugin hid on the authenticated credential; a data
@@ -338,7 +349,9 @@ LiteLLM guardrail:
   `apply_guardrail`, batch files per line, Bedrock, Gemini, Gigachat and
   generic pass-through bodies, Bedrock text documents; a pass-through with no
   visible body, or a document it cannot read, is unjudgeable
-  (`JEV_EDGE_UNJUDGED`), and a token-id prompt is sent to jev-edge.
+  (`JEV_EDGE_UNJUDGED`), and a token-id prompt is sent to jev-edge. A body
+  whose only text is under a structural key (`id`, `name`, `toolUseId`) on a
+  path jev-edge reads whole is sent, not skipped as "no text".
 
 laya-server:
 - **It takes a burst instead of dropping it** (listen backlog, connection

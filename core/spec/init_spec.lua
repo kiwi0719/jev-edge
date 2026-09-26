@@ -235,7 +235,7 @@ describe("core.evaluate end to end", function()
   it("blocks bad reputation at L1 in enforce mode without calling L2", function()
     local calls = 0
     local ctx = H.ctx({
-      config = { policy = { mode = "enforce" } },
+      config = { policy = { mode = "enforce" }, async = { rep_block_after = 1 } },
       judge = { call = function() calls = calls + 1; return {} end },
     })
     ctx.cache:set("rep:203.0.113.7", { blocked_until = ctx.clock() + 60 })

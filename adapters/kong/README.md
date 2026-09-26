@@ -65,7 +65,7 @@ Your upstream receives `X-Jev-Verdict`, `X-Jev-Score`, `X-Jev-Source`, `X-Jev-Re
 | `$jev_log` | the decision is added to Kong's log serializer as `jev` (`kong.log.set_serialize_value`), so `http-log`, `file-log`, `tcp-log`, `kafka-log` ... carry it with no extra config. `log_line: true` also writes it as one JSON line to the error log at NOTICE |
 | `PUT /_jev/config` hot reload | the Admin API or a new declarative config: Kong rebuilds the plugin conf and the plugin builds a new runtime for it |
 | `/_jev/health`, `/_jev/metrics`, `/_jev/feedback` | not exposed; Kong's `prometheus` plugin and the log serializer carry the verdict fields |
-| L3 side-path, reputation | same modules, same `async` config |
+| L3 side-path, reputation | same modules, same `async` config. IP reputation (`rep:<ip>` in `jev_cache`) is one namespace for every plugin instance: a plugin instance blocks on it only with its own `async.rep_block_after > 0`, and those that turn it on block the IPs any of them flagged |
 | `subject` | same keys; `from = "ip"` uses the forwarded IP; needs the `jev_subject` dict |
 | `/_jev/samples` | `sampling` is honoured and samples land in `jev_cache`; read them with `sampling.log = true`, or expose `resty.jev.edge.samples()` from a plain OpenResty location on the same box |
 

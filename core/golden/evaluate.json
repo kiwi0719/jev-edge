@@ -137,7 +137,11 @@
           }
         },
         "clock": 1000,
-        "config": {},
+        "config": {
+          "async": {
+            "rep_block_after": 1
+          }
+        },
         "judge": {
           "answers": {
             "injection": 0.1
@@ -194,6 +198,9 @@
         },
         "clock": 1000,
         "config": {
+          "async": {
+            "rep_block_after": 1
+          },
           "policy": {
             "mode": "enforce"
           }
@@ -219,6 +226,84 @@
         "subject": null
       },
       "name": "L1 block: ip reputation, enforce"
+    },
+    {
+      "expect": {
+        "breaker": null,
+        "cache_writes": {
+          "fp:e912b53a:cf223bdc": {
+            "ttl": 300,
+            "value": {
+              "reason": "injection 0.10",
+              "score": 0.1
+            }
+          }
+        },
+        "headers": {
+          "X-Jev-Reason": "injection+0.10",
+          "X-Jev-Score": "0.10",
+          "X-Jev-Source": "l2",
+          "X-Jev-Verdict": "safe"
+        },
+        "judge_calls": 1,
+        "prompt": {
+          "context": {
+            "deployment": "",
+            "method": "POST",
+            "path": "/v1/chat/completions"
+          },
+          "questions": [
+            "injection"
+          ],
+          "text": "Please write a detailed summary of the attached quarterly report."
+        },
+        "subject_record": null,
+        "subject_store_writes": null,
+        "verdict": {
+          "action": "pass",
+          "async": false,
+          "fingerprint": "cf223bdc",
+          "l2_ms": 0,
+          "reason": "injection 0.10",
+          "score": 0.1,
+          "source": "l2",
+          "verdict": "safe"
+        }
+      },
+      "input": {
+        "breaker": null,
+        "cache": {
+          "rep:203.0.113.7": {
+            "blocked_until": 2000
+          }
+        },
+        "clock": 1000,
+        "config": {
+          "policy": {
+            "mode": "enforce"
+          }
+        },
+        "judge": {
+          "answers": {
+            "injection": 0.1
+          }
+        },
+        "req": {
+          "body": "{\"messages\":[{\"role\":\"user\",\"content\":\"Please write a detailed summary of the attached quarterly report.\"}]}",
+          "body_size": 108,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/v1/chat/completions"
+        },
+        "rules": [
+          "llm-endpoints"
+        ],
+        "subject": null
+      },
+      "name": "ip reputation ignored when rep_block_after = 0"
     },
     {
       "expect": {
@@ -7258,7 +7343,11 @@
           }
         },
         "clock": 1000,
-        "config": {},
+        "config": {
+          "async": {
+            "rep_block_after": 1
+          }
+        },
         "judge": {
           "answers": {
             "injection": 0.1

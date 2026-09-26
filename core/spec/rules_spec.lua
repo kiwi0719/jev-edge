@@ -176,10 +176,30 @@ describe("rules.evaluate", function()
   end)
 
   it("blocks ips with bad reputation", function()
+    ctx.config.async.rep_block_after = 1
     ctx.cache:set("rep:203.0.113.7", { blocked_until = ctx.clock() + 100 })
     local r, _, reason = R.evaluate(H.chat_req("anything long enough to be judged"), rule, ctx)
     assert.equals(R.BLOCK, r)
     assert.equals("ip reputation", reason)
+  end)
+
+  -- kong-apisix#5: the rep: records are shared by every route and plugin
+  -- instance on the dict; a config that does not block by IP ignores them
+  it("ignores ip reputation under a config that does not block by it", function()
+    ctx.cache:set("rep:203.0.113.7", { blocked_until = ctx.clock() + 100 })
+    for _, off in ipairs({ 0, "0", -1 }) do
+      ctx.config.async.rep_block_after = off
+      local r, _, reason = R.evaluate(H.chat_req("anything long enough to be judged"), rule, ctx)
+      assert.equals(R.SUSPECT, r, tostring(off))
+      assert.equals("natural language", reason)
+    end
+    ctx.config.async = nil
+    assert.equals(R.SUSPECT, (R.evaluate(H.chat_req("anything long enough to be judged"), rule, ctx)))
+    ctx.config.async = { rep_block_after = "2" }
+    assert.equals(R.BLOCK, (R.evaluate(H.chat_req("anything long enough to be judged"), rule, ctx)))
+    -- a rules-only caller, with no config to ask: the record decides
+    ctx.config = nil
+    assert.equals(R.BLOCK, (R.evaluate(H.chat_req("anything long enough to be judged"), rule, ctx)))
   end)
 
   it("never passes on reputation: a run of safe verdicts earns an ip nothing", function()
@@ -195,6 +215,7 @@ describe("rules.evaluate", function()
   end
 
   it("checks reputation before method, content-type and body", function()
+    ctx.config.async.rep_block_after = 1
     ctx.cache:set("rep:203.0.113.7", { blocked_until = ctx.clock() + 100 })
     local r, _, reason = R.evaluate(headers_only("GET"), rule, ctx)
     assert.equals(R.BLOCK, r)
@@ -389,6 +410,7 @@ describe("rules: json_only_paths", function()
   end)
 
   it("decides before the reputation checks, on the Content-Type when there is no body", function()
+    ctx.config.async.rep_block_after = 1
     ctx.cache:set("rep:203.0.113.7", { blocked_until = 2000 })
     ctx.clock = function() return 1000 end
     assert.equals(R.PASS, (R.evaluate(root("application/x-www-form-urlencoded", FORM), rule, ctx)))

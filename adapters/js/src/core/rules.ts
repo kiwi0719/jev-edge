@@ -89,7 +89,10 @@ export interface RulesCtx {
   re_find?: (subject: string, pattern: string) => boolean | readonly [number, number] | null;
   log?: (level: string, msg: string) => void;
   subject?: SubjectCtx;
-  config?: { subject?: { reputation?: ReputationConfig }; untrusted?: UntrustedConfig; policy?: { partial?: string; unjudgeable?: string } };
+  config?: {
+    subject?: { reputation?: ReputationConfig }; untrusted?: UntrustedConfig; policy?: { partial?: string; unjudgeable?: string };
+    async?: { rep_block_after?: number | string };
+  };
 }
 
 /**
@@ -799,6 +802,16 @@ export async function judgedText(req: Req, rule: Rule | undefined, ctx?: RulesCt
   return r.text;
 }
 
+// Port of ip_rep_on in core/rules.lua: does the evaluating config block by
+// IP reputation? true when there is no config to ask (rules-only callers).
+function ipRepOn(ctx: RulesCtx): boolean {
+  const cfg = ctx.config;
+  if (typeof cfg !== "object" || cfg === null) return true;
+  const v = cfg.async?.rep_block_after;
+  const n = typeof v === "number" || typeof v === "string" ? Number(v) : 0;
+  return (Number.isNaN(n) ? 0 : n) > 0;
+}
+
 /** The result, text, reason, windowed, chunks, capped, untrusted, tools, and retrieved (see rules.evaluate in core/rules.lua). */
 export async function evaluate(
   req: Req, rule: Rule, ctx?: RulesCtx,
@@ -811,8 +824,10 @@ export async function evaluate(
   if (miss) return [PASS, "", NOT_JSON];
 
   // 2. reputation, before anything that needs a body. It only ever blocks:
-  //    safe verdicts earn an IP nothing (see core/rules.lua)
-  if (ctx?.cache && req.client_ip) {
+  //    safe verdicts earn an IP nothing (see core/rules.lua); and only under
+  //    a config that blocks by IP (async.rep_block_after > 0), since the rep:
+  //    records are shared by every route on the store
+  if (ctx?.cache && req.client_ip && ipRepOn(ctx)) {
     const rep = (await ctx.cache.get("rep:" + req.client_ip)) as { blocked_until?: number } | undefined;
     if (rep && typeof rep === "object") {
       const now = ctx.clock ? ctx.clock() : 0;

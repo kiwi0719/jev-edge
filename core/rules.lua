@@ -426,6 +426,15 @@ end
 -- lack of text: what was left unread may be what the model reads.
 local BOUND_REASON = "unjudgeable: json over the walk bounds"
 
+-- Does the evaluating config block by IP reputation (kong-apisix#5)? true
+-- when there is no config to ask (the rules-only contexts).
+local function ip_rep_on(ctx)
+  local cfg = ctx.config
+  if type(cfg) ~= "table" then return true end
+  local a = cfg.async
+  return (tonumber(type(a) == "table" and a.rep_block_after or nil) or 0) > 0
+end
+
 --- Evaluate one rule set against a request.
 -- @param req  { method, path, headers, body, body_size, client_ip }, and
 --             where the adapter has them decoded, body_head, body_tail and
@@ -455,7 +464,12 @@ function _M.evaluate(req, rule, ctx)
   --    headers-only forward-auth request can still be rejected. Reputation
   --    only ever blocks: a run of safe verdicts earns an IP nothing, or an
   --    attacker could warm one up with harmless requests and skip L2 after.
-  if ctx and ctx.cache and req.client_ip then
+  --    Only for a config that blocks by IP (async.rep_block_after > 0): the
+  --    rep: records are shared by every route and plugin instance on the
+  --    dict, and one that keeps the default 0 (one NAT or carrier IP can hide
+  --    thousands of users) does not block on another's. Without a config (a
+  --    rules-only caller) the record decides, as it always did.
+  if ctx and ctx.cache and req.client_ip and ip_rep_on(ctx) then
     local rep = ctx.cache:get("rep:" .. req.client_ip)
     if type(rep) == "table" then
       local now = ctx.clock and ctx.clock() or 0

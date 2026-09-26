@@ -109,3 +109,42 @@ describe("repRecord: counted / onCounted, as in Lua", () => {
     expect(called).toBe(false);
   });
 });
+
+// kong-apisix#5 (twin of core/spec/rules_spec.lua): a rep:<ip> record in a
+// store shared with another route blocks only under a config that blocks by
+// IP reputation (async.rep_block_after > 0)
+describe("ip reputation", () => {
+  const shared = memoryStore();
+  const rt = (repBlockAfter?: number) => createRuntime({
+    cache: shared,
+    config: {
+      jev: { provider: "mock", mock_score: 0.1, timeout_ms: 400 },
+      policy: { mode: "enforce" },
+      ...(repBlockAfter === undefined ? {} : { async: { rep_block_after: repBlockAfter } }),
+    },
+  });
+
+  it("is ignored by a config that keeps rep_block_after = 0, and blocks where it is on", async () => {
+    await shared.set("rep:203.0.113.7", { blocked_until: Date.now() / 1000 + 600 }, 600);
+    for (const off of [undefined, 0]) {
+      const res = await handle(post(BENIGN, "k"), rt(off), seen);
+      expect(res.status, String(off)).toBe(200);
+      expect(((await res.json()) as Record<string, string>).verdict).toBe("safe");
+    }
+    const on = await handle(post(BENIGN, "k"), rt(1), seen);
+    expect(on.status).toBe(403);
+    expect(on.headers.get("x-jev-verdict")).toBe(verdict.MALICIOUS);
+  });
+
+  it("decides on the record alone for a rules-only caller with no config", async () => {
+    const { rules } = await import("../src/core");
+    const { load } = await import("../src/rules");
+    const cache = memoryStore();
+    await cache.set("rep:203.0.113.7", { blocked_until: 2000 }, 600);
+    const req = { method: "POST", path: "/v1/chat/completions", headers: { "content-type": "application/json" }, body: BENIGN, body_size: BENIGN.length, client_ip: "203.0.113.7" };
+    const [r, , reason] = await rules.evaluate(req, load("llm-endpoints"), { cache, clock: () => 1000, json_decode: JSON.parse });
+    expect([r, reason]).toEqual(["block", "ip reputation"]);
+    const [r2] = await rules.evaluate(req, load("llm-endpoints"), { cache, clock: () => 1000, json_decode: JSON.parse, config: { async: { rep_block_after: 0 } } });
+    expect(r2).toBe("suspect");
+  });
+});

@@ -42,6 +42,8 @@ export type JsonValue = null | boolean | number | string | JsonValue[] | { [k: s
 // ---------------------------------------------------------------------------
 
 interface Seg { key: string; each: boolean }
+/** A field path's segments; `whole` when its value is read whole (WHOLE_FIELDS). */
+type Segs = Seg[] & { whole?: boolean };
 
 function splitPath(path: string): Seg[] {
   const segs: Seg[] = [];
@@ -58,14 +60,77 @@ function isObj(v: unknown): v is { [k: string]: JsonValue } | JsonValue[] {
   return typeof v === "object" && v !== null;
 }
 
+// Port of read_whole() in core/normalize.lua. Values the model reads whole: a
+// Gemini function response, a Cohere document, a Responses stored prompt's
+// variables. Every key and string below the value, object keys in byte order
+// (as Lua sorts them), arrays in order, empty strings left out. Bounded:
+// WHOLE_DEPTH levels below the value (cjson's nesting limit), and sorting:
+// one extraction sorts WHOLE_SORT keys in all, and an object with more keys
+// than it has left is read in the object's own order instead (all of the
+// text, in an order the two cores do not share).
+const WHOLE_DEPTH = 1000;
+const WHOLE_SORT = 20000;
+// keys one extraction may still sort; extractJsonValues and
+// extractUntrustedValues reset it (extraction is synchronous)
+let sortLeft = WHOLE_SORT;
+
+// Byte order of the UTF-8 encodings, i.e. code point order: UTF-16 order
+// differs only where a surrogate (a code point past U+FFFF) meets U+E000..U+FFFF.
+function byteOrder(a: string, b: string): number {
+  const n = Math.min(a.length, b.length);
+  for (let i = 0; i < n; i++) {
+    const x = a.charCodeAt(i);
+    const y = b.charCodeAt(i);
+    if (x === y) continue;
+    const xs = x >= 0xd800 && x <= 0xdfff;
+    const ys = y >= 0xd800 && y <= 0xdfff;
+    if (xs !== ys) return xs ? 1 : -1;
+    return x - y;
+  }
+  return a.length - b.length;
+}
+
+function readWhole(node: JsonValue | undefined, out: string[], depth: number): void {
+  if (typeof node === "string") {
+    if (node !== "") out.push(node);
+    return;
+  }
+  if (!isObj(node) || depth > WHOLE_DEPTH) return;
+  if (Array.isArray(node)) {
+    for (const v of node) readWhole(v, out, depth + 1);
+    return;
+  }
+  const keys = Object.keys(node);
+  if (keys.length <= sortLeft) {
+    sortLeft -= keys.length;
+    keys.sort(byteOrder);
+  }
+  for (const k of keys) {
+    if (k !== "") out.push(k);
+    readWhole(node[k], out, depth + 1);
+  }
+}
+
+// A Gemini part's function result: `functionResponse`, or `function_response`
+// as the REST API also takes it.
+function functionResponses(part: { [k: string]: JsonValue }, out: string[]): void {
+  for (const k of ["functionResponse", "function_response"]) {
+    const fr = part[k];
+    if (isObj(fr) && !Array.isArray(fr) && fr.response !== undefined) readWhole(fr.response, out, 1);
+  }
+}
+
 // A leaf that is not a string is a "content parts" value: the array form of
 // `messages[*].content` every current chat API accepts
 // (`[{type:"text", text:"..."}, {type:"image_url", ...}]`), the Responses API's
 // `input_text`, and Anthropic's `tool_result` whose `content` nests once more.
 // Collect every string, every part's `text`, and recurse into `content`, to a
-// bounded depth. Two parts keep their text elsewhere: an Anthropic `document`
+// bounded depth. Some parts keep their text elsewhere: an Anthropic `document`
 // block under `source.data` (source type "text") or `source.content` (type
-// "content"), and a Responses `file_search_call` under `results[*].text`.
+// "content"), a Responses `file_search_call` under `results[*].text`, a
+// Gemini part's function result under `functionResponse.response` and a
+// Cohere v2 `document` part (a tool result's) under `document`; the last two
+// are read whole (readWhole).
 // The depth leaves room for a content document inside a tool_result.
 // Anything else (numbers, images) contributes nothing.
 // Mirrors collect() in core/normalize.lua, including Lua's "array if [1] is
@@ -94,6 +159,8 @@ function collect(node: JsonValue | undefined, out: string[], depth: number): voi
     if (src.type === "content" && src.content !== undefined && src.content !== null) collect(src.content, out, depth + 1);
   }
   if (node.type === "file_search_call" && isObj(node.results)) collect(node.results, out, depth + 1);
+  functionResponses(node, out);
+  if (node.type === "document" && node.document !== undefined) readWhole(node.document, out, 1);
 }
 
 /**
@@ -123,7 +190,21 @@ function variants(node: { [k: string]: JsonValue }, key: string): string[] | und
   return others?.sort();
 }
 
-function descend(child: JsonValue | undefined, segs: Seg[], i: number, out: string[]): void {
+// Port of WHOLE_FIELDS in core/normalize.lua: field paths whose values are
+// read whole (readWhole), whatever their shape, instead of as content parts:
+// `documents`, retrieved documents (Cohere v1 maps of title, snippet, text or
+// any other key, Cohere v2 strings or { id, data }, vLLM chat's `documents`),
+// and `prompt.variables`, the values a Responses API stored prompt is filled
+// with (strings or input_text parts, under names the client picks).
+const WHOLE_FIELDS = new Set(["documents", "prompt.variables"]);
+
+function fieldPath(f: string): Segs {
+  const segs: Segs = splitPath(f);
+  segs.whole = WHOLE_FIELDS.has(f);
+  return segs;
+}
+
+function descend(child: JsonValue | undefined, segs: Segs, i: number, out: string[]): void {
   if (segs[i].each) {
     // Lua ipairs over a cjson array: null is a value, skipped, not the end
     if (!Array.isArray(child)) return;
@@ -139,10 +220,11 @@ function descend(child: JsonValue | undefined, segs: Seg[], i: number, out: stri
 // A path key is matched the way fold() says, and every key that folds to it
 // is read, since with several the backend may take any one: the exact key
 // first, the others in byte order.
-function walk(node: JsonValue | undefined, segs: Seg[], i: number, out: string[]): void {
+function walk(node: JsonValue | undefined, segs: Segs, i: number, out: string[]): void {
   if (node === undefined || node === null) return;
   if (i >= segs.length) {
-    collect(node, out, 1);
+    if (segs.whole) readWhole(node, out, 1);
+    else collect(node, out, 1);
     return;
   }
   const key = segs[i].key;
@@ -159,7 +241,8 @@ export function extractJson(decoded: JsonValue, fields: string[]): string {
 /** The strings extractJson joins, in order (newest last), for window(). */
 export function extractJsonValues(decoded: JsonValue, fields: string[]): string[] {
   const out: string[] = [];
-  for (const f of fields ?? []) walk(decoded, splitPath(f), 0, out);
+  sortLeft = WHOLE_SORT;
+  for (const f of fields ?? []) walk(decoded, fieldPath(f), 0, out);
   return out;
 }
 
@@ -171,6 +254,10 @@ export function extractJsonValues(decoded: JsonValue, fields: string[]): string[
 //                            (function_call_output, custom_tool_call_output,
 //                            local_shell_call_output, ...) or "mcp_call": output;
 //                            "file_search_call": results[*].text
+//   Gemini                   contents[*].parts[*].functionResponse.response
+//                            (contents and parts may each be one object, as
+//                            LiteLLM takes them), read whole
+// and retrieved documents, read whole: `documents` (Cohere v1 and v2, vLLM).
 const responsesResult = (t: unknown) => typeof t === "string" && (t.endsWith("_call_output") || t === "mcp_call");
 
 function toolResults(decoded: JsonValue, out: string[]): void {
@@ -196,18 +283,37 @@ function toolResults(decoded: JsonValue, out: string[]): void {
       else if (item.type === "file_search_call" && isObj(item.results)) collect(item.results, out, 1);
     }
   }
+  const contents = decoded.contents;
+  if (isObj(contents)) {
+    for (const c of Array.isArray(contents) ? contents : [contents]) {
+      const parts = isObj(c) && !Array.isArray(c) ? c.parts : undefined;
+      if (!isObj(parts)) continue;
+      for (const part of Array.isArray(parts) ? parts : [parts]) {
+        if (isObj(part) && !Array.isArray(part)) functionResponses(part, out);
+      }
+    }
+  }
+  if (decoded.documents !== undefined) readWhole(decoded.documents, out, 1);
 }
 
 /**
  * Port of extract_untrusted: retrieved content in a decoded JSON body, tool
  * results (unless `spec.tool_results` is false) and the values of
- * `spec.fields`, in that order. Returns the values (newest last).
+ * `spec.fields`, in that order; a field value the tool results already hold
+ * is not added again (see the Lua original). Returns the values (newest last).
  */
 export function extractUntrustedValues(decoded: JsonValue | undefined, spec: { tool_results?: boolean; fields?: string[] }): string[] {
   const out: string[] = [];
   if (!isObj(decoded)) return out;
+  sortLeft = WHOLE_SORT;
   if (spec.tool_results !== false) toolResults(decoded, out);
-  for (const f of spec.fields ?? []) walk(decoded, splitPath(f), 0, out);
+  const fields = spec.fields ?? [];
+  if (fields.length > 0) {
+    const seen = new Set(out);
+    const more: string[] = [];
+    for (const f of fields) walk(decoded, fieldPath(f), 0, more);
+    for (const v of more) if (!seen.has(v)) out.push(v);
+  }
   return out;
 }
 

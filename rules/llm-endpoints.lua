@@ -72,20 +72,25 @@ return {
   -- or text blocks): Anthropic Messages and Ollama /api/generate;
   -- instructions: the Responses API; preamble: Cohere v1; system_prompt: LM
   -- Studio /api/v1/chat; systemInstruction or system_instruction: Gemini.
+  -- documents: retrieved documents (Cohere v1 and v2, vLLM chat), read
+  -- whole: every key and string in them (WHOLE_FIELDS in core/normalize.lua).
   -- template: Ollama. messages[*].parts: AI SDK 5 UIMessages, which carry no
-  -- content. contents: Gemini (a list, or one content as LiteLLM takes it).
-  -- chat_history[*].message, message: Cohere v1 /v1/chat.
-  -- prompt.prompt_string: llama.cpp's prompt object, alone or in a list.
+  -- content. contents: Gemini (a list, or one content as LiteLLM takes it),
+  -- function responses included. chat_history[*].message, message: Cohere v1
+  -- /v1/chat. prompt.prompt_string: llama.cpp's prompt object, alone or in a
+  -- list. prompt.variables: the values a Responses API stored prompt is
+  -- filled with, read whole.
   -- input[*].output: a Responses API function_call_output (a tool result).
   -- inputs, instances: TGI /generate, / and /vertex.
   -- suffix: OpenAI completions and Ollama; input_prefix, input_suffix,
   -- input_extra: llama.cpp /infill.
   text_fields = { "system", "instructions", "preamble", "system_prompt", "systemInstruction.parts",
-                  "system_instruction.parts", "template", "messages[*].content", "messages[*].parts",
-                  "contents[*].parts", "contents.parts", "chat_history[*].message", "message", "prompt",
-                  "prompt.prompt_string", "prompt[*].prompt_string", "input", "input[*].output", "inputs",
-                  "instances[*].inputs", "instances[*].messages[*].content", "query", "text", "suffix",
-                  "input_prefix", "input_suffix", "input_extra[*].text" },
+                  "system_instruction.parts", "documents", "template", "messages[*].content",
+                  "messages[*].parts", "contents[*].parts", "contents.parts", "chat_history[*].message",
+                  "message", "prompt", "prompt.prompt_string", "prompt[*].prompt_string", "prompt.variables",
+                  "input", "input[*].output", "inputs", "instances[*].inputs",
+                  "instances[*].messages[*].content", "query", "text", "suffix", "input_prefix",
+                  "input_suffix", "input_extra[*].text" },
   min_text_chars = 20,
   always_suspect = {
     [[\b(ignore|disregard|forget)\b.{0,20}\b(previous|prior|above|earlier|all)\b]]

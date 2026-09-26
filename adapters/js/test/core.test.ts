@@ -506,6 +506,32 @@ describe("normalize: documents and retrieved results", () => {
     expect(ex({ input: [{ type: "file_search_call", queries: ["q"], results: [
       { file_id: "f", text: "found one" }, { file_id: "g", text: "found two" }] }] }, "input")).toBe("found one\nfound two");
   });
+
+  it("reads documents, prompt.variables and Gemini function responses whole, keys in UTF-8 byte order", () => {
+    const ex = (d: object, f: string) => core.normalize.extractJson(d as never, [f]);
+    expect(ex({ documents: [{ title: "T", snippet: "S", rank: 1, tags: ["a", ""] }, "plain"] }, "documents"))
+      .toBe("rank\nsnippet\nS\ntags\na\ntitle\nT\nplain");
+    expect(ex({ prompt: { id: "p", variables: { city: "Paris", q: { type: "input_text", text: "why" } } } }, "prompt.variables"))
+      .toBe("city\nParis\nq\ntext\nwhy\ntype\ninput_text");
+    // a path that only ends in the same name is read as content parts
+    expect(ex({ meta: { documents: { title: "not read" } } }, "meta.documents")).toBe("");
+    expect(ex({ contents: [{ parts: [{ text: "hi" }, { functionResponse: { name: "f", response: { b: "2", a: "1" } } }] }] },
+      "contents[*].parts")).toBe("hi\na\n1\nb\n2");
+    // U+E000 sorts before U+1F600 in UTF-8 (and in Lua), after it in UTF-16
+    expect(ex({ documents: { "\u{1F600}": "x", "\uE000": "y", "\u00e9": "z" } }, "documents"))
+      .toBe("\u00e9\nz\n\uE000\ny\n\u{1F600}\nx");
+  });
+
+  it("reads an object past the sort budget in full, only not in byte order", () => {
+    const big: Record<string, string> = {};
+    for (let i = 0; i < 20001; i++) big["k" + i] = "v" + i;
+    const small = { b: "2", a: "1" };
+    const v = core.normalize.extractJsonValues({ documents: [big, small] } as never, ["documents"]);
+    expect(v.length).toBe(40002 + 4);
+    expect(new Set(v.slice(0, 40002)).size).toBe(40002);
+    // the keys the budget has left are still sorted
+    expect(v.slice(40002)).toEqual(["a", "1", "b", "2"]);
+  });
 });
 
 describe("normalize.chunks", () => {

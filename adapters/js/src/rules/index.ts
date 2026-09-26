@@ -37,11 +37,12 @@ export const llmEndpoints: Rule = {
   // oldest first: the judging window keeps the last ones first
   text_fields: [
     "system", "instructions", "preamble", "system_prompt", "systemInstruction.parts",
-    "system_instruction.parts", "template", "messages[*].content", "messages[*].parts",
-    "contents[*].parts", "contents.parts", "chat_history[*].message", "message", "prompt",
-    "prompt.prompt_string", "prompt[*].prompt_string", "input", "input[*].output", "inputs",
-    "instances[*].inputs", "instances[*].messages[*].content", "query", "text", "suffix",
-    "input_prefix", "input_suffix", "input_extra[*].text",
+    "system_instruction.parts", "documents", "template", "messages[*].content",
+    "messages[*].parts", "contents[*].parts", "contents.parts", "chat_history[*].message",
+    "message", "prompt", "prompt.prompt_string", "prompt[*].prompt_string", "prompt.variables",
+    "input", "input[*].output", "inputs", "instances[*].inputs",
+    "instances[*].messages[*].content", "query", "text", "suffix", "input_prefix",
+    "input_suffix", "input_extra[*].text",
   ],
   min_text_chars: 20,
   always_suspect: [
@@ -105,11 +106,12 @@ export function resolve(spec: RuleSpec): Rule {
   if (!uok) throw new Error(uerr);
   out.text_fields ??= [
     "system", "instructions", "preamble", "system_prompt", "systemInstruction.parts",
-    "system_instruction.parts", "template", "messages[*].content", "messages[*].parts",
-    "contents[*].parts", "contents.parts", "chat_history[*].message", "message", "prompt",
-    "prompt.prompt_string", "prompt[*].prompt_string", "input", "input[*].output", "inputs",
-    "instances[*].inputs", "instances[*].messages[*].content", "query", "text", "suffix",
-    "input_prefix", "input_suffix", "input_extra[*].text",
+    "system_instruction.parts", "documents", "template", "messages[*].content",
+    "messages[*].parts", "contents[*].parts", "contents.parts", "chat_history[*].message",
+    "message", "prompt", "prompt.prompt_string", "prompt[*].prompt_string", "prompt.variables",
+    "input", "input[*].output", "inputs", "instances[*].inputs",
+    "instances[*].messages[*].content", "query", "text", "suffix", "input_prefix",
+    "input_suffix", "input_extra[*].text",
   ];
   out.templates ??= ["injection"];
   return out;

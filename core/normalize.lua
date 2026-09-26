@@ -21,14 +21,76 @@ local function split_path(path)
   return segs
 end
 
+-- ---------------------------------------------------------------------------
+-- Values the model reads whole: a Gemini function response, a Cohere
+-- document, a Responses stored prompt's variables. A template renders them
+-- as JSON or as "key: value" lines, so an instruction can sit under any key,
+-- or be one: every key and string below the value is read, object keys in
+-- byte order (a Lua table has none, and both cores must produce the same
+-- text), arrays in order, empty strings left out. Bounded: WHOLE_DEPTH
+-- levels below the value, cjson's own nesting limit, so the bound only
+-- guards the recursion; and sorting, which is what costs on a big object
+-- (150k keys take about 50 ms under LuaJIT and in Node): one extraction
+-- sorts WHOLE_SORT keys in all, and an object with more keys than it has
+-- left is read in the table's own order instead. That text is all there,
+-- in an order the two cores do not share.
+-- ---------------------------------------------------------------------------
+
+local WHOLE_DEPTH = 1000
+local WHOLE_SORT = 20000
+-- keys one extraction may still sort; extract_json and extract_untrusted
+-- reset it (extraction never yields, so one counter per VM is enough)
+local sort_left = WHOLE_SORT
+
+local function read_whole(node, out, depth)
+  if type(node) == "string" then
+    if node ~= "" then out[#out + 1] = node end
+    return
+  end
+  if type(node) ~= "table" or depth > WHOLE_DEPTH then return end
+  if node[1] ~= nil then
+    for _, v in ipairs(node) do read_whole(v, out, depth + 1) end
+    return
+  end
+  local keys, n = {}, 0
+  for k in pairs(node) do
+    if type(k) == "string" then
+      n = n + 1
+      keys[n] = k
+    end
+  end
+  if n <= sort_left then
+    sort_left = sort_left - n
+    table.sort(keys)
+  end
+  for i = 1, n do
+    local k = keys[i]
+    if k ~= "" then out[#out + 1] = k end
+    read_whole(node[k], out, depth + 1)
+  end
+end
+
+-- A Gemini part's function result: `functionResponse`, or
+-- `function_response` as the REST API also takes it.
+local FUNCTION_RESPONSE = { "functionResponse", "function_response" }
+local function function_responses(part, out)
+  for _, k in ipairs(FUNCTION_RESPONSE) do
+    local fr = part[k]
+    if type(fr) == "table" and fr.response ~= nil then read_whole(fr.response, out, 1) end
+  end
+end
+
 -- A leaf that is not a string is a "content parts" value: the array form of
 -- `messages[*].content` every current chat API accepts
 -- (`[{type="text", text="..."}, {type="image_url", ...}]`), the Responses API's
 -- `input_text`, and Anthropic's `tool_result` whose `content` nests once more.
 -- Collect every string, every part's `text`, and recurse into `content`, to a
--- bounded depth. Two parts keep their text elsewhere: an Anthropic `document`
+-- bounded depth. Some parts keep their text elsewhere: an Anthropic `document`
 -- block under `source.data` (source type "text") or `source.content` (type
--- "content"), and a Responses `file_search_call` under `results[*].text`.
+-- "content"), a Responses `file_search_call` under `results[*].text`, a
+-- Gemini part's function result under `functionResponse.response` and a
+-- Cohere v2 `document` part (a tool result's) under `document`; the last two
+-- are read whole (read_whole).
 -- The depth leaves room for a content document inside a tool_result. Anything
 -- else (numbers, images, JSON null) contributes nothing. A decoder that keeps
 -- null as a value (cjson.null) is assumed: `[null, {...}]` goes on past the
@@ -54,6 +116,8 @@ local function collect(node, out, depth)
   if node.type == "file_search_call" and type(node.results) == "table" then
     collect(node.results, out, depth + 1)
   end
+  function_responses(node, out)
+  if node.type == "document" and node.document ~= nil then read_whole(node.document, out, 1) end
 end
 
 -- Go's encoding/json (Ollama's /api/chat, a default watched path) matches an
@@ -95,6 +159,21 @@ local function variants(node, key)
   return others
 end
 
+-- Field paths whose values are read whole (read_whole), whatever their
+-- shape, instead of as content parts: `documents`, retrieved documents
+-- (Cohere v1 maps of title, snippet, text or any other key, Cohere v2
+-- strings or { id, data }, vLLM chat's `documents`), and `prompt.variables`,
+-- the values a Responses API stored prompt is filled with (strings or
+-- input_text parts, under names the client picks).
+local WHOLE_FIELDS = { documents = true, ["prompt.variables"] = true }
+
+-- The segments of field path `f`; `whole` when its value is read whole.
+local function field_path(f)
+  local segs = split_path(f)
+  segs.whole = WHOLE_FIELDS[f] == true
+  return segs
+end
+
 local NONE = {}
 local walk
 local function descend(child, segs, i, out)
@@ -111,7 +190,7 @@ end
 walk = function(node, segs, i, out)
   if node == nil then return end
   if i > #segs then
-    collect(node, out, 1)
+    if segs.whole then read_whole(node, out, 1) else collect(node, out, 1) end
     return
   end
   local key = segs[i].key
@@ -129,8 +208,9 @@ end
 -- @return string (joined with "\n"), may be ""; and the list of strings found
 function _M.extract_json(decoded, fields)
   local out = {}
+  sort_left = WHOLE_SORT
   for _, f in ipairs(fields or {}) do
-    walk(decoded, split_path(f), 1, out)
+    walk(decoded, field_path(f), 1, out)
   end
   return table.concat(out, "\n"), out
 end
@@ -142,6 +222,10 @@ end
 --                            (function_call_output, custom_tool_call_output,
 --                            local_shell_call_output, ...) or "mcp_call": output;
 --                            "file_search_call": results[*].text
+--   Gemini                   contents[*].parts[*].functionResponse.response
+--                            (contents and parts may each be one object, as
+--                            LiteLLM takes them), read whole
+-- and retrieved documents, read whole: `documents` (Cohere v1 and v2, vLLM).
 local function responses_result(item)
   local t = item.type
   return type(t) == "string" and (t:sub(-12) == "_call_output" or t == "mcp_call")
@@ -174,19 +258,41 @@ local function tool_results(decoded, out)
       end
     end
   end
+  local contents = decoded.contents
+  if type(contents) == "table" then
+    for _, c in ipairs(contents[1] ~= nil and contents or { contents }) do
+      local parts = type(c) == "table" and c.parts
+      if type(parts) == "table" then
+        for _, part in ipairs(parts[1] ~= nil and parts or { parts }) do
+          if type(part) == "table" then function_responses(part, out) end
+        end
+      end
+    end
+  end
+  if decoded.documents ~= nil then read_whole(decoded.documents, out, 1) end
 end
 
 --- Retrieved content in a decoded JSON body: tool results (when
--- `spec.tool_results`) and the values of `spec.fields`, in that order.
+-- `spec.tool_results`) and the values of `spec.fields`, in that order. A
+-- field value the tool results already hold is not added again: tool
+-- results read `documents` whole, and `documents[*].text` was the field an
+-- app listed for them before.
 -- @param decoded table
 -- @param spec    { tool_results = bool, fields = { path, ... } }
 -- @return string (joined with "\n"), may be ""; and the list of strings found
 function _M.extract_untrusted(decoded, spec)
   local out = {}
+  sort_left = WHOLE_SORT
   if type(decoded) ~= "table" or type(spec) ~= "table" then return "", out end
   if spec.tool_results ~= false then tool_results(decoded, out) end
-  for _, f in ipairs(spec.fields or {}) do
-    walk(decoded, split_path(f), 1, out)
+  local fields = spec.fields or {}
+  if #fields > 0 then
+    local seen, more = {}, {}
+    for _, v in ipairs(out) do seen[v] = true end
+    for _, f in ipairs(fields) do walk(decoded, field_path(f), 1, more) end
+    for _, v in ipairs(more) do
+      if not seen[v] then out[#out + 1] = v end
+    end
   end
   return table.concat(out, "\n"), out
 end

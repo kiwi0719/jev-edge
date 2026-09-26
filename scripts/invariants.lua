@@ -277,10 +277,11 @@ rule("rule-parity", function(r)
   -- (a cut is "(window)" or unjudgeable in one core only otherwise) and the
   -- same JSON Schema type names left out of a tool definition
   local nlua, nts = code("core/normalize.lua"), code("adapters/js/src/core/normalize.ts")
-  local depth, nodes = nts:match("export const DEEP = { depth: (%d+), nodes: (%d+) }")
+  local depth, nodes, count = nts:match("export const DEEP = { depth: (%d+), nodes: (%d+), count: (%d+) }")
   if not depth or nlua:match("\n_M%.DEEP_DEPTH = (%d+)") ~= depth
-     or nlua:match("\n_M%.DEEP_NODES = (%d+)") ~= nodes then
-    fail(r, "DEEP_DEPTH / DEEP_NODES differ between core/normalize.lua and src/core/normalize.ts")
+     or nlua:match("\n_M%.DEEP_NODES = (%d+)") ~= nodes
+     or nlua:match("\n_M%.DEEP_COUNT = (%d+)") ~= count then
+    fail(r, "DEEP_DEPTH / DEEP_NODES / DEEP_COUNT differ between core/normalize.lua and src/core/normalize.ts")
   end
   local function sorted_words(s)
     local out = {}

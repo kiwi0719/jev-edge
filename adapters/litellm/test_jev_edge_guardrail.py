@@ -550,10 +550,8 @@ def test_generate_content_is_judged(call_type, route):
 def test_tool_call_arguments_are_sent_whole():
     # tool-call arguments are sent whole because they are model-visible
     # text: keys the media filter drops elsewhere are text there. jev-edge's
-    # rules read OpenAI's, Anthropic's and the Responses API's arguments,
-    # every key and string; Bedrock's toolUse.input and Gemini's
-    # functionCall.args are sent as the model gets them, though no rule
-    # reads them
+    # rules read OpenAI's, Anthropic's, the Responses API's, Bedrock's
+    # toolUse.input and Gemini's functionCall.args, every key and string
     args = {"bytes": ATTACK, "image_url": "https://x/a.png", "inline_data": {"note": "keep"}, "type": "image",
             "source": {"type": "base64", "data": "a string the model wrote", "media_type": "text/plain"}}
     msgs = [{"role": "assistant", "content": None,

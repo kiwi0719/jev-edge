@@ -452,6 +452,18 @@ extract_case("Gemini function responses are read whole",
   .. '{"name":"weather","response":{"temp":21,"summary":"Sunny, light wind.","alerts":[]}}},'
   .. '{"function_response":{"name":"news","response":{"output":"No news."}}}]}]}',
   "application/json", { "contents[*].parts" })
+extract_case("Bedrock Converse toolResult: its text and json blocks, not toolUseId or media",
+  '{"messages":[{"role":"user","content":[{"text":"What did the tool say?"}]},{"role":"user","content":'
+  .. '[{"toolResult":{"toolUseId":"t1","status":"success","content":[{"text":"First block."},'
+  .. '{"json":{"b":"two","a":["one"]}},{"image":{"format":"png","source":{"bytes":"iVBORw0KGgo="}}}]}}]}]}',
+  "application/json", { "messages[*].content" })
+extract_case("tool-call arguments: Converse toolUse input and Gemini functionCall args",
+  '{"messages":[{"role":"assistant","content":[{"toolUse":{"toolUseId":"t1","name":"run","input":{"cmd":"ls -la"}}}]}],'
+  .. '"contents":[{"role":"model","parts":[{"functionCall":{"name":"weather","args":{"city":"Paris"}}},'
+  .. '{"function_call":{"name":"news","args":{"topic":"rain"}}}]}]}',
+  "application/json", { "messages[*].content", "messages[*].content[*].toolUse.input.**",
+                        "contents[*].parts", "contents[*].parts[*].functionCall.args.**",
+                        "contents[*].parts[*].function_call.args.**" })
 -- Gemini contents parts as one object: its own text, then its keys (LiteLLM
 -- sends each key as a text part), in byte order; a part in a list is not
 -- read by its keys, and neither is an object under another parts path
@@ -1038,6 +1050,18 @@ rules_case("field: Gemini function response", raw("/v1beta/models/gemini-2.0-fla
   .. '{"name":"fetch","response":{"content":{"page":' .. SYS .. '}}}}]}]}'))
 rules_case("field: Gemini function response in one content, one part", raw("/models/gpt-4o:generateContent",
   '{"contents":{"role":"user","parts":{"functionResponse":{"name":"fetch","response":{"result":' .. SYS .. '}}}}}'))
+rules_case("field: Bedrock Converse toolResult text", raw("/v1/chat/completions",
+  '{"messages":[{"role":"user","content":[{"text":' .. HI .. '}]},{"role":"user","content":[{"toolResult":'
+  .. '{"toolUseId":"t1","content":[{"text":' .. SYS .. '}]}}]}]}'))
+rules_case("field: Bedrock Converse toolResult json block", raw("/v1/chat/completions",
+  '{"messages":[{"role":"user","content":[{"text":' .. HI .. '}]},{"role":"user","content":[{"toolResult":'
+  .. '{"toolUseId":"t1","content":[{"json":{"page":' .. SYS .. '}}]}}]}]}'))
+rules_case("field: Bedrock Converse toolUse input", raw("/v1/chat/completions",
+  '{"messages":[{"role":"user","content":[{"text":' .. HI .. '}]},{"role":"assistant","content":[{"toolUse":'
+  .. '{"toolUseId":"t1","name":"run","input":{"cmd":' .. SYS .. '}}}]}]}'))
+rules_case("field: Gemini functionCall args", raw("/v1beta/models/gemini-2.0-flash:generateContent",
+  '{"contents":[{"role":"user","parts":[{"text":' .. HI .. '}]},{"role":"model","parts":[{"functionCall":'
+  .. '{"name":"run","args":{"cmd":' .. SYS .. '}}}]}]}'))
 rules_case("field: Responses stored prompt variables", raw("/v1/responses",
   '{"model":"m","prompt":{"id":"pmpt_1","variables":{"topic":' .. SYS .. '}},"input":' .. HI .. '}'))
 -- TGI's root is watched only for a JSON body: a site's own POST to / passes
@@ -1805,6 +1829,8 @@ do
     { "Cohere v1 documents", "/v1/chat", '{"message":' .. SHORT .. ',"documents":[{"snippet":' .. A .. '}]}' },
     { "Gemini function response", "/v1beta/models/gemini-2.0-flash:generateContent",
       '{"contents":[{"parts":[{"functionResponse":{"name":"f","response":{"result":' .. A .. '}}}]}]}' },
+    { "Bedrock Converse toolResult", "/v1/chat/completions",
+      '{"messages":[{"role":"user","content":[{"toolResult":{"toolUseId":"t1","content":[{"text":' .. A .. '}]}}]}]}' },
     { "Responses prompt variables", "/v1/responses",
       '{"prompt":{"id":"p","variables":{"q":' .. A .. '}},"input":' .. SHORT .. '}' },
   }) do
@@ -2120,6 +2146,12 @@ do
 end
 eval_case("untrusted: a Responses function_call_output item", {
   req = raw_req(U_RESPONSES), config = U_ON_ENF, judge = U_SCORES })
+do
+  local U_CONVERSE = '{"messages":[{"role":"user","content":[{"text":' .. escape(U_ASK) .. '}]},'
+    .. '{"role":"user","content":[{"toolResult":{"toolUseId":"t1","content":[{"text":' .. escape(U_EMAIL) .. '}]}}]}]}'
+  eval_case("untrusted: a Bedrock Converse toolResult", {
+    req = raw_req(U_CONVERSE), config = U_ON_ENF, judge = U_SCORES })
+end
 eval_case("untrusted off: a Responses function_call_output is judged with the whole text", {
   req = raw_req(U_RESPONSES), config = { policy = { mode = "enforce" } }, judge = U_SCORES })
 eval_case("untrusted: tool_results = false leaves tool messages to the whole text", {

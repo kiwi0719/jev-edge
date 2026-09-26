@@ -100,6 +100,21 @@ local function function_responses(part, out)
   end
 end
 
+-- A Bedrock Converse tool result: { toolResult = { toolUseId, content = {
+-- { text = ... }, { json = <any> }, { image | document | video = ... } } } }.
+-- Its text blocks are read, and a json block whole (read_whole), as the model
+-- is shown it; media blocks and toolUseId contribute nothing.
+local function converse_result(tr, out)
+  local c = tr.content
+  if type(c) ~= "table" then return end
+  for _, block in ipairs(c) do
+    if type(block) == "table" then
+      if type(block.text) == "string" then out[#out + 1] = block.text end
+      if block.json ~= nil then read_whole(block.json, out, 1) end
+    end
+  end
+end
+
 -- A leaf that is not a string is a "content parts" value: the array form of
 -- `messages[*].content` every current chat API accepts
 -- (`[{type="text", text="..."}, {type="image_url", ...}]`), the Responses API's
@@ -108,6 +123,7 @@ end
 -- bounded depth. Some parts keep their text elsewhere: an Anthropic `document`
 -- block under `source.data` (source type "text") or `source.content` (type
 -- "content"), a Responses `file_search_call` under `results[*].text`, a
+-- Bedrock Converse `toolResult` under its content's `text` and `json` blocks, a
 -- Gemini part's function result under `functionResponse.response` and a
 -- Cohere v2 `document` part (a tool result's) under `document`; the last two
 -- are read whole (read_whole).
@@ -149,6 +165,7 @@ local function collect(node, out, depth, st)
   end
   function_responses(node, out)
   if node.type == "document" and node.document ~= nil then read_whole(node.document, out, 1) end
+  if type(node.toolResult) == "table" then converse_result(node.toolResult, out) end
 end
 
 -- Go's encoding/json (Ollama's /api/chat, a default watched path) matches an
@@ -822,7 +839,10 @@ local function tool_results(decoded, st)
           if type(c) == "table" and c[1] == nil then read_whole(c, out, 1) else collect(c, out, 1) end
         elseif type(m.content) == "table" then
           for _, block in ipairs(m.content) do
-            if type(block) == "table" and block.type == "tool_result" then collect(block.content, out, 1) end
+            if type(block) == "table" then
+              if block.type == "tool_result" then collect(block.content, out, 1) end
+              if type(block.toolResult) == "table" then converse_result(block.toolResult, out) end
+            end
           end
         end
         if type(m.parts) == "table" then

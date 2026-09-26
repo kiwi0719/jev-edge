@@ -90,9 +90,11 @@ return {
   -- template: Ollama.
   -- Tool-call arguments, which chat templates render for the model and a
   -- client can write into the history: OpenAI and Ollama tool_calls, legacy
-  -- function_call, Anthropic tool_use input, Responses function_call and
-  -- mcp_call arguments (".**": every key and string below, a string of JSON
-  -- read decoded), and the free-text input of custom tool calls.
+  -- function_call, Anthropic tool_use input, Bedrock Converse toolUse input,
+  -- Gemini functionCall args, Responses function_call and mcp_call arguments
+  -- (".**": every key and string below, a string of JSON read decoded), and
+  -- the free-text input of custom tool calls. A Converse toolResult's text
+  -- and json blocks are read as content (core/normalize.lua converse_result).
   -- messages[*].parts: AI SDK 5 UIMessages, which carry no content; the
   -- input of their tool parts (type "tool-<name>" and "dynamic-tool") is a
   -- tool call's arguments, and their output (state "output-available") the
@@ -117,9 +119,11 @@ return {
                   "system_instruction.parts", "documents", "template",
                   "messages[*].content", "messages[*].tool_calls[*].function.arguments.**",
                   "messages[*].tool_calls[*].custom.input", "messages[*].function_call.arguments.**",
-                  "messages[*].content[*].input.**", "messages[*].parts",
+                  "messages[*].content[*].input.**", "messages[*].content[*].toolUse.input.**",
+                  "messages[*].parts",
                   "messages[*].parts[*].input.**", "messages[*].parts[*].output.**",
-                  "contents[*].parts", "contents.parts", "chat_history[*].message", "message",
+                  "contents[*].parts", "contents[*].parts[*].functionCall.args.**",
+                  "contents[*].parts[*].function_call.args.**", "contents.parts", "chat_history[*].message", "message",
                   "prompt", "prompt.prompt_string", "prompt[*].prompt_string", "prompt.variables.**",
                   "input", "input[*].arguments.**", "input[*].input", "input[*].output",
                   "inputs", "instances[*].inputs", "instances[*].messages[*].content",

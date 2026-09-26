@@ -208,12 +208,15 @@ describe("tool-call arguments (\"**\" paths)", function()
 
   it("tells a list under a key a plain path ends at from a \"**\" value there by its depth", function()
     local rule = load("llm-endpoints")
-    -- "input" is a "**" path's key (a tool_use input, an AI SDK tool part's
-    -- input, at depth 5) and plain paths' (the Responses input list at 1, a
-    -- custom tool call's input at 3 and 6); "output" a "**" path's (an AI SDK
-    -- tool part's output, 5) and a plain path's (a function_call_output's, 3);
-    -- "variables" (prompt.variables.**) is a "**" path's key only
-    assert.same({ arguments = "any", input = { [1] = true, [3] = true, [6] = true }, output = { [3] = true },
+    -- "input" is a "**" path's key (a tool_use input or an AI SDK tool part's
+    -- input at depth 5, a Converse toolUse input at 6) and plain paths' (the
+    -- Responses input list at 1, a Responses item's input at 3; a custom tool
+    -- call's input at 6 is also where the Converse one ends, so 6 is no list
+    -- depth); "output" a "**" path's (an AI SDK tool part's output, 5) and a
+    -- plain path's (a function_call_output's, 3); "variables"
+    -- (prompt.variables.**) and "args" (Gemini functionCall args) are "**"
+    -- paths' keys only
+    assert.same({ args = "any", arguments = "any", input = { [1] = true, [3] = true }, output = { [3] = true },
       variables = "any" }, normalize.deep_keys(rule.text_fields))
     -- a depth a "**" path ends at too is no list; a "**" path whose segments
     -- end at another key than the one the scan finds ("a[*][*]" is a key of

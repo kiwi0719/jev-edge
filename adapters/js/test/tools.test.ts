@@ -201,13 +201,16 @@ describe('tool-call arguments ("**" paths)', () => {
 
   it('tells a list under a key a plain path ends at from a "**" value there by its depth', () => {
     const fields = load("llm-endpoints").text_fields;
-    // "input" is a "**" path's key (a tool_use input, an AI SDK tool part's
-    // input, at depth 5) and plain paths' (the Responses input list at 1, a
-    // custom tool call's input at 3 and 6); "output" a "**" path's (an AI SDK
-    // tool part's output, 5) and a plain path's (a function_call_output's, 3);
-    // "variables" (prompt.variables.**) is a "**" path's key only
-    expect(normalize.deepKeys(fields)).toEqual(new Map<string, "any" | Set<number>>([["arguments", "any"],
-      ["input", new Set([1, 3, 6])], ["output", new Set([3])], ["variables", "any"]]));
+    // "input" is a "**" path's key (a tool_use input or an AI SDK tool part's
+    // input at depth 5, a Converse toolUse input at 6) and plain paths' (the
+    // Responses input list at 1, a Responses item's input at 3; a custom tool
+    // call's input at 6 is also where the Converse one ends, so 6 is no list
+    // depth); "output" a "**" path's (an AI SDK tool part's output, 5) and a
+    // plain path's (a function_call_output's, 3); "variables"
+    // (prompt.variables.**) and "args" (Gemini functionCall args) are "**"
+    // paths' keys only
+    expect(normalize.deepKeys(fields)).toEqual(new Map<string, "any" | Set<number>>([["args", "any"], ["arguments", "any"],
+      ["input", new Set([1, 3])], ["output", new Set([3])], ["variables", "any"]]));
     // a depth a "**" path ends at too is no list; a "**" path whose segments
     // end at another key than the one the scan finds ("a[*][*]" is a key of
     // its own to the walk) leaves the set empty

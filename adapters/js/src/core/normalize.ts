@@ -156,6 +156,18 @@ function functionResponses(part: { [k: string]: JsonValue }, out: string[]): voi
 // Mirrors collect() in core/normalize.lua, including Lua's "array if [1] is
 // set" test: an empty array is a table with no array part and yields nothing.
 const LEAF_DEPTH = 6;
+/** Port of converse_result() in core/normalize.lua: a Bedrock Converse
+ *  toolResult's text blocks, and its json blocks read whole. */
+function converseResult(tr: { [k: string]: JsonValue }, out: string[]): void {
+  const c = tr.content;
+  if (!Array.isArray(c)) return;
+  for (const block of c) {
+    if (!isObj(block) || Array.isArray(block)) continue;
+    if (typeof block.text === "string") out.push(block.text);
+    if (block.json !== undefined && block.json !== null) readWhole(block.json, out, 1);
+  }
+}
+
 function collect(node: JsonValue | undefined, out: string[], depth: number, st?: { tokens: boolean }): void {
   if (typeof node === "string") {
     out.push(node);
@@ -185,6 +197,7 @@ function collect(node: JsonValue | undefined, out: string[], depth: number, st?:
   if (node.type === "file_search_call" && isObj(node.results)) collect(node.results, out, depth + 1, st);
   functionResponses(node, out);
   if (node.type === "document" && node.document !== undefined) readWhole(node.document, out, 1);
+  if (isObj(node.toolResult) && !Array.isArray(node.toolResult)) converseResult(node.toolResult, out);
 }
 
 /**
@@ -835,7 +848,9 @@ function toolResults(decoded: JsonValue, st: WalkState): void {
         else collect(m.content, out, 1);
       } else if (Array.isArray(m.content)) {
         for (const block of m.content) {
-          if (isObj(block) && !Array.isArray(block) && block.type === "tool_result") collect(block.content, out, 1);
+          if (!isObj(block) || Array.isArray(block)) continue;
+          if (block.type === "tool_result") collect(block.content, out, 1);
+          if (isObj(block.toolResult) && !Array.isArray(block.toolResult)) converseResult(block.toolResult, out);
         }
       }
       if (Array.isArray(m.parts)) {

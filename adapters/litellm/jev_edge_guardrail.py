@@ -144,9 +144,8 @@ STRUCTURAL_KEYS = frozenset({"role", "type", "id", "call_id", "tool_call_id", "t
 # `image_url`) is text here. jev-edge's rules for tool-call arguments read
 # every key and string of OpenAI's, Anthropic's and the Responses API's
 # (messages[*].tool_calls[*].function.arguments.**,
-# messages[*].content[*].input.**, ...). None reads Bedrock Converse's
-# toolUse.input or Gemini's functionCall.args: sent as the model gets them
-# all the same.
+# messages[*].content[*].input.**, ...), Bedrock Converse's toolUse.input
+# and Gemini's functionCall.args included.
 TOOL_ARGUMENTS = frozenset({
     ("messages", "*", "tool_calls", "*", "function", "arguments"),
     ("messages", "*", "tool_calls", "*", "custom", "input"),

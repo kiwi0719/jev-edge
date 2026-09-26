@@ -534,7 +534,8 @@ function _M.resolve(spec, load)
     out.text_fields = { "system", "template",
                         "messages[*].content", "messages[*].tool_calls[*].function.arguments.**",
                         "messages[*].tool_calls[*].custom.input", "messages[*].function_call.arguments.**",
-                        "messages[*].content[*].input.**", "messages[*].parts", "prompt",
+                        "messages[*].content[*].input.**", "messages[*].parts",
+                        "messages[*].parts[*].input.**", "prompt",
                         "input", "input[*].arguments.**", "input[*].input", "input[*].output",
                         "query", "text", "suffix", "input_prefix", "input_suffix", "input_extra[*].text" }
   end

@@ -53,14 +53,17 @@ return {
   -- function_call, Anthropic tool_use input, Responses function_call and
   -- mcp_call arguments (".**": every key and string below, a string of JSON
   -- read decoded), and the free-text input of custom tool calls.
-  -- messages[*].parts: AI SDK 5 UIMessages, which carry no content.
+  -- messages[*].parts: AI SDK 5 UIMessages, which carry no content; the
+  -- input of their tool parts (type "tool-<name>" and "dynamic-tool") is a
+  -- tool call's arguments.
   -- input[*].output: a Responses API function_call_output (a tool result).
   -- suffix: OpenAI completions and Ollama; input_prefix, input_suffix,
   -- input_extra: llama.cpp /infill.
   text_fields = { "system", "template",
                   "messages[*].content", "messages[*].tool_calls[*].function.arguments.**",
                   "messages[*].tool_calls[*].custom.input", "messages[*].function_call.arguments.**",
-                  "messages[*].content[*].input.**", "messages[*].parts", "prompt",
+                  "messages[*].content[*].input.**", "messages[*].parts",
+                  "messages[*].parts[*].input.**", "prompt",
                   "input", "input[*].arguments.**", "input[*].input", "input[*].output",
                   "query", "text", "suffix", "input_prefix", "input_suffix", "input_extra[*].text" },
   -- Tool definitions and output schemas, judged as a part of their own with

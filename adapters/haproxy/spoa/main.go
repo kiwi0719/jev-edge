@@ -562,8 +562,9 @@ func (l *guardListener) Accept() (net.Conn, error) {
 		}
 		if atomic.AddInt64(&l.active, 1) > l.max {
 			atomic.AddInt64(&l.active, -1)
-			c.Close()
+			// counted before the close, so whoever sees it closed sees it counted
 			n := l.refused.Add(1)
+			c.Close()
 			// one line a second at most, whatever the rate
 			if now := time.Now().Unix(); l.lastLog.Swap(now) != now {
 				log.Printf("jev-spoa: over %d connections (-max-conns): closed %s (%d refused so far)", l.max, c.RemoteAddr(), n)

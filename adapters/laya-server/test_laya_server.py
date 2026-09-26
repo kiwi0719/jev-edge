@@ -82,6 +82,11 @@ def profile_timeout_ms() -> int:
         return int(re.search(r"^\s*timeout_ms\s*=\s*(\d+)", f.read(), re.M).group(1))
 
 
+def profile_max_inflight() -> int:
+    with open(os.path.join(HERE, "jev-laya.conf.lua")) as f:
+        return int(re.search(r"^\s*max_inflight\s*=\s*(\d+)", f.read(), re.M).group(1))
+
+
 def stop(srv):
     srv.shutdown()
     srv.server_close()
@@ -348,6 +353,58 @@ class Http(unittest.TestCase):
                               r"to at most 1")
 
 
+class SharedPool(Hostile):
+    """Hostile, and the requests being scored share one pool of compute, as
+    the workers of the default onnx pool share its onnxruntime threads: a
+    batch of windows takes `ms` per window, one batch at a time, so two
+    worst-case texts at once take twice as long as one, together."""
+
+    def __init__(self, ms: float):
+        self.ms, self.lock = ms, threading.Lock()
+
+    def logits(self, first, seconds):
+        with self.lock:
+            time.sleep(len(seconds) * self.ms / 1000)
+        return [L.MockBackend.logit(self, first, s) for s in seconds]
+
+
+class Profile(unittest.TestCase):
+    """python-adapters#4: a 503 from this server and a timeout count toward
+    the gateway's breaker, a call its own max_inflight cap refuses does not.
+    The profile's max_inflight has to shed a burst of worst-case texts before
+    this server, with its defaults, must."""
+
+    def test_max_inflight_never_waits_for_a_worker_of_the_default_pool(self):
+        # one gateway at the profile's max_inflight finds a worker free in
+        # the default pool on any host, so no call waits or gets a 503
+        mi = profile_max_inflight()
+        for cpus in range(1, 129):
+            self.assertLessEqual(mi, L.pool_sizes("onnx", {}, cpus)[0], cpus)
+
+    def test_the_worst_case_fits_the_profile_at_its_max_inflight_and_not_past_it(self):
+        # At the ~33 ms per window the profile's floor is sized from, two
+        # workers sharing their compute as the default pool does: the
+        # profile's max_inflight worst-case texts at once pass at its floor.
+        # One more is admitted by the second worker but answered past the
+        # gateway's read (a timeout there), and the run says to lower
+        # max_inflight.
+        mi = profile_max_inflight()
+        srv, url = serve({"LAYA_WORKERS": "2"}, backend=SharedPool(33))
+        try:
+            rc, out = conformance_run(url, "--budget-ms", str(profile_timeout_ms()), "--concurrency", str(mi))
+            rc2, out2 = conformance_run(url, "--budget-ms", str(profile_timeout_ms()),
+                                        "--concurrency", str(mi + 1))
+        finally:
+            stop(srv)
+        self.assertEqual(rc, 0, out)
+        self.assertRegex(out, rf"ok    worst case within {profile_timeout_ms()} ms .*, {mi} at once")
+        self.assertEqual(rc2, 1, out2)
+        self.assertRegex(out2, rf"FAIL  worst case within {profile_timeout_ms()} ms .*, {mi + 1} at once: .*p99 "
+                               rf"[\d.]+ ms needs a timeout_ms of \d+ at 2x headroom, over the "
+                               rf"{profile_timeout_ms()} ms budget")
+        self.assertIn("or lower max_inflight (summed over the gateways that call this server)", out2)
+
+
 class Verdicts(unittest.TestCase):
     """conformance/run.py's timing verdicts from given latencies: a check
     passes only with the headroom the run recommends, and a 503 must come
@@ -411,7 +468,7 @@ class Verdicts(unittest.TestCase):
 
 
 class Load(unittest.TestCase):
-    """lead-laya-python#31: the gateway opens up to jev.max_inflight (64)
+    """lead-laya-python#31: the gateway opens up to jev.max_inflight (64 by default)
     connections at once. socketserver's listen backlog of 5 dropped most of
     a burst; each dropped connection was an L2 timeout, which passes the
     request, and enough of them opened the breaker for every tenant."""

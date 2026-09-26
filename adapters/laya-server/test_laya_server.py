@@ -138,6 +138,77 @@ class Windows(unittest.TestCase):
         self.assertGreater(usage["windows"], 1)
 
 
+def questions(n: int) -> dict:
+    return {f"q{i}": dict(Q) for i in range(n)}
+
+
+class Counting(L.MockBackend):
+    """The mock, counting how often it tokenizes a judged text (count() is
+    the question segment and the windows) and scores a window."""
+
+    def __init__(self):
+        self.spans_calls, self.scored = 0, 0
+
+    def spans(self, text):
+        self.spans_calls += 1
+        return L.MockBackend.spans(self, text)
+
+    def count(self, text):
+        return len(L.MockBackend.spans(self, text))
+
+    def logit(self, first, second):
+        self.scored += 1
+        return super().logit(first, second)
+
+
+class Questions(unittest.TestCase):
+    """python-adapters#10: a request could ask any number of questions, and
+    each one tokenized and scored the whole text again: one 256 KB request
+    of 5,000 trivial questions ran 38,000 window scorings."""
+
+    def test_more_than_max_questions_is_413(self):
+        L.validate({"state": "x", "questions": questions(8)})
+        with self.assertRaises(L.Refused) as cm:
+            L.validate({"state": "x", "questions": questions(9)})
+        self.assertEqual((cm.exception.status, cm.exception.code), (413, "too_many_questions"))
+        for env, n, want in (({}, 8, 200), ({}, 9, 413), ({"LAYA_MAX_QUESTIONS": "2"}, 2, 200),
+                             ({"LAYA_MAX_QUESTIONS": "2"}, 3, 413)):
+            srv, url = serve(env)
+            try:
+                t = conformance.Target(url, None, "laya", 5)
+                body = json.dumps({"state": "hello", "questions": questions(n)}).encode()
+                status, data, _ = t.request("POST", "/v1/systemone", body)
+            finally:
+                stop(srv)
+            self.assertEqual(status, want, (env, n, data))
+            if want == 413:
+                self.assertEqual(json.loads(data)["error"]["code"], "too_many_questions")
+                self.assertIsNone(conformance.check_error_body(data))
+
+    def test_the_text_is_tokenized_once_per_request(self):
+        b = Counting()
+        s = L.Scorer(b, max_tokens=64, overlap=8, max_windows=8)
+        text = " ".join(["benign"] * 150) + " ATTACK"
+        per_question = len(s.windows("x", text))
+        self.assertGreater(per_question, 1)
+        b.spans_calls = 0
+        ans, usage = s.score(text, questions(3))
+        self.assertEqual(b.spans_calls, 1)
+        self.assertEqual(usage["windows"], 3 * per_question)
+        self.assertEqual(b.scored, 3 * per_question)
+        self.assertTrue(all(a["noul"] > 0.5 for a in ans.values()), ans)
+
+    def test_a_question_refused_413_costs_the_request_no_scoring(self):
+        b = Counting()
+        s = L.Scorer(b, max_tokens=64, overlap=8, max_windows=8)
+        qs = questions(2)
+        qs["q1"]["instructions"] = " ".join(["q"] * 60)  # fills the model: question_too_long
+        with self.assertRaises(L.Refused) as cm:
+            s.score("hello there", qs)
+        self.assertEqual(cm.exception.code, "question_too_long")
+        self.assertEqual(b.scored, 0)
+
+
 class Temperature(unittest.TestCase):
     def test_noul_is_sigmoid_of_logit_over_t(self):
         for t in (0.5, 1.0, 2.0):
@@ -243,8 +314,8 @@ class Http(unittest.TestCase):
 
     def test_conformance_catches_silent_truncation(self):
         class Truncating(L.Scorer):
-            def windows(self, first, text):
-                return super().windows(first, text)[:1]   # the bug the suite exists for
+            def windows(self, first, text, spans=None):
+                return super().windows(first, text, spans)[:1]   # the bug the suite exists for
 
         srv, url = serve()
         srv.RequestHandlerClass.scorer = Truncating(L.MockBackend())

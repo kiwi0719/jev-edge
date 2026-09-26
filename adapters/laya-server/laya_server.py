@@ -20,7 +20,8 @@ Guarantees the gateway relies on, checked by conformance/ (make conformance):
     with the temperature fitted by fit_temperature.py on held-out labels;
   * no silent truncation: text longer than one model window is scored in
     overlapping windows and the question takes the highest score; text that
-    would need more than LAYA_MAX_WINDOWS windows is refused with 413;
+    would need more than LAYA_MAX_WINDOWS windows is refused with 413,
+    and so is a request of more than LAYA_MAX_QUESTIONS questions;
   * text that is not valid Unicode (a lone surrogate escape, invalid UTF-8)
     is judged with U+FFFD in its place, never refused;
   * load past what the server can take is answered, never dropped: the
@@ -55,6 +56,8 @@ Configuration (environment):
   LAYA_MAX_TOKENS    model context length in tokens               (1024)
   LAYA_WINDOW_OVERLAP tokens shared by adjacent windows           (64)
   LAYA_MAX_WINDOWS   windows per question before 413              (8)
+  LAYA_MAX_QUESTIONS questions per request before 413; the gateway asks
+                     at most 3                                    (8)
   LAYA_MAX_BODY_BYTES request body limit                          (262144)
   LAYA_API_KEY       when set, requests need "Authorization: Bearer <key>"
   LAYA_ACCESS_LOG    0 turns off the per-request line on stderr     (1)
@@ -477,7 +480,10 @@ class Scorer:
         self.overlap = overlap
         self.max_windows = max_windows
 
-    def windows(self, first: str, text: str) -> list[str]:
+    def windows(self, first: str, text: str, spans=None) -> list[str]:
+        """The slices of `text` scored next to `first`. spans: the text's
+        token spans, when the caller has them (logits tokenizes the text
+        once for every question of a request)."""
         room = self.max_tokens - self.b.pair_overhead - self.b.count(first) - SLACK
         if room <= self.overlap:
             # the question and the assistant description alone fill the model:
@@ -486,7 +492,8 @@ class Scorer:
             raise Refused(413, "question_too_long",
                           f"question and assistant description leave {max(room, 0)} of "
                           f"{self.max_tokens} tokens for the text")
-        spans = self.b.spans(text)
+        if spans is None:
+            spans = self.b.spans(text)
         if len(spans) <= room:
             return [text]
         step = room - self.overlap
@@ -506,13 +513,28 @@ class Scorer:
         """Raw "yes" logit per question (highest over the windows), before the
         temperature. fit_temperature.py fits on exactly these."""
         assistant, text = split_state(state)
-        out, windows, tokens = {}, 0, 0
+        # the text is tokenized once, and every question's windows are cut
+        # before the first model call: a question refused 413 costs the
+        # request no scoring. Questions differ only in the room they leave,
+        # so their windows are mostly the same strings, counted once.
+        spans = self.b.spans(text)
+        plan = []
         for name, q in questions.items():
             first = question_segment(q, assistant)
-            ws = self.windows(first, text)
+            plan.append((name, first, self.windows(first, text, spans)))
+        counts: dict[str, int] = {}
+
+        def count(w: str) -> int:
+            n = counts.get(w)
+            if n is None:
+                n = counts[w] = self.b.count(w)
+            return n
+
+        out, windows, tokens = {}, 0, 0
+        for name, first, ws in plan:
             windows += len(ws)
             head = self.b.count(first) + self.b.pair_overhead
-            tokens += sum(head + self.b.count(w) for w in ws)
+            tokens += sum(head + count(w) for w in ws)
             if len(ws) > 1 and hasattr(self.b, "logits"):
                 out[name] = max(self.b.logits(first, ws))
             else:
@@ -556,7 +578,14 @@ def _nonempty_str(v) -> bool:
     return isinstance(v, str) and v != ""
 
 
-def validate(req) -> None:
+# LAYA_MAX_QUESTIONS by default. The gateway asks at most 3 questions in one
+# request (injection, abuse, untrusted). Every question tokenizes and scores
+# the whole text again, up to LAYA_MAX_WINDOWS windows, so without a cap one
+# 256 KB request of 5,000 trivial questions ran 38,000 window scorings.
+MAX_QUESTIONS_DEFAULT = 8
+
+
+def validate(req, max_questions: int = MAX_QUESTIONS_DEFAULT) -> None:
     if not isinstance(req, dict):
         raise Refused(400, "invalid_request", "body must be a JSON object")
     state = req.get("state")
@@ -568,6 +597,8 @@ def validate(req) -> None:
     qs = req.get("questions")
     if not isinstance(qs, dict) or not qs:
         raise Refused(400, "invalid_questions", "questions must be a non-empty object")
+    if len(qs) > max_questions:
+        raise Refused(413, "too_many_questions", f"{len(qs)} questions; LAYA_MAX_QUESTIONS is {max_questions}")
     for name, q in qs.items():
         if not isinstance(q, dict) or q.get("type") != "noul":
             raise Refused(400, "invalid_questions", f"question {name!r}: only type \"noul\" is supported")
@@ -770,6 +801,7 @@ class Handler(BaseHTTPRequestHandler):
     model_name = "laya"
     api_key = None
     max_body = 262144
+    max_questions = MAX_QUESTIONS_DEFAULT
     timeout = 120  # LAYA_IDLE_TIMEOUT_S, applied to the socket by StreamRequestHandler
 
     access_log = True
@@ -900,7 +932,7 @@ class Handler(BaseHTTPRequestHandler):
                     req = json.loads(raw.decode("utf-8-sig", "replace"))
             except ValueError:
                 raise Refused(400, "invalid_json", "body is not valid JSON") from None
-            validate(req)
+            validate(req, self.max_questions)
             with self.workers.slot(cost_units(req["state"], req["questions"]), since=received) as waited:
                 t0 = time.perf_counter()
                 answers, usage = self.scorer.score(req["state"], req["questions"])
@@ -985,6 +1017,9 @@ def make_server(env=os.environ, backend=None, cpus: tuple[int, str] | None = Non
                 "python" if isinstance(backend, PythonBackend) else "mock")
     workers, threads = pool_sizes(kind, env, cpus[0])
     gateway_timeout_ms = float(env.get("LAYA_GATEWAY_TIMEOUT_MS") or GATEWAY_TIMEOUT_MS_DEFAULT)
+    max_questions = int(env.get("LAYA_MAX_QUESTIONS") or MAX_QUESTIONS_DEFAULT)
+    if max_questions < 1:
+        raise ValueError("LAYA_MAX_QUESTIONS must be >= 1")
     backend = backend or load_backend(env, threads=threads)
     scorer = Scorer(
         backend,
@@ -999,6 +1034,7 @@ def make_server(env=os.environ, backend=None, cpus: tuple[int, str] | None = Non
         "model_name": env.get("LAYA_MODEL_NAME", "laya"),
         "api_key": env.get("LAYA_API_KEY") or None,
         "max_body": int(env.get("LAYA_MAX_BODY_BYTES", "262144")),
+        "max_questions": max_questions,
         "access_log": env.get("LAYA_ACCESS_LOG", "1") != "0",
         "timeout": float(env.get("LAYA_IDLE_TIMEOUT_S", "120")) or None,
     }
@@ -1027,7 +1063,8 @@ def startup_lines(srv: Server) -> list[str]:
     out = [f"laya-server on {host}:{port}{PATH}: {pool} on {count(srv.cpus, 'CPU')} ({srv.cpu_source}), "
            f"answering within {h.workers.answer_ms:g} ms of a {srv.gateway_timeout_ms:g} ms gateway timeout, "
            f"backlog {srv.request_queue_size}, "
-           f"at most {srv.max_connections} connections"
+           f"at most {srv.max_connections} connections, "
+           f"{count(h.max_questions, 'question')} a request, {count(h.scorer.max_windows, 'window')} a question"
            + (f", providers {','.join(providers)}" if providers else "")]
     if t == 0:
         out.append("laya-server: LAYA_ORT_THREADS=0 lets onnxruntime size its pool from the host's "

@@ -264,6 +264,19 @@ async function readBounded(request: Request, maxBytes: number): Promise<BodyRead
 
 const utf8 = new TextDecoder("utf-8", { fatal: false });
 
+/**
+ * The first `max` bytes of `b` cut back to a character boundary (the
+ * normalize.head of resty/jev/body.lua): `b` carries one byte past `max`,
+ * which says whether `max` falls inside a character.
+ */
+function wholeChars(b: Uint8Array, max: number): Uint8Array {
+  if (b.byteLength <= max) return b;
+  let end = max;
+  // back off continuation bytes to the start of the character at `max`
+  while (end > 0 && (b[end] & 0xc0) === 0x80) end--;
+  return b.subarray(0, end);
+}
+
 async function readReq(request: Request, rt: Runtime): Promise<[core.Req, ProviderRequestInfo]> {
   const url = new URL(request.url);
   const path = normalizePath(url.pathname);
@@ -290,12 +303,26 @@ async function readReq(request: Request, rt: Runtime): Promise<[core.Req, Provid
     if (ce !== "") {
       // decode only a body read whole: a cut compressed stream is corrupt
       if (whole) {
-        const d = await decodeBody(r.head, ce, maxBytes);
+        // past maxBytes, decoded on to SCAN_FACTOR x maxBytes looking for the
+        // end, where the newest message is (resty/jev/body.lua does the same)
+        const d = await decodeBody(r.head, ce, maxBytes, { tail: core.rules.TAIL_BYTES, scan: SCAN_FACTOR * maxBytes });
         if (d[0]) {
           req.decoded = true;
           if (d[1]) {
-            req.body_head = utf8.decode(d[0].subarray(0, maxBytes));
-            req.body_size = maxBytes + 1;
+            const info = d[2];
+            if (info?.complete) {
+              req.body_head = utf8.decode(wholeChars(d[0].subarray(0, maxBytes + 1), maxBytes));
+              if (info.tail) {
+                let skip = 0;
+                while (skip < info.tail.byteLength && (info.tail[skip] & 0xc0) === 0x80) skip++;
+                if (skip < info.tail.byteLength) req.body_tail = utf8.decode(info.tail.subarray(skip));
+              }
+              req.body_size = info.size;
+            } else {
+              // the scan bound came before the end: nothing to judge it on, and
+              // core reports it unjudgeable (body too large)
+              req.body_size = Math.max(info?.size ?? 0, maxBytes + 1);
+            }
           } else {
             body = utf8.decode(d[0]);
             req.body_size = d[0].byteLength;

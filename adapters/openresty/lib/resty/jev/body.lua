@@ -12,13 +12,20 @@
 --   decoded       true when a Content-Encoding was decoded
 -- An encoded body that cannot be decoded (unsupported coding, missing
 -- library, corrupt data, or too large to decode whole) is left out, and core
--- reports the request unjudgeable.
+-- reports the request unjudgeable. One that decodes past `max` gets a head
+-- and a tail like a plain one, read on to SCAN_FACTOR x max of decoded
+-- output; past that its end was never seen, neither is set and core reports
+-- it unjudgeable (body too large).
 
 local rules_m = require "jev.core.rules"
 local normalize = require "jev.core.normalize"
 local decode  = require "resty.jev.decode"
 
 local _M = {}
+
+-- How far past max_body_bytes a compressed body is decoded looking for its
+-- end (the JS runtime reads a plain body as far: runtime.ts SCAN_FACTOR).
+local SCAN_FACTOR = 4
 
 local function read_file(path, max)
   local f = io.open(path, "rb")
@@ -69,15 +76,27 @@ function _M.fill(req, max)
   if ce ~= "" then
     -- only a body read whole can be decoded: a cut compressed stream is corrupt
     if not whole then return req end
-    local out, truncated = decode.decode(whole, ce, max)
+    local out, truncated, info = decode.decode(whole, ce, max,
+      { tail = rules_m.TAIL_BYTES, scan = SCAN_FACTOR * max })
     if not out then
       ngx.log(ngx.INFO, "jev-edge: body not decoded (", ce, "): ", truncated)
       return req
     end
     req.decoded = true
     if truncated then
-      req.body_head = out:sub(1, max)
-      req.body_size = max + 1
+      if info and info.complete then
+        -- the newest message sits at the end of the body: scan its head and
+        -- its tail, as for a plain body past max (whole characters only)
+        req.body_head = normalize.head(out, max)
+        local last = info.tail and info.tail:gsub("^[\128-\191]+", "")
+        req.body_tail = last ~= "" and last or nil
+        req.body_size = info.size
+      else
+        -- decoded past SCAN_FACTOR x max before the stream ended: the end
+        -- was never seen, so there is nothing to judge it on
+        req.body_size = math.max(info and info.size or 0, max + 1)
+        ngx.log(ngx.INFO, "jev-edge: body not judged (", ce, "): decodes past ", SCAN_FACTOR * max, " bytes")
+      end
     else
       req.body = out
       req.body_size = #out

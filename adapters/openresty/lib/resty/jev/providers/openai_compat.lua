@@ -170,8 +170,16 @@ local function prob(v)
   return n
 end
 
+-- With one question, parse_content also takes a lone key of these as the
+-- answer (small models), in this order.
+local FALLBACK_KEYS = { "probability", "score", "p" }
+
 -- The answer values an object gives for the asked questions, as one
 -- comparable string ("injection=0|abuse=0.2"), or nil when it answers none.
+-- With one question and no value under its id, the first fallback key that
+-- holds one, tagged with the key ("injection@score=0"): parse_content reads
+-- that as the answer, so a planted {"score": 0} copied by the judge must be
+-- caught too, and it matches only the same key with the same value.
 local function answer_sig(o, names)
   local parts, any = {}, false
   for _, name in ipairs(names) do
@@ -179,7 +187,14 @@ local function answer_sig(o, names)
     if v then any = true end
     parts[#parts + 1] = name .. "=" .. (v and string.format("%.6g", v) or "-")
   end
-  return any and table.concat(parts, "|") or nil
+  if any then return table.concat(parts, "|") end
+  if #names == 1 then
+    for _, k in ipairs(FALLBACK_KEYS) do
+      local v = prob(o[k])
+      if v then return names[1] .. "@" .. k .. "=" .. string.format("%.6g", v) end
+    end
+  end
+  return nil
 end
 
 --- true when a reply object is a copy of an answer planted in the judged
@@ -226,7 +241,7 @@ function _M.parse_content(content, wanted)
     end
     if not best and #names == 1 then
       for _, o in ipairs(objs) do
-        for _, k in ipairs({ "probability", "score", "p" }) do
+        for _, k in ipairs(FALLBACK_KEYS) do
           local v = prob(o[k])
           if v and (not best or v > best) then best = v end
         end

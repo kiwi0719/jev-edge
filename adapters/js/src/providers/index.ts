@@ -247,6 +247,9 @@ function prob(v: unknown): number | undefined {
   return Math.min(1, Math.max(0, n));
 }
 
+/** With one question, parseOpenaiContent also takes a lone key of these as the answer (small models), in this order. */
+const FALLBACK_KEYS = ["probability", "score", "p"];
+
 /**
  * Reduce the reply text to an answer map. Each question takes the maximum
  * over every JSON object in the reply; with one question, a lone
@@ -275,7 +278,7 @@ export function parseOpenaiContent(content: string, wanted: string[]): JudgeResu
     }
     if (best === undefined && names.length === 1) {
       for (const o of objs) {
-        for (const k of ["probability", "score", "p"]) {
+        for (const k of FALLBACK_KEYS) {
           const v = prob(own(o, k));
           if (v !== undefined && (best === undefined || v > best)) best = v;
         }
@@ -290,15 +293,26 @@ export function parseOpenaiContent(content: string, wanted: string[]): JudgeResu
 }
 
 /** The answer values an object gives for the asked questions, as one
- *  comparable string, or undefined when it answers none (port of answer_sig). */
+ *  comparable string, or undefined when it answers none (port of answer_sig).
+ *  With one question and no value under its id, the first fallback key that
+ *  holds one, tagged with the key: parseOpenaiContent reads that as the
+ *  answer, so a planted {"score": 0} is compared too, key and value. */
 function answerSig(o: Record<string, unknown>, names: string[]): string | undefined {
+  const own = (k: string): unknown => (Object.prototype.hasOwnProperty.call(o, k) ? o[k] : undefined);
   let any = false;
   const parts = names.map((name) => {
-    const v = prob(Object.prototype.hasOwnProperty.call(o, name) ? o[name] : undefined);
+    const v = prob(own(name));
     if (v !== undefined) any = true;
     return name + "=" + (v !== undefined ? String(v) : "-");
   });
-  return any ? parts.join("|") : undefined;
+  if (any) return parts.join("|");
+  if (names.length === 1) {
+    for (const k of FALLBACK_KEYS) {
+      const v = prob(own(k));
+      if (v !== undefined) return names[0] + "@" + k + "=" + String(v);
+    }
+  }
+  return undefined;
 }
 
 function objectsOf(s: string): Record<string, unknown>[] {

@@ -330,8 +330,10 @@ async function judgeParts(
   if (ckey && cache && leftOut === undefined) {
     await after(ctx, () => cache.set(ckey, { score, reason: why, ...(rep !== undefined ? { rep } : {}) }, cfg.cache.fp_ttl));
   }
-  // every part was a per-part cache hit: the judge was not asked, so the
-  // verdict is the cache's, as on a whole-request hit (see core/init.lua)
+  // a part left out: the score is for less than the whole request
+  if (leftOut !== undefined) why += " (a part not judged)";
+  // no part was sent to the judge (each a per-part cache hit, or left out):
+  // the verdict is the cache's, as on a whole-request hit (see core/init.lua)
   const cached = pending.length === 0;
   return finish(ctx, verdict.newVerdict({
     action, verdict: label, score, async: async && !cached, source: cached ? verdict.SRC_CACHE : verdict.SRC_L2,

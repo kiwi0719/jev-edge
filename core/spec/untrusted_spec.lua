@@ -409,7 +409,7 @@ describe("untrusted content: pipeline", function()
       policy = { mode = "enforce" } } })
     local v = core.evaluate(tool_req(USER, ATTACK), ctx)
     assert.equals(V.ACTION_BLOCK, v.action)
-    assert.equals("injection 0.95", v.reason)
+    assert.equals("injection 0.95 (a part not judged)", v.reason)
     assert.equals(1, #j.prompts)
     assert.is_nil(j.prompts[1].questions.untrusted)
     local logged = false

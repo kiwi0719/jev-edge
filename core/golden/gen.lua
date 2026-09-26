@@ -2200,6 +2200,14 @@ do
     req = r, config = U_ON, judge = U_SCORES,
     cache = { [core.cache_key(fp_of(text), llm, cfg, normalize.djb2)] = { score = 0.2, reason = "injection 0.20" },
               [untrusted_key(U_EMAIL, U_ON)] = { score = 0.6, reason = "untrusted 0.60" } } })
+  -- the text a cache hit and the tool result's part left out (a template
+  -- judge does not know): still no judge call and a cache verdict, but the
+  -- reason says a part was not judged
+  local nope = { untrusted = { enabled = true, templates = { "nope" } } }
+  eval_case("untrusted: a cached text beside a part left out says a part was not judged", {
+    req = r, config = nope, judge = U_SCORES,
+    cache = { [core.cache_key(fp_of(text), llm, defaults.merge(defaults.config, nope), normalize.djb2)] =
+              { score = 0.2, reason = "injection 0.20" } } })
 end
 eval_case("untrusted: no answer to the untrusted question is an error", {
   req = raw_req(U_TOOL), config = U_ON_ENF, judge = { by_question = { injection = 0.2 } } })

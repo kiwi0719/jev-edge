@@ -377,9 +377,13 @@ local function judge_parts(ctx, rule, parts, suffix, fp, ckey, reason)
   if ckey and ctx.cache and not left_out then
     ctx.cache:set(ckey, { score = best, reason = why, rep = rep }, cfg.cache.fp_ttl)
   end
-  -- Every part was a per-part cache hit: the judge was not asked, so the
-  -- verdict is the cache's, as on a whole-request hit (source cache, never
-  -- async, no L2 time), and the L2 latency and error counts leave it out.
+  -- a part left out (its prompt could not be built): the score is for less
+  -- than the whole request, and the reason says so
+  if left_out then why = why .. " (a part not judged)" end
+  -- No part was sent to the judge (each was a per-part cache hit, or left
+  -- out): the verdict is the cache's, as on a whole-request hit (source
+  -- cache, never async, no L2 time), and the L2 latency and error counts
+  -- leave it out.
   local cached = #pending == 0
   return finish(ctx, verdict.new({
     action = action, verdict = label, score = best, async = async and not cached,

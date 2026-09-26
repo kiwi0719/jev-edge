@@ -332,7 +332,7 @@ describe("untrusted: an unknown template", () => {
     const j = recording({ injection: 0.95 });
     const { ctx, logs, entries } = ctxWith(j, { enabled: true, templates: ["nope"] });
     const v = await core.evaluate(toolReq(USER, ATTACK), ctx);
-    expect([v.action, v.reason]).toEqual(["block", "injection 0.95"]);
+    expect([v.action, v.reason]).toEqual(["block", "injection 0.95 (a part not judged)"]);
     expect(j.prompts.length).toBe(1);
     expect(j.prompts[0].questions.untrusted).toBeUndefined();
     expect(logs.some((l) => l.includes("nope"))).toBe(true);

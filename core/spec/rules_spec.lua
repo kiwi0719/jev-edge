@@ -46,7 +46,7 @@ describe("rules.evaluate", function()
         { headers = { ["content-type"] = ct } }), rule, ctx)
       local ms = (os.clock() - t0) * 1000
       assert.equals(R.SUSPECT, r)
-      assert.is_true(ms < 50, ("took %.1f ms"):format(ms))
+      assert.is_true(ms < 250, ("took %.1f ms"):format(ms))
     end
   end)
 

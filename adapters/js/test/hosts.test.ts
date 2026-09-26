@@ -656,6 +656,32 @@ describe("lambdaEdgeHandler", () => {
     expect("body" in out && out.body).toBe('{"error":"request rejected"}');
   });
 
+  it("Include Body off: a POST with Content-Length and no body is 'no body', warned once, never 'no text'", async () => {
+    let calls = 0;
+    const counting = { ...providers.mock, call: (...a: Parameters<typeof providers.mock.call>) => { calls++; return providers.mock.call(...a); } };
+    const h = lambdaEdgeHandler({ ...opts("monitor"), provider: counting });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      for (let i = 0; i < 2; i++) {
+        const ev = event(null, { method: "POST", body: undefined }, { "Content-Length": "5000" });
+        const out = (await h(ev)) as CfRequest;
+        expect(out.headers["x-jev-verdict"][0].value).toBe("skipped");
+        expect(out.headers["x-jev-reason"][0].value).toBe("no+body");
+        // the request CloudFront forwards keeps its headers as they came
+        expect(out.headers["content-length"][0].value).toBe("5000");
+      }
+      expect(calls).toBe(0);
+      const msgs = warn.mock.calls.map((c) => String(c[0]));
+      expect(msgs.filter((m) => m.includes("Include Body"))).toHaveLength(1);
+      // with Include Body on, the same request is judged as before
+      const on = (await h(event(BENIGN, {}, { "Content-Length": String(BENIGN.length) }))) as CfRequest;
+      expect(on.headers["x-jev-source"][0].value).toBe("l2");
+      expect(calls).toBe(1);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it("a truncated body is scanned as the head of a larger one, not passed", async () => {
     const h = lambdaEdgeHandler(opts());
     const cut = ATTACK.slice(0, ATTACK.length - 10); // CloudFront cut it mid-string

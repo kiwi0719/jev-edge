@@ -58,6 +58,8 @@ export interface Req {
   body_tail?: string | null;
   /** true when the adapter decoded the Content-Encoding and `body` is the decoded body. */
   decoded?: boolean;
+  /** true when the gateway in front forwarded only the first part of the body: `body` (or `body_head`) is that part. */
+  body_partial?: boolean;
 }
 
 export interface CacheLike {
@@ -73,7 +75,7 @@ export interface RulesCtx {
   re_find?: (subject: string, pattern: string) => boolean | readonly [number, number] | null;
   log?: (level: string, msg: string) => void;
   subject?: SubjectCtx;
-  config?: { subject?: { reputation?: ReputationConfig }; untrusted?: UntrustedConfig };
+  config?: { subject?: { reputation?: ReputationConfig }; untrusted?: UntrustedConfig; policy?: { partial?: string } };
 }
 
 /**
@@ -380,6 +382,10 @@ async function judged(
   let text: string;
   let partial = false;
   let untrusted: UntrustedPart | undefined;
+  // the gateway in front forwarded only the first part of the body: what the
+  // adapter has is a head, whatever its size, never a whole document
+  const gatewayCut = req.body_partial === true;
+  if (gatewayCut && size <= max) size = max + 1;
   if (size > max) {
     let hd = req.body_head ?? undefined;
     let tl = req.body_tail ?? undefined;
@@ -390,6 +396,9 @@ async function judged(
     }
     if (media && !(hd !== undefined && isText(hd))) return { text: "", unj: CT_NOT_WATCHED };
     if (hd === undefined) return { text: "", unj: "unjudgeable: body too large" };
+    // policy.partial = "unjudgeable": the part the gateway cut off counts as
+    // unread, and policy.unjudgeable decides
+    if (gatewayCut && ctx?.config?.policy?.partial === "unjudgeable") return { text: "", unj: "unjudgeable: partial body" };
     const keys = fieldKeys(rule.text_fields);
     values = scanStrings(hd, keys, []);
     if (tl !== undefined) scanStrings(tl, keys, values);

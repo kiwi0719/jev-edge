@@ -13,8 +13,9 @@ _M.BLOCK   = "block"
 _M.SUSPECT = "suspect"
 -- A watched request L1 cannot read: compressed with an encoding the adapter
 -- could not decode, binary, declared JSON the decoder refused with no text in
--- it, or over max_body_bytes with no text in the part the adapter could hand
--- over. policy.unjudgeable decides what happens.
+-- it, over max_body_bytes with no text in the part the adapter could hand
+-- over, or cut by the gateway in front when policy.partial = "unjudgeable".
+-- policy.unjudgeable decides what happens.
 _M.UNJUDGEABLE = "unjudgeable"
 
 _M.MAX_BODY_BYTES  = 1048576   -- parsed whole up to here (nginx's default client_max_body_size)
@@ -206,6 +207,10 @@ local function judged(req, rule, ctx, ct, size)
   local values, text
   local partial = false
   local untrusted
+  -- the gateway in front forwarded only the first part of the body: what the
+  -- adapter has is a head, whatever its size, never a whole document
+  local gateway_cut = req.body_partial == true
+  if gateway_cut and size <= max then size = max + 1 end
   if size > max then
     local head, tail = req.body_head, req.body_tail
     if not head and req.body then
@@ -218,6 +223,10 @@ local function judged(req, rule, ctx, ct, size)
     end
     if media and not (head and normalize.is_text(head)) then return nil, CT_NOT_WATCHED end
     if not head then return nil, "unjudgeable: body too large" end
+    -- policy.partial = "unjudgeable": the part the gateway cut off counts as
+    -- unread, and policy.unjudgeable decides
+    local pol = ctx and ctx.config and ctx.config.policy
+    if gateway_cut and pol and pol.partial == "unjudgeable" then return nil, "unjudgeable: partial body" end
     local keys = normalize.field_keys(rule.text_fields)
     values = normalize.scan_strings(head, keys, {})
     if tail then normalize.scan_strings(tail, keys, values) end
@@ -258,7 +267,9 @@ local function judged(req, rule, ctx, ct, size)
 end
 
 --- Evaluate one rule set against a request.
--- @param req  { method, path, headers, body, body_size, client_ip }
+-- @param req  { method, path, headers, body, body_size, client_ip }, and
+--             where the adapter has them decoded, body_head, body_tail and
+--             body_partial (the gateway forwarded only the body's first part)
 -- @param rule rule table (see rules/*.lua)
 -- @param ctx  { cache = {get=fn}, json_decode = fn, clock = fn,
 --               re_find = fn(subject, pcre) -> truthy on match (case-insensitive) }

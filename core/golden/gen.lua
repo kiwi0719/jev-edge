@@ -411,6 +411,22 @@ do
   r.body = nil   -- a gateway that forwards headers only
   rules_case("body over max_body_bytes with nothing to scan is unjudgeable", r)
 end
+do
+  -- body_partial: the gateway in front forwarded only the first part of the
+  -- body (Envoy's allow_partial_message). What the adapter has is a head,
+  -- whatever its size: scanned for text fields, never parsed as a document
+  local whole = chat_body(LONG)
+  local cut = whole:sub(1, #whole - 3)
+  rules_case("a body the gateway cut is scanned as a head",
+    req("", { body = cut, body_size = #cut, body_partial = true }))
+  rules_case("a body the gateway cut without the flag is parsed as a whole", req("", { body = cut, body_size = #cut }))
+  local h = req("", { body_head = cut, body_size = 1048577, body_partial = true })
+  h.body = nil
+  rules_case("a body the gateway cut, head handed over, is scanned as a head", h)
+  rules_case("a binary media body the gateway cut is not watched",
+    req("", { body = "\0\0\0\rIHDR\0\0\1\0 binary image payload", headers = { ["content-type"] = "image/png" },
+      body_partial = true }))
+end
 rules_case("empty content type is judged", req(LONG, { headers = { ["content-type"] = "" } }))
 rules_case("text/json is judged", req(LONG, { headers = { ["content-type"] = "text/json" } }))
 rules_case("octet-stream JSON is judged", req(LONG, { headers = { ["content-type"] = "application/octet-stream" } }))
@@ -1063,6 +1079,35 @@ do
     config = { policy = { mode = "enforce", unjudgeable = "block" } }, judge = { answers = { injection = 0.9 } } })
   eval_case("unjudgeable never blocks in monitor", { req = r,
     config = { policy = { mode = "monitor", unjudgeable = "block" } }, judge = { answers = { injection = 0.9 } } })
+end
+do
+  -- a body the gateway cut (body_partial): judged on its head by default;
+  -- policy.partial = "unjudgeable" hands it to policy.unjudgeable instead
+  local whole = chat_body(ATTACK .. " " .. LONG)
+  local cut = whole:sub(1, #whole - 3)
+  local r = req("", { body = cut, body_size = #cut, body_partial = true })
+  eval_case("a body the gateway cut is judged on its head by default", { req = r,
+    config = { policy = { mode = "enforce" } }, judge = { answers = { injection = 0.9 } } })
+  eval_case("a body the gateway cut is unjudgeable with policy.partial = unjudgeable", { req = r,
+    config = { policy = { mode = "enforce", partial = "unjudgeable" } }, judge = { answers = { injection = 0.9 } } })
+  eval_case("a body the gateway cut blocks with policy.partial = unjudgeable and policy.unjudgeable = block", { req = r,
+    config = { policy = { mode = "enforce", partial = "unjudgeable", unjudgeable = "block" } },
+    judge = { answers = { injection = 0.1 } } })
+  eval_case("a body the gateway cut never blocks as unjudgeable in monitor", { req = r,
+    config = { policy = { mode = "monitor", partial = "unjudgeable", unjudgeable = "block" } },
+    judge = { answers = { injection = 0.1 } } })
+  eval_case("policy.partial leaves a body the gateway did not cut alone", { req = req(ATTACK),
+    config = { policy = { mode = "enforce", partial = "unjudgeable", unjudgeable = "block" } },
+    judge = { answers = { injection = 0.1 } } })
+  eval_case("policy.partial leaves an oversized body handed over whole alone", {
+    req = req(ATTACK, { body_size = 2000000 }),
+    config = { policy = { mode = "enforce", partial = "unjudgeable", unjudgeable = "block" } },
+    judge = { answers = { injection = 0.1 } } })
+  eval_case("a binary media body the gateway cut is not watched under policy.partial = unjudgeable", {
+    req = req("", { body = "\0\0\0\rIHDR\0\0\1\0 binary image payload", headers = { ["content-type"] = "image/png" },
+      body_partial = true }),
+    config = { policy = { mode = "enforce", partial = "unjudgeable", unjudgeable = "block" } },
+    judge = { answers = { injection = 0.9 } } })
 end
 eval_case("a scanned oversized body says its score is for a window", { req = req(ATTACK, { body_size = 2000000 }),
   judge = { answers = { injection = 0.9 } } })

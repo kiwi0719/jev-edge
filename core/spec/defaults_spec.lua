@@ -41,6 +41,18 @@ describe("defaults.validate", function()
     end
   end)
 
+  it("takes policy.partial = judge | unjudgeable and nothing else", function()
+    assert.equals("judge", D.config.policy.partial)
+    for _, v in ipairs({ "judge", "unjudgeable" }) do
+      assert.is_true((D.validate(D.merge(D.config, { policy = { partial = v } }))))
+    end
+    for _, v in ipairs({ "block", "pass", true, 1 }) do
+      local ok, err = D.validate(D.merge(D.config, { policy = { partial = v } }))
+      assert.is_nil(ok)
+      assert.matches("policy.partial", err, 1, true)
+    end
+  end)
+
   it("rejects zero timeout", function()
     local ok = D.validate(D.merge(D.config, { jev = { timeout_ms = 0 } }))
     assert.is_nil(ok)

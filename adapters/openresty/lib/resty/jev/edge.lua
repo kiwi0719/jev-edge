@@ -101,11 +101,15 @@ local function build_req(rules, over)
   -- 0 = no limit: past the default 100 the rest are dropped, and a
   -- Content-Type sent after 100 junk headers would read as absent.
   local headers = ngx.req.get_headers(0)
+  -- false: the adapter knows there is no client address (authz behind a
+  -- relay that did not say who its client was); nil: the peer is the client
+  local client_ip = over.client_ip
+  if client_ip == nil then client_ip = ngx.var.remote_addr end
   local req = {
     method    = over.method or ngx.req.get_method(),
     path      = over.path or ngx.var.uri,
     headers   = headers,
-    client_ip = over.client_ip or ngx.var.remote_addr,
+    client_ip = client_ip or nil,
     body      = nil,
     body_size = tonumber(headers["content-length"]) or 0,
   }
@@ -121,8 +125,29 @@ local function build_req(rules, over)
     body_m.fill(req, max)
     -- The gateway in front sent only part of the body (Envoy's
     -- allow_partial_message, HAProxy past tune.bufsize): scan it as the head
-    -- of a larger body instead of parsing truncated JSON as a whole.
-    if over.partial and req.body then
+    -- of a larger body instead of parsing truncated JSON as a whole, and let
+    -- policy.partial decide whether that is judged (core: body_partial).
+    local cut = over.partial
+    -- authz: a body that reaches max_body_bytes is taken as cut whatever the
+    -- gateway says. Envoy can report a body it cut at max_request_bytes as
+    -- whole (x-envoy-auth-partial-body: false) when the bytes it had so far
+    -- end exactly there, and a client places that point with its own pauses;
+    -- parsed as whole, the head would read as truncated JSON. Past
+    -- max_body_bytes it is still scanned head and tail. cut_at_cap counts
+    -- what jev-edge did, not what the gateway did: it cannot tell a body
+    -- Envoy cut and called whole from a whole one of exactly max_body_bytes,
+    -- and behind a gateway that answers 413 past its cap every count is a
+    -- whole body.
+    if over.cut_at_cap and not cut and (req.body_received or 0) >= max then
+      cut = true
+      metrics.incr_authz("cut_at_cap")
+      local said = tostring(over.partial_flag or "(absent)"):sub(1, 16)
+      ngx.log(req.body_received == max and ngx.WARN or ngx.INFO,
+        "jev-edge: authz body of ", req.body_received, " bytes (max_body_bytes ", max,
+        ") taken as cut; the gateway said x-envoy-auth-partial-body: ", said)
+    end
+    if cut then req.body_partial = true end
+    if cut and req.body then
       -- The gateway cuts at a byte count, so the head can end inside a UTF-8
       -- sequence (a client picks where with its padding). Drop that
       -- incomplete sequence: invalid UTF-8 in the L2 prompt can make the
@@ -482,12 +507,19 @@ end
 -- right (1 = last). Envoy's x-envoy-external-address is already that value,
 -- but only Envoy sets it: `envoy` is true for authz() alone. Traefik, Caddy
 -- and nginx pass a client's copy of it through to forward_auth().
+--
+-- authz() is always called by a relay (Envoy, an Istio sidecar or gateway,
+-- the gRPC shim, HAProxy's agent), never by the client: without either
+-- header, or with fewer X-Forwarded-For hops than trusted_hops, the peer
+-- address is the relay's own, and every request through it would share one
+-- IP reputation and one subject. It returns nil there (no client address).
 local function client_ip_from(h, cfg, envoy)
   local function first(v) if type(v) == "table" then return v[1] end return v end
   local ext = envoy and first(h["x-envoy-external-address"])
   if type(ext) == "string" and ext ~= "" then return (ext:match("^%s*(%S+)")) end
   local xff = first(h["x-forwarded-for"])
   if type(xff) ~= "string" or xff == "" then
+    if envoy then return nil end
     local real = first(h["x-real-ip"])
     if type(real) == "string" and real ~= "" then return (real:match("^%s*(%S+)")) end
     return ngx.var.remote_addr
@@ -496,7 +528,38 @@ local function client_ip_from(h, cfg, envoy)
   for ip in xff:gmatch("[^,%s]+") do hops[#hops + 1] = ip end
   local n = tonumber(cfg.client_ip and cfg.client_ip.trusted_hops) or 1
   local ip = hops[#hops - n + 1]
-  return ip or ngx.var.remote_addr
+  if ip or envoy then return ip end
+  return ngx.var.remote_addr
+end
+
+-- What Envoy removes from the request it lets through: on a 200 answer,
+-- ext_authz removes the headers named in x-envoy-auth-headers-to-remove (and
+-- never forwards that header itself, on any answer). Every X-Jev-* header
+-- jev-edge does not set: X-Jev-Subject (unless it is the subject header the
+-- config reads), X-Jev-Body-Partial, and any other X-Jev-* the gateway
+-- showed us. The ones jev-edge sets replace the client's copies through
+-- allowed_upstream_headers; naming them here would remove jev-edge's own.
+local function headers_to_remove(h, cfg)
+  local keep = {}
+  for _, n in ipairs(HEADER_NAMES) do keep[n:lower()] = true end
+  local s = cfg.subject
+  if type(s) == "table" and s.from == "header" and type(s.name) == "string" then keep[s.name:lower()] = true end
+  local out, seen = {}, {}
+  local function add(n)
+    if not keep[n] and not seen[n] then seen[n], out[#out + 1] = true, n end
+  end
+  add("x-jev-body-partial")
+  add("x-jev-subject")
+  local extra = {}
+  for k in pairs(h) do
+    if type(k) == "string" then
+      local n = k:lower()
+      if n:sub(1, 6) == "x-jev-" and not n:find("[,%s]") then extra[#extra + 1] = n end
+    end
+  end
+  table.sort(extra)
+  for _, n in ipairs(extra) do add(n) end
+  return table.concat(out, ",")
 end
 
 -- Path normalisation for headers that carry the original URI: decode %XX,
@@ -543,12 +606,13 @@ local function respond_authz(cfg, rules, over, who)
 end
 
 --- content_by_lua for Envoy HTTP ext_authz. Configure Envoy with
---   path_prefix: "/_jev/authz"   with_request_body: {max_request_bytes: 65536}
+--   path_prefix: "/_jev/authz"   with_request_body: {max_request_bytes: 1048576}
 --   allowed_upstream_headers: X-Jev-*
 -- and nginx with `location /_jev/authz/ { content_by_lua_block { ...authz() } }`.
 -- Envoy forwards the original method, path (after the prefix), headers and
 -- body. 200 = allow, verdict headers go upstream; 403 = deny with the block
--- body. Any adapter error is 200 + X-Jev-Verdict: error (fail-open).
+-- body. Any adapter error is 200 + X-Jev-Verdict: error (fail-open). Every
+-- answer names the other X-Jev-* headers in x-envoy-auth-headers-to-remove.
 function _M.authz(prefix)
   prefix = prefix or "/_jev/authz"
   local cfg = config.current()
@@ -560,11 +624,25 @@ function _M.authz(prefix)
   -- Envoy sets x-envoy-external-address / x-forwarded-for; nginx sees Envoy's IP.
   local h = ngx.req.get_headers(0)
   local client_ip = client_ip_from(h, cfg, true)
-  -- set by Envoy (with_request_body.allow_partial_message) and the HAProxy
-  -- SPOA agent, which both strip client copies
-  local partial = h["x-envoy-auth-partial-body"] == "true" or h["x-jev-body-partial"] == "1"
+  if not client_ip then metrics.incr_authz("no_client_ip") end
+  -- The relay's cut flag. Envoy writes x-envoy-auth-partial-body over a
+  -- client's copy whenever it forwards a body (allow_partial_message).
+  -- X-Jev-Body-Partial is the HAProxy agent's, and the agent drops a
+  -- client's copy of it and of x-envoy-external-address. The gRPC shim
+  -- forwards every header the client sent and fills
+  -- x-envoy-external-address from the peer address when Envoy did not set
+  -- it, so next to that header X-Jev-Body-Partial is the client's and is
+  -- ignored: with policy.partial = "unjudgeable" it would turn judging off
+  -- for the request.
+  local flag = h["x-envoy-auth-partial-body"]
+  if type(flag) == "table" then flag = flag[1] end
+  local partial = flag == "true"
+    or (h["x-envoy-external-address"] == nil and h["x-jev-body-partial"] == "1")
+  local okr, remove = pcall(headers_to_remove, h, cfg)
+  if okr then ngx.header["x-envoy-auth-headers-to-remove"] = remove end
 
-  return respond_authz(cfg, rules, { path = path, client_ip = client_ip, partial = partial }, "authz")
+  return respond_authz(cfg, rules, { path = path, client_ip = client_ip or false, partial = partial,
+                                     cut_at_cap = true, partial_flag = flag }, "authz")
 end
 
 --- content_by_lua for generic forward-auth: Traefik ForwardAuth, Caddy

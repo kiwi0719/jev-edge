@@ -10,7 +10,7 @@ Request to jev-edge:
 
 - `POST /_jev/authz/<original path>` (any method; the original method is what L1 checks)
 - the original `Content-Type`, `Content-Encoding` and body (a compressed body is decoded; without the header it cannot be read)
-- the client address in `X-Forwarded-For` (first value is used)
+- the client address in `X-Forwarded-For`: jev-edge takes element `client_ip.trusted_hops` from the right (the last one by default), the address your gateway appended, never the first, which is whatever the client wrote. jev-edge reads Envoy's `x-envoy-external-address` instead when the gateway sends it. Without either header, or with fewer elements than `trusted_hops`, there is no client address, since the peer is the gateway: no IP reputation and no `subject.from = "ip"` apply, and `jev_authz_events_total{event="no_client_ip"}` counts the request.
 
 Answer:
 
@@ -19,12 +19,12 @@ Answer:
 | 200 | `X-Jev-Verdict`, `X-Jev-Score`, `X-Jev-Source`, `X-Jev-Reason`, `X-Jev-Request-Id` | allow; copy the headers to the upstream request |
 | >= 400 with `X-Jev-Verdict` (`policy.block_status`, 403 by default) | same headers, JSON body | block; return the status and body to the client |
 | 200 with `X-Jev-Verdict: error` | | jev-edge could not judge (provider down, breaker open); allow |
-| anything else | no `X-Jev-Verdict` | not jev-edge (a 404, a 5xx from a proxy); allow, see below |
+| anything else | no `X-Jev-Verdict` | not a verdict: the nginx in front of jev-edge refused the request, or the answer is not jev-edge's (a 404, a 5xx from a proxy); see below |
 
 Two properties every recipe must keep:
 
 - **Fail-open.** If jev-edge is unreachable or slow, allow the request and mark it `X-Jev-Verdict: error`. Every gateway below has a switch for this; it is set in every snippet.
-- **Body size.** jev-edge parses a body up to `rules.max_body_bytes` (1 MiB) whole; past it, it scans the first `max_body_bytes` and the last 64 KiB for the text fields. Give the gateway the same cap. A gateway that forwards only part of a larger body must say so: Envoy-based ones (Istio, Envoy Gateway) send `x-envoy-auth-partial-body: true` with `allowPartialMessage`, and jev-edge scans that body as a head. A cut body with no flag is parsed as if whole, and truncated JSON yields no text. Details in the operating guide, [Body size and what L1 reads](design.md#body-size-and-what-l1-reads).
+- **Body size.** jev-edge parses a body up to `rules.max_body_bytes` (1 MiB) whole; past it, it scans the first `max_body_bytes` and the last 64 KiB for the text fields. Give the gateway the same cap. A gateway that forwards only part of a larger body must say so: Envoy with `allow_partial_message` (Istio's `allowPartialMessage`) sends `x-envoy-auth-partial-body: true` and HAProxy's agent `X-Jev-Body-Partial: 1`, and jev-edge scans that body as a head. The flag must come from the gateway, never from the client (see Istio, "Bodies past `maxRequestBytes`"). jev-edge also takes any body that reaches `max_body_bytes` as cut, whatever the flag says. A body cut shorter than that with no flag is read as whole: the tolerant scanner finds the text fields before the cut in its truncated JSON, and a body with none is `unjudgeable: invalid json`. Envoy Gateway never forwards part of a body; it answers 413. Details in the operating guide, [Body size and what L1 reads](design.md#body-size-and-what-l1-reads).
 
 The nginx side is one location:
 
@@ -38,32 +38,88 @@ What every adapter that only relays `/_jev/authz` (Envoy, the gRPC shim, HAProxy
 
 - **200** = a decision; the verdict is in the headers, copy them upstream.
 - **>= 400 with `X-Jev-Verdict`** = a block; return that status and body to the client.
-- **Anything else** (no `X-Jev-Verdict`, a 3xx, a timeout, a connection error) = not judged; fail open with `X-Jev-Verdict: error` and, if the adapter can, `X-Jev-Source: adapter`.
-- **Strip inbound `X-Jev-*`** (verdict, score, source, reason, request-id, subject) before the upstream sees the request, so a client cannot pre-fill a verdict. Overwrite, do not append.
+- **Anything else** is not a verdict. No answer (a timeout, a connection error), a 5xx without `X-Jev-Verdict`, or `X-Jev-Verdict` on a status that is neither 200 nor >= 400 means jev-edge could not answer: fail open with `X-Jev-Verdict: error` and, if the adapter can, `X-Jev-Source: adapter`. An answer below 500 without `X-Jev-Verdict` is the nginx in front of jev-edge refusing the request before jev-edge ran (400, 413, 414), so nobody judged it: the gRPC shim and HAProxy's agent mark it `skipped` with reason `unjudgeable: authz answered <status>` and pass or refuse it as their `-unjudged` flag says, like `policy.unjudgeable`. Envoy's HTTP `ext_authz` (Istio, Envoy Gateway) returns it to the client.
+- **Strip inbound `X-Jev-*`** (verdict, score, source, reason, request-id, subject, body-partial) before the upstream sees the request, so a client cannot pre-fill a verdict. An adapter that forwards the client's headers to `/_jev/authz` strips them there too: jev-edge reads `X-Jev-Body-Partial` as HAProxy's cut flag. Overwrite, do not append.
 - **Keep the admin endpoints off the gateway path.** `/_jev/config`, `/_jev/samples`, `/_jev/feedback`, `/_jev/health` and `/_jev/metrics` sit next to `/_jev/authz`; serve them from a separate server block or port, and refuse to forward paths containing `..`, `%2e` or `//`.
 
 ## Istio
 
-`extensionProviders` in the mesh config declares jev-edge once; an `AuthorizationPolicy` with `action: CUSTOM` attaches it to workloads and paths.
+Five pieces: jev-edge running in the cluster, a mesh extension provider that points at it, an `AuthorizationPolicy` with `action: CUSTOM` that attaches it to the LLM workload, an `EnvoyFilter` that strips forged `X-Jev-*` headers before the check, and an ingress gateway that sees the client's address. The policy and the filter below were checked on Istio 1.31.
+
+**jev-edge.** OpenResty with the adapter installed (`luarocks install lua-resty-jev-edge`), your `jev-edge.conf.lua`, the `http` block of [example.nginx.conf](../adapters/openresty/conf/example.nginx.conf), and a server for the authz hop. Every request Envoy accepts must fit it: otherwise nginx answers 400, 413 or 414 before jev-edge runs, and Envoy hands that answer to the client (see `failOpen` below). Envoy caps the header block, path included, at 60 KiB, and the body at `maxRequestBytes`:
+
+```nginx
+server {
+    listen 8080;
+    large_client_header_buffers 4 64k;
+    client_max_body_size 1m;            # at least maxRequestBytes
+    location /_jev/authz/ { content_by_lua_block { require("resty.jev.edge").authz() } }
+}
+# /_jev/metrics, /_jev/config and the other admin endpoints: another server on
+# another port, not in the Service
+```
 
 ```yaml
-# istio operator / helm values
-meshConfig:
-  extensionProviders:
-    - name: jev-edge
-      envoyExtAuthzHttp:
-        service: jev-edge.jev.svc.cluster.local
-        port: 8080
-        pathPrefix: /_jev/authz
-        timeout: 2s
-        failOpen: true
-        includeRequestHeadersInCheck: ["content-type", "content-encoding", "content-length", "x-forwarded-for"]
-        includeRequestBodyInCheck:
-          maxRequestBytes: 1048576
-          allowPartialMessage: true
-        headersToUpstreamOnAllow: ["x-jev-*"]
-        headersToDownstreamOnDeny: ["content-type", "x-jev-*"]
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: jev-edge, namespace: jev }
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: jev-edge } }
+  template:
+    metadata: { labels: { app: jev-edge } }
+    spec:
+      containers:
+        - name: jev-edge
+          image: registry.example.com/jev-edge:0.6.1   # your OpenResty image with the files above
+          ports: [{ containerPort: 8080 }]
+          env:
+            - name: TYPESAFE_API_KEY                  # jev.api_key_env; `env TYPESAFE_API_KEY;` in nginx.conf
+              valueFrom: { secretKeyRef: { name: jev-edge, key: api-key } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: jev-edge, namespace: jev }
+spec:
+  selector: { app: jev-edge }
+  ports: [{ name: http, port: 8080, targetPort: 8080 }]
 ```
+
+**Mesh config.** The `default` profile installs `istio-ingressgateway`; `minimal` does not, so install a gateway separately there (the `gateway` Helm chart). The same keys go into Helm values.
+
+```yaml
+# istioctl install -f jev-istio.yaml
+apiVersion: install.istio.io/v1alpha1
+kind: IstioOperator
+spec:
+  profile: default
+  components:
+    ingressGateways:
+      - name: istio-ingressgateway
+        enabled: true
+        k8s:
+          service:
+            externalTrafficPolicy: Local   # the gateway sees the client's address, not a node's
+  meshConfig:
+    extensionProviders:
+      - name: jev-edge
+        envoyExtAuthzHttp:
+          service: jev-edge.jev.svc.cluster.local
+          port: 8080
+          pathPrefix: /_jev/authz
+          timeout: 2s                      # above jev.timeout_max_ms
+          failOpen: true
+          includeRequestHeadersInCheck: ["content-type", "content-encoding", "content-length", "x-forwarded-for"]
+          includeRequestBodyInCheck:
+            maxRequestBytes: 1048576       # see "Bodies past maxRequestBytes"
+            allowPartialMessage: true
+          headersToUpstreamOnAllow: ["x-jev-*"]
+          headersToDownstreamOnDeny: ["content-type"]
+```
+
+istiod reads `extensionProviders` from the mesh config (the `istio` ConfigMap in `istio-system`) and pushes a change to the proxies without restarting them. That takes seconds to a minute: test after the push, not right after the apply (`istioctl proxy-config listener <pod>.<namespace> -o json | grep -c ext_authz` shows when the filter is there). Istio sends the body only when `includeRequestBodyInCheck` is set; without it jev-edge answers `skipped` with reason `no body`. Do not add `x-jev-*` to `includeRequestHeadersInCheck`.
+
+**The policy.**
 
 ```yaml
 apiVersion: security.istio.io/v1
@@ -81,10 +137,62 @@ spec:
   rules:
     - to:
         - operation:
-            paths: ["/v1/*", "/api/chat*"]
+            notMethods: ["GET", "HEAD", "OPTIONS"]
 ```
 
-Istio sends the body only when `includeRequestBodyInCheck` is set; without it jev-edge answers `skipped` with reason `no body`. `allowPartialMessage: true` is what makes a body over the cap arrive truncated, flagged `x-envoy-auth-partial-body: true`, instead of failing the check; jev-edge scans it as the head of a larger body.
+No path list: every request that can carry a body goes to jev-edge, and the rule's `watch_paths` decide what is judged. They are matched the way the backend routes, ASCII case folded, `;` parameters dropped and dot segments resolved, and they cover every alias the servers accept. A path list here would have to name every alias in `rules/llm-endpoints.lua` (`/chat/completions`, `/engines/<model>/...`, `/openai/deployments/<name>/...`, `/api/generate`, `/completion`, `/infill`, and more) in every spelling, and a request on one it misses is never checked. A request jev-edge does not watch costs one round trip and is answered `skipped`.
+
+**Forged `X-Jev-*` headers.** `headersToUpstreamOnAllow` replaces the headers jev-edge sets, and jev-edge names every other `X-Jev-*` header (`X-Jev-Subject`, `X-Jev-Body-Partial`) in `x-envoy-auth-headers-to-remove`, which Envoy applies when it allows the request. Neither happens when the check fails open, so strip them before the check as well, on the workload's inbound listener, which covers traffic from the gateway and from inside the mesh:
+
+```yaml
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: jev-strip-inbound
+  namespace: llm
+spec:
+  workloadSelector:
+    labels:
+      app: llm-api
+  configPatches:
+    - applyTo: HTTP_FILTER
+      match:
+        context: SIDECAR_INBOUND
+        listener:
+          filterChain:
+            filter:
+              name: envoy.filters.network.http_connection_manager
+              subFilter:
+                name: envoy.filters.http.ext_authz
+      patch:
+        operation: INSERT_BEFORE
+        value:
+          name: jev-strip-inbound
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutation
+            mutations:
+              request_mutations:
+                - remove: x-jev-verdict
+                - remove: x-jev-score
+                - remove: x-jev-reason
+                - remove: x-jev-source
+                - remove: x-jev-request-id
+                - remove: x-jev-subject
+                - remove: x-jev-body-partial
+```
+
+**Client address.** jev-edge takes the client from `X-Forwarded-For`, element `client_ip.trusted_hops` from the right. The ingress gateway appends the address it sees, which is the client's only with `externalTrafficPolicy: Local`; with `Cluster`, kube-proxy replaces it with a node address and every client shares one IP reputation. Behind a load balancer that writes `X-Forwarded-For` itself, the gateway appends the balancer's address after the client's: set `client_ip.trusted_hops = 2` (and `numTrustedProxies: 1` in the gateway's `proxy.istio.io/config`, so Istio's own policies see the client too). A workload inside the mesh that calls the service directly sends no `X-Forwarded-For`, and its sidecar adds none: jev-edge then has no client address, applies no IP reputation and no `subject.from = "ip"` to it, and counts it in `jev_authz_events_total{event="no_client_ip"}`. Follow those callers with `subject.from = "header"`, on a header every caller sends and the backend checks, such as its API key, so that a caller cannot shed its record by changing the value. Add that header to `includeRequestHeadersInCheck`: Istio forwards only the headers listed there, and without it no in-mesh request has a subject. Give it a name outside `X-Jev-*`: the `EnvoyFilter` above removes `x-jev-subject` before the check, so jev-edge would never see it, and `includeRequestHeadersInCheck` must not carry `x-jev-*`. A caller that sets `X-Forwarded-For` itself picks its own address.
+
+**`failOpen`.** Envoy allows the request when jev-edge cannot be reached, times out, or answers 5xx. Any other answer that is not 200 is a denial and goes to the client as it is, which is why the nginx server above must take every request Envoy accepts. A request allowed that way reaches the backend with no `X-Jev-Verdict` at all (Istio does not expose Envoy's `failure_mode_allow_header_add`): treat a missing verdict as not judged. On a block the client gets the status, the block body and its `content-type`, not the score or the reason; add `x-jev-request-id` to `headersToDownstreamOnDeny` to match a block to jev-edge's log.
+
+**Bodies past `maxRequestBytes`.** With `allowPartialMessage: true` Envoy sends the first `maxRequestBytes` of a larger body with `x-envoy-auth-partial-body: true`; jev-edge scans it as the head of a larger body, and the rest is never judged. That is enough in monitor mode. In enforce mode, pick one:
+
+- `allowPartialMessage: false`, with `maxRequestBytes` and nginx's `client_max_body_size` set to the backend's own body limit. Envoy answers 413 to anything larger, so every body jev-edge sees is whole; past `rules.max_body_bytes` it is scanned head and tail.
+- `allowPartialMessage: true`, with `maxRequestBytes` equal to `rules.max_body_bytes`, and `policy.partial = "unjudgeable"`. A cut body is then `skipped` with reason `unjudgeable: partial body`, and `policy.unjudgeable = "block"` refuses it.
+
+`policy.partial = "unjudgeable"` makes the cut flag mean "do not judge", so the flag must come from Envoy, never from the client; with `policy.unjudgeable = "pass"` a forged one would skip judging. Envoy writes `x-envoy-auth-partial-body` over a client's copy whenever it forwards a body, and Istio forwards only the headers listed in `includeRequestHeadersInCheck`, so a client's `X-Jev-Body-Partial` (HAProxy's flag, which jev-edge also reads) never reaches jev-edge. With `policy.unjudgeable = "block"`, as above, a forged flag could only get the client's own request refused. Envoy with the gRPC shim, which forwards every header the client sent, is covered too: jev-edge ignores an `X-Jev-Body-Partial` that arrives with `x-envoy-external-address`, and the shim always sends that header.
+
+jev-edge takes any body that reaches `max_body_bytes` as cut, whatever the flag says: Envoy can report a body it cut exactly at `maxRequestBytes` as whole, and a client can place that cut with a pause. `jev_authz_events_total{event="cut_at_cap"}` counts each body taken as cut this way, cut or not: jev-edge cannot tell a body Envoy cut and called whole from a whole one of exactly that size. With the first option, where Envoy answers 413 instead of cutting, every count is a whole body at or past `max_body_bytes`. That is also why `policy.partial = "unjudgeable"` goes with the second option only: with the first, a whole body past `max_body_bytes` would count as cut.
 
 ## Envoy Gateway (Gateway API)
 
@@ -111,7 +219,11 @@ spec:
       headersToBackend: ["x-jev-verdict", "x-jev-score", "x-jev-source", "x-jev-reason", "x-jev-request-id"]
 ```
 
-`path` is forwarded to Envoy as a path prefix, which is what jev-edge expects (it strips `/_jev/authz` and evaluates the rest). Verify on the first request: an `X-Jev-Reason: path+not+watched` on a chat endpoint means your Envoy Gateway version replaced the path instead of prefixing it; pin `path` off and set the prefix through an `EnvoyPatchPolicy` in that case. Note `bodyToExtAuth.maxRequestBytes` returns 413 for larger bodies rather than skipping the check; set it to your real upper bound, not to 1 MiB, if you accept larger uploads on the same route. A body that reaches jev-edge whole but exceeds `rules.max_body_bytes` is judged on its head and tail.
+`path` is forwarded to Envoy as a path prefix, which is what jev-edge expects (it strips `/_jev/authz` and evaluates the rest). Verify on the first request: an `X-Jev-Reason: path+not+watched` on a chat endpoint means your Envoy Gateway version replaced the path instead of prefixing it; pin `path` off and set the prefix through an `EnvoyPatchPolicy` in that case. The policy covers every path of the route; leave the choice of what to judge to `watch_paths`, as with Istio.
+
+Note `bodyToExtAuth.maxRequestBytes` returns 413 for larger bodies rather than skipping the check: set it, and the `client_max_body_size` of jev-edge's nginx, to your real upper bound, not to 1 MiB, if you accept larger uploads on the same route. Nothing is cut, so leave `policy.partial` at `"judge"`: jev-edge takes a body that reaches `rules.max_body_bytes` as cut (see Istio; here every `cut_at_cap` count is a whole body), and `"unjudgeable"` would make every whole body past it unjudgeable. A body that reaches jev-edge whole but exceeds `rules.max_body_bytes` is judged on its head and tail. The nginx sizing and the `failOpen` behaviour are the ones described for Istio.
+
+jev-edge's `x-envoy-auth-headers-to-remove` clears a client's other `X-Jev-*` headers when the request is allowed; strip them before `ext_authz` as well for the fail-open case, with a `ClientTrafficPolicy` on the Gateway (`headers.earlyRequestHeaders.remove`, the same seven names as the Istio `EnvoyFilter`). A subject header (`subject.from = "header"`) goes into `headersToExtAuth`, under a name outside `X-Jev-*`, for the reasons given for Istio. The client address is the last `X-Forwarded-For` element Envoy Gateway appends; behind a load balancer that writes the header, raise `client_ip.trusted_hops` by one.
 
 ## Azure API Management
 

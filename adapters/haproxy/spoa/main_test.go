@@ -61,6 +61,32 @@ func TestNormalizePath(t *testing.T) {
 	}
 }
 
+// /_jev/authz trusts x-envoy-auth-partial-body as Envoy's cut flag and
+// X-Jev-Body-Partial as the agent's. A client's copy of either would mark a
+// whole body cut (with policy.partial = "unjudgeable", a request nobody
+// judges): neither reaches jev-edge, and the agent sets its own flag from
+// HAProxy's body size alone.
+func TestClientCutFlagsNeverReachJevEdge(t *testing.T) {
+	var got http.Header
+	authz(t, func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+		w.Header().Set("X-Jev-Verdict", "safe")
+	})
+	forged := "content-type: application/json\r\nX-Envoy-Auth-Partial-Body: true\r\nx-envoy-auth-partial-body: true\r\n" +
+		"X-Jev-Body-Partial: 1\r\n\r\n"
+	check(msg(map[string]string{"method": "POST", "path": "/v1/chat/completions", "hdrs": forged, "body": "{}", "size": "2"}))
+	if v := got.Values("X-Envoy-Auth-Partial-Body"); len(v) != 0 {
+		t.Fatalf("a client's x-envoy-auth-partial-body reached jev-edge: %q", v)
+	}
+	if v := got.Values("X-Jev-Body-Partial"); len(v) != 0 {
+		t.Fatalf("a client's X-Jev-Body-Partial reached jev-edge: %q", v)
+	}
+	check(msg(map[string]string{"method": "POST", "path": "/v1/chat/completions", "hdrs": forged, "body": "{}", "size": "200000"}))
+	if v := got.Values("X-Jev-Body-Partial"); len(v) != 1 || v[0] != "1" || len(got.Values("X-Envoy-Auth-Partial-Body")) != 0 {
+		t.Fatalf("cut body: X-Jev-Body-Partial %q, x-envoy-auth-partial-body %q", v, got.Values("X-Envoy-Auth-Partial-Body"))
+	}
+}
+
 func TestPartialBody(t *testing.T) {
 	for _, c := range []struct {
 		declared string

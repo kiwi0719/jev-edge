@@ -237,6 +237,10 @@ var skipHeader = map[string]bool{
 	"x-jev-request-id": true, "x-jev-subject": true,
 	// set below from HAProxy's own body size, never taken from the client
 	"x-jev-body-partial": true,
+	// Envoy's cut flag, which /_jev/authz trusts as Envoy's: a client's copy
+	// would mark a whole body cut, and with policy.partial = "unjudgeable"
+	// turn judging off for the request
+	"x-envoy-auth-partial-body": true,
 }
 
 // copyHeaders adds each "Name: value" line of a raw header block to dst,

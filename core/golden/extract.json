@@ -1199,6 +1199,7 @@
           "messages[*].content[*].input.**",
           "messages[*].parts",
           "messages[*].parts[*].input.**",
+          "messages[*].parts[*].output.**",
           "prompt",
           "input",
           "input[*].arguments.**",
@@ -1232,6 +1233,7 @@
           "messages[*].content[*].input.**",
           "messages[*].parts",
           "messages[*].parts[*].input.**",
+          "messages[*].parts[*].output.**",
           "prompt",
           "input",
           "input[*].arguments.**",
@@ -1250,7 +1252,7 @@
     {
       "expect": {
         "kind": "json",
-        "text": "What is the weather in Paris?\ncity\nParis\nunit\ncelsius\nq\na string input\nIt is 20 degrees."
+        "text": "What is the weather in Paris?\ncity\nParis\nunit\ncelsius\ntemp\nq\na string input\nIt is 20 degrees."
       },
       "input": {
         "body": "{\"messages\":[{\"id\":\"m1\",\"role\":\"user\",\"parts\":[{\"type\":\"text\",\"text\":\"What is the weather in Paris?\"}]},{\"id\":\"m2\",\"role\":\"assistant\",\"parts\":[{\"type\":\"step-start\"},{\"type\":\"tool-getWeather\",\"toolCallId\":\"c1\",\"state\":\"output-available\",\"input\":{\"city\":\"Paris\",\"unit\":\"celsius\"},\"output\":{\"temp\":20}},{\"type\":\"dynamic-tool\",\"toolName\":\"lookup\",\"toolCallId\":\"c2\",\"state\":\"input-available\",\"input\":\"{\\\"q\\\":\\\"a string input\\\"}\"},{\"type\":\"text\",\"text\":\"It is 20 degrees.\"}]}]}",
@@ -1265,6 +1267,7 @@
           "messages[*].content[*].input.**",
           "messages[*].parts",
           "messages[*].parts[*].input.**",
+          "messages[*].parts[*].output.**",
           "prompt",
           "input",
           "input[*].arguments.**",

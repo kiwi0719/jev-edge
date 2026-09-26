@@ -76,6 +76,22 @@ describe("untrusted: extraction", () => {
     expect(v).toEqual(["custom output", "shell output", "mcp output", "file text"]);
   });
 
+  it("finds AI SDK 5 tool parts' output, every key and string, whatever the part's state", () => {
+    const [values, capped] = normalize.extractUntrusted({ messages: [
+      { role: "user", parts: [{ type: "text", text: "hi" }] },
+      { role: "assistant", parts: [
+        { type: "tool-weather", toolCallId: "t1", state: "output-available", input: { city: "Paris" },
+          output: { report: "sunny", extra: ["warm", 21] } },
+        { type: "dynamic-tool", toolName: "fetch", toolCallId: "t2", state: "input-available", output: "a string output" },
+        { type: "tool-empty", toolCallId: "t3", state: "output-available", output: null },
+        // not a tool part: its output is not a tool result
+        { type: "text", text: "the assistant's own words", output: "not a tool result" },
+      ] },
+    ] }, spec, (x) => JSON.parse(x) as normalize.JsonValue);
+    expect(values).toEqual(["extra", "warm", "report", "sunny", "a string output"]);
+    expect(capped).toBe(false);
+  });
+
   it("reads fields, and skips tool results when tool_results is false", () => {
     const doc = { messages: [{ role: "tool", content: "tool" }], documents: [{ text: "d1" }, { text: "d2" }] };
     expect(normalize.extractUntrustedValues(doc, { fields: ["documents[*].text"] })).toEqual(["tool", "d1", "d2"]);

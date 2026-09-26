@@ -204,7 +204,7 @@ describe('tool-call arguments ("**" paths)', () => {
     // "input" is a "**" path's key (a tool_use input) and a plain path's
     // (the Responses input list): an object under it is read whole, an array
     // is scanned inside, as any other value
-    expect(normalize.deepKeys(fields)).toEqual(new Map([["arguments", "any"], ["input", "object"]]));
+    expect(normalize.deepKeys(fields)).toEqual(new Map([["arguments", "any"], ["input", "object"], ["output", "object"]]));
     const s = '{"input":[{"role":"user","content":"q"},{"type":"x","input":{"cmd":"rm","n":1}},'
       + '{"type":"function_call","arguments":["a",{"b":"c"}]}],"messages":[{"content":[{"type":"tool_use",'
       + '"input":{"k":"v"';

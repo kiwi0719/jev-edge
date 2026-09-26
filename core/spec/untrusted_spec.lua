@@ -96,6 +96,23 @@ describe("untrusted content: extraction", function()
     assert.equals("custom output\nshell output\nmcp output\nfile text", t)
   end)
 
+  it("finds AI SDK 5 tool parts' output, every key and string, whatever the part's state", function()
+    local _, values, capped = normalize.extract_untrusted({ messages = {
+      { role = "user", parts = { { type = "text", text = "hi" } } },
+      { role = "assistant", parts = {
+        { type = "tool-weather", toolCallId = "t1", state = "output-available", input = { city = "Paris" },
+          output = { report = "sunny", extra = { "warm", 21 } } },
+        { type = "dynamic-tool", toolName = "fetch", toolCallId = "t2", state = "input-available",
+          output = "a string output" },
+        { type = "tool-empty", toolCallId = "t3", state = "output-available", output = H.json.null },
+        -- not a tool part: its output is not a tool result
+        { type = "text", text = "the assistant's own words", output = "not a tool result" },
+      } },
+    } }, spec, H.body_decode)
+    assert.same({ "extra", "warm", "report", "sunny", "a string output" }, values)
+    assert.is_false(capped)
+  end)
+
   it("reads untrusted.fields, and skips tool results when tool_results is false", function()
     local doc = { messages = { { role = "tool", content = "tool" } }, documents = { { text = "d1" }, { text = "d2" } } }
     assert.equals("tool\nd1\nd2", (normalize.extract_untrusted(doc, { fields = { "documents[*].text" } })))

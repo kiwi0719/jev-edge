@@ -565,12 +565,22 @@ end
 --                            (function_call_output, custom_tool_call_output,
 --                            local_shell_call_output, ...) or "mcp_call": output;
 --                            "file_search_call": results[*].text
+--   AI SDK 5 UIMessages      messages[*].parts[*] with type "tool-<name>" or
+--                            "dynamic-tool": output, whatever its state (the
+--                            client sets it), read as a "**" path reads it
 local function responses_result(item)
   local t = item.type
   return type(t) == "string" and (t:sub(-12) == "_call_output" or t == "mcp_call")
 end
 
-local function tool_results(decoded, out)
+local function sdk_tool_part(part)
+  local t = part.type
+  return type(t) == "string" and (t:sub(1, 5) == "tool-" or t == "dynamic-tool")
+end
+
+-- `st`: a walk state; a tool part's output leaves a slot for settle() to fill.
+local function tool_results(decoded, st)
+  local out = st.out
   local msgs = decoded.messages
   if type(msgs) == "table" then
     for _, m in ipairs(msgs) do
@@ -580,6 +590,15 @@ local function tool_results(decoded, out)
         elseif type(m.content) == "table" then
           for _, block in ipairs(m.content) do
             if type(block) == "table" and block.type == "tool_result" then collect(block.content, out, 1) end
+          end
+        end
+        if type(m.parts) == "table" then
+          for _, part in ipairs(m.parts) do
+            if type(part) == "table" and part.output ~= nil and sdk_tool_part(part) then
+              local slot = { node = part.output }
+              out[#out + 1] = slot
+              st.defer[#st.defer + 1] = slot
+            end
           end
         end
       end
@@ -609,7 +628,7 @@ end
 function _M.extract_untrusted(decoded, spec, json_decode)
   local st = new_state(json_decode)
   if type(decoded) ~= "table" or type(spec) ~= "table" then return "", st.out, false end
-  if spec.tool_results ~= false then tool_results(decoded, st.out) end
+  if spec.tool_results ~= false then tool_results(decoded, st) end
   walk(decoded, plan_of(spec.fields, false), st)
   local out = settle(st)
   return table.concat(out, "\n"), out, st.capped

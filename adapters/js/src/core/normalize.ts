@@ -595,10 +595,16 @@ export function extractTools(decoded: JsonValue | undefined, fields: string[] | 
 //                            (function_call_output, custom_tool_call_output,
 //                            local_shell_call_output, ...) or "mcp_call": output;
 //                            "file_search_call": results[*].text
+//   AI SDK 5 UIMessages      messages[*].parts[*] with type "tool-<name>" or
+//                            "dynamic-tool": output, whatever its state (the
+//                            client sets it), read as a "**" path reads it
 const responsesResult = (t: unknown) => typeof t === "string" && (t.endsWith("_call_output") || t === "mcp_call");
+const sdkToolPart = (t: unknown) => typeof t === "string" && (t.startsWith("tool-") || t === "dynamic-tool");
 
-function toolResults(decoded: JsonValue, out: string[]): void {
+// `st`: a walk state; a tool part's output leaves a slot for settle() to fill.
+function toolResults(decoded: JsonValue, st: WalkState): void {
   if (!isObj(decoded) || Array.isArray(decoded)) return;
+  const out = st.out as string[];
   const msgs = decoded.messages;
   if (Array.isArray(msgs)) {
     for (const m of msgs) {
@@ -608,6 +614,15 @@ function toolResults(decoded: JsonValue, out: string[]): void {
       } else if (Array.isArray(m.content)) {
         for (const block of m.content) {
           if (isObj(block) && !Array.isArray(block) && block.type === "tool_result") collect(block.content, out, 1);
+        }
+      }
+      if (Array.isArray(m.parts)) {
+        for (const part of m.parts) {
+          if (!isObj(part) || Array.isArray(part) || part.output === undefined || part.output === null) continue;
+          if (!sdkToolPart(part.type)) continue;
+          const slot: Slot = { node: part.output, values: [] };
+          st.out.push(slot);
+          st.defer.push(slot);
         }
       }
     }
@@ -633,7 +648,7 @@ export function extractUntrusted(
 ): [string[], boolean] {
   const st = newState(jsonDecode);
   if (!isObj(decoded)) return [[], false];
-  if (spec.tool_results !== false) toolResults(decoded, st.out as string[]);
+  if (spec.tool_results !== false) toolResults(decoded, st);
   walk(decoded, planOf(spec.fields, false), st);
   return [settle(st), st.capped];
 }

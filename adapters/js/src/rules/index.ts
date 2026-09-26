@@ -31,7 +31,7 @@ export const llmEndpoints: Rule = {
     "messages[*].content", "messages[*].tool_calls[*].function.arguments.**",
     "messages[*].tool_calls[*].custom.input", "messages[*].function_call.arguments.**",
     "messages[*].content[*].input.**", "messages[*].parts",
-    "messages[*].parts[*].input.**", "prompt",
+    "messages[*].parts[*].input.**", "messages[*].parts[*].output.**", "prompt",
     "input", "input[*].arguments.**", "input[*].input", "input[*].output",
     "query", "text", "suffix", "input_prefix", "input_suffix", "input_extra[*].text",
   ],
@@ -104,7 +104,7 @@ export function resolve(spec: RuleSpec): Rule {
     "messages[*].content", "messages[*].tool_calls[*].function.arguments.**",
     "messages[*].tool_calls[*].custom.input", "messages[*].function_call.arguments.**",
     "messages[*].content[*].input.**", "messages[*].parts",
-    "messages[*].parts[*].input.**", "prompt",
+    "messages[*].parts[*].input.**", "messages[*].parts[*].output.**", "prompt",
     "input", "input[*].arguments.**", "input[*].input", "input[*].output",
     "query", "text", "suffix", "input_prefix", "input_suffix", "input_extra[*].text",
   ];

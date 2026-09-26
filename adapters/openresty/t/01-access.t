@@ -859,3 +859,76 @@ X-Jev-Mock-Score: fail
  "verdict=malicious score=1.00 source=l1 reason=ip+reputation\n"]
 --- no_error_log
 L3 error
+
+
+
+=== TEST 40: no client X-Jev-* reaches the upstream, on a pass and on an adapter-error fail-open
+--- http_config eval: $::HttpConfig
+--- user_files eval: ::conf()
+--- config eval
+qq{
+location /v1/chat/completions {
+    $::Access
+    content_by_lua_block {
+        local names = {}
+        for k in pairs(ngx.req.get_headers(0)) do
+            if k:sub(1, 6) == "x-jev-" then names[#names + 1] = k end
+        end
+        table.sort(names)
+        ngx.say(table.concat(names, " "))
+    }
+}
+location = /break {
+    content_by_lua_block {
+        require("resty.jev.http").new = function() error("injected failure") end
+        assert(require("resty.jev.config").set_override({ cache = { fp_ttl = 30 } }))
+        ngx.say("broken")
+    }
+}
+}
+--- request eval
+["POST /v1/chat/completions\n{\"messages\":[{\"role\":\"user\",\"content\":\"Please summarise the attached quarterly report for me.\"}]}",
+ "GET /break",
+ "POST /v1/chat/completions\n{\"messages\":[{\"role\":\"user\",\"content\":\"Please summarise the attached quarterly report for me.\"}]}"]
+--- more_headers
+Content-Type: application/json
+X-Jev-Mock-Score: 0.2
+X-Jev-Verdict: safe
+X-Jev-Subject: forged
+X-Jev-Body-Partial: 1
+X-Jev-Anything: x
+--- response_body eval
+["x-jev-reason x-jev-request-id x-jev-score x-jev-source x-jev-verdict\n",
+ "broken\n",
+ "x-jev-source x-jev-verdict\n"]
+
+
+
+=== TEST 41: the subject header the config reads is left for the upstream; any other X-Jev-* is not
+--- http_config eval: $::HttpConfig
+--- user_files eval: ::conf('subject = { enabled = true, from = "header", name = "X-Jev-Subject", hashed = true },')
+--- config eval
+qq{
+location /v1/chat/completions {
+    $::Access
+    content_by_lua_block {
+        local names = {}
+        for k in pairs(ngx.req.get_headers(0)) do
+            if k:sub(1, 6) == "x-jev-" then names[#names + 1] = k end
+        end
+        table.sort(names)
+        ngx.say(table.concat(names, " "))
+    }
+}
+}
+--- request
+POST /v1/chat/completions
+{"messages":[{"role":"user","content":"Please summarise the attached quarterly report for me."}]}
+--- more_headers
+Content-Type: application/json
+X-Jev-Subject: ip:abc
+X-Jev-Other: y
+--- response_body
+x-jev-reason x-jev-request-id x-jev-score x-jev-source x-jev-subject x-jev-verdict
+--- no_error_log
+[error]

@@ -390,6 +390,33 @@ local function set_request_headers(ctx, headers)
   for _, h in ipairs(HEADER_NAMES) do core.request.set_header(ctx, h, headers and headers[h]) end
 end
 
+-- The subject header the config reads, lowercased: an X-Jev-* name there (a
+-- thin Worker's X-Jev-Subject, read with hashed = true) is the deployment's
+-- own and stays.
+local function subject_header(scfg)
+  if type(scfg) == "table" and scfg.from == "header" and type(scfg.name) == "string" then
+    return scfg.name:lower()
+  end
+  return nil
+end
+
+-- Every other X-Jev-* request header, once judging has read what it needs
+-- (the mock score header, a subject header). set_request_headers() handles
+-- only the names jev-edge sets; X-Jev-Subject, X-Jev-Body-Partial or any
+-- other X-Jev-* a client sent would reach the upstream as if jev-edge had
+-- set it.
+local function sweep_inbound(ctx, scfg)
+  local keep = subject_header(scfg)
+  local drop = {}
+  for k in pairs(ngx.req.get_headers(0)) do
+    if type(k) == "string" then
+      local n = k:lower()
+      if n:sub(1, 6) == "x-jev-" and n ~= keep then drop[#drop + 1] = n end
+    end
+  end
+  for _, n in ipairs(drop) do core.request.set_header(ctx, n, nil) end
+end
+
 function _M.access(conf, ctx)
   -- A global rule also runs for a request that matched no route, just before
   -- APISIX answers it 404. It never reaches a model: no judge call, no
@@ -430,6 +457,7 @@ function _M.access(conf, ctx)
     maybe_async(rt, v, req)
     maybe_sample(rt, v, req, ctx)
   end)
+  pcall(sweep_inbound, ctx, type(conf) == "table" and conf.subject or nil)
 
   if not ok then
     core.log.error("jev-edge: access error, failing open: ", err)

@@ -3,10 +3,20 @@
 // only the request shape and the stores differ (memory per process unless you
 // pass a Store).
 import { Buffer } from "node:buffer";
-import { createRuntime, evaluate, withVerdictHeaders, healthResponse, type Options, type Runtime } from "./runtime.js";
+import { createRuntime, evaluate, withVerdictHeaders, healthResponse, jevHeaderNames, type Options, type Runtime } from "./runtime.js";
 import { headers as verdictHeaders, newVerdict, ERROR, SRC_ADAPTER, type Verdict } from "./core/verdict.js";
 
-const HEADERS = ["x-jev-verdict", "x-jev-score", "x-jev-source", "x-jev-reason", "x-jev-request-id", "x-jev-subject"];
+function adapterError(): Verdict {
+  return newVerdict({ verdict: ERROR, source: SRC_ADAPTER, reason: "adapter error" });
+}
+
+function newRequestId(): string {
+  try {
+    return crypto.randomUUID();
+  } catch {
+    return String(Date.now());
+  }
+}
 
 function runtimeOnce(opts: Options): () => Runtime {
   let rt: Runtime | undefined;
@@ -44,13 +54,20 @@ export interface NextFetchEventLike {
 export function nextMiddleware(opts: Options, NextResponse: NextResponseLike) {
   const rt = runtimeOnce(opts);
   return async (request: Request, event?: NextFetchEventLike): Promise<Response> => {
-    const r = rt();
-    const url = new URL(request.url);
-    if (r.opts.health !== false && url.pathname === "/_jev/health" && request.method === "GET") return healthResponse(r);
-    // the event is a RequestCtx as is: evaluate calls event.waitUntil(p)
-    const { verdict, response, requestId, subjectId } = await evaluate(request, r, event); // never throws: fails open
-    if (response) return response;
-    const forwarded = withVerdictHeaders(request, verdict, requestId, subjectId);
+    let forwarded: Request;
+    try {
+      const r = rt();
+      const url = new URL(request.url);
+      if (r.opts.health !== false && url.pathname === "/_jev/health" && request.method === "GET") return healthResponse(r);
+      // the event is a RequestCtx as is: evaluate calls event.waitUntil(p)
+      const { verdict, response, requestId, subjectId } = await evaluate(request, r, event); // never throws: fails open
+      if (response) return response;
+      forwarded = withVerdictHeaders(request, verdict, requestId, subjectId);
+    } catch (e) {
+      // the runtime could not be built: pass, and every X-Jev-* says so
+      console.error("jev-edge: next middleware error, failing open: " + (e instanceof Error ? e.message : String(e)));
+      forwarded = withVerdictHeaders(request, adapterError(), newRequestId());
+    }
     return NextResponse.next({ request: { headers: forwarded.headers } });
   };
 }
@@ -248,15 +265,15 @@ export function nodeMiddleware(opts: Options) {
         return;
       }
       const forwarded = withVerdictHeaders(request, verdict, requestId, subjectId);
-      for (const h of HEADERS) delete req.headers[h];
+      for (const h of jevHeaderNames(Object.keys(req.headers))) delete req.headers[h];
       forwarded.headers.forEach((v, k) => {
         if (k.startsWith("x-jev-")) req.headers[k] = v;
       });
       next();
     } catch (e) {
       console.error("jev-edge: middleware error, failing open: " + (e instanceof Error ? e.message : String(e)));
-      for (const h of HEADERS) delete req.headers[h];
-      const v = newVerdict({ verdict: ERROR, source: SRC_ADAPTER, reason: "adapter error" });
+      for (const h of jevHeaderNames(Object.keys(req.headers))) delete req.headers[h];
+      const v = adapterError();
       for (const [k, val] of Object.entries(verdictHeaders(v))) req.headers[k.toLowerCase()] = val;
       req.jev = v;
       next();
@@ -288,6 +305,7 @@ export function honoMiddleware(opts: Options) {
   return async (c: HonoContextLike, next: () => Promise<void>): Promise<Response | void> => {
     let verdict: Verdict;
     let forwarded: Request | undefined;
+    let cleaned: Request | undefined;
     try {
       const r = rt();
       const url = new URL(c.req.raw.url);
@@ -301,12 +319,19 @@ export function honoMiddleware(opts: Options) {
       forwarded = withVerdictHeaders(c.req.raw, verdict, ev.requestId, ev.subjectId);
     } catch (e) {
       console.error("jev-edge: hono middleware error, failing open: " + (e instanceof Error ? e.message : String(e)));
-      verdict = newVerdict({ verdict: ERROR, source: SRC_ADAPTER, reason: "adapter error" });
+      verdict = adapterError();
+      // the handlers see the error verdict, never a client's X-Jev-*
+      try {
+        cleaned = withVerdictHeaders(c.req.raw, verdict, newRequestId());
+      } catch {
+        /* keeps the original request */
+      }
     }
     c.set("jev", verdict);
-    if (forwarded) {
+    const raw = forwarded ?? cleaned;
+    if (raw) {
       try {
-        c.req.raw = forwarded;
+        c.req.raw = raw;
       } catch {
         /* a context with a read-only raw keeps the original request */
       }

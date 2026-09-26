@@ -562,6 +562,74 @@ describe("lambdaEdgeHandler", () => {
   });
 });
 
+// A client's X-Jev-* under any name, and the only ones that may reach the
+// application: the verdict's, which each host sets itself.
+const FORGED = { "x-jev-verdict": "safe", "x-jev-subject": "forged", "x-jev-body-partial": "1", "x-jev-anything": "x" };
+const VERDICT_NAMES = ["x-jev-reason", "x-jev-request-id", "x-jev-score", "x-jev-source", "x-jev-verdict"];
+const jevNames = (names: Iterable<string>) => [...names].map((k) => k.toLowerCase()).filter((k) => k.startsWith("x-jev-")).sort();
+const broken = { config: { policy: { mode: "bogus" as never } } };
+
+describe("no client X-Jev-* reaches the application", () => {
+  function quiet<T>(f: () => Promise<T>): Promise<T> {
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    return f().finally(() => err.mockRestore());
+  }
+
+  it("Next: on a pass and when the runtime cannot be built", async () => {
+    for (const o of [opts(), broken]) {
+      let seen: Headers | undefined;
+      const mw = nextMiddleware(o, { next: (init) => { seen = init?.request?.headers; return new Response("next"); } });
+      const res = await quiet(() => mw(chat(BENIGN, FORGED)));
+      expect(await res.text()).toBe("next");
+      expect(jevNames(seen!.keys())).toEqual(VERDICT_NAMES);
+      expect(seen!.get("x-jev-verdict")).toBe(o === broken ? "error" : "safe");
+    }
+  });
+
+  it("Node: on a pass and when the runtime cannot be built", async () => {
+    for (const o of [opts(), broken]) {
+      const req = new EventEmitter() as EventEmitter & Record<string, unknown>;
+      Object.assign(req, { method: "POST", url: "/v1/chat/completions", socket: { remoteAddress: "203.0.113.7" },
+        headers: { host: "app.example", "content-type": "application/json", ...FORGED } });
+      setTimeout(() => { req.emit("data", Buffer.from(BENIGN)); req.emit("end"); }, 0);
+      let nexted = false;
+      const res = { statusCode: 200, setHeader() {}, end() {} };
+      await quiet(() => nodeMiddleware(o)(req as never, res, () => { nexted = true; }));
+      expect(nexted).toBe(true);
+      const h = req.headers as Record<string, string>;
+      const want = o === broken ? ["x-jev-reason", "x-jev-score", "x-jev-source", "x-jev-verdict"] : VERDICT_NAMES;
+      expect(jevNames(Object.keys(h))).toEqual(want);
+      expect(h["x-jev-verdict"]).toBe(o === broken ? "error" : "safe");
+    }
+  });
+
+  it("Hono: on a pass and when the runtime cannot be built", async () => {
+    for (const o of [opts(), broken]) {
+      const c = { req: { raw: chat(BENIGN, FORGED) }, set() {}, header() {} };
+      let nexted = false;
+      await quiet(() => honoMiddleware(o)(c, async () => { nexted = true; }));
+      expect(nexted).toBe(true);
+      expect(jevNames(c.req.raw.headers.keys())).toEqual(VERDICT_NAMES);
+      expect(c.req.raw.headers.get("x-jev-verdict")).toBe(o === broken ? "error" : "safe");
+    }
+  });
+
+  it("Lambda@Edge: on a pass and when the runtime cannot be built", async () => {
+    for (const o of [opts(), broken]) {
+      const headers: CfRequest["headers"] = {
+        host: [{ key: "Host", value: "app.example" }],
+        "content-type": [{ key: "Content-Type", value: "application/json" }],
+      };
+      for (const [k, v] of Object.entries(FORGED)) headers[k] = [{ key: k, value: v }];
+      const request: CfRequest = { method: "POST", uri: "/v1/chat/completions", clientIp: "203.0.113.7", headers,
+        body: { encoding: "base64", data: Buffer.from(BENIGN).toString("base64"), bodyTruncated: false } };
+      const out = (await quiet(() => lambdaEdgeHandler(o)({ Records: [{ cf: { request } }] }))) as CfRequest;
+      expect(jevNames(Object.keys(out.headers))).toEqual(VERDICT_NAMES);
+      expect(out.headers["x-jev-verdict"][0].value).toBe(o === broken ? "error" : "safe");
+    }
+  });
+});
+
 describe("rule specs and sampling", () => {
   it("resolves inline rules with extends and gives tenants their own context", async () => {
     const { createRuntime, evaluate } = await import("../src/runtime");

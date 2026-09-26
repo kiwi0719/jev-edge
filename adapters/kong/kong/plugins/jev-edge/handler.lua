@@ -265,8 +265,34 @@ end
 -- phases
 -- ---------------------------------------------------------------------------
 
-local function fail_open(err)
+-- The subject header the config reads, lowercased: an X-Jev-* name there (a
+-- thin Worker's X-Jev-Subject, read with hashed = true) is the deployment's
+-- own and stays. scfg may be the raw plugin conf's (ngx.null for unset).
+local function subject_header(scfg)
+  if type(scfg) == "table" and scfg.from == "header" and type(scfg.name) == "string" then
+    return scfg.name:lower()
+  end
+  return nil
+end
+
+-- Every other X-Jev-* header off the service request, once judging has read
+-- what it needs (the mock score header, a subject header). The early strip
+-- takes only the names jev-edge sets; X-Jev-Subject, X-Jev-Body-Partial or
+-- any other X-Jev-* a client sent would reach the upstream as if jev-edge
+-- had set it.
+local function sweep_inbound(scfg)
+  local keep = subject_header(scfg)
+  for k in pairs(ngx.req.get_headers(0)) do
+    if type(k) == "string" then
+      local n = k:lower()
+      if n:sub(1, 6) == "x-jev-" and n ~= keep then kong.service.request.clear_header(n) end
+    end
+  end
+end
+
+local function fail_open(err, conf)
   kong.log.err("jev-edge: access error, failing open: ", err)
+  pcall(sweep_inbound, type(conf) == "table" and conf.subject or nil)
   pcall(kong.service.request.set_header, "X-Jev-Verdict", verdict.ERROR)
   pcall(kong.service.request.set_header, "X-Jev-Source", "adapter")
 end
@@ -291,11 +317,12 @@ function JevEdge:access(conf)
     })
     maybe_async(rt, v, req)
     maybe_sample(rt, v, req)
+    sweep_inbound(rt.cfg.subject)
     for k, val in pairs(verdict.headers(v)) do kong.service.request.set_header(k, val) end
     kong.service.request.set_header("X-Jev-Request-Id", ngx.var.request_id or "")
   end)
 
-  if not ok then return fail_open(err) end
+  if not ok then return fail_open(err, conf) end
   kong.ctx.plugin.verdict = v
 
   if v.action == verdict.ACTION_BLOCK then

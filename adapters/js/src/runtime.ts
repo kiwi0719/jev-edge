@@ -532,15 +532,30 @@ async function evaluateInner(request: Request, rt: Runtime, requestId: string, r
 }
 
 /**
+ * Every X-Jev-* name among `names`, lowercased: what a client sent under
+ * jev-edge's prefix, whatever it is called (X-Jev-Subject,
+ * X-Jev-Body-Partial, the mock score header, ...), for the hosts to drop
+ * before they set the verdict's own.
+ */
+export function jevHeaderNames(names: Iterable<string>): string[] {
+  const out: string[] = [];
+  for (const k of names) {
+    const n = k.toLowerCase();
+    if (n.startsWith("x-jev-")) out.push(n);
+  }
+  return out;
+}
+
+/**
  * The request to forward upstream: original plus X-Jev-* headers. Every
- * client-supplied X-Jev-* header is dropped, including X-Jev-Subject; when
- * this runtime computed a subject id it is forwarded as X-Jev-Subject so an
- * origin jev-edge configured with `hashed = true` sees the same trajectory.
+ * client-supplied X-Jev-* header is dropped, X-Jev-Subject and any other
+ * X-Jev-* name included; when this runtime computed a subject id it is
+ * forwarded as X-Jev-Subject so an origin jev-edge configured with
+ * `hashed = true` sees the same trajectory.
  */
 export function withVerdictHeaders(request: Request, verdict: core.Verdict, requestId: string, subjectId?: string): Request {
   const headers = new Headers(request.headers);
-  for (const h of HEADER_NAMES) headers.delete(h);
-  headers.delete(SUBJECT_HEADER);
+  for (const h of jevHeaderNames(headers.keys())) headers.delete(h);
   for (const [k, v] of Object.entries(core.verdict.headers(verdict))) headers.set(k, v);
   headers.set("X-Jev-Request-Id", requestId);
   if (subjectId) headers.set("X-Jev-Subject", subjectId);

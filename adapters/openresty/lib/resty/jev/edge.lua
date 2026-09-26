@@ -175,7 +175,32 @@ local function strip_inbound()
   for _, h in ipairs(HEADER_NAMES) do ngx.req.clear_header(h) end
 end
 
-local function set_headers(v)
+-- The subject header the config reads, lowercased: an X-Jev-* name there (a
+-- thin Worker's X-Jev-Subject, read with hashed = true) is the deployment's
+-- own, not a client's, and is left in place.
+local function subject_header(cfg)
+  local s = type(cfg) == "table" and cfg.subject
+  if type(s) == "table" and s.from == "header" and type(s.name) == "string" then return s.name:lower() end
+  return nil
+end
+
+-- Every other X-Jev-* request header, once judging has read what it needs
+-- (the mock score header, a subject header). strip_inbound() takes only the
+-- names jev-edge sets, before judging; X-Jev-Subject, X-Jev-Body-Partial or
+-- any other X-Jev-* a client sent would otherwise reach the upstream as if
+-- jev-edge had set it.
+local function sweep_inbound(cfg)
+  local keep = subject_header(cfg)
+  for k in pairs(ngx.req.get_headers(0)) do
+    if type(k) == "string" then
+      local n = k:lower()
+      if n:sub(1, 6) == "x-jev-" and n ~= keep then ngx.req.clear_header(n) end
+    end
+  end
+end
+
+local function set_headers(v, cfg)
+  sweep_inbound(cfg)
   for k, val in pairs(verdict.headers(v)) do ngx.req.set_header(k, val) end
   ngx.req.set_header("X-Jev-Request-Id", ngx.var.request_id or "")
 end
@@ -300,12 +325,15 @@ function _M.access()
   local v
   local ok, err = pcall(function()
     v = evaluate_current(cfg, rules)
-    set_headers(v)
+    set_headers(v, cfg)
   end)
 
   if not ok then
     ngx.log(ngx.ERR, "jev-edge: access error, failing open: ", err)
     pcall(metrics.incr_adapter_error, "access")
+    -- the early strip may never have run (a throw before it): every X-Jev-*
+    -- goes, then the two that say what happened
+    if not pcall(sweep_inbound, cfg) then pcall(strip_inbound) end
     ngx.req.set_header("X-Jev-Verdict", verdict.ERROR)
     ngx.req.set_header("X-Jev-Source", "adapter")
     return
@@ -602,8 +630,8 @@ end
 local function headers_to_remove(h, cfg)
   local keep = {}
   for _, n in ipairs(HEADER_NAMES) do keep[n:lower()] = true end
-  local s = cfg.subject
-  if type(s) == "table" and s.from == "header" and type(s.name) == "string" then keep[s.name:lower()] = true end
+  local sh = subject_header(cfg)
+  if sh then keep[sh] = true end
   local out, seen = {}, {}
   local function add(n)
     if not keep[n] and not seen[n] then seen[n], out[#out + 1] = true, n end

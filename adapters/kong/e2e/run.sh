@@ -50,6 +50,11 @@ check "block response carries verdict header" "malicious" "$hdr"
 check "client-supplied X-Jev-* is stripped" "app verdict=skipped score=0.00 source=l1" "$(curl -s -H 'X-Jev-Verdict: safe' -H 'X-Jev-Score: 0.00' -H 'X-Jev-Source: l2' $base/healthz)"
 check "client X-Jev-* on a judged route is replaced" "app verdict=safe score=0.20 source=l2" "$(curl -s -H 'Content-Type: application/json' -H 'X-Jev-Verdict: bogus' -H 'X-Jev-Source: forged' -d "$LONG" $base/v1/chat/completions)"
 check "provider failure fails open" "app verdict=error score=0.00 source=l2" "$(post /v1/chat/completions fail "$ATTACK")"
+FORGED="-H X-E2e-Jev-Names:1 -H X-Jev-Subject:forged -H X-Jev-Body-Partial:1 -H X-Jev-Anything:x"
+check "no client X-Jev-* reaches the upstream on a judged route" "app verdict=safe score=0.20 source=l2 jev=x-jev-reason,x-jev-request-id,x-jev-score,x-jev-source,x-jev-verdict" \
+  "$(curl -s $FORGED -H 'Content-Type: application/json' -d "$LONG" $base/v1/chat/completions)"
+check "no client X-Jev-* reaches the upstream on an unwatched path" "app verdict=skipped score=0.00 source=l1 jev=x-jev-reason,x-jev-request-id,x-jev-score,x-jev-source,x-jev-verdict" \
+  "$(curl -s $FORGED $base/healthz)"
 check "GET on a watched path passes at L1" "app verdict=skipped score=0.00 source=l1" "$(curl -s $base/v1/models)"
 printf '%s' "$LONG" | gzip -c > "$tmp/long.gz"
 printf '%s' "$ATTACK" | gzip -c > "$tmp/attack.gz"

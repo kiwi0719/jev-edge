@@ -295,6 +295,10 @@ async function readReq(request: Request, rt: Runtime): Promise<[core.Req, Provid
   const len = lenHeader === null ? NaN : Number(lenHeader);
   const req: core.Req = { method: request.method, path, headers, client_ip: clientIp, body_size: Number.isFinite(len) ? len : 0 };
   let body: string | null = null;
+  // the body's length in bytes as read (or decoded): TextDecoder turns each
+  // invalid byte into U+FFFD, three bytes once re-encoded, so the decoded
+  // string's UTF-8 length is not the body's size (Lua's #body is)
+  let bodyBytes = 0;
   // The body is only read for a request some rule would judge; everything
   // else passes at L1 on path or method without touching the stream.
   if (request.body && isCandidate(rt, path, request.method)) {
@@ -313,12 +317,13 @@ async function readReq(request: Request, rt: Runtime): Promise<[core.Req, Provid
             req.body_size = maxBytes + 1;
           } else {
             body = utf8.decode(d[0]);
-            req.body_size = d[0].byteLength;
+            bodyBytes = d[0].byteLength;
           }
         }
       }
     } else if (whole) {
       body = utf8.decode(r.head);
+      bodyBytes = r.head.byteLength;
     } else {
       req.body_head = utf8.decode(r.head);
       if (r.tail) req.body_tail = utf8.decode(r.tail);
@@ -326,7 +331,8 @@ async function readReq(request: Request, rt: Runtime): Promise<[core.Req, Provid
   }
   if (body !== null) {
     req.body = body;
-    req.body_size = core.normalize.byteLength(body);
+    req.body_size = bodyBytes;
+    req.body_bytes = bodyBytes;
   }
   return [req, { method: request.method, path, headers: request.headers, body, clientIp }];
 }

@@ -60,6 +60,11 @@ export interface Req {
   /** A repeated header may arrive as a list (Lua's ngx.req.get_headers does this). */
   headers?: Record<string, string | string[] | undefined>;
   body?: string | null;
+  /** The body's length in bytes as the adapter read it, when `body` was
+   *  decoded from bytes that were not all valid UTF-8 (each invalid byte is
+   *  one U+FFFD, three bytes re-encoded): core counts this, as Lua counts
+   *  #body. Absent: the UTF-8 length of `body`. */
+  body_bytes?: number;
   body_size?: number;
   client_ip?: string;
   /** Past max_body_bytes: the first bytes and the last bytes (not overlapping) the adapter kept. */
@@ -482,10 +487,12 @@ function ctWatched(ct: string, rule: Rule): boolean | "media" {
 const CT_NOT_WATCHED = "content-type not watched";
 
 // The body's size as core counts it: the larger of what the adapter declared
-// and what it handed over (bytes, like Lua's #body).
+// and what it handed over (bytes as read, like Lua's #body: body_bytes when
+// the adapter gave it).
 function bodySize(req: Req): number {
   const declared = Number(req.body_size);
-  return Math.max(Number.isFinite(declared) ? declared : 0, typeof req.body === "string" ? byteLength(req.body) : 0);
+  const given = typeof req.body !== "string" ? 0 : typeof req.body_bytes === "number" ? req.body_bytes : byteLength(req.body);
+  return Math.max(Number.isFinite(declared) ? declared : 0, given);
 }
 
 // Port of json_only_miss() in core/rules.lua: a json_only_paths path is

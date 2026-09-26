@@ -34,6 +34,7 @@ local null = ngx.null
 
 local DICT = "jev_cache"
 local SUBJECT_DICT = "jev_subject"
+local SUBJECT_REP_DICT = "jev_subject_rep"   -- subject reputation, apart from the trajectories
 local HEADER_NAMES = { "X-Jev-Verdict", "X-Jev-Score", "X-Jev-Source", "X-Jev-Reason", "X-Jev-Request-Id" }
 local DEFAULT_BLOCK_BODY = '{"error":"request rejected"}'
 
@@ -56,7 +57,6 @@ local JevEdge = {
 
 local runtimes = setmetatable({}, { __mode = "k" })
 local cache
-local subject_store
 
 -- Unset schema fields can arrive as ngx.null; core wants them absent.
 local function strip_nulls(t)
@@ -147,16 +147,17 @@ local function subject_ctx(rt, req)
   })
   local id = subject_m.hash_id(scfg, raw, sha256_hex)
   if not id then return nil end
-  subject_store = subject_store or cache_m.new(SUBJECT_DICT)
-  local store = subject_store
+  local rep_on = type(scfg.reputation) == "table" and (tonumber(scfg.reputation.block_at) or 0) > 0
+  local ring, rep = cache_m.subject_stores(SUBJECT_DICT, SUBJECT_REP_DICT, rep_on)
   return {
     id = id,
-    history = subject_m.ring_load(store, id, scfg.max_entries),
+    history = subject_m.ring_load(ring, id, scfg.max_entries),
+    -- never evicts: a full dict drops the new entry
     record = function(e)
-      subject_m.ring_append(store, id, e, scfg.max_entries, scfg.history_ttl)
+      subject_m.ring_append(ring, id, e, scfg.max_entries, scfg.history_ttl)
     end,
-    -- reputation counters (subject.reputation): incr is atomic in the dict
-    store = store,
+    -- reputation counters and blocks (subject.reputation): incr is atomic in the dict
+    store = rep,
   }
 end
 

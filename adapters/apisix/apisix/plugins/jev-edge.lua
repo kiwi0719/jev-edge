@@ -44,6 +44,7 @@ local to_hex    = require("resty.string").to_hex
 
 local DICT = "jev_cache"
 local SUBJECT_DICT = "jev_subject"
+local SUBJECT_REP_DICT = "jev_subject_rep"   -- subject reputation, apart from the trajectories
 local HEADER_NAMES = { "X-Jev-Verdict", "X-Jev-Score", "X-Jev-Source", "X-Jev-Reason", "X-Jev-Request-Id" }
 
 local schema = {
@@ -175,7 +176,6 @@ end
 
 local runtimes = setmetatable({}, { __mode = "k" })
 local cache
-local subject_store
 
 -- SHA-256 for fingerprints and subject ids, the same as the OpenResty adapter
 -- and the JavaScript hosts: a collision-resistant fingerprint (it keys the
@@ -198,18 +198,19 @@ local function subject_ctx(rt, req, ctx)
   })
   local id = subject_m.hash_id(scfg, raw, sha256_hex_subject)
   if not id then return nil end
-  subject_store = subject_store or cache_m.new(SUBJECT_DICT)
-  local store = subject_store
+  local rep_on = type(scfg.reputation) == "table" and (tonumber(scfg.reputation.block_at) or 0) > 0
+  local ring, rep = cache_m.subject_stores(SUBJECT_DICT, SUBJECT_REP_DICT, rep_on)
   return {
     id = id,
-    history = subject_m.ring_load(store, id, scfg.max_entries),
+    history = subject_m.ring_load(ring, id, scfg.max_entries),
     -- Two atomic dict operations, inline: cheaper than the timer it
-    -- replaces and safe across workers (no read-modify-write).
+    -- replaces and safe across workers (no read-modify-write). They never
+    -- evict: a full dict drops the new entry.
     record = function(e)
-      subject_m.ring_append(store, id, e, scfg.max_entries, scfg.history_ttl)
+      subject_m.ring_append(ring, id, e, scfg.max_entries, scfg.history_ttl)
     end,
-    -- reputation counters (subject.reputation): incr is atomic in the dict
-    store = store,
+    -- reputation counters and blocks (subject.reputation): incr is atomic in the dict
+    store = rep,
   }
 end
 

@@ -14,8 +14,8 @@ services:
       KONG_DECLARATIVE_CONFIG: /kong/kong.yml
       KONG_PLUGINS: bundled,jev-edge
       KONG_LUA_PACKAGE_PATH: "/opt/jev-edge/adapters/kong/?.lua;/opt/jev-edge/adapters/openresty/lib/?.lua;/opt/jev-edge/?.lua;/opt/jev-edge/?/init.lua;;"
-      # Kong injects `lua_shared_dict <value>;`; the second dict rides on the same line
-      KONG_NGINX_HTTP_LUA_SHARED_DICT: "jev_cache 16m; lua_shared_dict jev_subject 4m"
+      # Kong injects `lua_shared_dict <value>;`; the other dicts ride on the same line
+      KONG_NGINX_HTTP_LUA_SHARED_DICT: "jev_cache 16m; lua_shared_dict jev_subject 4m; lua_shared_dict jev_subject_rep 1m"
       KONG_NGINX_MAIN_ENV: TYPESAFE_API_KEY
       KONG_PROXY_LISTEN: "0.0.0.0:8000"
       KONG_ADMIN_LISTEN: "off"

@@ -44,7 +44,7 @@ plugins:
    KONG_NGINX_MAIN_ENV=TYPESAFE_API_KEY                 # kong.conf: nginx_main_env = TYPESAFE_API_KEY
    ```
 
-   Kong turns each `nginx_http_<directive>` into one `<directive> <value>;` line, so a second dict (for `subject`) rides on the same value: `"jev_cache 64m; lua_shared_dict jev_subject 16m"`. A custom nginx template works too. Instead of the environment variable, `jev.api_key` is referenceable: `api_key: "{vault://env/typesafe-api-key}"`.
+   Kong turns each `nginx_http_<directive>` into one `<directive> <value>;` line, so the dicts for `subject` ride on the same value: `"jev_cache 64m; lua_shared_dict jev_subject 16m; lua_shared_dict jev_subject_rep 4m"` (`jev_subject_rep` holds subject reputation apart from the trajectories, which never evict and drop new entries when full). A custom nginx template works too. Instead of the environment variable, `jev.api_key` is referenceable: `api_key: "{vault://env/typesafe-api-key}"`.
 
 3. Start Kong with `TYPESAFE_API_KEY` in its environment and add the plugin to a route or service (above).
 
@@ -66,7 +66,7 @@ Your upstream receives `X-Jev-Verdict`, `X-Jev-Score`, `X-Jev-Source`, `X-Jev-Re
 | `PUT /_jev/config` hot reload | the Admin API or a new declarative config: Kong rebuilds the plugin conf and the plugin builds a new runtime for it |
 | `/_jev/health`, `/_jev/metrics`, `/_jev/feedback` | not exposed; Kong's `prometheus` plugin and the log serializer carry the verdict fields |
 | L3 side-path, reputation | same modules, same `async` config |
-| `subject` | same keys; `from = "ip"` uses the forwarded IP; needs the `jev_subject` dict |
+| `subject` | same keys; `from = "ip"` uses the forwarded IP; needs the `jev_subject` dict, and `jev_subject_rep` with `reputation` (without it reputation shares `jev_subject`, with a warning) |
 | `/_jev/samples` | `sampling` is honoured and samples land in `jev_cache`; read them with `sampling.log = true`, or expose `resty.jev.edge.samples()` from a plain OpenResty location on the same box |
 
 One runtime (provider client, breaker, adaptive timeout) is built per plugin conf table and kept until Kong hands over a new one (config change, declarative reload). Breaker, adaptive timeout and in-flight counters are keyed by provider, endpoint and model, so plugin instances calling the same provider share its health. Verdict-cache keys are scoped by rule, templates, deployment context, provider and model (`core.cache_key`).

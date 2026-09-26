@@ -19,3 +19,4 @@ nginx_config:
     lua_shared_dict:
       jev_cache: 16m
       jev_subject: 4m
+      jev_subject_rep: 1m

@@ -231,6 +231,19 @@ class Http(unittest.TestCase):
             srv.shutdown()
             srv.server_close()
 
+    def test_warm_connection_answers_without_waiting_for_an_ack(self):
+        # headers and body are two writes: with Nagle on, a Linux client's
+        # delayed ACK held every answer back about 40 ms
+        srv, url = serve()
+        try:
+            t = conformance.Target(url, None, "laya", 5)
+            body = json.dumps({"state": "hello", "questions": {"q": Q}}).encode()
+            err, lat, _ = conformance.timed(t, body, 20)
+        finally:
+            stop(srv)
+        self.assertIsNone(err)
+        self.assertLess(conformance.pct(lat, 0.5), 20, lat)
+
     def test_body_over_the_limit_is_413(self):
         srv, url = serve({"LAYA_MAX_BODY_BYTES": "100"})
         try:

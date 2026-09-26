@@ -432,6 +432,11 @@ class Workers:
 class Handler(BaseHTTPRequestHandler):
     server_version = "laya-server"
     protocol_version = "HTTP/1.1"  # keepalive: the gateway pools connections
+    # TCP_NODELAY. An answer goes out in two writes, the headers and then the
+    # body; with Nagle on, the body waits for the client to acknowledge the
+    # headers, and a Linux client delays that ACK by about 40 ms: every
+    # answer on a warm connection took 40 ms longer than its scoring.
+    disable_nagle_algorithm = True
 
     # set by make_server
     scorer: Scorer

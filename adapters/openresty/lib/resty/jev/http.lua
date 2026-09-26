@@ -173,14 +173,20 @@ function _M.new(cfg, inflight, metrics)
     return answers
   end
 
-  function self.call(prompt, requested_timeout)
+  --- @param opts optional { lane = "l3" }: an L3 re-judge (resty.jev.async),
+  -- which takes no L2 slot. L3 jobs are capped by async.max_async on their
+  -- own counter, and they run while the L2 calls that overflowed still hold
+  -- their slots: under the L2 cap every re-judge of a "max_inflight
+  -- exceeded" request was refused the same way. At saturation the provider
+  -- sees up to max_inflight + max_async calls.
+  function self.call(prompt, requested_timeout, opts)
     -- Concurrency cap applies to every provider, mock included, so the limit
     -- is exercised by the soak test. The slot is given back after a return
     -- or a Lua error; a thread killed mid-call (a client abort under
     -- lua_check_client_abort, a worker shutdown) never gets there, and its
     -- slot comes back with the lease (_M.slots).
     local slot
-    if l2 then
+    if l2 and not (opts and opts.lane == "l3") then
       slot = l2.take(tonumber(cfg.max_inflight) or 64)
       if slot == nil then return nil, judge.BUSY end
     end
@@ -192,17 +198,17 @@ function _M.new(cfg, inflight, metrics)
 
   --- Several prompts at once, one light thread each (text judged in chunks,
   -- core's judge_chunks): the wall time is the slowest call, not the sum.
-  -- Each call takes its own in-flight slot. Returns
-  -- { { answers, err, kind }, ... } in prompt order.
-  function self.call_many(prompts, requested_timeout)
+  -- Each call takes its own in-flight slot (none with opts.lane = "l3").
+  -- Returns { { answers, err, kind }, ... } in prompt order.
+  function self.call_many(prompts, requested_timeout, opts)
     local results = {}
     if not (ngx and ngx.thread) or #prompts < 2 then
-      for i, p in ipairs(prompts) do results[i] = { self.call(p, requested_timeout) } end
+      for i, p in ipairs(prompts) do results[i] = { self.call(p, requested_timeout, opts) } end
       return results
     end
     local threads = {}
     for i, p in ipairs(prompts) do
-      local th, serr = ngx.thread.spawn(self.call, p, requested_timeout)
+      local th, serr = ngx.thread.spawn(self.call, p, requested_timeout, opts)
       threads[i] = th or false
       if not th then results[i] = { nil, "thread: " .. tostring(serr) } end
     end

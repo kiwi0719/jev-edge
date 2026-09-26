@@ -746,3 +746,50 @@ X-Jev-Mock-Score: 0.97
  "verdict=malicious score=0.97 source=l2 reason=injection+0.97\n"]
 --- no_error_log
 [error]
+
+
+
+=== TEST 37: the L3 re-judge of a request over max_inflight is not refused by the same cap, and is counted
+--- http_config eval: $::HttpConfig
+--- user_files eval: ::conf('jev = { provider = "mock", mock_score = 0.2, mock_delay_ms = 300, timeout_ms = 400, timeout_max_ms = 1000, max_inflight = 1 },')
+--- config eval
+qq{
+location /v1/chat/completions { $::Access $::Echo }
+location = /_jev/metrics { content_by_lua_block { require("resty.jev.edge").metrics() } }
+location = /burst {
+    content_by_lua_block {
+        -- two requests at once: one holds the only L2 slot for 300 ms, the
+        -- other is refused (max_inflight exceeded) and gets an L3 job while
+        -- that slot is still held
+        local http = require "resty.http"
+        local texts = { "Please write a detailed summary of the attached quarterly report.",
+                        "Please translate the following paragraph into formal French." }
+        local function post(text)
+            local c = http.new()
+            local res = c:request_uri("http://127.0.0.1:" .. ngx.var.server_port .. "/v1/chat/completions", {
+                method = "POST", headers = { ["Content-Type"] = "application/json" },
+                body = '{"messages":[{"role":"user","content":"' .. text .. '"}]}' })
+            return res and res.body or "no answer"
+        end
+        local th = {}
+        for i, t in ipairs(texts) do th[i] = ngx.thread.spawn(post, t) end
+        local busy, got = nil, {}
+        for i = 1, 2 do
+            local _, body = ngx.thread.wait(th[i])
+            got[#got + 1] = body:match("source=%S+ reason=%S+")
+            if body:find("max_inflight", 1, true) then busy = texts[i] end
+        end
+        table.sort(got)
+        ngx.say(table.concat(got, " | "))
+        ngx.sleep(0.6)   -- the L3 job (300 ms) is done
+        if busy then ngx.print(post(busy)) else ngx.say("none busy") end
+    }
+}
+}
+--- request eval
+["GET /burst", "GET /_jev/metrics"]
+--- response_body_like eval
+["^source=l2 reason=injection\\+0.20 \\| source=l2 reason=max_inflight\\+exceeded\nverdict=safe score=0.20 source=cache reason=injection\\+0.20\n\$",
+ '(?s)(?=.*# TYPE jev_async_total counter\n)(?=.*\njev_async_total\{result="ok"\} 1\n)(?!.*jev_async_total\{result="(?!ok))']
+--- no_error_log
+L3 judge failed

@@ -46,6 +46,14 @@ end
 
 function _M.incr_async_dropped() incr("async_dropped") end
 
+-- An async (L3) job that ran, by what it got (resty.jev.async on_result, a
+-- fixed set): ok | failed | busy | no_scores | error.
+local ASYNC_RESULTS = { ok = true, failed = true, busy = true, no_scores = true, error = true }
+function _M.incr_async_result(result)
+  if not ASYNC_RESULTS[result] then result = "error" end
+  incr("async:" .. result)
+end
+
 -- /_jev/authz events a relay's answer hides (a fixed set, so the label
 -- cannot be minted by traffic):
 --   no_client_ip  neither x-envoy-external-address nor X-Forwarded-For
@@ -119,6 +127,7 @@ function _M.render()
   line("# TYPE jev_feedback_total counter")
   line("# TYPE jev_authz_events_total counter")
   line("# TYPE jev_adapter_errors_total counter")
+  line("# TYPE jev_async_total counter")
   for _, key in ipairs(d:get_keys(0)) do
     local val = d:get(key)
     local src, verdict = key:match("^req:([^:]+):(.+)$")
@@ -140,6 +149,8 @@ function _M.render()
       line("jev_breaker_state " .. val)
     elseif key == "async_dropped" then
       line("jev_async_dropped_total " .. val)
+    elseif key:match("^async:") then
+      line(string.format('jev_async_total{result="%s"} %d', key:sub(7), val))
     elseif key == "l2_timeout_ms" then
       line("jev_l2_timeout_ms " .. val)
     elseif key:match("^unjudged:") then

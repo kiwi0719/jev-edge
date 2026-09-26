@@ -194,6 +194,7 @@ local function maybe_async(cfg, v, req, rules)
   if not job then return end
   local ok, err = async.schedule({
     cfg = cfg, cache = cache, state = state_store(), judge = judge, job = job, client_ip = req.client_ip,
+    on_result = metrics.incr_async_result,
   })
   if not ok and err ~= "disabled" then metrics.incr_async_dropped() end
 end

@@ -6,6 +6,7 @@
 
 local core    = require "jev.core"
 local verdict = require "jev.core.verdict"
+local judge_m = require "jev.core.judge"
 local http    = require "resty.jev.http"
 
 local _M = {}
@@ -29,27 +30,37 @@ local function done(job)
   job.slot = nil
 end
 
+-- resty.jev.http takes no L2 in-flight slot for these calls: L3 has its own
+-- cap (max_async), and the L2 slots are the ones that just overflowed.
+local LANE = { lane = "l3" }
+
 -- One answer (or nil) per part, in order; several parts at once when the
--- judge can (resty.jev.http's call_many, one light thread each).
+-- judge can (resty.jev.http's call_many, one light thread each). The second
+-- value is nil when every part answered, "busy" when the only failures were
+-- a judge's in-flight cap, "failed" otherwise.
 local function judge_all(judge, parts, timeout)
-  local results = {}
+  local results, failed = {}, nil
+  local function fail(err)
+    ngx.log(ngx.WARN, "jev-edge: L3 judge failed: ", tostring(err))
+    if err == judge_m.BUSY and failed ~= "failed" then failed = "busy" else failed = "failed" end
+  end
   if #parts > 1 and type(judge.call_many) == "function" then
     local prompts = {}
     for k, part in ipairs(parts) do prompts[k] = part.prompt end
-    local rs = judge.call_many(prompts, timeout) or {}
+    local rs = judge.call_many(prompts, timeout, LANE) or {}
     for k = 1, #parts do
       local r = rs[k] or {}
-      if not r[1] then ngx.log(ngx.WARN, "jev-edge: L3 judge failed: ", tostring(r[2])) end
+      if not r[1] then fail(r[2]) end
       results[k] = r[1]
     end
-    return results
+    return results, failed
   end
   for k, part in ipairs(parts) do
-    local answers, jerr = judge.call(part.prompt, timeout)
-    if not answers then ngx.log(ngx.WARN, "jev-edge: L3 judge failed: ", tostring(jerr)) end
+    local answers, jerr = judge.call(part.prompt, timeout, LANE)
+    if not answers then fail(jerr) end
     results[k] = answers
   end
-  return results
+  return results, failed
 end
 
 local function handler(premature, job)
@@ -58,9 +69,13 @@ local function handler(premature, job)
   if premature then return done(job) end
   local cache = job.cache
   local cfg = job.cfg
+  local result
   local ok, err = pcall(function()
-    local timeout = l3_timeout(cfg)
-    local res = core.l3_result(job.job, judge_all(job.judge, job.job.parts, timeout), cfg)
+    local answers, failed = judge_all(job.judge, job.job.parts, l3_timeout(cfg))
+    local res = core.l3_result(job.job, answers, cfg)
+    -- a job with a part that got no answer is not a second look, even when
+    -- the other parts' answers are written
+    result = failed or (res and "ok" or "no_scores")
     if not res then
       -- no score in any answer: a provider fault, never a cached SAFE
       ngx.log(ngx.WARN, "jev-edge: L3 got no score for the request")
@@ -96,15 +111,24 @@ local function handler(premature, job)
       cache:set(key, rep, cfg.cache.rep_ttl)
     end
   end)
-  if not ok then ngx.log(ngx.ERR, "jev-edge: L3 error: ", err) end
+  if not ok then
+    result = "error"
+    ngx.log(ngx.ERR, "jev-edge: L3 error: ", err)
+  end
+  if job.on_result then pcall(job.on_result, result) end
   done(job)
 end
 
 --- Schedule an L3 job. Never blocks; drops when over max_async.
--- @param job { cfg, cache, state, judge, job, client_ip, on_alert }
+-- @param job { cfg, cache, state, judge, job, client_ip, on_alert, on_result }
 --   job: core.l3_job() for the request (its parts' prompts and cache keys).
 --   cache: verdict / reputation dict; state: where the in-flight counter lives
 --   (defaults to cache).
+--   on_result: optional function(result) once the job has run, result one of
+--   "ok" (every part answered), "failed" (a part got no answer: provider
+--   error or timeout), "busy" (the judge's in-flight cap, and nothing else,
+--   refused a part), "no_scores" (answers without a score) or "error" (the
+--   job threw).
 function _M.schedule(job)
   local cfg = job.cfg
   if not cfg.async or cfg.async.enabled == false then return false, "disabled" end

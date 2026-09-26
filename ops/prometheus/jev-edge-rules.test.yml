@@ -212,6 +212,44 @@ tests:
         alertname: JevAsyncDropped
         exp_alerts: []
 
+  # Async results: gw1's re-judges fail 3 times for every one that answers;
+  # gw2's fail 1 in 10.
+  - interval: 1m
+    input_series:
+      - series: 'jev_async_total{job="jev",instance="gw1",result="ok"}'
+        values: '0+1x30'
+      - series: 'jev_async_total{job="jev",instance="gw1",result="failed"}'
+        values: '0+3x30'
+      - series: 'jev_async_total{job="jev",instance="gw2",result="ok"}'
+        values: '0+9x30'
+      - series: 'jev_async_total{job="jev",instance="gw2",result="failed"}'
+        values: '0+1x30'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: JevAsyncFailing
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: JevAsyncFailing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: jev
+              instance: gw1
+            exp_annotations:
+              summary: "jev-edge async re-judges failing (75%) on gw1"
+              description: >-
+                More than half of the async re-judge jobs that ran on
+                gw1 in the last 10 minutes got no answer.
+                Suspicious and errored requests are not getting their second look:
+                no cached verdict, and reputation blocking does not learn from them.
+              runbook: >-
+                Break down by result: sum by (result) (increase(jev_async_total[10m])).
+                failed: read the error log for "L3 judge failed" (provider errors,
+                or async.timeout_ms too short for the provider). no_scores: the
+                provider answers without the scores asked for (model, template).
+                busy: a custom judge's own cap. error: "L3 error" in the error log,
+                a bug.
+
   # Adapter errors: gw1's access handler fails 3 requests a minute from minute
   # 6 to 10 and then stops; gw2 never fails.
   - interval: 1m

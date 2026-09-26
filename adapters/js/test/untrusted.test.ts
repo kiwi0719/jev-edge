@@ -45,6 +45,21 @@ describe("untrusted: extraction", () => {
     expect(v).toEqual(["tool says", "function says"]);
   });
 
+  // r5 tool_results: collect() read none of an object content's keys
+  it("reads a tool or function message's object content whole", () => {
+    const v = normalize.extractUntrustedValues({ messages: [
+      { role: "user", content: { x: "a user's object is not a tool result" } },
+      { role: "tool", content: { x: "tool says", n: 2, more: ["deep"] } },
+      { role: "function", name: "f", content: { text: "function says", k: "v" } },
+      { role: "tool", content: [{ type: "text", text: "parts as before" }] },
+    ] }, spec);
+    expect(v).toEqual(["more", "deep", "n", "x", "tool says", "k", "v", "text", "function says", "parts as before"]);
+    // the text walk reads it the same way
+    const decoded: normalize.JsonValue = { messages: [{ role: "user", content: "Any news?" },
+      { role: "tool", content: { x: "tool says", n: 2 } }, { role: "user", content: { x: "not read" } }] };
+    expect(normalize.extractJson(decoded, ["messages[*].content"])).toBe("Any news?\nn\nx\ntool says");
+  });
+
   it("finds Anthropic tool_result blocks, nested content included", () => {
     const v = normalize.extractUntrustedValues({ messages: [{ role: "user", content: [
       { type: "tool_result", tool_use_id: "t1", content: "plain result" },

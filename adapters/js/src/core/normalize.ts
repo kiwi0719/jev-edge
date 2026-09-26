@@ -336,6 +336,8 @@ interface WalkState {
   defer: Slot[];
   /** a text field holds a number: token ids (collect) */
   tokenIds?: boolean;
+  /** a tool or function message's content, while the walk goes through its key (see walk) */
+  toolContent?: JsonValue;
 }
 
 function newState(decode?: Decode): WalkState {
@@ -579,8 +581,8 @@ const OP_END = 1, OP_DEEP = 2, OP_KEY = 3;
 interface EndOp { kind: typeof OP_END; depth: number; whole?: boolean; keyed?: boolean }
 /** A "**" here. */
 interface DeepOp { kind: typeof OP_DEEP }
-/** A key the paths go on through: the plan for its value when that is not an array (`whole`), and when it is, the plans for the array and for each item. */
-interface KeyOp { kind: typeof OP_KEY; key: string; whole?: Plan; wholeArr?: Plan; itemsArr?: Plan }
+/** A key the paths go on through: the plan for its value when that is not an array (`whole`), and when it is, the plans for the array and for each item; `content`: the key folds to "content" (see walk). */
+interface KeyOp { kind: typeof OP_KEY; key: string; whole?: Plan; wholeArr?: Plan; itemsArr?: Plan; content?: boolean }
 type Op = EndOp | DeepOp | KeyOp;
 /** What to do at a node, in the order the first path for each op comes; `folded`, `first`, `lens`, `exact`: for variantsOf. */
 interface Plan { ops: Op[]; folded?: Map<string, number[]>; first?: Set<number>; lens?: Set<number>; exact?: Set<string> }
@@ -603,7 +605,7 @@ function compile(cursors: Cursor[], leaf: boolean): Plan {
       if (!g) {
         g = [];
         groups.set(seg.key, g);
-        ops.push({ kind: OP_KEY, key: seg.key });
+        ops.push({ kind: OP_KEY, key: seg.key, content: fold(seg.key) === "content" });
       }
       g.push(c);
     }
@@ -704,17 +706,21 @@ function through(child: JsonValue | undefined, op: KeyOp, st: WalkState): void {
 
 // Port of walk: a path that ends here, a "**" here, or the paths that go on
 // through one key. A key is matched the way fold() says, and every key that
-// folds to it is read: the exact key first, the others in byte order.
+// folds to it is read: the exact key first, the others in byte order. The
+// content of a message with role "tool" or "function" that is an object is
+// read whole, as toolResults reads it (st.toolContent while the walk goes
+// through the message's content key).
 function walk(node: JsonValue | undefined, plan: Plan, st: WalkState): void {
   if (node === undefined || node === null) return;
   const obj = isObj(node) && !Array.isArray(node) ? node : undefined;
+  const wholeHere = obj !== undefined && st.toolContent === node;
   const found = plan.folded && obj ? variantsOf(obj, plan) : undefined;
   const ops = plan.ops;
   for (let i = 0; i < ops.length; i++) {
     const op = ops[i];
     if (op.kind === OP_END) {
       if (st.leaf) st.leaf(node, st);
-      else if (op.whole) readWhole(node, st.out as string[], op.depth);
+      else if (op.whole || wholeHere) readWhole(node, st.out as string[], op.depth);
       else {
         collect(node, st.out as string[], op.depth, st);
         if (op.keyed && isObj(node) && !Array.isArray(node)) for (const k of objectKeys(node)) take(st, k);
@@ -726,9 +732,18 @@ function walk(node: JsonValue | undefined, plan: Plan, st: WalkState): void {
     } else if (op.key === "") {
       through(node, op, st);
     } else if (obj) {
+      const tool = op.content === true && (obj.role === "tool" || obj.role === "function");
+      const saved = st.toolContent;
+      if (tool) st.toolContent = obj[op.key];
       through(obj[op.key], op, st);
       const others = found?.[i];
-      if (others) for (const k of others) through(obj[k], op, st);
+      if (others) {
+        for (const k of others) {
+          if (tool) st.toolContent = obj[k];
+          through(obj[k], op, st);
+        }
+      }
+      st.toolContent = saved;
     }
   }
 }
@@ -809,7 +824,9 @@ function toolResults(decoded: JsonValue, st: WalkState): void {
     for (const m of msgs) {
       if (!isObj(m) || Array.isArray(m)) continue;
       if (m.role === "tool" || m.role === "function") {
-        collect(m.content, out, 1);
+        // an object content is read whole (see walk)
+        if (isObj(m.content) && !Array.isArray(m.content)) readWhole(m.content, out, 1);
+        else collect(m.content, out, 1);
       } else if (Array.isArray(m.content)) {
         for (const block of m.content) {
           if (isObj(block) && !Array.isArray(block) && block.type === "tool_result") collect(block.content, out, 1);

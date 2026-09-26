@@ -500,9 +500,10 @@ end
 -- ({ kind = END, depth, whole, keyed }: collect()'s or read_whole()'s depth,
 -- 2 for a path that ends at an array read item by item; field_path's flags),
 -- a "**" here ({ kind = DEEP }), or a key the
--- paths go on through ({ kind = KEY, key, whole, whole_arr, items_arr }):
--- the plan for the value under the key when it is not an array (`whole`),
--- and when it is, the plans for the array itself and for each of its items.
+-- paths go on through ({ kind = KEY, key, whole, whole_arr, items_arr,
+-- content }): the plan for the value under the key when it is not an array
+-- (`whole`), and when it is, the plans for the array itself and for each of
+-- its items; `content` when the key folds to "content" (see walk).
 -- ---------------------------------------------------------------------------
 
 -- Field paths whose values are read whole (read_whole), whatever their
@@ -549,7 +550,7 @@ local function compile(cursors, leaf)
     else
       local g = groups[seg.key]
       if not g then
-        g = { kind = KEY, key = seg.key, cursors = {} }
+        g = { kind = KEY, key = seg.key, cursors = {}, content = fold(seg.key) == "content" }
         groups[seg.key] = g
         ops[#ops + 1] = g
       end
@@ -674,8 +675,16 @@ end
 -- st.out collects the values; st.leaf, when set, reads the value a path
 -- ends at (tool_fields), read_whole() or collect() otherwise. A "**" value leaves a slot
 -- for settle() to fill.
+--
+-- The content of a message with role "tool" or "function" that is an
+-- object, not a list or a string, is read whole (every key and string, as
+-- tool_results reads it): collect() reads only the keys content parts keep
+-- their text under, and {"x": <instruction>} gave nothing, while a backend
+-- that takes such a content renders all of it. st.tool_content is that
+-- value while the walk goes through the message's content key.
 walk = function(node, plan, st)
   if node == nil then return end
+  local whole_here = type(node) == "table" and node[1] == nil and st.tool_content == node
   local found = plan.folded and type(node) == "table" and node[1] == nil and variants_of(node, plan)
   for i = 1, #plan do
     local op = plan[i]
@@ -683,7 +692,7 @@ walk = function(node, plan, st)
     if kind == END then
       if st.leaf then
         st.leaf(node, st)
-      elseif op.whole then
+      elseif op.whole or whole_here then
         read_whole(node, st.out, op.depth)
       else
         collect(node, st.out, op.depth, st)
@@ -698,11 +707,17 @@ walk = function(node, plan, st)
     elseif op.key == "" then
       through(node, op, st)
     elseif type(node) == "table" then
+      local tool, saved = op.content and (node.role == "tool" or node.role == "function"), st.tool_content
+      if tool then st.tool_content = node[op.key] end
       through(node[op.key], op, st)
       local others = found and found[i]
       if others then
-        for _, k in ipairs(others) do through(node[k], op, st) end
+        for _, k in ipairs(others) do
+          if tool then st.tool_content = node[k] end
+          through(node[k], op, st)
+        end
       end
+      st.tool_content = saved
     end
   end
 end
@@ -762,7 +777,8 @@ function _M.extract_tools(decoded, fields, json_decode)
 end
 
 -- Tool results in the chat shapes gateways see:
---   OpenAI Chat Completions  messages[*] with role "tool" (or legacy "function"): content
+--   OpenAI Chat Completions  messages[*] with role "tool" (or legacy "function"): content,
+--                            read whole when it is an object (see walk)
 --   Anthropic Messages       messages[*].content[*] with type "tool_result": content
 --   OpenAI Responses         input[*] with a type ending in "_call_output"
 --                            (function_call_output, custom_tool_call_output,
@@ -793,7 +809,8 @@ local function tool_results(decoded, st)
     for _, m in ipairs(msgs) do
       if type(m) == "table" then
         if m.role == "tool" or m.role == "function" then
-          collect(m.content, out, 1)
+          local c = m.content
+          if type(c) == "table" and c[1] == nil then read_whole(c, out, 1) else collect(c, out, 1) end
         elseif type(m.content) == "table" then
           for _, block in ipairs(m.content) do
             if type(block) == "table" and block.type == "tool_result" then collect(block.content, out, 1) end

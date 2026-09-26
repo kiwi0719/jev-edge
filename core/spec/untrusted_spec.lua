@@ -63,6 +63,17 @@ describe("untrusted content: extraction", function()
     assert.equals("tool says\nfunction says", t)
   end)
 
+  -- r5 tool_results: collect() read none of an object content's keys
+  it("reads a tool or function message's object content whole", function()
+    local t = normalize.extract_untrusted({ messages = {
+      { role = "user", content = { x = "a user's object is not a tool result" } },
+      { role = "tool", content = { x = "tool says", n = 2, more = { "deep" } } },
+      { role = "function", name = "f", content = { text = "function says", k = "v" } },
+      { role = "tool", content = { { type = "text", text = "parts as before" } } },
+    } }, spec)
+    assert.equals("more\ndeep\nn\nx\ntool says\nk\nv\ntext\nfunction says\nparts as before", t)
+  end)
+
   it("finds Anthropic tool_result blocks, nested content included", function()
     local t = normalize.extract_untrusted({ messages = {
       { role = "user", content = {
@@ -277,6 +288,22 @@ describe("untrusted content: pipeline", function()
     assert.equals(0.9, v.score)
     assert.equals(V.ACTION_BLOCK, v.action)
     assert.matches("^untrusted 0.90", v.reason)
+  end)
+
+  it("judges a tool message's object content, with the whole text when off and on its own when on", function()
+    local obj = { x = ATTACK }
+    local j = recording({ injection = 0.2, untrusted = 0.9 })
+    local v = core.evaluate(tool_req("Any news?", obj), H.ctx({ judge = j }))
+    assert.equals(1, #j.prompts)
+    assert.truthy(j.prompts[1].text:find(ATTACK, 1, true))
+    assert.equals(0.2, v.score)
+    j = recording({ injection = 0.2, untrusted = 0.9 })
+    v = core.evaluate(tool_req("Any news?", obj), H.ctx({ judge = j, config = on({ policy = { mode = "enforce" } }) }))
+    local asked
+    for _, p in ipairs(j.prompts) do if p.questions.untrusted then asked = p end end
+    assert.truthy(asked)
+    assert.equals("x\n" .. ATTACK, asked.text)
+    assert.equals(V.ACTION_BLOCK, v.action)
   end)
 
   it("asks the untrusted question without the deployment context", function()

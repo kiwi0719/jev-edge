@@ -225,6 +225,28 @@ describe("providers: error kinds", () => {
     expect(await laya.call(prompt("x"), {} as JevConfig, 1000)).toEqual([null, "laya: malformed response", "unusable"]);
   });
 
+  it("backend: any 4xx with X-Jev-Verdict is the origin's block, reported as 1 whatever its score", async () => {
+    const cfg = { provider: "backend", endpoint: "http://origin" } as JevConfig;
+    // blocked at the origin's calibrated 0.5: a 0.60 must not reach the Worker's 0.7
+    reply(() => new Response('{"error":"request rejected"}', { status: 403, headers: { "X-Jev-Verdict": "malicious", "X-Jev-Score": "0.60", "X-Jev-Reason": "injection+0.60" } }));
+    expect(await backend.call(prompt("x"), cfg, 1000)).toEqual([{ injection: 1 }, null]);
+    for (const status of [400, 429, 451]) {
+      reply(() => new Response(null, { status, headers: { "X-Jev-Verdict": "malicious", "X-Jev-Score": "0.95", "X-Jev-Reason": "injection+0.95" } }));
+      expect(await backend.call(prompt("x"), cfg, 1000), String(status)).toEqual([{ injection: 1 }, null]);
+    }
+    // a block response that carries the verdict only
+    reply(() => new Response(null, { status: 403, headers: { "X-Jev-Verdict": "malicious" } }));
+    expect(await backend.call(prompt("x"), cfg, 1000)).toEqual([{ backend: 1 }, null]);
+    // a 4xx without X-Jev-Verdict is not jev-edge's answer: it fails open
+    reply(() => new Response("forbidden", { status: 403 }));
+    expect(await backend.call(prompt("x"), cfg, 1000)).toEqual([null, "backend http 403", "rejected"]);
+    reply(() => new Response(null, { status: 429 }));
+    expect(await backend.call(prompt("x"), cfg, 1000)).toEqual([null, "backend http 429", "unavailable"]);
+    // a 5xx is never a block, verdict header or not
+    reply(() => new Response(null, { status: 503, headers: { "X-Jev-Verdict": "malicious", "X-Jev-Score": "0.95" } }));
+    expect(await backend.call(prompt("x"), cfg, 1000)).toEqual([null, "backend http 503", "unavailable"]);
+  });
+
   it("backend: an origin that answered without a score is unusable, its 4xx rejected", async () => {
     const cfg = { provider: "backend", endpoint: "http://origin" } as JevConfig;
     reply(() => new Response(null, { status: 200, headers: { "X-Jev-Verdict": "error", "X-Jev-Reason": "laya+http+400" } }));

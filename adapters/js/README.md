@@ -36,7 +36,7 @@ export default thinWorker({ config: { policy: { mode: "enforce" } } });
 JEV_ORIGIN = "https://gateway.example.com"   # the jev-edge you already run
 ```
 
-Per request the Worker runs L1 (watch paths, method, content type, body size, `always_suspect` patterns, reputation) and checks its fingerprint cache. Only requests that would reach L2 are sent to the origin's `/_jev/authz/<path>` with the body and `X-Forwarded-For`, exactly as Envoy sends them. A 403 from the origin is a block at the edge; `X-Jev-Verdict: error` from the origin fails open. Set `upstream` when the app is not behind the same host as the gateway; bind `JEV_CACHE` (KV) to share the cache across isolates. [wrangler.thin.toml](wrangler.thin.toml), [examples/thin.ts](examples/thin.ts).
+Per request the Worker runs L1 (watch paths, method, content type, body size, `always_suspect` patterns, reputation) and checks its fingerprint cache. Only requests that would reach L2 are sent to the origin's `/_jev/authz/<path>` with the body and `X-Forwarded-For`, exactly as Envoy sends them. A block from the origin, any 4xx carrying `X-Jev-Verdict` (so a `policy.block_status` of 429 or 451 too), is a block at the edge whatever the Worker's own thresholds, and is cached as one; a 4xx without `X-Jev-Verdict` is not jev-edge's answer and fails open, as `X-Jev-Verdict: error` from the origin does. Set `upstream` when the app is not behind the same host as the gateway; bind `JEV_CACHE` (KV) to share the cache across isolates. [wrangler.thin.toml](wrangler.thin.toml), [examples/thin.ts](examples/thin.ts).
 
 ### Full Worker
 

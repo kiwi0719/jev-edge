@@ -223,11 +223,50 @@ describe("backend provider (thin Worker)", () => {
   });
 
   it("turns a 403 from the origin into a block at the edge", async () => {
-    stubAuthz(() => new Response('{"error":"request rejected"}', { status: 403, headers: { "X-Jev-Reason": "injection+0.95", "X-Jev-Score": "0.95" } }));
+    stubAuthz(() => new Response('{"error":"request rejected"}', { status: 403, headers: { "X-Jev-Verdict": "malicious", "X-Jev-Reason": "injection+0.95", "X-Jev-Score": "0.95" } }));
     const w = thinWorker({ origin: "https://origin.example", config: { policy: { mode: "enforce" } } });
     const res = await w.fetch(chat(ATTACK), {});
     expect(res.status).toBe(403);
-    expect(res.headers.get("x-jev-score")).toBe("0.95");
+    expect(res.headers.get("x-jev-verdict")).toBe("malicious");
+  });
+
+  it("blocks what the origin blocked below the Worker's threshold, and blocks the replay from its cache", async () => {
+    let authz = 0;
+    // the origin calibrated to block at 0.5; the Worker keeps the default 0.7
+    stubAuthz(() => {
+      authz++;
+      return new Response('{"error":"request rejected"}', { status: 403, headers: { "X-Jev-Verdict": "malicious", "X-Jev-Score": "0.60", "X-Jev-Reason": "injection+0.60" } });
+    });
+    const w = thinWorker({ origin: "https://origin.example", config: { policy: { mode: "enforce" } } });
+    const env = {};
+    expect((await w.fetch(chat(ATTACK), env)).status).toBe(403);
+    const replay = await w.fetch(chat(ATTACK), env);
+    expect(replay.status).toBe(403);
+    expect(replay.headers.get("x-jev-source")).toBe("cache");
+    expect(authz).toBe(1);
+  });
+
+  it("takes the origin's block_status: any 4xx that carries X-Jev-Verdict", async () => {
+    for (const status of [429, 451, 400]) {
+      stubAuthz(() => new Response('{"error":"request rejected"}', { status, headers: { "X-Jev-Verdict": "malicious", "X-Jev-Score": "0.95", "X-Jev-Reason": "injection+0.95" } }));
+      const w = thinWorker({ origin: "https://origin.example", config: { policy: { mode: "enforce" } } });
+      const res = await w.fetch(chat(ATTACK), {});
+      expect(res.status, String(status)).toBe(403);
+      expect(res.headers.get("x-jev-verdict")).toBe("malicious");
+    }
+  });
+
+  it("fails open on a 4xx from the origin without X-Jev-Verdict: not jev-edge's answer", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      stubAuthz(() => new Response("forbidden", { status: 403 }));
+      const w = thinWorker({ origin: "https://origin.example", config: { policy: { mode: "enforce" } } });
+      const res = await w.fetch(chat(ATTACK), {});
+      expect(res.status).toBe(200);
+      expect(((await res.json()) as Record<string, unknown>).verdict).toBe("error");
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("fails open when the origin reports an error", async () => {

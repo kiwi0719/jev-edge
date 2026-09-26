@@ -67,7 +67,7 @@ Your upstream receives `X-Jev-Verdict`, `X-Jev-Score`, `X-Jev-Source`, `X-Jev-Re
 | `PUT /_jev/config` hot reload | the Admin API or a new declarative config: Kong rebuilds the plugin conf and the plugin builds a new runtime for it |
 | `/_jev/health`, `/_jev/metrics`, `/_jev/feedback` | not exposed; Kong's `prometheus` plugin and the log serializer carry the verdict fields |
 | L3 side-path, reputation | same modules, same `async` config |
-| `subject` | same keys; `from = "ip"` uses the forwarded IP; needs the `jev_subject` dict, and `jev_subject_rep` with `reputation` (without it reputation shares `jev_subject`, with a warning) |
+| `subject` | same keys; `from = "ip"` uses the forwarded IP; `from = "header"` naming a header an auth plugin removed (`key-auth`, `basic-auth` ... with `hide_credentials = true`, which run first) falls back to the credential Kong authenticated, never to an anonymous consumer; needs the `jev_subject` dict, and `jev_subject_rep` with `reputation` (without it reputation shares `jev_subject`, with a warning) |
 | `/_jev/samples` | `sampling` is honoured and samples land in `jev_cache`; read them with `sampling.log = true`, or expose `resty.jev.edge.samples()` from a plain OpenResty location on the same box |
 
 One runtime (provider client, breaker, adaptive timeout) is built per plugin conf table and kept until Kong hands over a new one (config change, declarative reload). Breaker, adaptive timeout and in-flight counters are keyed by provider, endpoint and model, so plugin instances calling the same provider share its health. Verdict-cache keys are scoped by rule, templates, deployment context, provider and model (`core.cache_key`).

@@ -43,10 +43,12 @@ local JevEdge = {
   -- 905: after authentication (key-auth 1250, jwt 1450, basic-auth 1100, ...),
   -- ip-restriction (990), request-size-limiting (951), acl (950) and
   -- rate-limiting (910), so a request that is refused anyway never costs a
-  -- judge call and `subject.from = "header"` can key on a credential already
-  -- checked; before response-ratelimiting (900), request-transformer (801)
+  -- judge call; before response-ratelimiting (900), request-transformer (801)
   -- and the ai-* plugins (770s), so the judged body is the one the client
-  -- sent and ai-proxy only ever sees admitted requests.
+  -- sent and ai-proxy only ever sees admitted requests. An auth plugin with
+  -- hide_credentials = true has removed its header by then, so a
+  -- `subject.from = "header"` naming it falls back to the credential Kong
+  -- authenticated (subject_ctx).
   PRIORITY = 905,
 }
 
@@ -172,6 +174,19 @@ local function subject_ctx(rt, req)
     header = function(n) return req.headers[n] end,
     cookie = function(n) return ngx.var["cookie_" .. tostring(n)] end,
   })
+  -- No header: an auth plugin that ran first may have removed it
+  -- (key-auth, basic-auth ... with hide_credentials = true), so the
+  -- credential it authenticated is the subject. The credential, not the
+  -- consumer: an anonymous consumer has no credential, and anonymous
+  -- clients are never pooled into one reputation. Only where there would be
+  -- no subject, so no existing id changes; not with `hashed`, where the
+  -- header is an id another jev-edge computed.
+  if not raw and scfg.from == "header" and not scfg.hashed then
+    local cred = kong.client.get_credential()
+    if type(cred) == "table" and cred.id ~= nil and cred.id ~= null then
+      raw = "kong-credential:" .. tostring(cred.id)
+    end
+  end
   local id = subject_m.hash_id(scfg, raw, sha256_hex)
   if not id then return nil end
   local rep_on = type(scfg.reputation) == "table" and (tonumber(scfg.reputation.block_at) or 0) > 0

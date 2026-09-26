@@ -121,6 +121,36 @@ services:
               policy: { mode: enforce }
               cache: { fp_ttl: 0.001 }
               async: { enabled: false }
+      # key-auth (1250) with hide_credentials removes X-Api-Key before
+      # jev-edge (905) runs: the subject named by that header is the
+      # credential Kong authenticated, so one key's reputation still builds.
+      - name: keyed
+        paths: ["/keyed"]
+        strip_path: false
+        plugins:
+          - name: key-auth
+            config: { key_names: [x-api-key], hide_credentials: true }
+          - name: jev-edge
+            config:
+              jev: { provider: mock, mock_score: 0.2, mock_header: x-jev-mock-score, timeout_ms: 300 }
+              rules_json: '[{"id":"keyed","extends":"llm-endpoints","watch_paths":["^/keyed/"]}]'
+              policy: { mode: enforce }
+              subject:
+                enabled: true
+                from: header
+                name: x-api-key
+                salt: e2e-salt
+                reputation: { block_at: 3, window_s: 60, block_ttl: 60, suspicious: 1, malicious: 3 }
+              cache: { fp_ttl: 0.001 }
+              async: { enabled: false }
+              log_line: true
       - name: plain
         paths: ["/plain"]
         strip_path: false
+consumers:
+  - username: key-alice
+    keyauth_credentials:
+      - key: alice-key
+  - username: key-bob
+    keyauth_credentials:
+      - key: bob-key

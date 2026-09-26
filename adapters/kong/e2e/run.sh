@@ -116,6 +116,15 @@ check "a questions_json core refuses is refused" "yes" \
 check "provider laya judges" "app verdict=safe score=0.10 source=l2" "$(post /laya/chat/completions '' "$LONG")"
 check "provider laya blocks an injection" "403" \
   "$(curl -s -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' -d "$ATTACK" $base/laya/chat/completions)"
+# key-auth with hide_credentials: the X-Api-Key subject is the credential
+code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' -H 'X-Api-Key: alice-key' -H 'X-Jev-Mock-Score: 0.97' -d "$ATTACK" $base/keyed/chat/completions)
+check "hidden key: an injection is blocked" "403" "$code"
+code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' -H 'X-Api-Key: alice-key' -d "$LONG" $base/keyed/chat/completions)
+check "hidden key: that key's credential is then refused" "403" "$code"
+check "hidden key: another key is not" "app verdict=safe score=0.20 source=l2" \
+  "$(curl -s -H 'Content-Type: application/json' -H 'X-Api-Key: bob-key' -d "$LONG" $base/keyed/chat/completions)"
+check "hidden key: the decision names a subject" "yes" \
+  "$(docker compose logs kong 2>/dev/null | grep 'jev-edge: {' | grep 'keyed' | grep -q '"subject":"header:' && echo yes || echo no)"
 check "log_line writes the decision" "yes" "$(docker compose logs kong 2>/dev/null | grep -q 'jev-edge: {.*"verdict":"malicious"' && echo yes || echo no)"
 
 if [ $fail -ne 0 ]; then echo; echo "--- kong logs"; docker compose logs kong | tail -40; exit 1; fi

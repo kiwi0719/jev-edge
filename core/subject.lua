@@ -161,6 +161,12 @@ end
 -- `charge == false` (none of its own text judged, which with untrusted
 -- judging on includes a text that holds retrieved content) not at all.
 -- Every id of the request is charged (ids_of).
+-- One request can reach an adapter twice: a thin Worker asks the origin's
+-- /_jev/authz, then forwards the request to that same origin. Two optional
+-- hooks on ctx.subject let the adapter charge it once:
+--   counted(fp)     true: the other leg already added these points, add none
+--   on_counted(fp)  called after the points are added
+-- (fp: the verdict's fingerprint). Errors in either are swallowed.
 -- @param charge optional: the label to charge instead of v.verdict, or false
 -- @return the highest points total among the ids, or nil
 function _M.rep_record(ctx, v, charge)
@@ -174,6 +180,11 @@ function _M.rep_record(ctx, v, charge)
   if label == "malicious" then w = tonumber(r.malicious) or 3
   elseif label == "suspicious" then w = tonumber(r.suspicious) or 1 end
   if w <= 0 then return nil end
+  local s = ctx.subject
+  if type(s.counted) == "function" then
+    local ok, done = pcall(s.counted, v.fingerprint)
+    if ok and done then return nil end
+  end
   local best
   for _, id in ipairs(ids) do
     local ok, points = pcall(function()
@@ -192,6 +203,7 @@ function _M.rep_record(ctx, v, charge)
     end)
     if ok and points and (not best or points > best) then best = points end
   end
+  if type(s.on_counted) == "function" then pcall(s.on_counted, v.fingerprint) end
   return best
 end
 

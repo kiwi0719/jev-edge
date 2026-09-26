@@ -281,6 +281,12 @@ export interface SubjectCtx {
   record?: (entry: Entry) => void | Promise<void>;
   /** Store for subject reputation counters (see repRecord); optional. */
   store?: Store;
+  /** Optional, port of ctx.subject.counted in core/subject.lua: true when the
+   *  other leg of this request (an origin's /_jev/authz call, then the
+   *  request forwarded to it) already added its points; repRecord adds none. */
+  counted?: (fp: string) => boolean | Promise<boolean>;
+  /** Optional, port of ctx.subject.on_counted: called after the points are added. */
+  onCounted?: (fp: string) => void | Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -353,6 +359,14 @@ export async function repRecord(ctx: RepCtx, v: Verdict, charge?: string | false
   if (label === "malicious") w = r.malicious ?? 3;
   else if (label === "suspicious") w = r.suspicious ?? 1;
   if (!(w > 0)) return null;
+  const s = ctx.subject!;
+  if (typeof s.counted === "function") {
+    try {
+      if (await s.counted(v.fingerprint)) return null;
+    } catch {
+      /* swallowed, as in Lua (pcall) */
+    }
+  }
   let best: number | null = null;
   // every id of the request is charged (idsOf)
   for (const id of ids) {
@@ -371,6 +385,13 @@ export async function repRecord(ctx: RepCtx, v: Verdict, charge?: string | false
       if (best === null || p > best) best = p;
     } catch {
       /* swallowed, as in Lua (pcall per id) */
+    }
+  }
+  if (typeof s.onCounted === "function") {
+    try {
+      await s.onCounted(v.fingerprint);
+    } catch {
+      /* swallowed, as in Lua (pcall) */
     }
   }
   return best;

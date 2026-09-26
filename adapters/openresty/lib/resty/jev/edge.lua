@@ -209,10 +209,22 @@ local function maybe_sample(cfg, v, req, rules)
   if not ok then ngx.log(ngx.WARN, "jev-edge: sampling failed: ", err) end
 end
 
+-- One request, two legs: a thin Worker asks /_jev/authz here (leg "authz"),
+-- then forwards the request to this same origin (leg "access"), both with
+-- the same X-Jev-Subject, and each leg would add the verdict's reputation
+-- points. The authz leg leaves a marker per (subject, fingerprint) for
+-- COUNTED_TTL seconds when it adds points; the forwarded leg consumes one
+-- instead of adding them again. incr without init is atomic across workers
+-- and never creates the key, so one marker suppresses exactly one forwarded
+-- leg, and a forwarded leg with none (the Worker answered from its cache) is
+-- charged as usual. Both legs still check the block.
+local COUNTED_TTL = 30
+local function counted_key(id, fp) return subject_m.REP_PREFIX .. id .. ":a:" .. tostring(fp) end
+
 -- Per-subject trajectory: id extracted per cfg.subject, hashed with the salt
 -- before anything stores or logs it; history read once here; the write is a
 -- ring append (see core/subject.lua) and does not yield.
-local function subject_ctx(cfg, req)
+local function subject_ctx(cfg, req, leg)
   local scfg = cfg.subject
   if not scfg or not scfg.enabled then return nil end
   -- the raw Cookie header(s), not the cookie variable: nginx's $cookie_<name>
@@ -229,7 +241,7 @@ local function subject_ctx(cfg, req)
   if not id then return nil end
   subject_store = subject_store or cache_m.new(SUBJECT_DICT)
   local store = subject_store
-  return {
+  local subj = {
     id = id,
     ids = ids,
     history = subject_m.ring_load(store, id, scfg.max_entries),
@@ -241,13 +253,30 @@ local function subject_ctx(cfg, req)
     -- reputation counters (subject.reputation): incr is atomic in the dict
     store = store,
   }
+  if leg == "authz" then
+    subj.on_counted = function(fp)
+      if fp and fp ~= "" then store:incr(counted_key(id, fp), 1, COUNTED_TTL) end
+    end
+  elseif leg == "access" then
+    subj.counted = function(fp)
+      local dict = store.dict
+      if not dict or not fp or fp == "" then return false end
+      local k = counted_key(id, fp)
+      local n = dict:incr(k, -1)
+      -- none left: put the count back, so the next marker is not eaten
+      if n and n < 0 then dict:incr(k, 1) end
+      return n ~= nil and n >= 0
+    end
+  end
+  return subj
 end
 
-local function evaluate_current(cfg, rules, over)
+-- leg: "access" (the request itself) or "authz" (a relay asking about it)
+local function evaluate_current(cfg, rules, over, leg)
   ensure_runtime(cfg)
   strip_inbound()
   local req = build_req(rules, over)
-  local subj = subject_ctx(cfg, req)
+  local subj = subject_ctx(cfg, req, leg)
   ngx.ctx.jev_subject = subj and subj.id or nil
   local v = core.evaluate(req, {
     config = cfg, rules = rules, cache = cache, trust = state_store(), judge = judge, breaker = breaker, subject = subj,
@@ -274,7 +303,7 @@ function _M.access()
   local rules = config.rules()
   local v
   local ok, err = pcall(function()
-    v = evaluate_current(cfg, rules)
+    v = evaluate_current(cfg, rules, nil, "access")
     set_headers(v)
   end)
 
@@ -582,7 +611,7 @@ end
 local function respond_authz(cfg, rules, over, who)
   local v
   local ok, err = pcall(function()
-    v = evaluate_current(cfg, rules, over)
+    v = evaluate_current(cfg, rules, over, "authz")
   end)
   if not ok then
     ngx.log(ngx.ERR, "jev-edge: ", who, " error, failing open: ", err)

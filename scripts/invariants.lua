@@ -285,6 +285,37 @@ rule("grafana-state-timeline", function(r)
   if n == 0 then fail(r, f .. ": no state-timeline panel found") end
 end)
 
+-- 9c. A legend's {{label}} is a label the query keeps: an aggregation
+--     without `by` drops every label, and the Subject reputation blocks
+--     legend read "Value" under {{instance}} (audit lead-github-ops#34)
+rule("grafana-legend", function(r)
+  local f = "ops/grafana/jev-edge.json"
+  local s = read(f) or ""
+  local aggs = { sum = true, max = true, min = true, avg = true, count = true, group = true,
+                 stddev = true, stdvar = true }
+  local n, seen = 0, 0
+  for _ in s:gmatch('"legendFormat"%s*:') do n = n + 1 end
+  for raw, legend in s:gmatch('"expr"%s*:%s*"(.-[^\\])"%s*,%s*"legendFormat"%s*:%s*"([^"]*)"') do
+    seen = seen + 1
+    local expr = raw:gsub('\\"', '"')
+    local agg, by = expr:match("^%s*(%a+)%s+by%s*(%b())")
+    if not agg then
+      agg = expr:match("^%s*(%a+)%s*%(")
+      by = agg and aggs[agg] and (expr:match("%)%s*by%s*(%b())%s*$") or "()")
+    end
+    if agg and aggs[agg] and by then
+      local kept = {}
+      for l in by:gmatch("[%w_]+") do kept[l] = true end
+      for l in legend:gmatch("{{%s*([%w_]+)%s*}}") do
+        if not kept[l] then
+          fail(r, f .. ": legend " .. legend .. " names " .. l .. ", which " .. agg .. " drops in " .. expr)
+        end
+      end
+    end
+  end
+  if seen ~= n then fail(r, f .. ": read " .. seen .. " of " .. n .. " targets with a legend") end
+end)
+
 -- 10. The shipped rule set is the same in Lua and TypeScript
 rule("rule-parity", function(r)
   local lua = read("rules/llm-endpoints.lua") or ""

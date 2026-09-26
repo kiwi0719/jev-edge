@@ -177,6 +177,24 @@ def ort_providers(spec: str | None, available: list[str]) -> list[str]:
     return names
 
 
+def load_tokenizer(model_dir: str):
+    """The model's tokenizers Tokenizer (tokenizer.json) set up the way the
+    server encodes: no truncation (the server windows the text), no padding
+    (it pads a batch itself), and the special tokens' text in a judged text
+    or a deployment context encoded as text. Without encode_special_tokens,
+    a "[SEP]" or "[PAD]" (or "</s>", "<|endoftext|>") a client wrote became
+    that control token's id: a text could end its segment early or start a
+    third one, and the model read an input it never saw in training. The
+    structural [CLS] / [SEP] the post-processor adds are unaffected."""
+    from tokenizers import Tokenizer
+
+    tok = Tokenizer.from_file(os.path.join(model_dir, "tokenizer.json"))
+    tok.no_truncation()
+    tok.no_padding()
+    tok.encode_special_tokens = True
+    return tok
+
+
 class OnnxBackend:
     """A sequence-pair classifier exported to ONNX with a tokenizers tokenizer."""
 
@@ -187,12 +205,9 @@ class OnnxBackend:
         # own choice, which counts the host's cores, not a container's quota
         import numpy as np
         import onnxruntime as ort
-        from tokenizers import Tokenizer
 
         self.np = np
-        self.tok = Tokenizer.from_file(os.path.join(model_dir, "tokenizer.json"))
-        self.tok.no_truncation()
-        self.tok.no_padding()
+        self.tok = load_tokenizer(model_dir)
         opts = ort.SessionOptions()
         if threads:
             opts.intra_op_num_threads = threads

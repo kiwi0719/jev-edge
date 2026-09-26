@@ -831,6 +831,61 @@ class ContentLength(unittest.TestCase):
         self.assertNotIn("Traceback", log)
 
 
+def _has_tokenizers() -> bool:
+    try:
+        import tokenizers  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+@unittest.skipUnless(_has_tokenizers(), "tokenizers not installed")
+class SpecialTokensInText(unittest.TestCase):
+    """g1-provider-wire-parity#6: the onnx backend encoded a "[SEP]" or
+    "[PAD]" written in the judged text as the control token's id, so a
+    client could end its segment early, start a third one, or pad inside
+    the text; the model read an input it was never trained on."""
+
+    def setUp(self):
+        from tokenizers import Tokenizer, models, pre_tokenizers, processors
+
+        vocab = {w: i for i, w in enumerate(["[UNK]", "[CLS]", "[SEP]", "[PAD]", "a", "b", "is", "it",
+                                              "[", "]", "SEP", "PAD", "?"])}
+        tok = Tokenizer(models.WordLevel(vocab, unk_token="[UNK]"))
+        tok.pre_tokenizer = pre_tokenizers.Whitespace()
+        tok.add_special_tokens(["[CLS]", "[SEP]", "[PAD]"])
+        tok.post_processor = processors.BertProcessing(("[SEP]", vocab["[SEP]"]), ("[CLS]", vocab["[CLS]"]))
+        self.vocab = vocab
+        self.dir = tempfile.mkdtemp()
+        tok.save(os.path.join(self.dir, "tokenizer.json"))
+
+    def tearDown(self):
+        os.unlink(os.path.join(self.dir, "tokenizer.json"))
+        os.rmdir(self.dir)
+
+    def test_a_pair_carries_only_the_structural_special_tokens(self):
+        tok = L.load_tokenizer(self.dir)
+        enc = tok.encode("is it ?", "a [SEP] b [PAD]")
+        self.assertEqual(enc.ids.count(self.vocab["[SEP]"]), 2, enc.tokens)  # [CLS] q [SEP] text [SEP]
+        self.assertEqual(enc.ids.count(self.vocab["[CLS]"]), 1, enc.tokens)
+        self.assertNotIn(self.vocab["[PAD]"], enc.ids, enc.tokens)
+        self.assertEqual(enc.tokens, ["[CLS]", "is", "it", "?", "[SEP]", "a", "[", "SEP", "]", "b", "[", "PAD", "]",
+                                      "[SEP]"])
+        self.assertEqual(enc.type_ids, [0] * 5 + [1] * 9)  # the text is one segment, to its end
+        # no truncation and no padding, as the server windows and pads itself
+        self.assertEqual(len(tok.encode("a " * 3000, add_special_tokens=False).ids), 3000)
+
+    def test_spans_and_count_read_special_token_text_as_text(self):
+        b = L.OnnxBackend.__new__(L.OnnxBackend)  # the tokenizer part only: no model needed
+        b.tok = L.load_tokenizer(self.dir)
+        b.pair_overhead = b.tok.post_processor.num_special_tokens_to_add(True)
+        text = "a [SEP] b"
+        self.assertEqual(b.count(text), 5)
+        self.assertEqual([text[x:y] for x, y in b.spans(text)], ["a", "[", "SEP", "]", "b"])
+        s = L.Scorer(b, max_tokens=64, overlap=8, max_windows=4)
+        self.assertEqual(s.windows("is it ?", text), [text])
+
+
 class Cpus(unittest.TestCase):
     """Pool sizes come from the CPUs this process may use, not the host's
     count: a container limited to 2 CPUs on a 64-core host got 64 workers,

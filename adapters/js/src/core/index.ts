@@ -406,6 +406,17 @@ export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
     }
   }
 
+  // capped ----------------------------------------------------------------
+  // max_judge_chunks > 1: what still did not fit is unjudgeable. An L1
+  // decision that needs no provider, so it comes before the breaker: an open
+  // breaker must not turn it into a pass (core/init.lua).
+  if (chunks && chunks.length > 1 && capped && cfg.policy.unjudgeable === "block" && cfg.policy.mode === "enforce") {
+    return finish(ctx, verdict.newVerdict({
+      action: verdict.ACTION_BLOCK, verdict: verdict.SKIPPED, source: verdict.SRC_L1,
+      reason: "unjudgeable: text over max_judge_chunks", fingerprint: fp,
+    }));
+  }
+
   // breaker ---------------------------------------------------------------
   if (ctx.breaker && !(await ctx.breaker.allow())) {
     const [action, label, async] = policy.onSkipped();
@@ -413,16 +424,6 @@ export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
   }
 
   // L2 --------------------------------------------------------------------
-  if (chunks && chunks.length > 1) {
-    // max_judge_chunks > 1: what still did not fit is unjudgeable
-    if (capped && cfg.policy.unjudgeable === "block" && cfg.policy.mode === "enforce") {
-      await settle(ctx);
-      return finish(ctx, verdict.newVerdict({
-        action: verdict.ACTION_BLOCK, verdict: verdict.SKIPPED, source: verdict.SRC_L1,
-        reason: "unjudgeable: text over max_judge_chunks", fingerprint: fp,
-      }));
-    }
-  }
   const inParts = (chunks && chunks.length > 1) || !!untrusted || !!tools;
   // what the score covers, as the reason says it (plan() in core/init.lua)
   let suffix = windowed ? " (window)" : "";

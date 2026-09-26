@@ -232,6 +232,25 @@ describe("core.evaluate end to end", function()
     assert.is_true(v.async)
   end)
 
+  it("blocks text over max_judge_chunks under unjudgeable = block while the breaker is open (core-pipeline#9)",
+    function()
+    local rules = require "jev.core.rules"
+    local rule = assert(rules.resolve({ id = "long", extends = "llm-endpoints", max_judge_bytes = 256,
+      max_judge_chunks = 2 }, function(x) return require("jev.rules." .. x) end))
+    local calls = 0
+    local ctx = H.ctx({ rules = { rule }, config = { policy = { mode = "enforce", unjudgeable = "block" } },
+      judge = { call = function() calls = calls + 1; return { injection = 0 } end } })
+    ctx.breaker = B.new(H.store(), ctx.clock, {})
+    ctx.breaker:trip()
+    local v = core.evaluate(H.chat_req(string.rep("The quarterly report covers revenue. ", 40)), ctx)
+    assert.equals(0, calls)
+    assert.equals(V.ACTION_BLOCK, v.action)
+    assert.equals(V.SKIPPED, v.verdict)
+    assert.equals(V.SRC_L1, v.source)
+    assert.equals("unjudgeable: text over max_judge_chunks", v.reason)
+    assert.equals(B.OPEN, ctx.breaker:state())
+  end)
+
   it("blocks bad reputation at L1 in enforce mode without calling L2", function()
     local calls = 0
     local ctx = H.ctx({

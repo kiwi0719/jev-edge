@@ -443,6 +443,19 @@ function _M.evaluate(req, ctx)
     end
   end
 
+  -- capped --------------------------------------------------------------
+  -- max_judge_chunks > 1 was the operator's choice to judge long text in
+  -- full; what still did not fit is unjudgeable, and policy.unjudgeable
+  -- decides as it does for any other unreadable request. An L1 decision
+  -- that needs no provider: an open breaker must not turn it into a pass.
+  if chunks and #chunks > 1 and capped and cfg.policy.unjudgeable == "block"
+     and cfg.policy.mode == "enforce" then
+    return finish(ctx, verdict.new({
+      action = verdict.ACTION_BLOCK, verdict = verdict.SKIPPED, source = verdict.SRC_L1,
+      reason = "unjudgeable: text over max_judge_chunks", fingerprint = fp,
+    }))
+  end
+
   -- breaker -------------------------------------------------------------
   if ctx.breaker and not ctx.breaker:allow() then
     local action, label, async = policy.on_skipped()
@@ -453,18 +466,6 @@ function _M.evaluate(req, ctx)
   end
 
   -- L2 ------------------------------------------------------------------
-  if chunks and #chunks > 1 then
-    -- max_judge_chunks > 1 was the operator's choice to judge long text in
-    -- full; what still did not fit is unjudgeable, and policy.unjudgeable
-    -- decides as it does for any other unreadable request
-    if capped and cfg.policy.unjudgeable == "block" and cfg.policy.mode == "enforce" then
-      settle(ctx)
-      return finish(ctx, verdict.new({
-        action = verdict.ACTION_BLOCK, verdict = verdict.SKIPPED, source = verdict.SRC_L1,
-        reason = "unjudgeable: text over max_judge_chunks", fingerprint = fp,
-      }))
-    end
-  end
   if p.parts and not ctx.judge.whole then return judge_parts(ctx, rule, p.parts, p.suffix, fp, ckey, reason) end
   -- One piece; or a provider that judges the whole request in one call
   -- (ctx.judge.whole): all of it in one prompt (every chunk, the retrieved

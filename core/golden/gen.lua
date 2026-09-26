@@ -1318,7 +1318,8 @@ local function eval_case(name, spec)
       judge_calls = calls, prompt = prompt_seen or NULL, cache_writes = writes,
       subject_record = recorded or NULL,
       subject_store_writes = subject_writes or NULL,
-      breaker = brk and { calls = brk_calls, state = brk:state() } or NULL,
+      -- a request decided before the breaker is asked makes no call on it
+      breaker = brk and { calls = #brk_calls > 0 and brk_calls or EMPTY_LIST, state = brk:state() } or NULL,
     },
   }
 end
@@ -1705,6 +1706,13 @@ eval_case("chunks: over max_judge_chunks, the newest chunks whole and a window o
 eval_case("chunks: over max_judge_chunks with policy.unjudgeable = block is blocked in enforce", {
   req = req(OVER), rules = { CHUNKED }, config = { policy = { mode = "enforce", unjudgeable = "block" } },
   judge = { answers = { injection = 0.2 } } })
+-- a decision that needs no provider: made before the breaker is asked, so an
+-- open breaker does not pass it (core-pipeline#9)
+for _, st in ipairs({ "open", "closed" }) do
+  eval_case("chunks: over max_judge_chunks with policy.unjudgeable = block is blocked, breaker " .. st, {
+    req = req(OVER), rules = { CHUNKED }, config = { policy = { mode = "enforce", unjudgeable = "block" } },
+    breaker = st, judge = { answers = { injection = 0.2 } } })
+end
 eval_case("chunks: a judge error on a chunk is an error", {
   req = req(FITS), rules = { CHUNKED }, config = { policy = { mode = "enforce" } },
   judge = { error = "timeout" } })
@@ -1718,7 +1726,7 @@ eval_case("chunks: a 5xx on the chunks is one breaker failure", {
 eval_case("chunks: an unusable answer on the chunks is not a breaker failure", {
   req = req(FITS), rules = { CHUNKED }, breaker = "closed", config = { policy = { mode = "enforce" } },
   judge = { error = "laya: malformed response", kind = "unusable" } })
-eval_case("chunks: a half-open probe blocked as unjudgeable hands the probe on", {
+eval_case("chunks: a request blocked as unjudgeable never takes the half-open probe", {
   req = req(OVER), rules = { CHUNKED }, breaker = "half-open",
   config = { policy = { mode = "enforce", unjudgeable = "block" } }, judge = { answers = { injection = 0.2 } } })
 -- 128 bytes: the always_suspect phrase (bytes 39-70) is longer than the

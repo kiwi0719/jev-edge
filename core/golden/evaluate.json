@@ -9630,6 +9630,138 @@
     },
     {
       "expect": {
+        "breaker": {
+          "calls": [],
+          "state": 1
+        },
+        "cache_writes": {},
+        "headers": {
+          "X-Jev-Reason": "unjudgeable%3A+text+over+max_judge_chunks",
+          "X-Jev-Score": "0.00",
+          "X-Jev-Source": "l1",
+          "X-Jev-Verdict": "skipped"
+        },
+        "judge_calls": 0,
+        "prompt": null,
+        "subject_record": null,
+        "subject_store_writes": null,
+        "verdict": {
+          "action": "block",
+          "async": false,
+          "error_kind": "",
+          "fingerprint": "7646af02",
+          "l2_ms": 0,
+          "reason": "unjudgeable: text over max_judge_chunks",
+          "score": 0,
+          "source": "l1",
+          "verdict": "skipped"
+        }
+      },
+      "input": {
+        "breaker": "open",
+        "cache": {},
+        "clock": 1000,
+        "config": {
+          "policy": {
+            "mode": "enforce",
+            "unjudgeable": "block"
+          }
+        },
+        "judge": {
+          "answers": {
+            "injection": 0.2
+          }
+        },
+        "req": {
+          "body": "{\"messages\":[{\"role\":\"user\",\"content\":\"Please summarise the quarterly report. Please summarise the quarterly report. Please summarise the quarterly report. Please summarise the quarterly report. Please summarise the quarterly report. Please summarise the quarterly report. Please summarise the quarterly report. Please summarise the quarterly report. \"}]}",
+          "body_size": 355,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/v1/chat/completions"
+        },
+        "rules": [
+          {
+            "extends": "llm-endpoints",
+            "id": "chunked",
+            "max_judge_bytes": 64,
+            "max_judge_chunks": 3
+          }
+        ],
+        "subject": null
+      },
+      "name": "chunks: over max_judge_chunks with policy.unjudgeable = block is blocked, breaker open"
+    },
+    {
+      "expect": {
+        "breaker": {
+          "calls": [],
+          "state": 0
+        },
+        "cache_writes": {},
+        "headers": {
+          "X-Jev-Reason": "unjudgeable%3A+text+over+max_judge_chunks",
+          "X-Jev-Score": "0.00",
+          "X-Jev-Source": "l1",
+          "X-Jev-Verdict": "skipped"
+        },
+        "judge_calls": 0,
+        "prompt": null,
+        "subject_record": null,
+        "subject_store_writes": null,
+        "verdict": {
+          "action": "block",
+          "async": false,
+          "error_kind": "",
+          "fingerprint": "7646af02",
+          "l2_ms": 0,
+          "reason": "unjudgeable: text over max_judge_chunks",
+          "score": 0,
+          "source": "l1",
+          "verdict": "skipped"
+        }
+      },
+      "input": {
+        "breaker": "closed",
+        "cache": {},
+        "clock": 1000,
+        "config": {
+          "policy": {
+            "mode": "enforce",
+            "unjudgeable": "block"
+          }
+        },
+        "judge": {
+          "answers": {
+            "injection": 0.2
+          }
+        },
+        "req": {
+          "body": "{\"messages\":[{\"role\":\"user\",\"content\":\"Please summarise the quarterly report. Please summarise the quarterly report. Please summarise the quarterly report. Please summarise the quarterly report. Please summarise the quarterly report. Please summarise the quarterly report. Please summarise the quarterly report. Please summarise the quarterly report. \"}]}",
+          "body_size": 355,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/v1/chat/completions"
+        },
+        "rules": [
+          {
+            "extends": "llm-endpoints",
+            "id": "chunked",
+            "max_judge_bytes": 64,
+            "max_judge_chunks": 3
+          }
+        ],
+        "subject": null
+      },
+      "name": "chunks: over max_judge_chunks with policy.unjudgeable = block is blocked, breaker closed"
+    },
+    {
+      "expect": {
         "breaker": null,
         "cache_writes": {},
         "headers": {
@@ -9934,10 +10066,7 @@
     {
       "expect": {
         "breaker": {
-          "calls": [
-            "allow",
-            "release"
-          ],
+          "calls": [],
           "state": 2
         },
         "cache_writes": {},
@@ -9998,7 +10127,7 @@
         ],
         "subject": null
       },
-      "name": "chunks: a half-open probe blocked as unjudgeable hands the probe on"
+      "name": "chunks: a request blocked as unjudgeable never takes the half-open probe"
     },
     {
       "expect": {

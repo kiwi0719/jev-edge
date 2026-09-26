@@ -48,12 +48,16 @@ end
 -- the subject's own parts, the text it wrote. Retrieved content and tool
 -- definitions come from elsewhere (a web page, a mailbox, an MCP server the
 -- user may not control): their score decides the request, but charging it
--- would let anyone who plants text there get users blocked. nil (the
--- verdict's own label) when the subject's own text scored the request's
--- score, its own score when a part it is not charged for scored higher, and
--- false when none of its own text was judged. The whole request's cache
--- entry keeps it as `rep`, so a hit charges the same; L3 charges IP
--- reputation on the same label (l3_result).
+-- would let anyone who plants text there get users blocked. With untrusted
+-- judging on, the text is not the subject's own either when it holds
+-- retrieved content (a role "tool" message, a Responses *_output item: L1's
+-- `retrieved`), since its one score cannot say which of the two it is for;
+-- with untrusted judging off the text is charged whole, as it always was.
+-- nil (the verdict's own label) when the subject's own text scored the
+-- request's score, its own score when a part it is not charged for scored
+-- higher, and false when none of its own text was judged. The whole
+-- request's cache entry keeps it as `rep`, so a hit charges the same; L3
+-- charges IP reputation on the same label (l3_result).
 local function rep_of(best, own)
   if own == nil then return false end
   if own == best then return nil end
@@ -129,7 +133,7 @@ local TOOLS_LABEL = "tools+"
 -- request's fingerprint and whole-request cache key, the judge's context,
 -- and, when it is judged in more than one piece, the parts and the suffix
 -- their reason takes (for one piece, the suffix its reason takes).
-local function plan(req, cfg, hash, rule, text, windowed, chunks, capped, untrusted, tools)
+local function plan(req, cfg, hash, rule, text, windowed, chunks, capped, untrusted, tools, retrieved)
   local whole = text
   if untrusted then whole = whole .. UNTRUSTED_SEP .. untrusted.text end
   if tools then whole = whole .. TOOLS_SEP .. tools.text end
@@ -149,6 +153,8 @@ local function plan(req, cfg, hash, rule, text, windowed, chunks, capped, untrus
     path = req.path or "", method = req.method or "",
     deployment = rule.deployment_context or cfg.jev.deployment_context or "",
   }
+  -- the text holds retrieved content: not the subject's own (rep_of)
+  if retrieved then p.rep = false end
   if not ((chunks and #chunks > 1) or untrusted or tools) then
     -- the score is for the window, not the whole text; the reason says so
     p.suffix = windowed and " (window)" or ""
@@ -158,7 +164,7 @@ local function plan(req, cfg, hash, rule, text, windowed, chunks, capped, untrus
   -- the text only stands aside when it alone would have passed
   if not ((untrusted and untrusted.only) or (tools and tools.only)) then
     for _, c in ipairs((chunks and #chunks > 1) and chunks or { text }) do
-      parts[#parts + 1] = { text = c, templates = rule.templates, context = p.context }
+      parts[#parts + 1] = { text = c, templates = rule.templates, context = p.context, rep = p.rep }
     end
   end
   local suffix = ""
@@ -197,8 +203,9 @@ end
 -- @param parts  list of { text, templates, context, over, label, rep } (over:
 --               cache_key's; label: put before the template name in the
 --               reason when this part's score decides; rep = false: not the
---               subject's own text (retrieved content, tool definitions),
---               its score is not charged to it)
+--               subject's own text (retrieved content, tool definitions, a
+--               text that holds retrieved content), its score is not charged
+--               to it)
 -- @param suffix appended to the reason when a part answered
 local function judge_parts(ctx, rule, parts, suffix, fp, ckey, reason)
   local cfg = ctx.config
@@ -291,7 +298,8 @@ function _M.evaluate(req, ctx)
   local cfg = ctx.config
 
   -- L1 ------------------------------------------------------------------
-  local r, text, reason, rule, windowed, chunks, capped, untrusted, tools = rules_mod.evaluate_all(req, ctx.rules, ctx)
+  local r, text, reason, rule, windowed, chunks, capped, untrusted, tools, retrieved =
+    rules_mod.evaluate_all(req, ctx.rules, ctx)
 
   if r == rules_mod.PASS then
     return verdict.new({ verdict = verdict.SKIPPED, source = verdict.SRC_L1, reason = reason })
@@ -313,7 +321,7 @@ function _M.evaluate(req, ctx)
     }))
   end
 
-  local p = plan(req, cfg, ctx.hash, rule, text, windowed, chunks, capped, untrusted, tools)
+  local p = plan(req, cfg, ctx.hash, rule, text, windowed, chunks, capped, untrusted, tools, retrieved)
   local fp, ckey = p.fp, p.key
 
   -- trust ---------------------------------------------------------------
@@ -343,6 +351,8 @@ function _M.evaluate(req, ctx)
       -- amplifier (one suspicious prompt repeated N times = N L3 calls).
       local rep = hit.rep
       if rep ~= false and type(rep) ~= "number" then rep = nil end
+      -- none of this request's own text was judged alone: whatever the entry says
+      if p.rep == false then rep = false end
       return finish(ctx, verdict.new({
         action = action, verdict = label, score = hit.score, async = false,
         source = verdict.SRC_CACHE, reason = hit.reason or reason, fingerprint = fp,
@@ -416,13 +426,13 @@ function _M.evaluate(req, ctx)
   if windowed and top ~= "" then why = why .. " (window)" end
 
   if ckey and ctx.cache then
-    ctx.cache:set(ckey, { score = score, reason = why }, cfg.cache.fp_ttl)
+    ctx.cache:set(ckey, { score = score, reason = why, rep = p.rep }, cfg.cache.fp_ttl)
   end
 
   return finish(ctx, verdict.new({
     action = action, verdict = label, score = score, async = async,
     source = verdict.SRC_L2, reason = why, fingerprint = fp, l2_ms = elapsed,
-  }))
+  }), p.rep)
 end
 
 -- ---------------------------------------------------------------------------
@@ -444,13 +454,13 @@ end
 --         nil), reason (L1's), suffix, parts = { { prompt, key, label, rep } } }
 function _M.l3_job(req, ctx)
   local cfg = ctx.config
-  local r, text, reason, rule, windowed, chunks, capped, untrusted, tools = rules_mod.evaluate_all(req, ctx.rules,
-    { config = cfg, json_decode = ctx.json_decode, re_find = ctx.re_find, log = ctx.log })
+  local r, text, reason, rule, windowed, chunks, capped, untrusted, tools, retrieved = rules_mod.evaluate_all(req,
+    ctx.rules, { config = cfg, json_decode = ctx.json_decode, re_find = ctx.re_find, log = ctx.log })
   if r ~= rules_mod.SUSPECT then return nil end
-  local p = plan(req, cfg, ctx.hash, rule, text, windowed, chunks, capped, untrusted, tools)
+  local p = plan(req, cfg, ctx.hash, rule, text, windowed, chunks, capped, untrusted, tools, retrieved)
   local job = { fingerprint = p.fp, key = p.key, reason = reason, suffix = p.suffix, parts = {} }
   -- one piece: its answer is the whole request's
-  local parts = p.parts or { { text = text, templates = rule.templates, context = p.context } }
+  local parts = p.parts or { { text = text, templates = rule.templates, context = p.context, rep = p.rep } }
   for i, part in ipairs(parts) do
     local prompt = judge.build(part.templates, part.text, part.context)
     if not prompt then return nil end

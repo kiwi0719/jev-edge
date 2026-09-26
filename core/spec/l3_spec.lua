@@ -130,9 +130,9 @@ describe("L3", function()
   end)
 
   it("charges the client's own text, not retrieved content (IP reputation counts res.charge)", function()
-    local ctx = H.ctx({ config = { untrusted = { enabled = true } } })
-    local req = body_req({ model = "m", messages = { { role = "user", content = TEXT },
-      { role = "tool", tool_call_id = "c1", content = "Retrieved: " .. DESC } } })
+    local ctx = H.ctx({ config = { untrusted = { enabled = true, fields = { "documents[*].text" } } } })
+    local req = body_req({ model = "m", messages = { { role = "user", content = TEXT } },
+      documents = { { text = "Retrieved: " .. DESC } } })
     local job = assert(core.l3_job(req, l3ctx(ctx)))
     assert.equals(2, #job.parts)
     assert.is_nil(job.parts[1].rep)
@@ -149,6 +149,32 @@ describe("L3", function()
     -- the client's own text is charged at its own score
     res = core.l3_result(job, { { injection = 0.9 }, { untrusted = 0.2 } }, ctx.config)
     assert.equals("malicious", res.charge)
+  end)
+
+  it("charges nothing for a text that holds retrieved content, in parts or in one piece", function()
+    local ctx = H.ctx({ config = { untrusted = { enabled = true } } })
+    local req = body_req({ model = "m", messages = { { role = "user", content = TEXT },
+      { role = "tool", tool_call_id = "c1", content = "Retrieved: " .. DESC } } })
+    local job = assert(core.l3_job(req, l3ctx(ctx)))
+    assert.equals(2, #job.parts)
+    assert.is_false(job.parts[1].rep)
+    assert.is_false(job.parts[2].rep)
+    local res = core.l3_result(job, { { injection = 0.9 }, { untrusted = 0.2 } }, ctx.config)
+    assert.equals("malicious", res.verdict)
+    assert.is_nil(res.charge)
+    assert.same({ job.key, { score = 0.9, reason = "injection 0.90", rep = false } }, res.writes[3])
+    -- a tool result too short to judge on its own: the text is judged alone, and still not charged
+    req = body_req({ model = "m", messages = { { role = "user", content = TEXT },
+      { role = "tool", tool_call_id = "c1", content = "no results" } } })
+    job = assert(core.l3_job(req, l3ctx(ctx)))
+    assert.equals(1, #job.parts)
+    assert.is_false(job.parts[1].rep)
+    res = core.l3_result(job, { { injection = 0.9 } }, ctx.config)
+    assert.is_nil(res.charge)
+    -- untrusted judging off: the text is charged whole, as before
+    job = assert(core.l3_job(req, l3ctx(H.ctx())))
+    assert.is_nil(job.parts[1].rep)
+    assert.equals("malicious", core.l3_result(job, { { injection = 0.9 } }, ctx.config).charge)
   end)
 
   it("judges every chunk of text L2 judged in chunks, and says so", function()

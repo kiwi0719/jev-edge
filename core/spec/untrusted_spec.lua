@@ -383,14 +383,46 @@ describe("untrusted content: pipeline", function()
       assert.equals(2, #ctx.judge.prompts)
     end)
 
+    -- the user's own question; the retrieved content outside the text fields
+    local FIELD = { untrusted = { enabled = true, fields = { "documents[*].text" } } }
+    local function own_req() return req_for({ messages = { { role = "user", content = USER } },
+      documents = { { text = ATTACK } } }) end
+
     it("is charged for the subject's own text at its own score", function()
-      local ctx, store = rep_ctx(recording({ injection = 0.95, untrusted = 0.1 }))
-      core.evaluate(tool_req(USER, ATTACK), ctx)
+      local ctx, store = rep_ctx(recording({ injection = 0.95, untrusted = 0.1 }), FIELD)
+      core.evaluate(own_req(), ctx)
       assert.equals(3, points(store))
-      ctx, store = rep_ctx(recording({ injection = 0.6, untrusted = 0.95 }))
-      local v = core.evaluate(tool_req(USER, ATTACK), ctx)
+      ctx, store = rep_ctx(recording({ injection = 0.6, untrusted = 0.95 }), FIELD)
+      local v = core.evaluate(own_req(), ctx)
       assert.equals("untrusted 0.95", v.reason)
       assert.equals(1, points(store))
+    end)
+
+    it("is not charged for a text that holds retrieved content: one score cannot tell the two apart", function()
+      -- the review's probe: the tool result is in messages[*].content too
+      local ctx, store = rep_ctx(recording({ injection = 0.95, untrusted = 0.95 }))
+      for _ = 1, 3 do
+        local v = core.evaluate(tool_req(USER, ATTACK), ctx)
+        assert.equals(V.ACTION_BLOCK, v.action)
+      end
+      assert.equals(0, points(store))
+      -- the same with a Responses function_call_output (input[*].output)
+      ctx, store = rep_ctx(recording({ injection = 0.95, untrusted = 0.95 }))
+      core.evaluate(req_for({ input = { { role = "user", content = USER },
+        { type = "function_call_output", call_id = "c1", output = ATTACK } } }), ctx)
+      assert.equals(0, points(store))
+      -- and a body past max_body_bytes, which is scanned: nothing tells the two apart
+      ctx, store = rep_ctx(recording({ injection = 0.95 }))
+      local r = tool_req(USER, ATTACK)
+      r.body_size = 2000000
+      assert.equals(V.MALICIOUS, core.evaluate(r, ctx).verdict)
+      assert.equals(0, points(store))
+    end)
+
+    it("charges a text that holds tool results whole when untrusted judging is off, as before", function()
+      local ctx, store = rep_ctx(recording({ injection = 0.95 }), { untrusted = { enabled = false } })
+      core.evaluate(tool_req(USER, ATTACK), ctx)
+      assert.equals(3, points(store))
     end)
 
     it("charges nothing when only retrieved content was judged", function()

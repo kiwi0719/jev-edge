@@ -135,7 +135,8 @@ end
 -- score came from retrieved content or the tool definitions (which an agent
 -- loads from pages, mailboxes and servers the user may not control) is
 -- charged at `charge`, the label its own text earned, and with
--- `charge == false` (none of its own text judged) not at all.
+-- `charge == false` (none of its own text judged, which with untrusted
+-- judging on includes a text that holds retrieved content) not at all.
 -- @param charge optional: the label to charge instead of v.verdict, or false
 function _M.rep_record(ctx, v, charge)
   local r, at = rep_cfg(ctx)

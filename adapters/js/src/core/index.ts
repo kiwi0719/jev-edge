@@ -55,9 +55,11 @@ function nowMs(ctx: Ctx): number {
 
 // Port of rep_of in core/init.lua: what subject reputation charges for a
 // request judged in parts, the max score over the subject's own parts; never
-// retrieved content or tool definitions, which come from elsewhere. undefined:
-// the verdict's own label; a number: the subject's own text scored lower than
-// a part it is not charged for; false: none of its own text was judged.
+// retrieved content or tool definitions, which come from elsewhere, nor, with
+// untrusted judging on, a text that holds retrieved content (L1's
+// `retrieved`). undefined: the verdict's own label; a number: the subject's
+// own text scored lower than a part it is not charged for; false: none of its
+// own text was judged.
 type Rep = number | false | undefined;
 function repOf(best: number | undefined, own: number | undefined): Rep {
   if (own === undefined) return false;
@@ -124,7 +126,7 @@ interface Part {
   over?: { templates?: string[]; deployment?: string };
   /** put before the template name in the reason when this part's score decides */
   label?: string;
-  /** false: not the subject's own text (retrieved content, tool definitions), its score is not charged to it */
+  /** false: not the subject's own text (retrieved content, tool definitions, a text that holds retrieved content), its score is not charged to it */
   rep?: false;
 }
 
@@ -227,7 +229,7 @@ export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
   const cfg = ctx.config;
 
   // L1 --------------------------------------------------------------------
-  const [r, text, reason, rule, windowed, chunks, capped, untrusted, tools] = await rulesMod.evaluateAll(req, ctx.rules, ctx);
+  const [r, text, reason, rule, windowed, chunks, capped, untrusted, tools, retrieved] = await rulesMod.evaluateAll(req, ctx.rules, ctx);
 
   if (r === rulesMod.PASS) {
     return verdict.newVerdict({ verdict: verdict.SKIPPED, source: verdict.SRC_L1, reason });
@@ -253,6 +255,8 @@ export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
   const uspec = untrusted ? untrustedSpec(cfg, rule) : undefined;
   // the text only stands aside when it alone would have passed
   const only = !!(untrusted?.only || tools?.only);
+  // the text holds retrieved content: not the subject's own (repOf)
+  const textRep: false | undefined = retrieved ? false : undefined;
 
   // trust -----------------------------------------------------------------
   // An operator called this exact text a false positive. Checked before the
@@ -290,7 +294,8 @@ export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
       // Never async on a hit: the cached score already is the judge's
       // answer, and a re-judge per hit would turn the cache into an
       // amplifier (one suspicious prompt repeated N times = N L3 calls).
-      const rep: Rep = hit.rep === false || typeof hit.rep === "number" ? hit.rep : undefined;
+      // none of this request's own text was judged alone: whatever the entry says
+      const rep: Rep = textRep === false ? false : hit.rep === false || typeof hit.rep === "number" ? hit.rep : undefined;
       return finish(ctx, verdict.newVerdict({
         action, verdict: label, score: hit.score, async: false,
         source: verdict.SRC_CACHE, reason: hit.reason ?? reason, fingerprint: fp,
@@ -322,7 +327,9 @@ export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
     };
     const parts: Part[] = [];
     if (!only) {
-      for (const c of chunks && chunks.length > 1 ? chunks : [text]) parts.push({ text: c, templates: rule!.templates, context });
+      for (const c of chunks && chunks.length > 1 ? chunks : [text]) {
+        parts.push({ text: c, templates: rule!.templates, context, ...(textRep === false ? { rep: false as const } : {}) });
+      }
     }
     let suffix = "";
     if (chunks && chunks.length > 1) suffix = capped ? " (window)" : ` (${chunks.length} chunks${windowed ? ", window" : ""})`;
@@ -391,12 +398,12 @@ export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
   const why = top !== "" ? `${top} ${verdict.format2(score)}${windowed ? " (window)" : ""}` : reason;
 
   if (ckey && ctx.cache) {
-    await ctx.cache.set(ckey, { score, reason: why }, cfg.cache.fp_ttl);
+    await ctx.cache.set(ckey, { score, reason: why, ...(textRep === false ? { rep: false } : {}) }, cfg.cache.fp_ttl);
   }
 
   return finish(ctx, verdict.newVerdict({
     action, verdict: label, score, async, source: verdict.SRC_L2, reason: why, fingerprint: fp, l2_ms: elapsed,
-  }));
+  }), textRep);
 }
 
 export { rulesMod as rules, normalize, judge, policy, verdict, trust, subject };

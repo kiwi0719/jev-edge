@@ -208,14 +208,40 @@ describe("untrusted: subject reputation", () => {
     expect(j.prompts.length).toBe(2);
   });
 
+  // the user's own question; the retrieved content outside the text fields
+  const FIELD = { enabled: true, fields: ["documents[*].text"] };
+  const ownReq = () => reqFor({ messages: [{ role: "user", content: USER }], documents: [{ text: ATTACK }] });
+
   it("is charged for the subject's own text at its own score", async () => {
-    let { ctx, points } = repCtx(recording({ injection: 0.95, untrusted: 0.1 }));
-    await core.evaluate(toolReq(USER, ATTACK), ctx);
+    let { ctx, points } = repCtx(recording({ injection: 0.95, untrusted: 0.1 }), FIELD);
+    await core.evaluate(ownReq(), ctx);
     expect(points()).toBe(3);
-    ({ ctx, points } = repCtx(recording({ injection: 0.6, untrusted: 0.95 })));
-    const v = await core.evaluate(toolReq(USER, ATTACK), ctx);
+    ({ ctx, points } = repCtx(recording({ injection: 0.6, untrusted: 0.95 }), FIELD));
+    const v = await core.evaluate(ownReq(), ctx);
     expect(v.reason).toBe("untrusted 0.95");
     expect(points()).toBe(1);
+  });
+
+  it("is not charged for a text that holds retrieved content: one score cannot tell the two apart", async () => {
+    // the review's probe: the tool result is in messages[*].content too
+    let { ctx, points } = repCtx(recording({ injection: 0.95, untrusted: 0.95 }));
+    for (let i = 0; i < 3; i++) expect((await core.evaluate(toolReq(USER, ATTACK), ctx)).action).toBe("block");
+    expect(points()).toBe(0);
+    // the same with a Responses function_call_output (input[*].output)
+    ({ ctx, points } = repCtx(recording({ injection: 0.95, untrusted: 0.95 })));
+    await core.evaluate(reqFor({ input: [{ role: "user", content: USER },
+      { type: "function_call_output", call_id: "c1", output: ATTACK }] }), ctx);
+    expect(points()).toBe(0);
+    // and a body past max_body_bytes, which is scanned: nothing tells the two apart
+    ({ ctx, points } = repCtx(recording({ injection: 0.95 })));
+    expect((await core.evaluate({ ...toolReq(USER, ATTACK), body_size: 2000000 }, ctx)).verdict).toBe("malicious");
+    expect(points()).toBe(0);
+  });
+
+  it("charges a text that holds tool results whole when untrusted judging is off, as before", async () => {
+    const { ctx, points } = repCtx(recording({ injection: 0.95 }), { enabled: false });
+    await core.evaluate(toolReq(USER, ATTACK), ctx);
+    expect(points()).toBe(3);
   });
 
   it("charges nothing when only retrieved content was judged", async () => {

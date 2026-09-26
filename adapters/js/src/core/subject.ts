@@ -241,7 +241,9 @@ async function incrBy(store: Store, key: string, by: number, ttl: number): Promi
 /** Add this verdict's points and block the subject when it crosses block_at.
  *  Only judged verdicts count (not L1). `charge`: the label to charge instead
  *  of v.verdict (the subject's own text's, when retrieved content or the tool
- *  definitions decided), or false for nothing. Never throws. Returns the points, or null. */
+ *  definitions decided), or false for nothing (none of its own text judged,
+ *  which with untrusted judging on includes a text that holds retrieved
+ *  content). Never throws. Returns the points, or null. */
 export async function repRecord(ctx: RepCtx, v: Verdict, charge?: string | false): Promise<number | null> {
   const c = repCfg(ctx);
   if (!c || v.source === "l1" || charge === false) return null;

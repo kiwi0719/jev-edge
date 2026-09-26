@@ -361,17 +361,33 @@ export function reFind(subject: string, pattern: string): readonly [number, numb
   return [from, from + byteLength(m[0]) - 1];
 }
 
+const untrustedOn = (rule: Rule, ctx: RulesCtx | undefined) => untrustedSpec(ctx?.config, rule).enabled === true;
+
 // Port of untrusted_part() in core/rules.lua: retrieved content when untrusted
 // judging is on for `rule`, from a body parsed whole, cut to its own window;
-// and true when a walk bound left some of it unread (the part is a window).
-function untrustedPart(decoded: JsonValue | undefined, rule: Rule, ctx: RulesCtx | undefined): [UntrustedPart | undefined, boolean] {
+// true when a walk bound left some of it unread (the part is a window); and
+// the values read, whole, when untrusted judging is on and the body was parsed.
+function untrustedPart(
+  decoded: JsonValue | undefined, rule: Rule, ctx: RulesCtx | undefined,
+): [UntrustedPart | undefined, boolean, string[] | undefined] {
   const spec = untrustedSpec(ctx?.config, rule);
-  if (!spec.enabled || decoded === undefined || decoded === null || typeof decoded !== "object") return [undefined, false];
+  if (!spec.enabled || decoded === undefined || decoded === null || typeof decoded !== "object") return [undefined, false, undefined];
   const [values, capped] = extractUntrusted(decoded, spec, ctx?.json_decode);
   const utext = values.join("\n");
-  if (utext === "") return [undefined, capped];
+  if (utext === "") return [undefined, capped, values];
   const [w, cut] = window(utext, values, rule.max_judge_bytes ?? MAX_JUDGE_BYTES);
-  return [{ text: w, windowed: cut || capped }, capped];
+  return [{ text: w, windowed: cut || capped }, capped, values];
+}
+
+// Port of holds_retrieved() in core/rules.lua: with untrusted judging on,
+// true when the text's values hold retrieved content (one of `uvalues`, or
+// some of it went unread and may be there); its score is then not the
+// subject's own, and reputation charges none of it.
+function holdsRetrieved(values: string[], uvalues: string[], ucut: boolean): boolean {
+  if (ucut) return true;
+  const seen = new Set(uvalues.filter((v) => v !== ""));
+  if (seen.size === 0) return false;
+  return values.some((v) => seen.has(v));
 }
 
 // Port of tools_part() in core/rules.lua: the tool definitions the model
@@ -393,6 +409,8 @@ type Judged = {
   untrusted?: UntrustedPart; tools?: ToolsPart;
   /** a walk bound left text fields or tool definitions unread */
   bound?: boolean;
+  /** untrusted judging is on and the text holds retrieved content (holdsRetrieved, or it was scanned) */
+  retrieved?: boolean;
 };
 
 // Port of judged() in core/rules.lua.
@@ -407,6 +425,7 @@ async function judged(
   let text: string;
   let partial = false;
   let bound = false;
+  let retrieved = false;
   let untrusted: UntrustedPart | undefined;
   let tools: ToolsPart | undefined;
   if (size > max) {
@@ -426,6 +445,7 @@ async function judged(
     if (values.length === 0) return { text: "", unj: "unjudgeable: body too large" };
     text = values.join("\n");
     partial = true;
+    retrieved = untrustedOn(rule, ctx);
     if (hasToolFields(rule)) {
       const tkeys = fieldKeys(rule.tool_fields);
       const tvalues = scanTools(hd, tkeys, []);
@@ -444,8 +464,11 @@ async function judged(
     // a "**" field hit its bound: the text is not all there
     if (cut) partial = bound = true;
     let ucut: boolean;
-    [untrusted, ucut] = untrustedPart(decoded, rule, ctx);
+    let uvalues: string[] | undefined;
+    [untrusted, ucut, uvalues] = untrustedPart(decoded, rule, ctx);
     if (ucut) bound = true;
+    if (uvalues) retrieved = holdsRetrieved(values, uvalues, ucut);
+    else if (kind === "scan") retrieved = untrustedOn(rule, ctx);
     if (hasToolFields(rule) && decoded !== undefined && decoded !== null && typeof decoded === "object") {
       const [tvalues, tcut] = extractTools(decoded, rule.tool_fields, ctx?.json_decode);
       tools = toolsPart(tvalues, tcut, rule, ctx);
@@ -464,7 +487,7 @@ async function judged(
   if (maxc > 1 && byteLength(text) > budget) {
     // port of the chunked branch of judged() in core/rules.lua
     const [pieces, starts] = splitChunks(text, budget);
-    if (pieces.length <= maxc) return { text: pieces.join("\n"), hit: hit?.[0], windowed: partial, chunks: pieces, capped: false, untrusted, tools, bound };
+    if (pieces.length <= maxc) return { text: pieces.join("\n"), hit: hit?.[0], windowed: partial, chunks: pieces, capped: false, untrusted, tools, bound, retrieved };
     const firstKept = pieces.length - (maxc - 1); // 0-based
     const tb = utf8Bytes(text);
     let older = new TextDecoder().decode(tb.subarray(0, starts[firstKept] - 1));
@@ -473,10 +496,10 @@ async function judged(
     const inside = hit?.[1] !== undefined && hit?.[2] !== undefined && hit[2] <= olderLen;
     const [win] = window(older, [older], budget, inside ? hit![1] : undefined, inside ? hit![2] : undefined);
     const out = [win, ...pieces.slice(firstKept)];
-    return { text: out.join("\n"), hit: hit?.[0], windowed: true, chunks: out, capped: true, untrusted, tools, bound };
+    return { text: out.join("\n"), hit: hit?.[0], windowed: true, chunks: out, capped: true, untrusted, tools, bound, retrieved };
   }
   const [w, cut] = window(text, values, budget, hit?.[1], hit?.[2]);
-  return { text: w, hit: hit?.[0], windowed: cut || partial, untrusted, tools, bound };
+  return { text: w, hit: hit?.[0], windowed: cut || partial, untrusted, tools, bound, retrieved };
 }
 
 // Port of BOUND_REASON: a request the walk bounds cut and that would
@@ -493,9 +516,10 @@ export async function judgedText(req: Req, rule: Rule | undefined, ctx?: RulesCt
   return r.text;
 }
 
+/** The result, text, reason, windowed, chunks, capped, untrusted, tools, and retrieved (see rules.evaluate in core/rules.lua). */
 export async function evaluate(
   req: Req, rule: Rule, ctx?: RulesCtx,
-): Promise<[RuleResult, string, string, boolean?, string[]?, boolean?, UntrustedPart?, ToolsPart?]> {
+): Promise<[RuleResult, string, string, boolean?, string[]?, boolean?, UntrustedPart?, ToolsPart?, boolean?]> {
   // 1. path watch list
   if (!pathMatches(req.path ?? "", rule.watch_paths, rule.paths_case_sensitive)) return [PASS, "", "path not watched"];
 
@@ -563,7 +587,7 @@ export async function evaluate(
   else if (judgedToo) why = "natural language" + tag;
   else if (u) why = "retrieved content" + (u.windowed ? " (window)" : "");
   else why = "tool definitions" + (t!.windowed ? " (window)" : "");
-  return [SUSPECT, j.text, why, windowed, j.chunks, j.capped, u, t];
+  return [SUSPECT, j.text, why, windowed, j.chunks, j.capped, u, t, j.retrieved];
 }
 
 /** Port of rules.rule_for: the first rule whose path, method and content type all match. */
@@ -579,11 +603,11 @@ export function ruleFor(req: Req, rules: Rule[] | undefined): Rule | undefined {
 
 export async function evaluateAll(
   req: Req, rules: Rule[] | undefined, ctx?: RulesCtx,
-): Promise<[RuleResult, string, string, Rule | undefined, boolean?, string[]?, boolean?, UntrustedPart?, ToolsPart?]> {
+): Promise<[RuleResult, string, string, Rule | undefined, boolean?, string[]?, boolean?, UntrustedPart?, ToolsPart?, boolean?]> {
   let lastReason = "no rules";
   for (const rule of rules ?? []) {
-    const [r, text, reason, windowed, chunks, capped, untrusted, tools] = await evaluate(req, rule, ctx);
-    if (r !== PASS) return [r, text, reason, rule, windowed, chunks, capped, untrusted, tools];
+    const [r, text, reason, windowed, chunks, capped, untrusted, tools, retrieved] = await evaluate(req, rule, ctx);
+    if (r !== PASS) return [r, text, reason, rule, windowed, chunks, capped, untrusted, tools, retrieved];
     lastReason = reason;
   }
   return [PASS, "", lastReason, undefined];

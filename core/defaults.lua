@@ -25,6 +25,11 @@ _M.config = {
     -- before it (a load balancer in front of the gateway), and so on. Never
     -- the first element: that is whatever the client typed.
     trusted_hops = 1,
+    -- IP reputation and subject.from = "ip" count an IPv6 client by its
+    -- network's first ipv6_prefix bits: one host holds a whole /64, and a
+    -- fresh address per request would start clean every time. IPv4 is
+    -- counted per address.
+    ipv6_prefix = 64,
   },
   policy = {
     mode              = "monitor",
@@ -297,6 +302,10 @@ function _M.validate(c)
   local hops = ci.trusted_hops
   if hops ~= nil and (type(hops) ~= "number" or hops < 1 or hops % 1 ~= 0) then
     return nil, "client_ip.trusted_hops must be an integer >= 1"
+  end
+  local v6 = ci.ipv6_prefix
+  if v6 ~= nil and (type(v6) ~= "number" or v6 < 1 or v6 > 128 or v6 % 1 ~= 0) then
+    return nil, "client_ip.ipv6_prefix must be an integer from 1 to 128"
   end
   local as = c.async or {}
   if as.max_async ~= nil and (type(as.max_async) ~= "number" or as.max_async < 0) then

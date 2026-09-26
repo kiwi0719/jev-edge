@@ -234,6 +234,73 @@
     {
       "expect": {
         "breaker": null,
+        "cache_writes": {},
+        "headers": {
+          "X-Jev-Reason": "ip+reputation",
+          "X-Jev-Score": "1.00",
+          "X-Jev-Source": "l1",
+          "X-Jev-Verdict": "malicious"
+        },
+        "judge_calls": 0,
+        "prompt": null,
+        "subject_record": null,
+        "subject_store_writes": null,
+        "verdict": {
+          "action": "block",
+          "async": false,
+          "error_kind": "",
+          "fingerprint": "",
+          "l2_ms": 0,
+          "reason": "ip reputation",
+          "score": 1,
+          "source": "l1",
+          "verdict": "malicious"
+        }
+      },
+      "input": {
+        "breaker": null,
+        "cache": {
+          "rep:2001:0db8:0000:0000:0000:0000:0000:0000/48": {
+            "blocked_until": 2000
+          }
+        },
+        "clock": 1000,
+        "config": {
+          "async": {
+            "rep_block_after": 1
+          },
+          "client_ip": {
+            "ipv6_prefix": 48
+          },
+          "policy": {
+            "mode": "enforce"
+          }
+        },
+        "judge": {
+          "answers": {
+            "injection": 0.1
+          }
+        },
+        "req": {
+          "body": "{\"messages\":[{\"role\":\"user\",\"content\":\"Please write a detailed summary of the attached quarterly report.\"}]}",
+          "body_size": 108,
+          "client_ip": "2001:db8:0:7::1",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/v1/chat/completions"
+        },
+        "rules": [
+          "llm-endpoints"
+        ],
+        "subject": null
+      },
+      "name": "ip reputation: client_ip.ipv6_prefix = 48 counts the /48"
+    },
+    {
+      "expect": {
+        "breaker": null,
         "cache_writes": {
           "fp:e912b53a:cf223bdc": {
             "ttl": 300,

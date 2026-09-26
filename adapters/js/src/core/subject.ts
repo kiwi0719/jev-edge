@@ -18,7 +18,7 @@
 // something the request path has to wait for.
 import type { Verdict } from "./verdict.js";
 import type { Store } from "./breaker.js";
-import { trim } from "./normalize.js"; // Lua %s, not Unicode trim
+import { trim, ipKey } from "./normalize.js"; // Lua %s, not Unicode trim
 
 export const FORMAT = 1;
 export const KEY_PREFIX = "subj:";
@@ -43,6 +43,8 @@ export interface SubjectConfig {
 
 export interface RequestView {
   ip?: string | null;
+  /** cfg.client_ip.ipv6_prefix: an IPv6 `ip` is its network (normalize.ipKey, 64 bits when unset), the key IP reputation uses. */
+  ipv6Prefix?: number;
   header?: (name: string) => string | null | undefined;
   /** The raw Cookie header (repeated ones joined with "; ", or a list of them). */
   cookieHeader?: string | string[] | null;
@@ -126,7 +128,7 @@ export function extractAll(scfg: SubjectConfig | undefined, view: RequestView, d
   if (!scfg?.enabled) return [];
   const from = scfg.from ?? "ip";
   let raw: (string | null | undefined)[] = [];
-  if (from === "ip") raw = [view.ip];
+  if (from === "ip") raw = [view.ip === null || view.ip === undefined ? view.ip : ipKey(view.ip, view.ipv6Prefix)];
   else if (from === "header") raw = [view.header?.(scfg.name ?? "")];
   else if (from === "cookie") {
     raw = view.cookieHeader !== undefined && view.cookieHeader !== null

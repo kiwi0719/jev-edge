@@ -80,6 +80,19 @@ describe("defaults.validate", function()
     assert.equals("policy.block_status must be a 4xx status", err)
   end)
 
+  -- lead-gateways-live#21
+  it("takes client_ip.ipv6_prefix as an integer from 1 to 128, 64 by default", function()
+    assert.equals(64, D.config.client_ip.ipv6_prefix)
+    for _, v in ipairs({ 1, 48, 56, 64, 128 }) do
+      assert.is_true((D.validate(D.merge(D.config, { client_ip = { ipv6_prefix = v } }))), v)
+    end
+    for _, v in ipairs({ 0, 129, 64.5, "64", -1 }) do
+      local ok, err = D.validate(D.merge(D.config, { client_ip = { ipv6_prefix = v } }))
+      assert.is_nil(ok, tostring(v))
+      assert.equals("client_ip.ipv6_prefix must be an integer from 1 to 128", err)
+    end
+  end)
+
   it("takes policy.partial = judge | unjudgeable and nothing else", function()
     assert.equals("judge", D.config.policy.partial)
     for _, v in ipairs({ "judge", "unjudgeable" }) do

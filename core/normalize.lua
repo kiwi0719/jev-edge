@@ -178,6 +178,73 @@ function _M.trim(s)
   return s:sub(i, j)
 end
 
+-- The 16-bit groups of the part of an IPv6 address on one side of "::",
+-- or nil when a group is not 1 to 4 hex digits.
+local function hextets(part)
+  local out = {}
+  if part == "" then return out end
+  for g in (part .. ":"):gmatch("([^:]*):") do
+    if not g:find("^%x%x?%x?%x?$") then return nil end
+    out[#out + 1] = tonumber(g, 16)
+  end
+  return out
+end
+
+--- The key one client address is counted under: IP reputation (rep:<key>)
+-- and subject.from = "ip". IPv6 is aggregated to its first `prefix` bits
+-- (client_ip.ipv6_prefix, 64 by default): one host holds a whole /64 and
+-- would otherwise get a fresh reputation per address. A %zone is dropped,
+-- "::" expanded and the address masked, written as eight lowercase
+-- four-digit groups and "/<prefix>", so every spelling of one network is
+-- one key. IPv4, and IPv4-mapped IPv6 (::ffff:a.b.c.d, which is IPv4), are
+-- the dotted address. Anything that does not parse is returned as it is.
+function _M.ip_key(ip, prefix)
+  if type(ip) ~= "string" or not ip:find(":", 1, true) or #ip > 64 then return ip end
+  prefix = math.floor(tonumber(prefix) or 64)
+  if prefix < 1 or prefix > 128 then prefix = 64 end
+  local s = ip:match("^([^%%]*)")
+  -- an IPv4 address in the last 32 bits
+  local v4
+  local last = s:match("[^:]*$")
+  if last:find(".", 1, true) then
+    local a, b, c, d = last:match("^(%d%d?%d?)%.(%d%d?%d?)%.(%d%d?%d?)%.(%d%d?%d?)$")
+    a, b, c, d = tonumber(a), tonumber(b), tonumber(c), tonumber(d)
+    if not (a and a <= 255 and b <= 255 and c <= 255 and d <= 255) then return ip end
+    v4 = { a * 256 + b, c * 256 + d }
+    s = s:sub(1, #s - #last)
+    -- "::1.2.3.4" leaves "::", "0::1.2.3.4" leaves "0::", "0:...:0:1.2.3.4" a ':'
+    if s:sub(-2) ~= "::" then
+      if s:sub(-1) ~= ":" then return ip end
+      s = s:sub(1, -2)
+    end
+  end
+  local want = v4 and 6 or 8
+  local h
+  local dc = s:find("::", 1, true)
+  if dc then
+    if s:find("::", dc + 1, true) then return ip end
+    local l, r = hextets(s:sub(1, dc - 1)), hextets(s:sub(dc + 2))
+    if not l or not r or #l + #r >= want then return ip end
+    h = l
+    for _ = 1, want - #l - #r do h[#h + 1] = 0 end
+    for _, x in ipairs(r) do h[#h + 1] = x end
+  else
+    h = hextets(s)
+    if not h or #h ~= want then return ip end
+  end
+  if v4 then h[7], h[8] = v4[1], v4[2] end
+  if h[1] == 0 and h[2] == 0 and h[3] == 0 and h[4] == 0 and h[5] == 0 and h[6] == 0xffff then
+    return string.format("%d.%d.%d.%d", math.floor(h[7] / 256), h[7] % 256, math.floor(h[8] / 256), h[8] % 256)
+  end
+  local out = {}
+  for i = 1, 8 do
+    local bits = math.max(0, math.min(16, prefix - (i - 1) * 16))
+    local x = h[i]
+    out[i] = string.format("%04x", x - x % 2 ^ (16 - bits))
+  end
+  return table.concat(out, ":") .. "/" .. prefix
+end
+
 -- A folded key starts with the folded name's first byte, or with that
 -- letter's other case, or with the first byte of U+017F / U+212A.
 local FIRST = { s = 0xC5, k = 0xE2 }

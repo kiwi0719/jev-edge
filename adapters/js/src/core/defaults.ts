@@ -44,7 +44,7 @@ export interface Config {
    * balancer in front of the gateway), and so on. Never the first element:
    * that is whatever the client typed.
    */
-  client_ip: { trusted_hops: number };
+  client_ip: { trusted_hops: number; ipv6_prefix: number };
   async: { enabled: boolean; max_async: number; rep_block_after: number; rep_block_ttl: number };
   subject: {
     enabled: boolean; from: "ip" | "header" | "cookie"; name: string | null; salt: string | null; hashed: boolean;
@@ -79,7 +79,7 @@ export const config: Config = {
     max_inflight: 64,
   },
   rules: ["llm-endpoints"],
-  client_ip: { trusted_hops: 1 },
+  client_ip: { trusted_hops: 1, ipv6_prefix: 64 },
   policy: {
     mode: "monitor",
     block_threshold: 0.7,
@@ -153,6 +153,9 @@ export function validate(c: Config): [true, null] | [null, string] {
   const ci: Partial<Config["client_ip"]> = c.client_ip ?? {};
   if (ci.trusted_hops !== undefined && (typeof ci.trusted_hops !== "number" || ci.trusted_hops < 1 || !Number.isInteger(ci.trusted_hops))) {
     return [null, "client_ip.trusted_hops must be an integer >= 1"];
+  }
+  if (ci.ipv6_prefix !== undefined && (typeof ci.ipv6_prefix !== "number" || !Number.isInteger(ci.ipv6_prefix) || ci.ipv6_prefix < 1 || ci.ipv6_prefix > 128)) {
+    return [null, "client_ip.ipv6_prefix must be an integer from 1 to 128"];
   }
   const as: Partial<Config["async"]> = c.async ?? {};
   if (as.max_async !== undefined && (typeof as.max_async !== "number" || as.max_async < 0)) return [null, "async.max_async must be >= 0"];

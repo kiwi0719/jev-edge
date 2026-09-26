@@ -219,6 +219,7 @@ _M.KEY_PREFIX = "subj:"
 _M.MAX_IDS = 4
 
 local trim = require("jev.core.normalize").trim
+local ip_key = require("jev.core.normalize").ip_key
 
 -- Python's http.cookies unquoting of a quoted value's inside: \ooo (octal
 -- 000-377) is that code point, UTF-8 encoded, and \x is x.
@@ -308,13 +309,15 @@ end
 -- @param scfg cfg.subject
 -- @param view { ip = string|nil, header = fn(name) -> string|list|nil,
 --   cookie_header = the raw Cookie header(s), string|list|nil;
---   or, from an older adapter, cookie = fn(name) -> string|nil }
+--   or, from an older adapter, cookie = fn(name) -> string|nil;
+--   ipv6_prefix = cfg.client_ip.ipv6_prefix: an IPv6 `ip` is its network
+--   (normalize.ip_key, 64 bits when unset), the key IP reputation uses }
 function _M.extract_all(scfg, view)
   if type(scfg) ~= "table" or not scfg.enabled then return {} end
   local from = scfg.from or "ip"
   local raw = {}
   if from == "ip" then
-    raw[1] = view.ip
+    raw[1] = ip_key(view.ip, view.ipv6_prefix)
   elseif from == "header" then
     raw[1] = view.header and view.header(scfg.name)
   elseif from == "cookie" then

@@ -217,6 +217,72 @@ export function trim(s: string): string {
   return i === 0 && j === s.length ? s : s.slice(i, j);
 }
 
+// Port of hextets(): the 16-bit groups on one side of "::", or null when a
+// group is not 1 to 4 hex digits.
+function hextets(part: string): number[] | null {
+  if (part === "") return [];
+  const out: number[] = [];
+  for (const g of part.split(":")) {
+    if (!/^[0-9a-fA-F]{1,4}$/.test(g)) return null;
+    out.push(parseInt(g, 16));
+  }
+  return out;
+}
+
+/**
+ * Port of normalize.ip_key: the key one client address is counted under
+ * (IP reputation rep:<key>, subject.from = "ip"). IPv6 is aggregated to its
+ * first `prefix` bits (client_ip.ipv6_prefix, 64 by default), written as
+ * eight lowercase four-digit groups and "/<prefix>"; a %zone is dropped.
+ * IPv4 and IPv4-mapped IPv6 are the dotted address; anything that does not
+ * parse is returned as it is. The same bytes as Lua.
+ */
+export function ipKey<T>(ip: T, prefix?: unknown): T | string {
+  if (typeof ip !== "string" || !ip.includes(":") || byteLength(ip) > 64) return ip;
+  let p = Math.floor(Number(prefix ?? 64));
+  if (!(p >= 1 && p <= 128)) p = 64;
+  const pct = ip.indexOf("%");
+  let s = pct === -1 ? ip : ip.slice(0, pct);
+  let v4: [number, number] | undefined;
+  const last = s.slice(s.lastIndexOf(":") + 1);
+  if (last.includes(".")) {
+    const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(last);
+    if (!m) return ip;
+    const [a, b, c, d] = [m[1], m[2], m[3], m[4]].map(Number);
+    if (a > 255 || b > 255 || c > 255 || d > 255) return ip;
+    v4 = [a * 256 + b, c * 256 + d];
+    s = s.slice(0, s.length - last.length);
+    if (!s.endsWith("::")) {
+      if (!s.endsWith(":")) return ip;
+      s = s.slice(0, -1);
+    }
+  }
+  const want = v4 ? 6 : 8;
+  let h: number[];
+  const dc = s.indexOf("::");
+  if (dc !== -1) {
+    if (s.indexOf("::", dc + 1) !== -1) return ip;
+    const l = hextets(s.slice(0, dc)), r = hextets(s.slice(dc + 2));
+    if (!l || !r || l.length + r.length >= want) return ip;
+    h = [...l, ...new Array<number>(want - l.length - r.length).fill(0), ...r];
+  } else {
+    const all = hextets(s);
+    if (!all || all.length !== want) return ip;
+    h = all;
+  }
+  if (v4) h.push(v4[0], v4[1]);
+  if (h[0] === 0 && h[1] === 0 && h[2] === 0 && h[3] === 0 && h[4] === 0 && h[5] === 0xffff) {
+    return `${h[6] >> 8}.${h[6] & 255}.${h[7] >> 8}.${h[7] & 255}`;
+  }
+  const out: string[] = [];
+  for (let i = 0; i < 8; i++) {
+    const bits = Math.max(0, Math.min(16, p - i * 16));
+    const x = h[i];
+    out.push((x - (x % 2 ** (16 - bits))).toString(16).padStart(4, "0"));
+  }
+  return out.join(":") + "/" + p;
+}
+
 // Port of first_bytes: marks in `first` the UTF-16 units a key that folds to
 // `name` can start with: the folded name's first, that letter's other case,
 // U+017F for s and U+212A for k.

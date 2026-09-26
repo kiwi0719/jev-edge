@@ -559,6 +559,11 @@ describe("defaults.validate", () => {
       { async: { max_async: -1 } },
       { client_ip: { trusted_hops: 0 } },
       { client_ip: { trusted_hops: 1.5 } },
+      // lead-gateways-live#21
+      { client_ip: { ipv6_prefix: 0 } },
+      { client_ip: { ipv6_prefix: 129 } },
+      { client_ip: { ipv6_prefix: 64.5 } },
+      { client_ip: { ipv6_prefix: "64" } },
       { policy: { partial: "block" } },
       { policy: { partial: true } },
     ]) {
@@ -566,6 +571,8 @@ describe("defaults.validate", () => {
       expect(ok, JSON.stringify(over)).toBeNull();
     }
     expect(core.defaults.config.client_ip.trusted_hops).toBe(1);
+    expect(core.defaults.config.client_ip.ipv6_prefix).toBe(64);
+    for (const p of [1, 48, 128]) expect(core.defaults.validate(core.defaults.merge(core.defaults.config, { client_ip: { ipv6_prefix: p } }))[0]).toBe(true);
     expect(core.defaults.validate(core.defaults.merge(core.defaults.config, { policy: { block_status: 429 }, client_ip: { trusted_hops: 2 } }))[0]).toBe(true);
     for (const st of [400, 403, 429, 451, 499]) {
       expect(core.defaults.validate(core.defaults.merge(core.defaults.config, { policy: { block_status: st } }))[0], String(st)).toBe(true);
@@ -615,6 +622,49 @@ describe("subject id hygiene", () => {
     expect(core.subject.extract({ enabled: true, from: "header", name: "x" }, { header: () => "k".repeat(600) })).toBe("k".repeat(600));
     expect(core.subject.extract({ enabled: true, from: "header", name: "x" }, { header: () => "k".repeat(65537) })).toBeNull();
     expect(core.subject.extract({ enabled: true, from: "header", name: "x" }, { header: () => "  k-1 \n" })).toBe("k-1");
+  });
+});
+
+// lead-gateways-live#21: the same table is in core/spec/rules_spec.lua
+const IP_KEYS: [string, number | undefined, string][] = [
+  ["203.0.113.7", undefined, "203.0.113.7"],
+  ["2001:db8::1", undefined, "2001:0db8:0000:0000:0000:0000:0000:0000/64"],
+  ["2001:0DB8:0:0:ffff::42", undefined, "2001:0db8:0000:0000:0000:0000:0000:0000/64"],
+  ["2001:db8:0:0:1:2:3:4%eth0", undefined, "2001:0db8:0000:0000:0000:0000:0000:0000/64"],
+  ["2001:db8:0:1::1", undefined, "2001:0db8:0000:0001:0000:0000:0000:0000/64"],
+  ["::ffff:198.51.100.9", undefined, "198.51.100.9"],
+  ["::FFFF:c633:6409", undefined, "198.51.100.9"],
+  ["0:0:0:0:0:ffff:198.51.100.9", undefined, "198.51.100.9"],
+  ["::", undefined, "0000:0000:0000:0000:0000:0000:0000:0000/64"],
+  ["fe80::1%lo0", 10, "fe80:0000:0000:0000:0000:0000:0000:0000/10"],
+  ["2001:db8::1", 128, "2001:0db8:0000:0000:0000:0000:0000:0001/128"],
+  ["2001:db8:abcd:12ff::1", 56, "2001:0db8:abcd:1200:0000:0000:0000:0000/56"],
+  ["2001:db8::1", 1, "0000:0000:0000:0000:0000:0000:0000:0000/1"],
+  ["2001:db8::1", 129, "2001:0db8:0000:0000:0000:0000:0000:0000/64"],
+  ["2001:db8::1.2.3.4", undefined, "2001:0db8:0000:0000:0000:0000:0000:0000/64"],
+  ["1:2:3:4:5:6:1.2.3.4", undefined, "0001:0002:0003:0004:0000:0000:0000:0000/64"],
+  ["1:2:3:4:5:6:7::", undefined, "0001:0002:0003:0004:0000:0000:0000:0000/64"],
+  // does not parse: as it is
+  ["not:an:ip", undefined, "not:an:ip"], ["1:2:3:4:5:6:7:8:9", undefined, "1:2:3:4:5:6:7:8:9"],
+  ["1::2::3", undefined, "1::2::3"], [":1::2", undefined, ":1::2"], ["::1.2.3.400", undefined, "::1.2.3.400"],
+  ["1:2:3:4:5:6:7:1.2.3.4", undefined, "1:2:3:4:5:6:7:1.2.3.4"], ["12345::1", undefined, "12345::1"],
+  ["[2001:db8::1]", undefined, "[2001:db8::1]"], ["", undefined, ""],
+];
+
+describe("rules.ipKey", () => {
+  it("aggregates IPv6 to its network and keeps IPv4 as it is", () => {
+    for (const [ip, p, want] of IP_KEYS) {
+      expect(core.rules.ipKey(ip, p === undefined ? undefined : { client_ip: { ipv6_prefix: p } }), ip).toBe(want);
+    }
+  });
+
+  it("keys subject.from = ip by the network, as Lua does", () => {
+    const s = { enabled: true, from: "ip" as const, salt: "pepper" };
+    expect(core.subject.extract(s, { ip: "2001:db8::1" })).toBe("2001:0db8:0000:0000:0000:0000:0000:0000/64");
+    expect(core.subject.extract(s, { ip: "2001:DB8:0:0:ffff::9" })).toBe("2001:0db8:0000:0000:0000:0000:0000:0000/64");
+    expect(core.subject.extract(s, { ip: "2001:db8::1", ipv6Prefix: 128 })).toBe("2001:0db8:0000:0000:0000:0000:0000:0001/128");
+    expect(core.subject.extract(s, { ip: "::ffff:203.0.113.7" })).toBe("203.0.113.7");
+    expect(core.subject.extract(s, { ip: "203.0.113.7" })).toBe("203.0.113.7");
   });
 });
 

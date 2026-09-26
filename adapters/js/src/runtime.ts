@@ -354,6 +354,7 @@ async function subjectCtx(
   // checks and charges each id, the first one names the trajectory
   const raws = subjectMod.extractAll(scfg, {
     ip: clientIp,
+    ipv6Prefix: rt.config.client_ip?.ipv6_prefix,
     header: (n) => request.headers.get(n),
     cookieHeader: request.headers.get("cookie"),
   }, (why) => {

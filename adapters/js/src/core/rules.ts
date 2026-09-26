@@ -1,5 +1,5 @@
 // Port of core/rules.lua: L1, cheap and short-circuiting.
-import { extract, extractTools, extractUntrusted, jsonLike, isText, byteLength, head, tail, fieldKeys, deepKeys, scanStrings, scanTools, window, chunks as splitChunks, chunkOverlap, utf8Bytes, byteString, trim, type JsonValue } from "./normalize.js";
+import { extract, extractTools, extractUntrusted, jsonLike, isText, byteLength, head, tail, fieldKeys, deepKeys, scanStrings, scanTools, window, chunks as splitChunks, chunkOverlap, utf8Bytes, byteString, trim, ipKey as normalizeIpKey, type JsonValue } from "./normalize.js";
 import { untrustedSpec, type UntrustedConfig } from "./defaults.js";
 import { repBlocked, type SubjectCtx, type ReputationConfig } from "./subject.js";
 
@@ -97,6 +97,7 @@ export interface RulesCtx {
   config?: {
     subject?: { reputation?: ReputationConfig }; untrusted?: UntrustedConfig; policy?: { partial?: string; unjudgeable?: string };
     async?: { rep_block_after?: number | string };
+    client_ip?: { ipv6_prefix?: number };
   };
 }
 
@@ -894,6 +895,11 @@ function ipRepOn(ctx: RulesCtx): boolean {
   return (Number.isNaN(n) ? 0 : n) > 0;
 }
 
+/** Port of rules.ip_key: the key IP reputation counts `ip` under (rep:<key>) and subject.from = "ip" hashes: IPv6 aggregated to cfg.client_ip.ipv6_prefix bits (64 when unset). */
+export function ipKey(ip: string, cfg?: { client_ip?: { ipv6_prefix?: number } } | null): string {
+  return normalizeIpKey(ip, cfg?.client_ip?.ipv6_prefix);
+}
+
 /** The result, text, reason, windowed, chunks, capped, untrusted, tools, and retrieved (see rules.evaluate in core/rules.lua). */
 export async function evaluate(
   req: Req, rule: Rule, ctx?: RulesCtx,
@@ -910,7 +916,7 @@ export async function evaluate(
   //    a config that blocks by IP (async.rep_block_after > 0), since the rep:
   //    records are shared by every route on the store
   if (ctx?.cache && req.client_ip && ipRepOn(ctx)) {
-    const rep = (await ctx.cache.get("rep:" + req.client_ip)) as { blocked_until?: number } | undefined;
+    const rep = (await ctx.cache.get("rep:" + ipKey(req.client_ip, ctx.config))) as { blocked_until?: number } | undefined;
     if (rep && typeof rep === "object") {
       const now = ctx.clock ? ctx.clock() : 0;
       if (rep.blocked_until !== undefined && rep.blocked_until > now) return [BLOCK, "", "ip reputation"];

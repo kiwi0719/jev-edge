@@ -1195,6 +1195,18 @@ rules_case("ip reputation expired", req(LONG), { cache = { ["rep:203.0.113.7"] =
 rules_case("ip trust is not a bypass", req(LONG), { cache = { ["rep:203.0.113.7"] = { trusted_until = 2000 } } })
 rules_case("reputation checked before body", req("", { no_body = true }),
   { cache = { ["rep:203.0.113.7"] = { blocked_until = 2000 } } })
+-- IPv6 is counted per /64 (client_ip.ipv6_prefix, lead-gateways-live#21):
+-- every spelling of an address in the blocked network is blocked, the next
+-- network is not; IPv4-mapped IPv6 is the IPv4 address
+do
+  local NET = { cache = { ["rep:2001:0db8:0000:0000:0000:0000:0000:0000/64"] = { blocked_until = 2000 } } }
+  rules_case("ip reputation: an IPv6 address in the blocked /64", req(LONG, { client_ip = "2001:db8::1" }), NET)
+  rules_case("ip reputation: another spelling in the blocked /64",
+    req(LONG, { client_ip = "2001:0DB8:0:0:ffff:ffff:ffff:ffff%eth0" }), NET)
+  rules_case("ip reputation: the next /64 is not blocked", req(LONG, { client_ip = "2001:db8:0:1::1" }), NET)
+  rules_case("ip reputation: IPv4-mapped IPv6 is the IPv4 address", req(LONG, { client_ip = "::ffff:203.0.113.7" }),
+    { cache = { ["rep:203.0.113.7"] = { blocked_until = 2000 } } })
+end
 
 -- one positive per always_suspect pattern; the reason names the pattern that
 -- fired, so a port whose regex engine differs shows up here first
@@ -1483,6 +1495,11 @@ eval_case("L1 block: ip reputation, monitor", { req = req(LONG), config = REP_IP
 eval_case("L1 block: ip reputation, enforce", { req = req(LONG),
   config = { policy = { mode = "enforce" }, async = { rep_block_after = 1 } },
   cache = { ["rep:203.0.113.7"] = { blocked_until = 2000 } }, judge = { answers = { injection = 0.1 } } })
+eval_case("ip reputation: client_ip.ipv6_prefix = 48 counts the /48", {
+  req = req(LONG, { client_ip = "2001:db8:0:7::1" }),
+  config = { policy = { mode = "enforce" }, async = { rep_block_after = 1 }, client_ip = { ipv6_prefix = 48 } },
+  cache = { ["rep:2001:0db8:0000:0000:0000:0000:0000:0000/48"] = { blocked_until = 2000 } },
+  judge = { answers = { injection = 0.1 } } })
 eval_case("ip reputation ignored when rep_block_after = 0", { req = req(LONG),
   config = { policy = { mode = "enforce" } },
   cache = { ["rep:203.0.113.7"] = { blocked_until = 2000 } }, judge = { answers = { injection = 0.1 } } })

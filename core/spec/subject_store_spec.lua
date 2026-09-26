@@ -39,6 +39,19 @@ describe("subject extraction and hashing", function()
     end
   end)
 
+  -- lead-gateways-live#21: an IPv6 client is its network, as IP reputation
+  -- counts it; the same cases are in adapters/js/test/core.test.ts
+  it("keys from = ip by the IPv6 network, IPv4 and mapped IPv4 as the address", function()
+    local s = { enabled = true, from = "ip", salt = "pepper" }
+    local net = "2001:0db8:0000:0000:0000:0000:0000:0000/64"
+    assert.equals(net, subject.extract(s, { ip = "2001:db8::1" }))
+    assert.equals(net, subject.extract(s, { ip = "2001:DB8:0:0:ffff::9" }))
+    assert.equals("2001:0db8:0000:0000:0000:0000:0000:0001/128",
+      subject.extract(s, { ip = "2001:db8::1", ipv6_prefix = 128 }))
+    assert.equals("203.0.113.7", subject.extract(s, { ip = "::ffff:203.0.113.7" }))
+    assert.equals("203.0.113.7", subject.extract(s, { ip = "203.0.113.7" }))
+  end)
+
   it("hashes with the salt and never exposes the raw value", function()
     local id = subject.hash_id({ from = "header", salt = "pepper" }, "key-1", hash)
     assert.equals("header:H(pepper\0key-1)", id)

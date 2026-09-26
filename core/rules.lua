@@ -487,6 +487,14 @@ local function ip_rep_on(ctx)
   return (tonumber(type(a) == "table" and a.rep_block_after or nil) or 0) > 0
 end
 
+--- The key IP reputation counts `ip` under (rep:<key>), and subject.from =
+-- "ip" hashes: IPv6 aggregated to cfg.client_ip.ipv6_prefix bits (64 when
+-- unset), IPv4 as it is (normalize.ip_key). L1 reads and L3 writes it.
+function _M.ip_key(ip, cfg)
+  local ci = type(cfg) == "table" and cfg.client_ip
+  return normalize.ip_key(ip, type(ci) == "table" and ci.ipv6_prefix or nil)
+end
+
 --- Evaluate one rule set against a request.
 -- @param req  { method, path, headers, body, body_size, client_ip }, and
 --             where the adapter has them decoded, body_head, body_tail and
@@ -524,7 +532,7 @@ function _M.evaluate(req, rule, ctx)
   --    thousands of users) does not block on another's. Without a config (a
   --    rules-only caller) the record decides, as it always did.
   if ctx and ctx.cache and req.client_ip and ip_rep_on(ctx) then
-    local rep = ctx.cache:get("rep:" .. req.client_ip)
+    local rep = ctx.cache:get("rep:" .. _M.ip_key(req.client_ip, ctx.config))
     if type(rep) == "table" then
       local now = ctx.clock and ctx.clock() or 0
       if rep.blocked_until and rep.blocked_until > now then

@@ -286,6 +286,59 @@ describe("rules.evaluate", function()
   end)
 end)
 
+describe("rules.ip_key", function()
+  -- lead-gateways-live#21: the same table is in adapters/js/test/core.test.ts
+  local IP_KEYS = {
+    { "203.0.113.7", nil, "203.0.113.7" },
+    { "2001:db8::1", nil, "2001:0db8:0000:0000:0000:0000:0000:0000/64" },
+    { "2001:0DB8:0:0:ffff::42", nil, "2001:0db8:0000:0000:0000:0000:0000:0000/64" },
+    { "2001:db8:0:0:1:2:3:4%eth0", nil, "2001:0db8:0000:0000:0000:0000:0000:0000/64" },
+    { "2001:db8:0:1::1", nil, "2001:0db8:0000:0001:0000:0000:0000:0000/64" },
+    { "::ffff:198.51.100.9", nil, "198.51.100.9" },
+    { "::FFFF:c633:6409", nil, "198.51.100.9" },
+    { "0:0:0:0:0:ffff:198.51.100.9", nil, "198.51.100.9" },
+    { "::", nil, "0000:0000:0000:0000:0000:0000:0000:0000/64" },
+    { "fe80::1%lo0", 10, "fe80:0000:0000:0000:0000:0000:0000:0000/10" },
+    { "2001:db8::1", 128, "2001:0db8:0000:0000:0000:0000:0000:0001/128" },
+    { "2001:db8:abcd:12ff::1", 56, "2001:0db8:abcd:1200:0000:0000:0000:0000/56" },
+    { "2001:db8::1", 1, "0000:0000:0000:0000:0000:0000:0000:0000/1" },
+    { "2001:db8::1", 129, "2001:0db8:0000:0000:0000:0000:0000:0000/64" },
+    { "2001:db8::1.2.3.4", nil, "2001:0db8:0000:0000:0000:0000:0000:0000/64" },
+    { "1:2:3:4:5:6:1.2.3.4", nil, "0001:0002:0003:0004:0000:0000:0000:0000/64" },
+    { "1:2:3:4:5:6:7::", nil, "0001:0002:0003:0004:0000:0000:0000:0000/64" },
+    -- does not parse: as it is
+    { "not:an:ip", nil, "not:an:ip" }, { "1:2:3:4:5:6:7:8:9", nil, "1:2:3:4:5:6:7:8:9" },
+    { "1::2::3", nil, "1::2::3" }, { ":1::2", nil, ":1::2" }, { "::1.2.3.400", nil, "::1.2.3.400" },
+    { "1:2:3:4:5:6:7:1.2.3.4", nil, "1:2:3:4:5:6:7:1.2.3.4" }, { "12345::1", nil, "12345::1" },
+    { "[2001:db8::1]", nil, "[2001:db8::1]" }, { "", nil, "" },
+  }
+
+  it("aggregates IPv6 to its network and keeps IPv4 as it is", function()
+    for _, c in ipairs(IP_KEYS) do
+      assert.equals(c[3], R.ip_key(c[1], c[2] and { client_ip = { ipv6_prefix = c[2] } } or nil), c[1])
+    end
+    assert.is_nil(R.ip_key(nil, nil))
+  end)
+
+  it("blocks every address of a blocked /64, and not the next one", function()
+    local ctx = H.ctx()
+    ctx.config.async.rep_block_after = 1
+    ctx.cache:set("rep:2001:0db8:0000:0000:0000:0000:0000:0000/64", { blocked_until = ctx.clock() + 100 })
+    for _, ip in ipairs({ "2001:db8::1", "2001:DB8::ffff:1", "2001:db8:0:0:1:2:3:4" }) do
+      local r, _, reason = R.evaluate(H.chat_req("anything long enough to be judged", { client_ip = ip }), rule, ctx)
+      assert.equals(R.BLOCK, r, ip)
+      assert.equals("ip reputation", reason)
+    end
+    local r = R.evaluate(H.chat_req("anything long enough to be judged", { client_ip = "2001:db8:0:1::1" }), rule, ctx)
+    assert.are_not.equal(R.BLOCK, r)
+    -- a /48 config counts the whole /48
+    ctx.config.client_ip.ipv6_prefix = 48
+    ctx.cache:set("rep:2001:0db8:0000:0000:0000:0000:0000:0000/48", { blocked_until = ctx.clock() + 100 })
+    r = R.evaluate(H.chat_req("anything long enough to be judged", { client_ip = "2001:db8:0:1::1" }), rule, ctx)
+    assert.equals(R.BLOCK, r)
+  end)
+end)
+
 describe("rules: token ids", function()
   local ctx
   before_each(function() ctx = H.ctx() end)

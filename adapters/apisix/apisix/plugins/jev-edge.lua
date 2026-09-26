@@ -218,6 +218,7 @@ local function subject_ctx(rt, req)
   -- trajectory and the logs.
   local raws, long = subject_m.extract_all(scfg, {
     ip = req.client_ip,
+    ipv6_prefix = rt.cfg.client_ip and rt.cfg.client_ip.ipv6_prefix,
     header = function(n) return req.headers[n] end,
     cookie_header = req.headers["cookie"],
   })

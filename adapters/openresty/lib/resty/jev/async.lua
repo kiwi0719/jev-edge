@@ -6,17 +6,27 @@
 
 local core    = require "jev.core"
 local verdict = require "jev.core.verdict"
+local http    = require "resty.jev.http"
 
 local _M = {}
 
-local INFLIGHT_KEY = "inflight:l3"
+-- L3 is the retry L2 could not afford: it gets the ceiling, not the adaptive
+-- estimate that just failed.
+local function l3_timeout(cfg)
+  return cfg.async.timeout_ms or math.max(cfg.jev.timeout_max_ms or 0, 5000)
+end
+
+-- The jobs in flight, counted as leases (resty.jev.http slots): a timer
+-- killed mid-job (a worker past worker_shutdown_timeout) never runs done(),
+-- and its slot comes back with the lease instead of never. A job's parts are
+-- judged at once (call_many), so it runs about one L3 timeout.
+local function slots(cfg, st)
+  return http.slots(st, "inflight:l3", math.ceil(l3_timeout(cfg) / 1000) + 5)
+end
 
 local function done(job)
-  local st = job.state or job.cache
-  local n = st:incr(INFLIGHT_KEY, -1)
-  -- The key can be evicted or reset (reload, dict flush); never let the
-  -- counter go negative or the cap silently grows by that much.
-  if n and n < 0 then st:set(INFLIGHT_KEY, 0, 0) end
+  if job.slot then slots(job.cfg, job.state or job.cache).give(job.slot) end
+  job.slot = nil
 end
 
 -- One answer (or nil) per part, in order; several parts at once when the
@@ -49,9 +59,7 @@ local function handler(premature, job)
   local cache = job.cache
   local cfg = job.cfg
   local ok, err = pcall(function()
-    -- L3 is the retry L2 could not afford: give it the ceiling, not the
-    -- adaptive estimate that just failed.
-    local timeout = cfg.async.timeout_ms or math.max(cfg.jev.timeout_max_ms or 0, 5000)
+    local timeout = l3_timeout(cfg)
     local res = core.l3_result(job.job, judge_all(job.judge, job.job.parts, timeout), cfg)
     if not res then
       -- no score in any answer: a provider fault, never a cached SAFE
@@ -100,12 +108,9 @@ end
 function _M.schedule(job)
   local cfg = job.cfg
   if not cfg.async or cfg.async.enabled == false then return false, "disabled" end
-  local st = job.state or job.cache
-  local n = st:incr(INFLIGHT_KEY, 1)
-  if n and n > (cfg.async.max_async or 32) then
-    done(job)
-    return false, "max_async exceeded"
-  end
+  local slot = slots(cfg, job.state or job.cache).take(cfg.async.max_async or 32)
+  if slot == nil then return false, "max_async exceeded" end
+  job.slot = slot
   local ok, err = ngx.timer.at(0, handler, job)
   if not ok then
     done(job)

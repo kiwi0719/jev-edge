@@ -131,3 +131,70 @@ describe("http.state_prefix", function()
     assert.truthy(seen:find(hash("sk-route-a"), 1, true))
   end)
 end)
+
+-- In-flight slots are leases: a thread killed mid-call never gives its slot
+-- back (openresty-io#5), and the slot must stop counting on its own.
+describe("http.slots", function()
+  local http, saved_ngx, t
+  setup(function()
+    saved_ngx = _G.ngx
+    t = 1000
+    _G.ngx = { now = function() return t end }
+    package.loaded["resty.jev.http"] = nil
+    http = require "resty.jev.http"
+  end)
+  teardown(function()
+    _G.ngx = saved_ngx
+    package.loaded["resty.jev.http"] = nil
+  end)
+  before_each(function() t = 1000 end)
+
+  it("refuses past max and takes again once a slot is given back", function()
+    local s = http.slots(H.store(), "inflight:l2", 10)
+    local a, b = s.take(2), s.take(2)
+    assert.truthy(a); assert.truthy(b)
+    assert.is_nil(s.take(2))
+    s.give(a)
+    assert.truthy(s.take(2))
+  end)
+
+  it("stops counting a slot nobody gave back after two lease periods, not before", function()
+    local s = http.slots(H.store(), "inflight:l2", 10)
+    assert.truthy(s.take(1))              -- a thread killed mid-call: never given back
+    assert.is_nil(s.take(1))
+    t = t + 10                            -- the next period still counts it
+    assert.is_nil(s.take(1))
+    t = t + 10                            -- two periods on it is gone
+    local c = s.take(1)
+    assert.truthy(c)
+    assert.is_nil(s.take(1))
+    s.give(c)
+    assert.truthy(s.take(1))
+  end)
+
+  it("a slot given back in a later period frees exactly that slot", function()
+    local store = H.store()
+    local s = http.slots(store, "inflight:l2", 10)
+    local old = { s.take(2), s.take(2) }
+    t = t + 10
+    assert.is_nil(s.take(2))              -- both still in flight
+    s.give(old[1]); s.give(old[2])
+    local x, y = s.take(2), s.take(2)
+    assert.truthy(x); assert.truthy(y)
+    assert.is_nil(s.take(2))              -- the cap holds: no slot counted twice or lost
+    -- a release long after its counter expired never offsets a later call
+    t = t + 100
+    store:set(old[1], nil)                -- the dict dropped the old period's counter
+    s.give(old[1])
+    assert.truthy(s.take(1))
+    assert.is_nil(s.take(1))
+  end)
+
+  it("admits every call when there is no counter (a missing dict)", function()
+    local s = http.slots({ incr = function() return nil end, get = function() end, set = function() end },
+      "inflight:l2", 10)
+    assert.equals(false, s.take(1))
+    assert.equals(false, s.take(1))
+    s.give(false)
+  end)
+end)

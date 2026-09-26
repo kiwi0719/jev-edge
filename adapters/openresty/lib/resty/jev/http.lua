@@ -44,6 +44,52 @@ function _M.state_prefix(cfg, hash)
   }, "\n")):sub(1, 12) .. ":"
 end
 
+--- In-flight slots that come back on their own. A thread nginx kills
+-- mid-call (lua_check_client_abort on and the client goes away, or a worker
+-- past worker_shutdown_timeout) never runs its release, and a counter that
+-- never expires kept that slot for good: after max_inflight such calls every
+-- call was refused until the dict was flushed, HUP reloads included.
+--
+-- A slot is counted under the lease period it was taken in (now / lease) and
+-- given back to that same period's counter, and a call is admitted against
+-- this period's slots and the previous period's. No call that holds a slot
+-- runs as long as a lease, so a slot two periods old belongs to a thread that
+-- is gone, and stops counting: a lost release costs its slot for one to two
+-- leases. One counter per period, rather than one counter that expires,
+-- because the calls in flight when that one expired would give back slots
+-- the new counter never counted, and under sustained load the cap would grow
+-- by up to max_inflight at every expiry.
+-- @param store cache-like object with get / set / incr(key, by, ttl)
+-- @param name  counter name ("inflight:l2")
+-- @param lease seconds, longer than any call that holds a slot
+-- @return { take = function(max) -> slot or nil (over max), give = function(slot) }
+function _M.slots(store, name, lease)
+  lease = math.max(1, math.ceil(tonumber(lease) or 10))
+  local ttl = 3 * lease
+  local base = name .. ":" .. lease .. ":"
+  local s = {}
+  function s.give(slot)
+    if not slot then return end
+    local n = store:incr(slot, -1, ttl)
+    -- an evicted or reset counter: clamp instead of letting the cap grow
+    if n and n < 0 then store:set(slot, 0, ttl) end
+  end
+  function s.take(max)
+    local p = math.floor(ngx.now() / lease)
+    local slot = base .. p
+    local n = store:incr(slot, 1, ttl)
+    -- no counter (a missing or full dict): not counted, nothing to give back
+    if not n then return false end
+    local prev = tonumber(store:get(base .. (p - 1))) or 0
+    if n + math.max(prev, 0) > max then
+      s.give(slot)
+      return nil
+    end
+    return slot
+  end
+  return s
+end
+
 --- Build a judge object for the current config.
 -- @param cfg      cfg.jev section (provider, endpoint, model, api_key, timeout_*, max_inflight)
 -- @param inflight cache-like object with get/set/incr (shared dict); also backs the adaptive timeout
@@ -57,13 +103,10 @@ function _M.new(cfg, inflight, metrics)
 
   local function now_ms() return ngx.now() * 1000 end
 
-  local key = "inflight:l2"
-  local function release()
-    if not inflight then return end
-    local n = inflight:incr(key, -1, 0)
-    -- evicted or reset counter: clamp instead of letting the cap grow
-    if n and n < 0 then inflight:set(key, 0, 0) end
-  end
+  -- An L2 call, or /_jev/health's, runs at most timeout_max_ms (the
+  -- adaptive ceiling) plus the connect; the lease leaves 5 s over that.
+  local lease = math.ceil(math.max(tonumber(cfg.timeout_max_ms) or 1000, 5000) / 1000) + 5
+  local l2 = inflight and _M.slots(inflight, "inflight:l2", lease)
 
   -- core passes cfg.jev.timeout_ms and the adaptive estimate (floor..ceiling)
   -- overrides it. A caller asking for MORE than the estimate (L3 with the
@@ -132,18 +175,17 @@ function _M.new(cfg, inflight, metrics)
 
   function self.call(prompt, requested_timeout)
     -- Concurrency cap applies to every provider, mock included, so the limit
-    -- is exercised by the soak test. The slot is released on every exit,
-    -- including a Lua error or a client abort killing the thread mid-call.
-    local max = tonumber(cfg.max_inflight) or 64
-    if inflight then
-      local n = inflight:incr(key, 1, 0)
-      if n and n > max then
-        release()
-        return nil, judge.BUSY
-      end
+    -- is exercised by the soak test. The slot is given back after a return
+    -- or a Lua error; a thread killed mid-call (a client abort under
+    -- lua_check_client_abort, a worker shutdown) never gets there, and its
+    -- slot comes back with the lease (_M.slots).
+    local slot
+    if l2 then
+      slot = l2.take(tonumber(cfg.max_inflight) or 64)
+      if slot == nil then return nil, judge.BUSY end
     end
     local ok, answers, err, kind = pcall(do_call, prompt, requested_timeout)
-    release()
+    if slot then l2.give(slot) end
     if not ok then return nil, "judge error: " .. tostring(answers) end
     return answers, err, kind
   end

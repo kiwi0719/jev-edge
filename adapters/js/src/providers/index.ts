@@ -6,7 +6,7 @@
 //                  the "thin Worker" mode, one set of thresholds for edge and origin
 //   mock           fixed score, no network
 import { TRANSPORT, TIMEOUT, UNUSABLE, statusKind, type Prompt, type Answers, type ErrorKind } from "../core/judge.js";
-import type { JevConfig, QuestionWording } from "../core/defaults.js";
+import { OWN_BODY_KEYS, type JevConfig, type QuestionWording } from "../core/defaults.js";
 import type { Template } from "../core/templates.js";
 
 /** A failure carries its kind (core/judge.ts): a provider that answered 200
@@ -63,9 +63,10 @@ async function fetchWithin<T>(url: string, init: RequestInit, timeoutMs: number,
   }
 }
 
-/** A non-OK status is reported as an error string without reading the body. */
+/** A non-OK status, reported as an error string; `detail`: what the body
+ *  said, for a provider that reads it (openai-compat). */
 class HttpStatus extends Error {
-  constructor(public status: number) {
+  constructor(public status: number, public detail?: string) {
     super("http " + status);
     this.name = "HttpStatus";
   }
@@ -347,40 +348,96 @@ export function echoesInput(content: string, text: string | undefined, wanted: s
   });
 }
 
+/**
+ * The openai-compat request body (port of _M.body in
+ * providers/openai_compat.lua): model, response_format and the two messages,
+ * then jev.temperature (0; false leaves it out), jev.max_tokens (200) under
+ * jev.token_param, and the keys of jev.extra_body but the body's own.
+ */
+export function openaiBody(cfg: JevConfig, system: string, user: string): Record<string, unknown> {
+  const body: Record<string, unknown> = {
+    model: cfg.model ?? "gpt-4o-mini",
+    response_format: { type: "json_object" },
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: user },
+    ],
+  };
+  if (cfg.temperature !== false) body.temperature = typeof cfg.temperature === "number" ? cfg.temperature : 0;
+  body[cfg.token_param === "max_completion_tokens" ? "max_completion_tokens" : "max_tokens"] =
+    typeof cfg.max_tokens === "number" ? cfg.max_tokens : 200;
+  const extra = cfg.extra_body;
+  if (extra && typeof extra === "object" && !Array.isArray(extra)) {
+    for (const [k, v] of Object.entries(extra)) if (!OWN_BODY_KEYS.has(k)) body[k] = v;
+  }
+  return body;
+}
+
+/**
+ * What a JSON error body says (port of error_message): error.message,
+ * error as a string or message; control characters as spaces, cut to 200
+ * UTF-8 bytes on a character boundary. undefined when it says nothing.
+ */
+export function openaiErrorMessage(body: string): string | undefined {
+  let d: unknown;
+  try {
+    d = JSON.parse(body);
+  } catch {
+    return undefined;
+  }
+  if (!d || typeof d !== "object" || Array.isArray(d)) return undefined;
+  const o = d as Record<string, unknown>;
+  let m: unknown = o.error && typeof o.error === "object" && !Array.isArray(o.error) ? (o.error as Record<string, unknown>).message : o.error;
+  if (typeof m !== "string") m = o.message;
+  if (typeof m !== "string" || m === "") return undefined;
+  let s = m.replace(/[\x00-\x1f\x7f]/g, " ");
+  const bytes = new TextEncoder().encode(s);
+  if (bytes.length > 200) {
+    let end = 200;
+    // a cut inside a UTF-8 sequence drops its first bytes too
+    if ((bytes[200] & 0xc0) === 0x80) {
+      while (end > 0 && (bytes[end - 1] & 0xc0) === 0x80) end--;
+      if (end > 0 && bytes[end - 1] >= 0xc0) end--;
+    }
+    s = new TextDecoder().decode(bytes.subarray(0, end));
+  }
+  return s;
+}
+
+export const OPENAI_CUT = "openai-compat: reply cut at max_tokens (reasoning model? raise jev.max_tokens)";
+
 export const openaiCompat: Provider = {
   name: "openai-compat",
   async call(prompt, cfg, timeoutMs) {
     const endpoint = (cfg.endpoint ?? "http://127.0.0.1:11434/v1").replace(/\/+$/, "");
     const nonce = newNonce();
-    const body = JSON.stringify({
-      model: cfg.model ?? "gpt-4o-mini",
-      temperature: 0,
-      max_tokens: 200,
-      response_format: { type: "json_object" },
-      messages: [
-        { role: "system", content: openaiSystemPrompt(prompt.questions, nonce) },
-        { role: "user", content: openaiUserMessage(prompt.text, nonce) },
-      ],
-    });
+    const body = JSON.stringify(openaiBody(cfg, openaiSystemPrompt(prompt.questions, nonce), openaiUserMessage(prompt.text, nonce)));
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (cfg.api_key) headers.Authorization = "Bearer " + cfg.api_key;
-    let content: string;
+    let content: unknown;
+    let finish: unknown;
     try {
-      content = await fetchWithin(endpoint + "/chat/completions", { method: "POST", headers, body }, timeoutMs, async (res) => {
-        if (res.status !== 200) throw new HttpStatus(res.status);
+      [content, finish] = await fetchWithin(endpoint + "/chat/completions", { method: "POST", headers, body }, timeoutMs, async (res) => {
+        // the error body is read under the same deadline, for its message
+        if (res.status !== 200) throw new HttpStatus(res.status, openaiErrorMessage(await res.text().catch(() => "")));
         try {
-          const d = (await res.json()) as { choices?: { message?: { content?: string } }[] };
-          return d.choices?.[0]?.message?.content ?? "";
+          const d = (await res.json()) as { choices?: { message?: { content?: unknown }; finish_reason?: unknown }[] };
+          const c = d?.choices?.[0];
+          return [c?.message?.content, c?.finish_reason] as const;
         } catch (e) {
           if (e instanceof Error && e.name === "AbortError") throw e;
           throw new Error("malformed response");
         }
       });
     } catch (e) {
-      if (e instanceof HttpStatus) return [null, "openai-compat http " + e.status, statusKind(e.status)];
+      if (e instanceof HttpStatus) {
+        return [null, "openai-compat http " + e.status + (e.detail !== undefined ? ": " + e.detail : ""), statusKind(e.status)];
+      }
       if (e instanceof Error && e.message === "malformed response") return [null, "openai-compat: malformed response", UNUSABLE];
       return noAnswer(e, timeoutMs);
     }
+    // the token budget ran out before the answer (a reasoning model spends it thinking)
+    if (finish === "length" && (typeof content !== "string" || jsonObjects(content).length === 0)) return [null, OPENAI_CUT, UNUSABLE];
     if (typeof content !== "string") return [null, "openai-compat: no content", UNUSABLE];
     const wanted = Object.keys(prompt.questions);
     // a reply that copies an answer planted in the input: the judge was

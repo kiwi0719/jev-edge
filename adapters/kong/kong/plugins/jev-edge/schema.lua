@@ -11,6 +11,10 @@
 --   rules_json  the full rules list as JSON, ids and inline rules mixed,
 --               exactly the APISIX / Lua-config `rules` value; when set it
 --               replaces `rules`.
+-- For the same reason jev.extra_body (a JSON object merged into the
+-- openai-compat request) is jev.extra_body_json, a JSON object as a string,
+-- and jev.temperature is a number only (no false: set 1 for a model that
+-- takes only its default temperature).
 
 require("resty.jev.loader")()
 
@@ -54,6 +58,13 @@ local function check_rules_json(s)
   return true
 end
 
+-- jev.extra_body_json: a JSON object, checked as core checks jev.extra_body
+local function check_extra_body_json(s)
+  local eb = cjson.decode(s)
+  if type(eb) ~= "table" then return nil, "jev.extra_body_json must be a JSON object" end
+  return defaults.validate_extra_body(eb)
+end
+
 local function check_rule_ids(ids)
   local _, err = rules_mod.resolve_all(ids, load_rule)
   if err then return nil, err end
@@ -83,6 +94,12 @@ return {
             { timeout_max_ms     = { type = "integer", gt = 0 } },
             { timeout_adaptive   = { type = "boolean" } },
             { max_inflight       = { type = "integer", gt = 0 } },
+            -- the openai-compat request: the reply's token budget and the
+            -- parameter that carries it, the temperature, extra body keys
+            { max_tokens         = { type = "integer", gt = 0 } },
+            { token_param        = { type = "string", one_of = { "max_tokens", "max_completion_tokens" } } },
+            { temperature        = { type = "number", between = { 0, 2 } } },
+            { extra_body_json    = { type = "string", custom_validator = check_extra_body_json } },
             -- mock provider knobs, for tests
             { mock_score         = { type = "number", between = unit } },
             { mock_header        = { type = "string" } },
@@ -181,6 +198,9 @@ return {
       field_sources = { "config" },
       fn = function(entity)
         local conf = strip_nulls(entity.config)
+        if type(conf.jev) == "table" and conf.jev.extra_body_json then
+          conf.jev.extra_body, conf.jev.extra_body_json = cjson.decode(conf.jev.extra_body_json), nil
+        end
         local merged = defaults.merge(defaults.config, conf)
         local ok, err = defaults.validate(merged)
         if not ok then return nil, err end

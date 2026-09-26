@@ -25,6 +25,13 @@ export interface JevConfig {
   timeout_alpha?: number;
   timeout_warmup?: number;
   max_inflight?: number;
+  /** openai-compat: the reply's token budget (default 200) and the body key that carries it. */
+  max_tokens?: number;
+  token_param?: "max_tokens" | "max_completion_tokens";
+  /** openai-compat: 0 by default; false leaves it out (a model that takes only its default). */
+  temperature?: number | false;
+  /** openai-compat: more body keys, merged in; never model, messages or response_format. */
+  extra_body?: Record<string, unknown>;
   /** Per-provider question wording: fields here replace the bundled template's for jev / laya requests. */
   questions?: Record<string, QuestionWording>;
   [k: string]: unknown;
@@ -118,6 +125,17 @@ export function merge<T extends object>(base: T, over?: object | null): T {
   return out as T;
 }
 
+/** Port of OWN_BODY_KEYS: the openai-compat body's own keys, which jev.extra_body may not set. */
+export const OWN_BODY_KEYS: ReadonlySet<string> = new Set(["model", "messages", "response_format"]);
+
+/** Port of validate_extra_body: a table of body keys (a JSON object), none of them the body's own. */
+export function validateExtraBody(eb: unknown): [true, null] | [null, string] {
+  if (eb === undefined) return [true, null];
+  if (typeof eb !== "object" || eb === null || Array.isArray(eb)) return [null, "jev.extra_body must be a table of body keys"];
+  for (const k of Object.keys(eb)) if (OWN_BODY_KEYS.has(k)) return [null, `jev.extra_body may not set ${k}`];
+  return [true, null];
+}
+
 export function validate(c: Config): [true, null] | [null, string] {
   const p = c.policy ?? {};
   if (p.mode !== "monitor" && p.mode !== "enforce") return [null, "policy.mode must be monitor|enforce"];
@@ -166,6 +184,17 @@ export function validate(c: Config): [true, null] | [null, string] {
     if (v !== undefined && typeof v !== "string") return [null, `jev.${k} must be a string`];
   }
   if (c.jev.provider === "") return [null, "jev.provider must be a non-empty string"];
+  // the openai-compat request (providers/index.ts): see core/defaults.lua
+  const mt = c.jev.max_tokens;
+  if (mt !== undefined && (typeof mt !== "number" || !Number.isInteger(mt) || mt < 1)) return [null, "jev.max_tokens must be an integer >= 1"];
+  const tp = c.jev.token_param;
+  if (tp !== undefined && tp !== "max_tokens" && tp !== "max_completion_tokens") return [null, "jev.token_param must be max_tokens|max_completion_tokens"];
+  const temp = c.jev.temperature;
+  if (temp !== undefined && temp !== false && (typeof temp !== "number" || !(temp >= 0 && temp <= 2))) {
+    return [null, "jev.temperature must be a number from 0 to 2, or false"];
+  }
+  const [eok, eerr] = validateExtraBody(c.jev.extra_body);
+  if (!eok) return [null, eerr];
   const fb = c.feedback ?? {};
   if (fb.trust_ttl !== undefined && (typeof fb.trust_ttl !== "number" || fb.trust_ttl <= 0)) return [null, "feedback.trust_ttl must be > 0"];
   if (fb.max_renewals !== undefined && (typeof fb.max_renewals !== "number" || fb.max_renewals < 0)) return [null, "feedback.max_renewals must be >= 0"];

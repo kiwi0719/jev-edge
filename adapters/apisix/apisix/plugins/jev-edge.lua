@@ -62,6 +62,15 @@ local schema = {
         timeout_max_ms     = { type = "integer", minimum = 1 },
         timeout_adaptive   = { type = "boolean" },
         max_inflight       = { type = "integer", minimum = 1 },
+        -- the openai-compat request: the reply's token budget and the
+        -- parameter that carries it, the temperature (false: not sent),
+        -- extra body keys (core/defaults.lua refuses model, messages and
+        -- response_format there)
+        max_tokens         = { type = "integer", minimum = 1 },
+        token_param        = { type = "string", enum = { "max_tokens", "max_completion_tokens" } },
+        temperature        = { anyOf = { { type = "number", minimum = 0, maximum = 2 },
+                                         { type = "boolean", enum = { false } } } },
+        extra_body         = { type = "object" },
         -- mock provider knobs, for tests
         mock_score         = { type = "number", minimum = 0, maximum = 1 },
         mock_header        = { type = "string" },

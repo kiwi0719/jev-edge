@@ -196,6 +196,17 @@ describe("provider timeouts", () => {
     expect(((await res.json()) as Record<string, string>).verdict).toBe("error");
     expect(await rt.state.get("adapt")).toMatchObject({ n: 1, mean: 36 }); // fired * 1.2
   });
+
+  // lead-hosted-api-providers#2: openai-compat quotes the provider's error
+  // message now; a 504 that says "timeout" is an HTTP error, not the call
+  // timing out, and must not push the adaptive estimate up
+  it("an HTTP error whose message says timeout is not a timeout for the adaptive estimate", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ error: { message: "upstream request timeout" } }, { status: 504 })));
+    const rt = createRuntime({ config: { jev: { provider: "openai-compat", endpoint: "https://judge.example", timeout_ms: 30, timeout_warmup: 1, timeout_max_ms: 300 }, policy: { mode: "enforce" } } });
+    const res = await handle(chat(ATTACK), rt, echo);
+    expect(((await res.json()) as Record<string, string>).verdict).toBe("error");
+    expect(await rt.state.get("adapt")).toBeUndefined();
+  });
 });
 
 describe("backend provider (thin Worker)", () => {

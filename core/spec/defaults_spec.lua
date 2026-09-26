@@ -72,6 +72,39 @@ describe("defaults.validate", function()
               api_key_env = "K", deployment_context = "A support assistant." } })))
   end)
 
+  -- lead-hosted-api-providers#2: the openai-compat request knobs. The same
+  -- table is in adapters/js/test/core.test.ts ("defaults.validate").
+  it("checks jev.max_tokens, token_param, temperature and extra_body", function()
+    local NULL = io.stdout
+    for _, c in ipairs({
+      { { jev = { max_tokens = 0 } }, "jev.max_tokens must be an integer >= 1" },
+      { { jev = { max_tokens = 1.5 } }, "jev.max_tokens must be an integer >= 1" },
+      { { jev = { max_tokens = "200" } }, "jev.max_tokens must be an integer >= 1" },
+      { { jev = { token_param = "max_output_tokens" } }, "jev.token_param must be max_tokens|max_completion_tokens" },
+      { { jev = { temperature = true } }, "jev.temperature must be a number from 0 to 2, or false" },
+      { { jev = { temperature = 2.5 } }, "jev.temperature must be a number from 0 to 2, or false" },
+      { { jev = { temperature = -1 } }, "jev.temperature must be a number from 0 to 2, or false" },
+      { { jev = { temperature = NULL } }, "jev.temperature must be a number from 0 to 2, or false" },
+      { { jev = { extra_body = "seed=1" } }, "jev.extra_body must be a table of body keys" },
+      { { jev = { extra_body = { "a", "b" } } }, "jev.extra_body must be a table of body keys" },
+      { { jev = { extra_body = { model = "other" } } }, "jev.extra_body may not set model" },
+      { { jev = { extra_body = { messages = {} } } }, "jev.extra_body may not set messages" },
+      { { jev = { extra_body = { response_format = { type = "text" } } } },
+        "jev.extra_body may not set response_format" },
+    }) do
+      local ok, err = D.validate(D.merge(D.config, c[1]))
+      assert.is_nil(ok, c[2])
+      assert.equals(c[2], err)
+    end
+    for _, jev in ipairs({
+      { max_tokens = 1 }, { max_tokens = 4096, token_param = "max_completion_tokens" }, { token_param = "max_tokens" },
+      { temperature = 0 }, { temperature = 2 }, { temperature = 0.7 }, { temperature = false },
+      { extra_body = { reasoning_effort = "low", seed = 7, chat_template_kwargs = { enable_thinking = false } } },
+    }) do
+      assert.is_true((D.validate(D.merge(D.config, { jev = jev }))))
+    end
+  end)
+
   it("takes any 4xx as policy.block_status", function()
     for _, st in ipairs({ 400, 403, 429, 451, 499 }) do
       assert.is_true(D.validate(D.merge(D.config, { policy = { block_status = st } })), st)

@@ -630,6 +630,36 @@ describe("defaults.validate", () => {
     expect(core.defaults.validate(core.defaults.merge(core.defaults.config, { policy: { partial: "unjudgeable" } }))[0]).toBe(true);
   });
 
+  // lead-hosted-api-providers#2: the openai-compat request knobs. The same
+  // table is in core/spec/defaults_spec.lua.
+  it("checks jev.max_tokens, token_param, temperature and extra_body", () => {
+    const v = (jev: Record<string, unknown>) => core.defaults.validate(core.defaults.merge(core.defaults.config, { jev } as never));
+    for (const [jev, want] of [
+      [{ max_tokens: 0 }, "jev.max_tokens must be an integer >= 1"],
+      [{ max_tokens: 1.5 }, "jev.max_tokens must be an integer >= 1"],
+      [{ max_tokens: "200" }, "jev.max_tokens must be an integer >= 1"],
+      [{ token_param: "max_output_tokens" }, "jev.token_param must be max_tokens|max_completion_tokens"],
+      [{ temperature: true }, "jev.temperature must be a number from 0 to 2, or false"],
+      [{ temperature: 2.5 }, "jev.temperature must be a number from 0 to 2, or false"],
+      [{ temperature: -1 }, "jev.temperature must be a number from 0 to 2, or false"],
+      [{ temperature: null }, "jev.temperature must be a number from 0 to 2, or false"],
+      [{ extra_body: "seed=1" }, "jev.extra_body must be a table of body keys"],
+      [{ extra_body: ["a", "b"] }, "jev.extra_body must be a table of body keys"],
+      [{ extra_body: { model: "other" } }, "jev.extra_body may not set model"],
+      [{ extra_body: { messages: [] } }, "jev.extra_body may not set messages"],
+      [{ extra_body: { response_format: { type: "text" } } }, "jev.extra_body may not set response_format"],
+    ] as [Record<string, unknown>, string][]) {
+      expect(v(jev), JSON.stringify(jev)).toEqual([null, want]);
+    }
+    for (const jev of [
+      { max_tokens: 1 }, { max_tokens: 4096, token_param: "max_completion_tokens" }, { token_param: "max_tokens" },
+      { temperature: 0 }, { temperature: 2 }, { temperature: 0.7 }, { temperature: false },
+      { extra_body: { reasoning_effort: "low", seed: 7, chat_template_kwargs: { enable_thinking: false } } },
+    ]) {
+      expect(v(jev)[0], JSON.stringify(jev)).toBe(true);
+    }
+  });
+
   // keys the host reads as strings (openresty-edge#4); null is given and wrong, as cjson.null is in Lua
   it("wants block_body and the judge's settings to be strings", () => {
     for (const [over, want] of [

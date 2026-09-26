@@ -497,7 +497,12 @@ async function evaluateInner(request: Request, rt: Runtime, requestId: string, r
       const p = rt.adaptive.success(elapsed).catch(() => {});
       if (!keepAlive(rctx, p)) await p;
     }
-    else if (String(r[1]).includes("timeout")) await rt.adaptive.timeout(timeoutMs);
+    // a timeout by its kind: an HTTP error whose message says "timeout"
+    // (openai-compat quotes the provider's) is not one; the error string
+    // only for a provider that gives no kind
+    else if (r[2] === core.judge.TIMEOUT || (r[2] === undefined && String(r[1]).includes("timeout"))) {
+      await rt.adaptive.timeout(timeoutMs);
+    }
     return r;
   };
   const ctx: core.Ctx = {

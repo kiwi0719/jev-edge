@@ -98,6 +98,13 @@ local function config_from(conf)
     else kong.log.err("jev-edge: rules_json is not a JSON array, using rules") end
   end
   c.rules_json, c.log_line = nil, nil
+  -- jev.extra_body_json: core's jev.extra_body, as a JSON object in a string
+  if type(c.jev) == "table" and c.jev.extra_body_json then
+    local eb = cjson.decode(c.jev.extra_body_json)
+    if type(eb) == "table" then c.jev.extra_body = eb
+    else kong.log.err("jev-edge: jev.extra_body_json is not a JSON object, ignored") end
+    c.jev.extra_body_json = nil
+  end
   return defaults.merge(defaults.config, c)
 end
 

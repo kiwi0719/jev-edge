@@ -244,6 +244,22 @@ function _M.merge(base, over)
   return out
 end
 
+-- The openai-compat request body's own keys (providers/openai_compat.lua):
+-- jev.extra_body may add any other key, never one of these.
+_M.OWN_BODY_KEYS = { model = true, messages = true, response_format = true }
+
+--- jev.extra_body: a table of body keys (a JSON object), none of them the
+-- body's own. Kong decodes its extra_body_json with this too.
+function _M.validate_extra_body(eb)
+  if eb == nil then return true end
+  if type(eb) ~= "table" or eb[1] ~= nil then return nil, "jev.extra_body must be a table of body keys" end
+  for k in pairs(eb) do
+    if type(k) ~= "string" then return nil, "jev.extra_body must be a table of body keys" end
+    if _M.OWN_BODY_KEYS[k] then return nil, "jev.extra_body may not set " .. k end
+  end
+  return true
+end
+
 --- Validate a merged config. Returns true or nil, err.
 function _M.validate(c)
   local p = c.policy or {}
@@ -322,6 +338,23 @@ function _M.validate(c)
     end
   end
   if c.jev.provider == "" then return nil, "jev.provider must be a non-empty string" end
+  -- the openai-compat request (providers/openai_compat.lua): the reply's
+  -- token budget and the parameter that carries it, the temperature (false:
+  -- not sent, for a model that takes only its default) and extra body keys
+  local mt = c.jev.max_tokens
+  if mt ~= nil and (type(mt) ~= "number" or mt < 1 or mt % 1 ~= 0) then
+    return nil, "jev.max_tokens must be an integer >= 1"
+  end
+  local tp = c.jev.token_param
+  if tp ~= nil and tp ~= "max_tokens" and tp ~= "max_completion_tokens" then
+    return nil, "jev.token_param must be max_tokens|max_completion_tokens"
+  end
+  local temp = c.jev.temperature
+  if temp ~= nil and temp ~= false and (type(temp) ~= "number" or not (temp >= 0 and temp <= 2)) then
+    return nil, "jev.temperature must be a number from 0 to 2, or false"
+  end
+  local eok, eerr = _M.validate_extra_body(c.jev.extra_body)
+  if not eok then return nil, eerr end
   local sm = c.sampling or {}
   if sm.rate ~= nil and (type(sm.rate) ~= "number" or sm.rate < 0 or sm.rate > 1) then
     return nil, "sampling.rate must be in [0,1]"

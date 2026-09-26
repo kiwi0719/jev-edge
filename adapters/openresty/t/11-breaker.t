@@ -107,8 +107,8 @@ Content-Type: application/json
 --- more_headers
 Content-Type: application/json
 --- response_body eval
-["verdict=error score=0.00 source=l2 reason=openai-compat+http+503\n",
- "verdict=error score=0.00 source=l2 reason=openai-compat+http+503\n",
+["verdict=error score=0.00 source=l2 reason=openai-compat+http+503%3A+down\n",
+ "verdict=error score=0.00 source=l2 reason=openai-compat+http+503%3A+down\n",
  "verdict=skipped score=0.00 source=breaker reason=breaker+open\n"]
 --- no_error_log
 [error]
@@ -131,8 +131,8 @@ Content-Type: application/json
 --- more_headers
 Content-Type: application/json
 --- response_body eval
-["verdict=error score=0.00 source=l2 reason=openai-compat+http+503\n",
- "verdict=error score=0.00 source=l2 reason=openai-compat+http+503\n",
+["verdict=error score=0.00 source=l2 reason=openai-compat+http+503%3A+down\n",
+ "verdict=error score=0.00 source=l2 reason=openai-compat+http+503%3A+down\n",
  "ok\n",
  "verdict=error score=0.00 source=l2 reason=unusable%3A+openai-compat%3A+no+content\n",
  "verdict=safe score=0.30 source=l2 reason=injection+0.30\n",

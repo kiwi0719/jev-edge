@@ -689,6 +689,7 @@ class JevEdgeGuardrail(_ApplyGuardrailBase):
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
+        self._guardrail_name = kwargs.get("guardrail_name")
         url = str(_setting(jev_edge_url, "JEV_EDGE_URL", ""))
         if not url:
             raise ValueError("jev-edge guardrail: set JEV_EDGE_URL (or jev_edge_url)")
@@ -716,6 +717,12 @@ class JevEdgeGuardrail(_ApplyGuardrailBase):
             log.warning("jev-edge guardrail %s: default_on is not true, so LiteLLM runs it only for requests and keys "
                         "that name it, and a request that leaves it out is never judged; set default_on: true "
                         "under litellm_params to judge every request", kwargs.get("guardrail_name"))
+
+    def _own_name(self) -> Optional[str]:
+        """The guardrail_name config.yaml gives this guardrail (LiteLLM's
+        CustomGuardrail keeps it), None when code built it without one."""
+        name = getattr(self, "guardrail_name", None) or self._guardrail_name
+        return name if isinstance(name, str) and name else None
 
     def uses_apply_guardrail_interface(self) -> bool:
         # apply_guardrail only answers LiteLLM's direct calls (realtime text,
@@ -766,8 +773,15 @@ class JevEdgeGuardrail(_ApplyGuardrailBase):
             return "skip", f"call type {name} not judged"
         if name in NOT_VISIBLE_CALLS:
             return "unjudged", f"unjudgeable: call type {name}: {NOT_VISIBLE_CALLS[name]}"
-        if name == TEST_ENDPOINT_CALL and self.test_endpoint == "refuse":
-            return "refuse", None
+        if name == TEST_ENDPOINT_CALL:
+            # LiteLLM 1.102 runs every default_on guardrail's pre-call hook
+            # for the endpoint, whichever guardrail it names, and passes the
+            # name it was asked for: another guardrail answers that call
+            asked, own = data.get("guardrail_name"), self._own_name()
+            if isinstance(asked, str) and own and asked != own:
+                return "skip", f"call type {name}: /guardrails/apply_guardrail asked for guardrail {asked}"
+            if self.test_endpoint == "refuse":
+                return "refuse", None
         if name in NESTED_PASSTHROUGH_CALLS:
             # Bedrock's handlers build the data from scratch with the body
             # under `data`; Gigachat's reads the body into the data and puts
@@ -894,7 +908,7 @@ class JevEdgeGuardrail(_ApplyGuardrailBase):
             verdict = self._adapter("skipped", "no text")
         else:
             verdict = await self.judge(arg, ip)
-        if name == TEST_ENDPOINT_CALL:
+        if name == TEST_ENDPOINT_CALL and kind != "skip":
             _TEST_CALL_JUDGED.set(True)
 
         key = _metadata_key(data)

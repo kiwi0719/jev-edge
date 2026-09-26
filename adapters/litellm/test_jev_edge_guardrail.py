@@ -1387,10 +1387,10 @@ def test_the_test_endpoint_can_be_refused(request_data, enforce):
     assert seen["calls"] == 1
 
 
-def endpoint_call(xff="198.51.100.77"):
+def endpoint_call(xff="198.51.100.77", name="jev-edge"):
     """What LiteLLM 1.102's /guardrails/apply_guardrail hands the pre-call
     hook (call type apply_guardrail) before it calls apply_guardrail."""
-    return {"guardrail_name": "jev-edge", "input": [ATTACK], "messages": [], "model": None,
+    return {"guardrail_name": name, "input": [ATTACK], "messages": [], "model": None,
             "metadata": {"route": "/apply_guardrail", "user_api_key_auth": Auth(), "requester_ip_address": "127.0.0.1"},
             "proxy_server_request": psr("/guardrails/apply_guardrail", **{"x-forwarded-for": xff}),
             "litellm_logging_obj": object()}
@@ -1419,3 +1419,24 @@ def test_the_test_endpoint_on_1_102_is_refused_in_the_pre_call_hook():
                                                                                        "apply_guardrail"))
     assert ei.value.status_code == 403 and seen["calls"] == 0
     assert ei.value.detail["jev"]["action"] == "block" and ei.value.detail["jev"]["source"] == "adapter"
+
+
+@pytest.mark.parametrize("test_endpoint", ["judge", "refuse"])
+def test_the_test_endpoint_asking_for_another_guardrail_is_left_to_it(test_endpoint):
+    # LiteLLM 1.102 runs every default_on guardrail's pre-call hook for the
+    # endpoint, whichever guardrail the call names: jev-edge neither judges
+    # nor refuses a call for another one
+    transport, seen = fake_authz(status=403, verdict="malicious")
+    g = JevEdgeGuardrail(jev_edge_url=URL, transport=transport, guardrail_name="jev-edge", default_on=True,
+                         test_endpoint=test_endpoint)
+    data = endpoint_call(name="pii-filter")
+    out = run(g.async_pre_call_hook({}, None, data, "apply_guardrail"))
+    assert seen["calls"] == 0
+    assert out["metadata"]["jev_verdict"] == {
+        "verdict": "skipped", "score": "0.00", "source": "adapter", "action": "pass",
+        "reason": "call type apply_guardrail: /guardrails/apply_guardrail asked for guardrail pii-filter"}
+    # a call for jev-edge itself is judged, or refused
+    with pytest.raises(Exception) as ei:
+        run(g.async_pre_call_hook({}, None, endpoint_call(), "apply_guardrail"))
+    assert ei.value.status_code == 403
+    assert seen["calls"] == (1 if test_endpoint == "judge" else 0)

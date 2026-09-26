@@ -144,10 +144,12 @@ function variants(node: { [k: string]: JsonValue }, key: string): string[] | und
 // per extraction, and DEEP.depth levels below the path's value (cjson's
 // nesting limit, which tooDeep() applies here: JSON either core decodes is
 // never cut by depth). Object keys are read in UTF-8 byte order, as Lua's
-// table.sort orders them. An object with more keys than the budget has left
-// is skipped whole and the walk goes on; an array stops where the budget
-// does; `capped` says so. An empty object or array (and null) adds nothing
-// and is not counted. Tests lower the bounds.
+// table.sort orders them. One oversized node must not starve what comes
+// after it: an object with more keys than the budget has left is skipped
+// whole, and an array with more items than that keeps its newest ones (the
+// last), half as many as the budget has left; `capped` says so. An empty
+// object or array (and null) adds nothing and is not counted. Tests lower
+// the bounds.
 // ---------------------------------------------------------------------------
 
 export const DEEP = { depth: 1000, nodes: 20000 };
@@ -206,14 +208,19 @@ function keysOf(node: { [k: string]: JsonValue }, st: WalkState): string[] | und
   return keys.some((k) => SURROGATE.test(k)) ? keys.sort(byteOrder) : keys.sort();
 }
 
-// Port of count_item: one array item against the node budget.
-function countItem(st: WalkState): boolean {
-  if (st.nodes <= 0) {
-    st.capped = true;
-    return false;
+// Port of first_item: the index of the first item of array `node` the walk
+// reads, counted against the node budget: 0 when all of them fit; else the
+// newest items (the last ones), half as many as the budget has left.
+function firstItem(node: JsonValue[], st: WalkState): number {
+  const n = node.length;
+  if (n <= st.nodes) {
+    st.nodes -= n;
+    return 0;
   }
-  st.nodes--;
-  return true;
+  st.capped = true;
+  const k = Math.floor(st.nodes / 2);
+  st.nodes -= k;
+  return n - k;
 }
 
 function take(st: WalkState, s: string): void {
@@ -246,10 +253,7 @@ function everyString(node: JsonValue | undefined, st: WalkState, depth: number, 
     return;
   }
   if (Array.isArray(node)) {
-    for (const v of node) {
-      if (!countItem(st)) return;
-      everyString(v, st, depth + 1, schema);
-    }
+    for (let i = firstItem(node, st); i < node.length; i++) everyString(node[i], st, depth + 1, schema);
     return;
   }
   const keys = keysOf(node, st);

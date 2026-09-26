@@ -118,11 +118,13 @@ end
 -- LuaJIT and in Node), and DEEP_DEPTH levels below the path's value, which is
 -- cjson's own nesting limit: JSON either core decodes is never cut by depth,
 -- the bound only guards the recursion. Object keys are read in byte order: a
--- Lua table has none, and both cores must produce the same text. An object
--- with more keys than the budget has left is skipped whole and the walk goes
--- on, so one oversized object cannot starve what comes after it; an array
--- stops where the budget does. Whatever a bound leaves out, `capped` says so.
--- An empty object or array (and a decoder's null, which may be an empty
+-- Lua table has none, and both cores must produce the same text. One
+-- oversized node must not starve what comes after it: an object with more
+-- keys than the budget has left is skipped whole (reading any of its keys
+-- means sorting all of them), and an array with more items than that keeps
+-- its newest ones, the last, half as many as the budget has left, so what
+-- follows it keeps the other half. Whatever a bound leaves out, `capped` says
+-- so. An empty object or array (and a decoder's null, which may be an empty
 -- table) adds nothing and is not counted.
 -- ---------------------------------------------------------------------------
 
@@ -153,14 +155,19 @@ local function keys_of(node, st)
   return keys
 end
 
--- Counts one array item against the node budget; false once it is spent.
-local function count_item(st)
-  if st.nodes <= 0 then
-    st.capped = true
-    return false
+-- The index of the first item of array `node` the walk reads, counted
+-- against the node budget: 1 when all of them fit; else the newest items
+-- (the last ones), half as many as the budget has left.
+local function first_item(node, st)
+  local n = #node
+  if n <= st.nodes then
+    st.nodes = st.nodes - n
+    return 1
   end
-  st.nodes = st.nodes - 1
-  return true
+  st.capped = true
+  local k = math.floor(st.nodes / 2)
+  st.nodes = st.nodes - k
+  return n - k + 1
 end
 
 local function take(st, s)
@@ -195,10 +202,7 @@ local function every_string(node, st, depth, schema)
     return
   end
   if node[1] ~= nil then
-    for _, v in ipairs(node) do
-      if not count_item(st) then return end
-      every_string(v, st, depth + 1, schema)
-    end
+    for i = first_item(node, st), #node do every_string(node[i], st, depth + 1, schema) end
     return
   end
   local keys = keys_of(node, st)

@@ -71,7 +71,7 @@ spec:
     spec:
       containers:
         - name: jev-edge
-          image: registry.example.com/jev-edge:0.6.1   # your OpenResty image with the files above
+          image: registry.example.com/jev-edge:0.6.2   # your OpenResty image with the files above
           ports: [{ containerPort: 8080 }]
           env:
             - name: TYPESAFE_API_KEY                  # jev.api_key_env; `env TYPESAFE_API_KEY;` in nginx.conf

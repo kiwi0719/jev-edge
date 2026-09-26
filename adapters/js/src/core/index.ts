@@ -12,7 +12,7 @@ import type { BreakerLike } from "./breaker.js";
 import type { Req, Rule, CacheLike, RulesCtx } from "./rules.js";
 import type { JsonValue } from "./normalize.js";
 
-export const VERSION = "0.6.1";
+export const VERSION = "0.6.2";
 
 /** A failed call may say what it ran into (judge.ErrorKind); only a
  *  transport error, a timeout, a 5xx or a 429 is a breaker failure, and a

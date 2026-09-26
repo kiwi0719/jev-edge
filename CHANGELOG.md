@@ -6,6 +6,8 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-09-27
+
 The fixes from a full audit of 0.6.1 (correctness, security and latent bugs in
 core, the rule set, every adapter, CI, release and ops), each checked against
 a reproduction before and after. L1 now reads what the backends read in many

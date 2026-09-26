@@ -36,7 +36,7 @@ jev-edge 是一个装在网关上的准入组件。进来的每个请求，它�
 
 | | |
 |---|---|
-| 版本 | `v0.6.1`（[更新日志](CHANGELOG.md)、[路线图](docs/design.zh-CN.md#路线图)） |
+| 版本 | `v0.6.2`（[更新日志](CHANGELOG.md)、[路线图](docs/design.zh-CN.md#路线图)） |
 | 能跑在哪里 | OpenResty、Apache APISIX、Kong；Envoy、Istio、HAProxy、Traefik、Caddy 和 nginx 通过 `/_jev/authz` 接入；Cloudflare Workers、Next.js、Node、Hono、Lambda@Edge 和 Deno Deploy 通过 [`@jev-edge/js`](https://www.npmjs.com/package/@jev-edge/js) 接入；LiteLLM proxy 里作为护栏 |
 | 判定器 | TypeSafe Jev（已实测）、自己部署的微调版 Laya、任意兼容 OpenAI 接口的对话模型 |
 | 生产使用 | 目前还没有已知的生产案例。请先用 `monitor` 模式跑 |

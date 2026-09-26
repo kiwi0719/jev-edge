@@ -308,7 +308,7 @@
       "name": "a 4-byte emoji and digits beside it"
     }
   ],
-  "core_version": "0.6.1",
+  "core_version": "0.6.2",
   "format_version": 2,
   "generated_by": "core/golden/gen.lua",
   "suite": "normalize"

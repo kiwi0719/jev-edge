@@ -100,7 +100,7 @@
       "name": "bytes that never start a sequence"
     }
   ],
-  "core_version": "0.6.1",
+  "core_version": "0.6.2",
   "format_version": 2,
   "generated_by": "core/golden/gen.lua",
   "suite": "utf8"

@@ -55,7 +55,7 @@ rules_json: '[{"id":"route","extends":"llm-endpoints","watch_paths":["^/"]}]'
 
 ## Hybrid mode
 
-Run the same jev-edge version on the control plane and on every data plane. When a release adds plugin schema fields (the one after 0.6.1 added `questions_json`, `ssl_verify`, `subject.reputation`, `max_tokens`, `token_param`, `temperature`, `extra_body_json` and provider `laya`), upgrade the control plane first and every data plane right after. A data plane on the older version refuses every config push that uses a new field: it keeps its last config, a new data plane starts with none, and the control plane still shows it as connected. During the window freeze Admin API changes and old data planes' autoscaling, and watch the data planes' logs for `unable to update running config`.
+Run the same jev-edge version on the control plane and on every data plane. When a release adds plugin schema fields (0.6.2 added `questions_json`, `ssl_verify`, `subject.reputation`, `max_tokens`, `token_param`, `temperature`, `extra_body_json` and provider `laya`), upgrade the control plane first and every data plane right after. A data plane on the older version refuses every config push that uses a new field: it keeps its last config, a new data plane starts with none, and the control plane still shows it as connected. During the window freeze Admin API changes and old data planes' autoscaling, and watch the data planes' logs for `unable to update running config`.
 
 Rule files (`rules/<id>.lua`) must be on every node that runs the plugin. A data plane that lacks one accepts the config anyway and answers the routes naming it with verdict `error` (below), so one missing file never stops a data plane syncing every other route.
 

@@ -34,7 +34,7 @@ It is built for SREs and platform engineers, not agent authors. Existing Jev gua
 
 | | |
 |---|---|
-| Version | `v0.6.1` ([changelog](CHANGELOG.md), [roadmap](docs/design.md#roadmap)) |
+| Version | `v0.6.2` ([changelog](CHANGELOG.md), [roadmap](docs/design.md#roadmap)) |
 | Runs in | OpenResty, Apache APISIX, Kong; Envoy, Istio, HAProxy, Traefik, Caddy and nginx through `/_jev/authz`; Cloudflare Workers, Next.js, Node, Hono, Lambda@Edge and Deno Deploy through [`@jev-edge/js`](https://www.npmjs.com/package/@jev-edge/js); LiteLLM proxy as a guardrail |
 | Judges | TypeSafe Jev (verified live), a self-hosted fine-tuned Laya, any OpenAI-compatible chat endpoint |
 | Production use | none known yet. Run in `monitor` mode first |

@@ -118,6 +118,70 @@ describe("subject: recording", () => {
   });
 });
 
+// The same table is in core/spec/subject_store_spec.lua: both cores must give
+// these candidates, so a Worker and its origin agree on the ids.
+const COOKIES: [string | string[], string[]][] = [
+  ["SID=x; sid=REAL", ["REAL"]],
+  ["sid=x; sid=REAL", ["x", "REAL"]],
+  ["sid=REAL; sid=x", ["REAL", "x"]],
+  [["sid=REAL", "sid=x"], ["REAL", "x"]],
+  ['sid="REAL"', ["REAL"]],
+  ['sid="RE\\AL"', ["RE\\AL", "REAL"]],
+  ['sid="\\122EAL"', ["\\122EAL", "REAL"]],
+  ['sid="\\351t\\351"', ["\\351t\\351", "\u00e9t\u00e9"]],
+  [" sid = REAL ;other=1", ["REAL"]],
+  ['sid=; sid=""; foo=REAL', []],
+  ["sid=a; sid=b; sid=c; sid=d; sid=e; sid=f", ["a", "b", "e", "f"]],
+];
+
+describe("subject: cookie candidates (g1-subject-id-evasion#1)", () => {
+  const scfg = { enabled: true, from: "cookie" as const, name: "sid", salt: "pepper" };
+  const hash = (s: string) => "H(" + s + ")";
+
+  it("reads every value a Cookie header gives the name, as core/subject.lua does", async () => {
+    for (const [h, want] of COOKIES) {
+      expect(core.subject.cookieValues(h, "sid")).toEqual(want);
+      expect(core.subject.extractAll(scfg, { cookieHeader: h })).toEqual(want);
+      const ids = await core.subject.hashIds(scfg, core.subject.extractAll(scfg, { cookieHeader: h }), hash);
+      expect(ids).toHaveLength(want.length);
+      if (want[0]) expect(ids[0]).toBe("cookie:H(pepper\0" + want[0] + ")");
+    }
+    const real = await core.subject.hashId(scfg, "REAL", hash);
+    for (const h of ["SID=x; sid=REAL", "sid=x; sid=REAL", "sid=REAL; sid=x", 'sid="REAL"']) {
+      expect(await core.subject.hashIds(scfg, core.subject.extractAll(scfg, { cookieHeader: h }), hash)).toContain(real);
+    }
+    expect(core.subject.extractAll(scfg, { cookie: () => "s-9" })).toEqual(["s-9"]);
+  });
+
+  it("idsOf: id first, then the distinct ids, at most MAX_IDS", () => {
+    expect(core.subject.idsOf({ subject: { ids: ["a"] } })).toEqual([]);
+    expect(core.subject.idsOf({ subject: { id: "a" } })).toEqual(["a"]);
+    expect(core.subject.idsOf({ subject: { id: "a", ids: ["a", "b", "", 7 as unknown as string, "b", "c", "d", "e"] } }))
+      .toEqual(["a", "b", "c", "d"]);
+  });
+
+  it("the runtime hands every candidate to core: a block on any of them blocks", async () => {
+    const { createRuntime, handle } = await import("../src");
+    const rt = createRuntime({
+      config: {
+        jev: { provider: "mock", mock_score: 0.1, timeout_ms: 400 }, policy: { mode: "enforce" },
+        subject: { enabled: true, from: "cookie", name: "sid", salt: "pepper", reputation: { block_at: 5 } },
+      },
+    });
+    const id = await core.subject.hashId(scfg, "REAL", core.subject.sha256Hex);
+    await rt.subjectStore.set("srep:" + id + ":until", Date.now() / 1000 + 600, 600);
+    const body = JSON.stringify({ messages: [{ role: "user", content: LONG }] });
+    const post = (cookie: string) => new Request("https://edge.example/v1/chat/completions", {
+      method: "POST", headers: { "content-type": "application/json", cookie }, body,
+    });
+    const echo = async () => new Response("ok");
+    for (const c of ["SID=x; sid=REAL", "sid=x; sid=REAL", "sid=REAL; sid=x", 'sid="REAL"']) {
+      expect({ c, status: (await handle(post(c), rt, echo)).status }).toEqual({ c, status: 403 });
+    }
+    expect((await handle(post("sid=someone-else"), rt, echo)).status).toBe(200);
+  });
+});
+
 describe("subject.idOf", () => {
   it("treats every absent shape as no subject, never as an error", () => {
     expect(core.subject.idOf({})).toBeNull();

@@ -33,6 +33,50 @@ describe("subject extraction and hashing", function()
     assert.is_nil(subject.hash_id({ from = "ip", salt = "x" }, nil, hash))
   end)
 
+  -- The same table is in adapters/js/test/subject.test.ts: both cores must
+  -- give these candidates, so a Worker and its origin agree on the ids.
+  local COOKIES = {
+    { "SID=x; sid=REAL", { "REAL" } },                       -- names are case-sensitive
+    { "sid=x; sid=REAL", { "x", "REAL" } },                  -- duplicates: every one
+    { "sid=REAL; sid=x", { "REAL", "x" } },
+    { { "sid=REAL", "sid=x" }, { "REAL", "x" } },            -- the header sent twice
+    { 'sid="REAL"', { "REAL" } },                            -- one pair of DQUOTEs stripped
+    { 'sid="RE\\AL"', { "RE\\AL", "REAL" } },                 -- and the unescaped form
+    { 'sid="\\122EAL"', { "\\122EAL", "REAL" } },             -- octal escape
+    { 'sid="\\351t\\351"', { "\\351t\\351", "\195\169t\195\169" } }, -- a code point past ASCII, UTF-8
+    { " sid = REAL ;other=1", { "REAL" } },
+    { "sid=; sid=\"\"; foo=REAL", {} },
+    { "sid=a; sid=b; sid=c; sid=d; sid=e; sid=f", { "a", "b", "e", "f" } },   -- capped: first two, last two
+  }
+
+  it("reads every value a Cookie header gives the name, as the backend may (g1-subject-id-evasion#1)", function()
+    local scfg = { enabled = true, from = "cookie", name = "sid", salt = "pepper" }
+    for _, c in ipairs(COOKIES) do
+      assert.same(c[2], subject.cookie_values(c[1], "sid"))
+      assert.same(c[2], subject.extract_all(scfg, { cookie_header = c[1] }))
+      local ids = subject.hash_ids(scfg, subject.extract_all(scfg, { cookie_header = c[1] }), hash)
+      assert.equals(#c[2], #ids)
+      if c[2][1] then assert.equals("cookie:H(pepper\0" .. c[2][1] .. ")", ids[1]) end
+    end
+    -- whoever the backend picks, REAL is among the ids once it is sent
+    local real = subject.hash_id(scfg, "REAL", hash)
+    for _, h in ipairs({ "SID=x; sid=REAL", "sid=x; sid=REAL", "sid=REAL; sid=x", 'sid="REAL"' }) do
+      local ids = subject.hash_ids(scfg, subject.extract_all(scfg, { cookie_header = h }), hash)
+      local found = false
+      for _, id in ipairs(ids) do found = found or id == real end
+      assert.is_true(found, h)
+    end
+    -- an older adapter's single value still works
+    assert.same({ "s-9" }, subject.extract_all(scfg, { cookie = function() return "s-9" end }))
+  end)
+
+  it("ids_of: id first, then the distinct ids, at most MAX_IDS", function()
+    assert.same({}, subject.ids_of({ subject = { ids = { "a" } } }))
+    assert.same({ "a" }, subject.ids_of({ subject = { id = "a" } }))
+    assert.same({ "a", "b", "c", "d" },
+      subject.ids_of({ subject = { id = "a", ids = { "a", "b", "", 7, "b", "c", "d", "e" } } }))
+  end)
+
   it("keeps a bounded history in the store", function()
     local store = H.store()
     local h

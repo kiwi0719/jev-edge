@@ -120,7 +120,7 @@ describe("golden: evaluate", () => {
         config: core.defaults.merge(core.defaults.config, inp.config),
         subject: inp.subject
           ? {
-            id: inp.subject.id, history: inp.subject.history, record: (e) => { recorded = e; },
+            id: inp.subject.id, ids: inp.subject.ids, history: inp.subject.history, record: (e) => { recorded = e; },
             store: {
               get: (k) => sstore.get(k),
               set: (k, v, ttl) => { swrites![k] = { value: v, ttl }; sstore.set(k, v, ttl); },

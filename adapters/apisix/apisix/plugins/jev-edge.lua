@@ -188,20 +188,26 @@ local function sha256_hex(s)
 end
 local sha256_hex_subject = sha256_hex
 
-local function subject_ctx(rt, req, ctx)
+local function subject_ctx(rt, req)
   local scfg = rt.cfg.subject
   if not scfg or not scfg.enabled then return nil end
-  local raw = subject_m.extract(scfg, {
+  -- the raw Cookie header(s), not the cookie variable: nginx's $cookie_<name>
+  -- is the first match, compared case-insensitively, quotes kept, while the
+  -- backend may read another. Every candidate is an id (core/subject.lua
+  -- cookie_values); reputation checks and charges each, ids[1] names the
+  -- trajectory and the logs.
+  local ids = subject_m.hash_ids(scfg, subject_m.extract_all(scfg, {
     ip = req.client_ip,
     header = function(n) return req.headers[n] end,
-    cookie = function(n) return ctx.var["cookie_" .. tostring(n)] end,
-  })
-  local id = subject_m.hash_id(scfg, raw, sha256_hex_subject)
+    cookie_header = req.headers["cookie"],
+  }), sha256_hex_subject)
+  local id = ids[1]
   if not id then return nil end
   subject_store = subject_store or cache_m.new(SUBJECT_DICT)
   local store = subject_store
   return {
     id = id,
+    ids = ids,
     history = subject_m.ring_load(store, id, scfg.max_entries),
     -- Two atomic dict operations, inline: cheaper than the timer it
     -- replaces and safe across workers (no read-modify-write).
@@ -334,7 +340,7 @@ function _M.access(conf, ctx)
   local v
   local ok, err = pcall(function()
     local req = build_req(rt, ctx)
-    local subj = subject_ctx(rt, req, ctx)
+    local subj = subject_ctx(rt, req)
     ctx.jev_subject = subj and subj.id or nil
     v = jev_core.evaluate(req, {
       config = rt.cfg, rules = rt.rules, cache = cache, trust = cache, judge = rt.judge, breaker = rt.breaker,

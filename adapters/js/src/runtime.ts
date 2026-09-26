@@ -335,16 +335,20 @@ async function readReq(request: Request, rt: Runtime): Promise<[core.Req, Provid
 async function subjectCtx(rt: Runtime, request: Request, clientIp: string, rctx?: RequestCtx): Promise<subjectMod.SubjectCtx | undefined> {
   const scfg = rt.config.subject;
   if (!scfg?.enabled) return undefined;
-  const raw = subjectMod.extract(scfg, {
+  // every candidate value (a cookie sent twice, quoted or not): reputation
+  // checks and charges each id, the first one names the trajectory
+  const raws = subjectMod.extractAll(scfg, {
     ip: clientIp,
     header: (n) => request.headers.get(n),
-    cookie: (n) => subjectMod.cookieValue(request.headers.get("cookie"), n),
+    cookieHeader: request.headers.get("cookie"),
   });
-  const id = await subjectMod.hashId(scfg, raw, subjectMod.sha256Hex);
+  const ids = await subjectMod.hashIds(scfg, raws, subjectMod.sha256Hex);
+  const id = ids[0];
   if (!id) return undefined;
   const store = rt.subjectStore;
   return {
     id,
+    ids,
     // ring layout (incr + one key per entry) when the store has incr, so
     // concurrent requests do not lose entries; the one-list layout otherwise
     history: await subjectMod.loadHistory(store, id, scfg.max_entries),

@@ -132,7 +132,7 @@ describe("golden: evaluate", function()
       if inp.subject then
         local sstore = store_from(inp.subject.store)
         swrites = {}
-        subject_ctx = { id = inp.subject.id, history = inp.subject.history,
+        subject_ctx = { id = inp.subject.id, ids = inp.subject.ids, history = inp.subject.history,
                         record = function(e) recorded = e end,
                         store = {
                           get = function(_, k) return sstore:get(k) end,

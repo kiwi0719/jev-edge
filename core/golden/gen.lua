@@ -1221,7 +1221,8 @@ local function eval_case(name, spec)
     end
   end
 
-  -- subject: spec.subject is nil (no subject at all), or { id = ..., history = ... }.
+  -- subject: spec.subject is nil (no subject at all), or { id = ..., history = ... },
+  -- with an optional ids list (every id the adapter found, id first).
   -- The history is deliberately non-nil in some cases and must change nothing:
   -- these vectors are what pins "accepted and ignored" across implementations.
   -- spec.subject.store seeds the subject store (reputation counters); every
@@ -1233,6 +1234,7 @@ local function eval_case(name, spec)
     subject_writes = {}
     subject_ctx = {
       id = spec.subject.id,
+      ids = spec.subject.ids,
       history = spec.subject.history,
       record = function(e) recorded = e end,
       store = {
@@ -1573,6 +1575,14 @@ eval_case("subject reputation: a malicious cache hit counts", { req = req(ATTACK
 eval_case("subject reputation: unwatched path is not blocked", { req = req(LONG, { path = "/healthz" }),
   config = REP_ENF, subject = { id = "u-1", store = { ["srep:u-1:until"] = 1300 } },
   judge = { answers = { injection = 0.1 } } })
+-- several ids (a cookie sent twice under one name): any blocked id blocks,
+-- every id is charged; the first one names the trajectory
+eval_case("subject reputation: a request is blocked when its second id is", { req = req(LONG),
+  config = REP_ENF, subject = { id = "u-1", ids = { "u-1", "u-2" }, store = { ["srep:u-2:until"] = 1300 } },
+  judge = { answers = { injection = 0.1 } } })
+eval_case("subject reputation: every id of the request is charged", { req = req(ATTACK),
+  config = REP, subject = { id = "u-1", ids = { "u-1", "u-2", "u-1" }, store = { ["srep:u-2:b:1"] = 2 } },
+  judge = { answers = { injection = 0.95 } } })
 
 -- judging in chunks (rule.max_judge_chunks) --------------------------------
 -- an inline rule with a 64-byte window keeps these vectors small

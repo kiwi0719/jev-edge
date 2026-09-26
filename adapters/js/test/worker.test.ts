@@ -121,15 +121,18 @@ describe("handle", () => {
     expect(j.source).toBe("adapter");
   });
 
-  it("fails open when the subject store throws", async () => {
+  it("judges the request when the subject history cannot be read", async () => {
+    // js-hosts#12: core ignores the history, so a store that fails the read
+    // costs a warning, not a request failed open unjudged
     const rt = createRuntime({
       config: { jev: { provider: "mock", mock_score: 0.2, timeout_ms: 400 }, subject: { enabled: true, from: "ip", salt: "pepper" } },
       subjectStore: { get: () => { throw new Error("store down"); }, set: () => {} },
     });
-    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const res = await handle(chat(BENIGN), rt, echo);
-    err.mockRestore();
-    expect(((await res.json()) as Record<string, string>).verdict).toBe("error");
+    expect(warn.mock.calls.some((c) => String(c[0]).includes("subject history read failed: Error: store down"))).toBe(true);
+    warn.mockRestore();
+    expect(((await res.json()) as Record<string, string>).verdict).toBe("safe");
   });
 
   it("uses waitUntil for the subject write when the host provides one", async () => {

@@ -279,7 +279,9 @@ async function readBounded(request: Request, maxBytes: number): Promise<BodyRead
 
 const utf8 = new TextDecoder("utf-8", { fatal: false });
 
-async function readReq(request: Request, rt: Runtime): Promise<[core.Req, ProviderRequestInfo]> {
+/** The request as core sees it, what the provider may use of it, and
+ *  whether a rule watches its path and method (isCandidate). */
+async function readReq(request: Request, rt: Runtime): Promise<[core.Req, ProviderRequestInfo, boolean]> {
   const url = new URL(request.url);
   const path = normalizePath(url.pathname);
   const headers: Record<string, string> = {};
@@ -299,9 +301,10 @@ async function readReq(request: Request, rt: Runtime): Promise<[core.Req, Provid
   // invalid byte into U+FFFD, three bytes once re-encoded, so the decoded
   // string's UTF-8 length is not the body's size (Lua's #body is)
   let bodyBytes = 0;
+  const candidate = isCandidate(rt, path, request.method);
   // The body is only read for a request some rule would judge; everything
   // else passes at L1 on path or method without touching the stream.
-  if (request.body && isCandidate(rt, path, request.method)) {
+  if (request.body && candidate) {
     const r = await readBounded(request, maxBytes);
     const whole = r.complete && r.size <= maxBytes && !truncatedBodies.has(request);
     req.body_size = Math.max(req.body_size ?? 0, r.size, truncatedBodies.has(request) ? maxBytes + 1 : 0);
@@ -334,11 +337,15 @@ async function readReq(request: Request, rt: Runtime): Promise<[core.Req, Provid
     req.body_size = bodyBytes;
     req.body_bytes = bodyBytes;
   }
-  return [req, { method: request.method, path, headers: request.headers, body, clientIp }];
+  return [req, { method: request.method, path, headers: request.headers, body, clientIp }, candidate];
 }
 
-/** Subject context for this request, or undefined: hashed id, one history read, a sink that writes without being awaited. */
-async function subjectCtx(rt: Runtime, request: Request, clientIp: string, rctx?: RequestCtx): Promise<subjectMod.SubjectCtx | undefined> {
+/** Subject context for this request, or undefined: hashed id, the history
+ *  (read only for a request a rule watches), a sink that writes without being
+ *  awaited. */
+async function subjectCtx(
+  rt: Runtime, request: Request, clientIp: string, candidate: boolean, rctx?: RequestCtx,
+): Promise<subjectMod.SubjectCtx | undefined> {
   const scfg = rt.config.subject;
   if (!scfg?.enabled) return undefined;
   // every candidate value (a cookie sent twice, quoted or not): reputation
@@ -352,12 +359,25 @@ async function subjectCtx(rt: Runtime, request: Request, clientIp: string, rctx?
   const id = ids[0];
   if (!id) return undefined;
   const store = rt.subjectStore;
+  // Core ignores the history in this version, and a request no rule watches
+  // passes at L1 before it could look: only a candidate pays the read (one
+  // counter get, then the slots at once). A read that fails is no history,
+  // never an adapter error that fails the request open.
+  let history: unknown;
+  if (candidate) {
+    try {
+      history = await subjectMod.loadHistory(store, id, scfg.max_entries);
+    } catch (e) {
+      console.warn("jev-edge: subject history read failed: " + describe(e));
+      history = null;
+    }
+  }
   return {
     id,
     ids,
     // ring layout (incr + one key per entry) when the store has incr, so
     // concurrent requests do not lose entries; the one-list layout otherwise
-    history: await subjectMod.loadHistory(store, id, scfg.max_entries),
+    history,
     // reputation counters (subject.reputation); atomic where the store has incr
     store,
     record: (e) => {
@@ -456,8 +476,8 @@ export async function evaluate(request: Request, rt: Runtime, rctx?: RequestCtx)
 }
 
 async function evaluateInner(request: Request, rt: Runtime, requestId: string, rctx?: RequestCtx): Promise<Evaluation> {
-  const [req, info] = await readReq(request, rt);
-  const subject = await subjectCtx(rt, request, info.clientIp, rctx);
+  const [req, info, candidate] = await readReq(request, rt);
+  const subject = await subjectCtx(rt, request, info.clientIp, candidate, rctx);
   if (subject?.id) info.subjectId = subject.id;
   const judgeOnce = async (prompt: core.Prompt): Promise<core.JudgeResult> => {
     const timeoutMs = await rt.adaptive.current();

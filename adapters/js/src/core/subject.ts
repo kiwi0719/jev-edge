@@ -223,12 +223,16 @@ export async function ringLoad(store: Store | undefined, id: string | null, maxE
   const k = key(id);
   const n = Number(await store.get(k + ":n")) || 0;
   if (n <= 0) return null;
+  // the slots at once, not one round trip each (KV, a Durable Object)
+  const seqs: number[] = [];
+  for (let i = Math.max(1, n - max + 1); i <= n; i++) seqs.push(i);
+  const slots = await Promise.all(seqs.map((i) => store.get(k + ":" + ((i - 1) % max)) as Promise<Slot | undefined> | Slot | undefined));
   const out: Entry[] = [];
-  for (let i = Math.max(1, n - max + 1); i <= n; i++) {
-    const s = (await store.get(k + ":" + ((i - 1) % max))) as Slot | undefined;
+  seqs.forEach((i, j) => {
+    const s = slots[j];
     // an evicted, expired, stale or foreign slot is a hole, not an error
     if (s && typeof s === "object" && s.n === i && s.e && typeof s.e === "object") out.push(s.e);
-  }
+  });
   return out.length ? out : null;
 }
 

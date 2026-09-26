@@ -172,6 +172,10 @@ local schema = {
       },
     },
   },
+  -- Kept encrypted in etcd (apisix.data_encryption, on by default); APISIX
+  -- decrypts them before the plugin sees conf. Either may also be an
+  -- $env:// or $secret:// reference, resolved in runtime_for.
+  encrypt_fields = { "jev.api_key", "subject.salt" },
 }
 
 -- Priority 1000, access phase (APISIX 3.13). Every rewrite-phase plugin runs
@@ -301,10 +305,52 @@ local function maybe_sample(rt, v, req, ctx)
   if not ok then core.log.warn("jev-edge: sampling failed: ", err) end
 end
 
+-- APISIX's secret references ($env://NAME, $secret://manager/id/key), when
+-- this APISIX has them (3.x).
+local fetch_secrets
+do
+  local ok, secret = pcall(require, "apisix.secret")
+  if ok and type(secret) == "table" then fetch_secrets = secret.fetch_secrets end
+end
+
+-- conf with its $env:// and $secret:// references resolved: a copy, which
+-- APISIX caches per conf table for five minutes and then reads again, so a
+-- rotated secret is picked up within that. Without the secret module, or
+-- when resolving throws, conf as it is.
+local function resolved(conf)
+  if not fetch_secrets then return conf end
+  local ok, r = pcall(fetch_secrets, conf, true, conf, "")
+  if ok and type(r) == "table" then return r end
+  if not ok then core.log.error("jev-edge: resolving secret references failed: ", r) end
+  return conf
+end
+
+local function is_ref(v)
+  return type(v) == "string" and (v:sub(1, 7):upper() == "$ENV://" or v:sub(1, 10) == "$secret://")
+end
+
+-- The two referenceable fields as resolved now: the runtime is rebuilt when
+-- they differ from the ones it was built from.
+local function secrets(c)
+  local j, s = c.jev, c.subject
+  return type(j) == "table" and j.api_key or nil, type(s) == "table" and s.salt or nil
+end
+
 local function runtime_for(conf)
+  local rconf = resolved(conf)
+  local key, salt = secrets(rconf)
   local rt = runtimes[conf]
-  if rt then return rt end
-  local cfg = defaults.merge(defaults.config, conf)
+  if rt and rt.src_api_key == key and rt.src_salt == salt then return rt end
+  local cfg = defaults.merge(defaults.config, rconf)
+  -- a reference APISIX could not resolve (no such variable or secret) is
+  -- never sent as the bearer token: no key, so api_key_env applies
+  if is_ref(cfg.jev.api_key) then
+    core.log.error("jev-edge: jev.api_key reference ", cfg.jev.api_key, " did not resolve")
+    cfg.jev.api_key = nil
+  end
+  if cfg.subject and is_ref(cfg.subject.salt) then
+    core.log.error("jev-edge: subject.salt reference ", cfg.subject.salt, " did not resolve")
+  end
   if not cfg.jev.api_key and cfg.jev.provider ~= "mock" and cfg.jev.api_key_env then
     cfg.jev.api_key = os.getenv(cfg.jev.api_key_env)
     if not cfg.jev.api_key then
@@ -329,6 +375,7 @@ local function runtime_for(conf)
   rt = {
     cfg = cfg, rules = load_rules(cfg.rules), judge = judge, state = st,
     breaker = breaker_m.new(st, ngx.now, cfg.breaker),
+    src_api_key = key, src_salt = salt,
   }
   runtimes[conf] = rt
   return rt

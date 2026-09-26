@@ -81,6 +81,16 @@ check "route B (same endpoint, another key) is still judged at L2" "app verdict=
 check "route B still blocks an injection" "403" \
   "$(curl -s -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' -d "$ATTACK" $base/qb/chat/completions)"
 
+# jev.api_key as $env://JEV_E2E_KEY reaches the judge resolved (the stub
+# answers 401, and the request fails open as an error, to a key that is
+# still a reference); one naming no variable is not sent
+check "an \$env:// api_key is resolved" "app verdict=safe score=0.10 source=l2" "$(post /sec/chat/completions '' "$LONG")"
+check "an \$env:// api_key still blocks an injection" "403" \
+  "$(curl -s -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' -d "$ATTACK" $base/sec/chat/completions)"
+check "an \$env:// api_key that does not resolve is not sent" "app verdict=safe score=0.10 source=l2" "$(post /secmiss/chat/completions '' "$LONG")"
+check "an unresolved reference is reported" "yes" \
+  "$(docker compose logs apisix 2>/dev/null | grep -q 'jev.api_key reference \$env://JEV_E2E_NO_SUCH_KEY did not resolve' && echo yes || echo no)"
+
 # Keys the schema used to refuse (subject.reputation, provider laya,
 # ssl_verify, questions): the routes load, and the keys work
 code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' -H 'X-User: alice' -H 'X-Jev-Mock-Score: 0.95' -d "$ATTACK" $base/rep/chat/completions)

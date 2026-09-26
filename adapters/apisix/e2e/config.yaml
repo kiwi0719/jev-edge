@@ -17,6 +17,7 @@ nginx_config:
   error_log_level: warn
   envs:
     - TYPESAFE_API_KEY
+    - JEV_E2E_KEY
   http:
     # custom_lua_shared_dict: APISIX drops whatever is put under lua_shared_dict
     custom_lua_shared_dict:

@@ -89,6 +89,31 @@ routes:
         policy: { mode: enforce }
         breaker: { min_samples: 5 }
         async: { enabled: false }
+  # jev.api_key as an APISIX secret reference: $env://JEV_E2E_KEY is
+  # "good-key" (docker-compose.yml); the stub answers 401 to a key that is
+  # still a reference. One that names no variable is not sent at all.
+  - uri: /sec/*
+    upstream:
+      nodes:
+        "app:8081": 1
+      type: roundrobin
+    plugins:
+      jev-edge:
+        jev: { provider: jev, endpoint: "http://judge:8082/judge", api_key: "$env://JEV_E2E_KEY", timeout_ms: 1000 }
+        rules: [{ id: sec, extends: llm-endpoints, watch_paths: ["^/sec/"] }]
+        policy: { mode: enforce }
+        async: { enabled: false }
+  - uri: /secmiss/*
+    upstream:
+      nodes:
+        "app:8081": 1
+      type: roundrobin
+    plugins:
+      jev-edge:
+        jev: { provider: jev, endpoint: "http://judge:8082/judge", api_key: "$env://JEV_E2E_NO_SUCH_KEY", api_key_env: JEV_E2E_NO_SUCH_KEY, timeout_ms: 1000 }
+        rules: [{ id: secmiss, extends: llm-endpoints, watch_paths: ["^/secmiss/"] }]
+        policy: { mode: enforce }
+        async: { enabled: false }
   # Keys the schema used to refuse: subject.reputation (one malicious
   # verdict blocks the subject), provider laya, jev.ssl_verify and
   # jev.questions. A route whose plugin conf fails the schema is not loaded.

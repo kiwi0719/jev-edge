@@ -8,6 +8,8 @@ services:
       - ../../..:/opt/jev-edge:ro
       - ./config.yaml:/usr/local/apisix/conf/config.yaml:ro
       - ./apisix.yaml:/usr/local/apisix/conf/apisix.yaml:ro
+    environment:
+      JEV_E2E_KEY: good-key      # apisix.yaml /sec: api_key "$env://JEV_E2E_KEY"
     ports: ["9080:9080"]
     depends_on: [app, judge]
   app:

@@ -49,7 +49,9 @@ function _M.incr_async_dropped() incr("async_dropped") end
 -- /_jev/authz events a relay's answer hides (a fixed set, so the label
 -- cannot be minted by traffic):
 --   no_client_ip  neither x-envoy-external-address nor X-Forwarded-For
---                 named the client: no IP reputation, no subject = "ip"
+--                 named the client (no header, or fewer X-Forwarded-For
+--                 hops than client_ip.trusted_hops): no IP reputation, no
+--                 subject = "ip"
 --   cut_at_cap    a body at or past max_body_bytes the gateway did not flag
 --                 as cut, taken as cut
 local AUTHZ_EVENTS = { no_client_ip = true, cut_at_cap = true }

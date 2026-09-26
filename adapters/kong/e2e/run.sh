@@ -7,6 +7,11 @@ cd "$(dirname "$0")"
 tmp=$(mktemp -d)
 cleanup() { docker compose down -v --remove-orphans >/dev/null 2>&1 || true; rm -rf "$tmp"; }
 trap cleanup EXIT
+# the e2efile vault's secret (kong.yml route "vault"), readable by the containers
+mkdir -p "$tmp/secrets"
+printf 'vault-key-1' > "$tmp/secrets/jevkey"
+chmod 755 "$tmp" "$tmp/secrets"; chmod 644 "$tmp/secrets/jevkey"
+export JEV_E2E_SECRETS="$tmp/secrets"
 docker compose up -d --quiet-pull 2>&1 | grep -v ' Created\| Started\| Built' || true
 
 base="http://127.0.0.1:9380"
@@ -73,6 +78,18 @@ check "route A's breaker opens on its key's 429s" "breaker" "$last"
 check "route B (same endpoint, another key) is still judged at L2" "app verdict=safe score=0.10 source=l2" "$(post /qb/chat/completions '' "$LONG")"
 check "route B still blocks an injection" "403" \
   "$(curl -s -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' -d "$ATTACK" $base/qb/chat/completions)"
+# A rotated vault secret: Kong rewrites api_key in place on the same conf
+# table, and the next calls must carry the new key (the stub answers 401 to
+# the old one), not the one the runtime was first built with.
+check "vault key reaches the judge" "app verdict=safe score=0.10 source=l2" "$(post /vr/chat/completions '' "$LONG")"
+printf 'vault-key-2' > "$tmp/secrets/jevkey"
+last=""
+for i in $(seq 1 20); do
+  sleep 1
+  last=$(post /vr/chat/completions '' "$LONG")
+  [ "$last" = "app verdict=safe score=0.10 source=l2" ] && break
+done
+check "a rotated vault key is picked up" "app verdict=safe score=0.10 source=l2" "$last"
 check "log_line writes the decision" "yes" "$(docker compose logs kong 2>/dev/null | grep -q 'jev-edge: {.*"verdict":"malicious"' && echo yes || echo no)"
 
 if [ $fail -ne 0 ]; then echo; echo "--- kong logs"; docker compose logs kong | tail -40; exit 1; fi

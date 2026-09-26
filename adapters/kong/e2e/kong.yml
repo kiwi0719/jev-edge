@@ -70,6 +70,20 @@ services:
               policy: { mode: enforce }
               breaker: { min_samples: 5 }
               async: { enabled: false }
+      # The judge key comes from a vault the e2e rotates (kong/vaults/e2efile):
+      # Kong resolves it in place on the same conf table, and the runtime must
+      # pick the new key up; the stub refuses the old one with 401.
+      - name: vault
+        paths: ["/vr"]
+        strip_path: false
+        plugins:
+          - name: jev-edge
+            config:
+              jev: { provider: jev, endpoint: "http://judge:8082/judge", api_key: "{vault://e2efile/jevkey}", timeout_ms: 1000 }
+              rules_json: '[{"id":"vr","extends":"llm-endpoints","watch_paths":["^/vr/"]}]'
+              policy: { mode: enforce }
+              cache: { fp_ttl: 0.001 }
+              async: { enabled: false }
       - name: plain
         paths: ["/plain"]
         strip_path: false

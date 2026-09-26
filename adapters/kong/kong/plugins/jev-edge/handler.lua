@@ -52,7 +52,8 @@ local JevEdge = {
 
 -- ---------------------------------------------------------------------------
 -- runtime per plugin conf (Kong hands the same conf table to every request
--- of a plugin instance until the config changes, so identity is the key)
+-- of a plugin instance until the config changes, so identity is the key,
+-- along with the vault secrets resolved into it: runtime_for)
 -- ---------------------------------------------------------------------------
 
 local runtimes = setmetatable({}, { __mode = "k" })
@@ -101,10 +102,27 @@ local function config_from(conf)
   return defaults.merge(defaults.config, c)
 end
 
+-- The referenceable fields as Kong has them now. A {vault://...} reference
+-- is resolved in place on this same conf table on every request
+-- (kong.vault.update), so a rotated secret never changes the table's
+-- identity: the runtime keeps the values it was built from and is rebuilt
+-- when they differ. Breaker, adaptive and in-flight state are in the shared
+-- dict (under a prefix that names the key's hash), so a rebuild loses none.
+local function secrets(conf)
+  local j, s = conf.jev, conf.subject
+  local key = type(j) == "table" and j.api_key or nil
+  local salt = type(s) == "table" and s.salt or nil
+  return key ~= null and key or nil, salt ~= null and salt or nil
+end
+
 local function runtime_for(conf)
+  local key, salt = secrets(conf)
   local rt = runtimes[conf]
-  if rt then return rt end
+  if rt and rt.src_api_key == key and rt.src_salt == salt then return rt end
   local cfg = config_from(conf)
+  -- a vault reference that did not resolve reads "": no key, so the env
+  -- fallback and its warning apply rather than an empty bearer token
+  if cfg.jev.api_key == "" then cfg.jev.api_key = nil end
   if not cfg.jev.api_key and cfg.jev.provider ~= "mock" then
     local env = cfg.jev.api_key_env or "TYPESAFE_API_KEY"
     cfg.jev.api_key = os.getenv(env)
@@ -128,6 +146,7 @@ local function runtime_for(conf)
     cfg = cfg, rules = load_rules(cfg.rules), judge = judge, state = st,
     breaker = breaker_m.new(st, ngx.now, cfg.breaker),
     log_line = conf.log_line == true,
+    src_api_key = key, src_salt = salt,
   }
   runtimes[conf] = rt
   return rt

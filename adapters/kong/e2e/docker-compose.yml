@@ -9,11 +9,15 @@ services:
     volumes:
       - ../../..:/opt/jev-edge:ro
       - ./kong.yml:/kong/kong.yml:ro
+      # run.sh's secrets for the e2efile vault (kong/vaults/e2efile)
+      - ${JEV_E2E_SECRETS:-./secrets}:/secrets:ro
     environment:
       KONG_DATABASE: "off"
       KONG_DECLARATIVE_CONFIG: /kong/kong.yml
       KONG_PLUGINS: bundled,jev-edge
-      KONG_LUA_PACKAGE_PATH: "/opt/jev-edge/adapters/kong/?.lua;/opt/jev-edge/adapters/openresty/lib/?.lua;/opt/jev-edge/?.lua;/opt/jev-edge/?/init.lua;;"
+      KONG_VAULTS: bundled,e2efile
+      KONG_VAULT_ROTATION_INTERVAL: "2"
+      KONG_LUA_PACKAGE_PATH: "/opt/jev-edge/adapters/kong/?.lua;/opt/jev-edge/adapters/openresty/lib/?.lua;/opt/jev-edge/?.lua;/opt/jev-edge/?/init.lua;/opt/jev-edge/adapters/kong/e2e/?.lua;/opt/jev-edge/adapters/kong/e2e/?/init.lua;;"
       # Kong injects `lua_shared_dict <value>;`; the other dicts ride on the same line
       KONG_NGINX_HTTP_LUA_SHARED_DICT: "jev_cache 16m; lua_shared_dict jev_subject 4m; lua_shared_dict jev_subject_rep 1m"
       KONG_NGINX_MAIN_ENV: TYPESAFE_API_KEY
@@ -33,4 +37,5 @@ services:
     image: jev-edge-test
     volumes:
       - ./judge-stub.conf:/tmp/judge/conf/nginx.conf:ro
+      - ${JEV_E2E_SECRETS:-./secrets}:/secrets:ro
     command: ["sh", "-c", "mkdir -p /tmp/judge/logs && openresty -p /tmp/judge -c /tmp/judge/conf/nginx.conf -g 'daemon off;'"]

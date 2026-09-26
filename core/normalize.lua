@@ -1509,8 +1509,9 @@ local DEFAULTS = {
   strip_uuid     = true,
 }
 
---- Normalize text so that trivially varied payloads share a fingerprint.
--- Steps: lowercase, strip UUIDs / long digit runs, collapse whitespace, truncate.
+--- Normalize text for sampling and logs: lowercase, strip UUIDs / long digit
+-- runs, collapse whitespace, truncate. fingerprint() keeps the digits and
+-- UUIDs (they can be the payload) and the whole length.
 function _M.normalize(text, opts)
   opts = opts or DEFAULTS
   local s = tostring(text or ""):lower()
@@ -1527,13 +1528,15 @@ function _M.normalize(text, opts)
   return s
 end
 
---- Fingerprint = hash(normalize(text)) over the WHOLE normalized text.
--- `opts.prefix_bytes` is deliberately ignored here: a fingerprint that only
--- covers a prefix lets any text that shares the prefix reuse a cached or
--- trusted verdict (0.3.0 hashed the first 2048 bytes; fixed in 0.3.1).
--- Text that normalizes to nothing (digit runs, UUIDs) is hashed as typed, so
--- it still gets a cache entry instead of a judge call per request; text that
--- is only whitespace is hashed as one space, one entry for every such body.
+--- Fingerprint = hash(normalize(text)) over the WHOLE normalized text, with
+-- ASCII lowercase and whitespace collapse only. `opts` is deliberately
+-- ignored: a fingerprint that only covers a prefix lets any text that shares
+-- the prefix reuse a cached or trusted verdict (0.3.0 hashed the first 2048
+-- bytes; fixed in 0.3.1), and one that drops digit runs and UUIDs lets
+-- "transfer 12345 to acct" reuse the verdict of "transfer 99999 to acct",
+-- where the digits are the payload. Only texts that are the same but for
+-- case and whitespace share a verdict. Text that is only whitespace is
+-- hashed as one space, one entry for every such body.
 --
 -- `hash` is injected by the adapter and MUST be collision-resistant
 -- (sha256 hex or better). The fingerprint keys the verdict cache and the
@@ -1541,13 +1544,10 @@ end
 -- judge call, so an attacker who can forge a hash forges a verdict. CRC32
 -- and djb2 are linear and let a few appended bytes hit any chosen value;
 -- `djb2` below exists for the golden vectors only.
-function _M.fingerprint(text, opts, hash)
-  local o = { strip_digits = opts and opts.strip_digits, strip_uuid = opts and opts.strip_uuid,
-              prefix_bytes = math.huge }
-  local norm = _M.normalize(text, o)
-  if norm == "" then
-    norm = _M.normalize(text, { strip_digits = false, strip_uuid = false, prefix_bytes = math.huge })
-  end
+local FP_OPTS = { strip_digits = false, strip_uuid = false, prefix_bytes = math.huge }
+
+function _M.fingerprint(text, _, hash)
+  local norm = _M.normalize(text, FP_OPTS)
   if norm == "" and text ~= nil and tostring(text) ~= "" then norm = " " end
   if norm == "" then return "" end
   return tostring(hash(norm))

@@ -1537,12 +1537,15 @@ export function normalize(text: string | null | undefined, opts?: NormalizeOpts 
 }
 
 /**
- * Fingerprint = hash(normalize(text)) over the WHOLE normalized text.
- * `opts.prefix_bytes` is deliberately ignored here: a fingerprint that only
- * covers a prefix lets any text that shares the prefix reuse a cached or
- * trusted verdict (0.3.0 hashed the first 2048 bytes; fixed in 0.3.1).
- * Text that normalizes to nothing (digit runs, UUIDs) is hashed as typed, so
- * it still gets a cache entry instead of a judge call per request.
+ * Fingerprint = hash(normalize(text)) over the WHOLE normalized text, with
+ * ASCII lowercase and whitespace collapse only. `opts` is deliberately
+ * ignored: a fingerprint that only covers a prefix lets any text that shares
+ * the prefix reuse a cached or trusted verdict (0.3.0 hashed the first 2048
+ * bytes; fixed in 0.3.1), and one that drops digit runs and UUIDs lets
+ * "transfer 12345 to acct" reuse the verdict of "transfer 99999 to acct",
+ * where the digits are the payload. Only texts that are the same but for
+ * case and whitespace share a verdict. Text that is only whitespace is
+ * hashed as one space, one entry for every such body.
  *
  * `hash` is injected by the adapter and MUST be collision-resistant
  * (sha256 hex or better). The fingerprint keys the verdict cache and the
@@ -1551,14 +1554,14 @@ export function normalize(text: string | null | undefined, opts?: NormalizeOpts 
  * and djb2 are linear and let a few appended bytes hit any chosen value;
  * `djb2` below exists for the golden vectors only.
  */
+const FP_OPTS: NormalizeOpts = { strip_digits: false, strip_uuid: false, prefix_bytes: Infinity };
+
 export function fingerprint(
   text: string | null | undefined,
-  opts: NormalizeOpts | null | undefined,
+  _opts: NormalizeOpts | null | undefined,
   hash: (s: string) => string,
 ): string {
-  const o: NormalizeOpts = { strip_digits: opts?.strip_digits, strip_uuid: opts?.strip_uuid, prefix_bytes: Infinity };
-  let norm = normalize(text, o);
-  if (norm === "") norm = normalize(text, { strip_digits: false, strip_uuid: false, prefix_bytes: Infinity });
+  let norm = normalize(text, FP_OPTS);
   // whitespace-only text: one fingerprint for all of it, never none (Lua: tostring(text) ~= "")
   if (norm === "" && text !== null && text !== undefined && String(text) !== "") norm = " ";
   if (norm === "") return "";

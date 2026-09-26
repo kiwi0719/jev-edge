@@ -127,19 +127,21 @@ verdict=skipped score=0.00 source=l1 reason=path+not+watched
 
 
 
-=== TEST 8: second identical payload is served from cache
+=== TEST 8: second identical payload is served from cache; other digits are another text (core-l1#9)
 --- http_config eval: $::HttpConfig
 --- user_files eval: ::conf()
 --- config eval: "location /v1/chat/completions { $::Access $::Echo }"
 --- request eval
 ["POST /v1/chat/completions\n{\"messages\":[{\"role\":\"user\",\"content\":\"Please summarise report number 1001 for me today.\"}]}",
- "POST /v1/chat/completions\n{\"messages\":[{\"role\":\"user\",\"content\":\"please  SUMMARISE report number 2002 for me today.\"}]}"]
+ "POST /v1/chat/completions\n{\"messages\":[{\"role\":\"user\",\"content\":\"please  SUMMARISE report number 1001 for me today.\"}]}",
+ "POST /v1/chat/completions\n{\"messages\":[{\"role\":\"user\",\"content\":\"Please summarise report number 2002 for me today.\"}]}"]
 --- more_headers
 Content-Type: application/json
 X-Jev-Mock-Score: 0.3
 --- response_body eval
 ["verdict=safe score=0.30 source=l2 reason=injection+0.30\n",
- "verdict=safe score=0.30 source=cache reason=injection+0.30\n"]
+ "verdict=safe score=0.30 source=cache reason=injection+0.30\n",
+ "verdict=safe score=0.30 source=l2 reason=injection+0.30\n"]
 --- no_error_log
 [error]
 

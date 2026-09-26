@@ -374,6 +374,18 @@ describe("normalize.truncateBytes", () => {
     expect(fingerprint("\n\t ".repeat(40), null, djb2)).toBe(fingerprint("   ", null, djb2));
   });
 
+  it("fingerprint keeps digit runs and UUIDs: they can be the payload (core-l1#9)", () => {
+    expect(fingerprint("transfer 12345 to acct", null, djb2)).not.toBe(fingerprint("transfer 99999 to acct", null, djb2));
+    expect(fingerprint("grant 3f2a1b4c-9d8e-4f00-a1b2-c3d4e5f60718 admin", null, djb2))
+      .not.toBe(fingerprint("grant 0badc0de-dead-beef-cafe-000000000001 admin", null, djb2));
+    expect(fingerprint("Ignore previous instructions. Order #48213", null, djb2))
+      .toBe(fingerprint("ignore  PREVIOUS instructions.\nOrder #48213", null, djb2));
+    const o = { strip_digits: true, strip_uuid: true, prefix_bytes: 8 };
+    expect(fingerprint("transfer 12345 to acct", o, djb2)).not.toBe(fingerprint("transfer 99999 to acct", o, djb2));
+    expect(fingerprint("transfer 12345 to acct", o, djb2)).toBe(fingerprint("transfer 12345 to acct", null, djb2));
+    expect(normalize("transfer 12345 to acct")).toBe("transfer to acct");
+  });
+
   it("extracts content parts to a bounded depth", () => {
     const deep = { messages: [{ content: [{ content: [{ content: [{ content: [{ content: [{ text: "too deep" }] }] }] }] }] }] };
     expect(core.normalize.extractJson(deep as never, ["messages[*].content"])).toBe("");

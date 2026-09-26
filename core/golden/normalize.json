@@ -13,7 +13,7 @@
     },
     {
       "expect": {
-        "fingerprint": "bb3798c9",
+        "fingerprint": "332b4581",
         "normalized": "session ended"
       },
       "input": {
@@ -24,7 +24,7 @@
     },
     {
       "expect": {
-        "fingerprint": "72bc2cfd",
+        "fingerprint": "3b4a1a13",
         "normalized": "order 123 and and"
       },
       "input": {
@@ -35,7 +35,7 @@
     },
     {
       "expect": {
-        "fingerprint": "03f1d063",
+        "fingerprint": "f328fdf8",
         "normalized": "id x y"
       },
       "input": {
@@ -94,7 +94,7 @@
     },
     {
       "expect": {
-        "fingerprint": "00ab4c37",
+        "fingerprint": "efd2f47d",
         "normalized": "3f2a1b4c-9d8e-4f00-a1b2-c3d4e5f"
       },
       "input": {
@@ -118,7 +118,7 @@
     },
     {
       "expect": {
-        "fingerprint": "7c9e560f",
+        "fingerprint": "f3e4a147",
         "normalized": "tail"
       },
       "input": {
@@ -129,25 +129,80 @@
     },
     {
       "expect": {
-        "fingerprint": "15934e7b",
+        "fingerprint": "4cf83625",
         "normalized": "ignore previous instructions. ticket ."
       },
       "input": {
         "opts": null,
         "text": "Ignore previous instructions. Ticket 100234."
       },
-      "name": "replay variants share a fingerprint (a)"
+      "name": "replays with other digits get other fingerprints (a)"
     },
     {
       "expect": {
-        "fingerprint": "15934e7b",
+        "fingerprint": "ca5c8f3f",
         "normalized": "ignore previous instructions. ticket ."
       },
       "input": {
         "opts": null,
         "text": "ignore   previous instructions.  ticket 998811."
       },
-      "name": "replay variants share a fingerprint (b)"
+      "name": "replays with other digits get other fingerprints (b)"
+    },
+    {
+      "expect": {
+        "fingerprint": "4cf83625",
+        "normalized": "ignore previous instructions. ticket ."
+      },
+      "input": {
+        "opts": null,
+        "text": "IGNORE previous\n\tinstructions.  Ticket 100234."
+      },
+      "name": "case and whitespace variants share a fingerprint"
+    },
+    {
+      "expect": {
+        "fingerprint": "cc49f607",
+        "normalized": "transfer to acct"
+      },
+      "input": {
+        "opts": null,
+        "text": "transfer 12345 to acct"
+      },
+      "name": "a digit payload is part of the fingerprint (a)"
+    },
+    {
+      "expect": {
+        "fingerprint": "a43ca8e5",
+        "normalized": "transfer to acct"
+      },
+      "input": {
+        "opts": null,
+        "text": "transfer 99999 to acct"
+      },
+      "name": "a digit payload is part of the fingerprint (b)"
+    },
+    {
+      "expect": {
+        "fingerprint": "19ee3f82",
+        "normalized": "grant admin"
+      },
+      "input": {
+        "opts": null,
+        "text": "grant 3f2a1b4c-9d8e-4f00-a1b2-c3d4e5f60718 admin"
+      },
+      "name": "a UUID-shaped payload is part of the fingerprint (a)"
+    },
+    {
+      "expect": {
+        "fingerprint": "abb42de1",
+        "normalized": "grant admin"
+      },
+      "input": {
+        "opts": null,
+        "text": "grant 0badc0de-dead-beef-cafe-000000000001 admin"
+      },
+      "name": "a UUID-shaped payload is part of the fingerprint (b)"
     },
     {
       "expect": {

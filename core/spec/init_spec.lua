@@ -23,10 +23,17 @@ describe("core.evaluate end to end", function()
     assert.equals(0.3, v1.score)
     assert.not_equals("", v1.fingerprint)
 
-    local v2 = core.evaluate(H.chat_req(LONG .. " 12345"), ctx)
+    -- the same text but for case and whitespace: one entry
+    local v2 = core.evaluate(H.chat_req("  " .. LONG:upper() .. "\n"), ctx)
     assert.equals(V.SRC_CACHE, v2.source)
     assert.equals(v1.fingerprint, v2.fingerprint)
     assert.equals(1, calls)
+
+    -- a digit run is part of the text judged, not noise (core-l1#9)
+    local v3 = core.evaluate(H.chat_req(LONG .. " 12345"), ctx)
+    assert.equals(V.SRC_L2, v3.source)
+    assert.not_equals(v1.fingerprint, v3.fingerprint)
+    assert.equals(2, calls)
   end)
 
   it("blocks in enforce mode on high score", function()

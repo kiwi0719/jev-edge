@@ -701,8 +701,10 @@ def test_prompt_next_to_messages_and_lists():
     assert body({"prompt": [40, 1541, 6766]}) == {"prompt": [40, 1541, 6766]}
     assert body({"input": [[]], "prompt": []}) is None
     assert body({"prompt": [True, None]}) is None
-    # a number in a tool definition is not a prompt: nothing to send here
-    assert body({"messages": [], "tools": [{"type": "function", "function": {"name": "f", "parameters": {"enum": [1, 2]}}}]}) is None
+    # a number in a tool definition is not a prompt, but jev-edge judges the
+    # definition itself, its name and keys included: it is sent for that
+    tools = [{"type": "function", "function": {"name": "f", "parameters": {"enum": [1, 2]}}}]
+    assert body({"messages": [], "tools": tools}) == {"tools": tools, "messages": []}
 
 
 def test_a_token_prompt_goes_to_jev_edge_which_may_refuse_it():
@@ -825,6 +827,26 @@ def test_the_encoding_is_json_dumps():
     for _ in range(500):
         v = {"messages": value(0)}
         assert jg._dumps(v) == json.dumps(v, ensure_ascii=False, separators=(",", ":"))
+
+
+@pytest.mark.parametrize("body", [
+    {"input": "hi", "prompt": {"id": "p", "variables": {"toolUseId": ATTACK}}},
+    {"input": "hi", "prompt": {"id": "p", "variables": {ATTACK: 1}}},
+    {"messages": [{"role": "tool", "content": [{"type": "document", "document": {"data": {"toolUseId": ATTACK}}}]}]},
+    {"documents": [{"id": ATTACK}]},
+    {"tools": [{"type": "function", "function": {"name": ATTACK}}]},
+    {"messages": [{"role": "tool", "tool_call_id": "c", "content": {"name": ATTACK}}]},
+    {"messages": [{"role": "user", "parts": [{"type": "tool-x", "toolCallId": "c", "input": {"id": ATTACK}}]}]},
+])
+def test_text_under_a_structural_key_on_a_path_read_whole_is_text(body):
+    # jev-edge reads these paths whole, keys and strings alike, so a string
+    # under `id`, `name` or `toolUseId` there is text worth the round trip
+    assert jg._has_text(body)
+
+
+def test_structural_keys_elsewhere_are_still_no_text():
+    assert not jg._has_text({"messages": [{"role": "user", "content": [{"type": "text", "name": "n", "id": "i"}]}]})
+    assert not jg._has_text({"messages": [{"role": "user", "content": {"name": "n"}}]})
 
 
 def test_no_text_is_skipped_without_a_call():

@@ -174,6 +174,20 @@ TOOL_RESULTS = frozenset({
 })
 SENT_WHOLE = TOOL_ARGUMENTS | TOOL_RESULTS
 _SENT_WHOLE_PREFIXES = frozenset(p[:i] for p in SENT_WHOLE for i in range(1, len(p)))
+# Paths jev-edge reads whole, every key and string (a key named `name` or
+# `id` included): the tool definitions, retrieved documents, a Responses
+# stored prompt's variables, AI SDK 5 tool parts' input and output, and a
+# Cohere v2 document part. The media filter treats them as any other path;
+# only the text check (_has_text) does not take a structural key's string
+# for no text there. A tool or function message whose content is an object
+# is read whole too (_has_text checks the role).
+READ_WHOLE = SENT_WHOLE | frozenset({
+    ("tools",), ("functions",), ("response_format", "json_schema"), ("text", "format"),
+    ("documents",), ("prompt", "variables"),
+    ("messages", "*", "parts", "*", "input"), ("messages", "*", "parts", "*", "output"),
+    ("messages", "*", "content", "*", "document"),
+})
+_READ_WHOLE_PREFIXES = frozenset(p[:i] for p in READ_WHOLE for i in range(1, len(p)))
 # Containers nested deeper than this below a top-level key are dropped:
 # jev-edge's decoder (cjson) refuses JSON nested more than 1000 levels, and
 # the body's own top-level object is the first of them. Below that, jev-edge
@@ -302,15 +316,16 @@ def _fold(key: str) -> str:
 _WHOLE = object()
 
 
-def _step(path: Any, seg: str) -> Any:
-    """Where a child at `seg` is: _WHOLE below a path sent whole, the path
-    while it can still lead to one, None once it cannot."""
+def _step(path: Any, seg: str, whole: frozenset = SENT_WHOLE, prefixes: frozenset = _SENT_WHOLE_PREFIXES) -> Any:
+    """Where a child at `seg` is: _WHOLE below a path in `whole` (by default
+    the paths sent whole), the path while it can still lead to one, None
+    once it cannot."""
     if path is None or path is _WHOLE:
         return path
     path = path + (seg,)
-    if path in SENT_WHOLE:
+    if path in whole:
         return _WHOLE
-    return path if path in _SENT_WHOLE_PREFIXES else None
+    return path if path in prefixes else None
 
 
 def _clean(node: Any, media: bool = True, key: Optional[str] = None) -> Any:
@@ -434,8 +449,8 @@ def _dumps(node: Any) -> str:
 
 def _has_text(body: dict) -> bool:
     """Whether any string in `body` is text, not a structural name: below a
-    path sent whole every key and string is (jev-edge reads a Gemini
-    function response whole, keys too). Without recursion, as _clean."""
+    path jev-edge reads whole (READ_WHOLE, and a tool or function message's
+    object content) every key and string is. Without recursion, as _clean."""
     stack: list = [(body, "", ())]
     while stack:
         n, key, path = stack.pop()
@@ -443,12 +458,16 @@ def _has_text(body: dict) -> bool:
             if n != "" and (path is _WHOLE or key not in STRUCTURAL_KEYS):
                 return True
         elif isinstance(n, dict):
+            tool_msg = path == ("messages", "*") and n.get("role") in ("tool", "function")
             for k, v in n.items():
                 if path is _WHOLE and k != "":
                     return True
-                stack.append((v, k, _step(path, _fold(k))))
+                if tool_msg and _fold(k) == "content" and isinstance(v, dict):
+                    stack.append((v, k, _WHOLE))
+                else:
+                    stack.append((v, k, _step(path, _fold(k), READ_WHOLE, _READ_WHOLE_PREFIXES)))
         elif isinstance(n, list):
-            stack.extend((v, key, _step(path, "*")) for v in n)
+            stack.extend((v, key, _step(path, "*", READ_WHOLE, _READ_WHOLE_PREFIXES)) for v in n)
     return False
 
 

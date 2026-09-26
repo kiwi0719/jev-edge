@@ -31,8 +31,8 @@ export interface Options {
   rules?: RuleSpec[];
   /** Overrides config.jev.provider with an instance. */
   provider?: Provider;
-  /** KV namespace for the fingerprint / reputation cache. Memory (per isolate) if absent. The JevState
-   *  Durable Object (namespace, `{ namespace, name }` or stub, as for `state`) is taken too, as
+  /** KV namespace for the fingerprint / reputation cache. Memory (per isolate, the 20000 most recently used
+   *  entries) if absent. The JevState Durable Object (namespace, `{ namespace, name }` or stub, as for `state`) is taken too, as
    *  durableStore: one object for every lookup, and entries kept until overwritten. */
   cache?: KVLike | StateTarget | Store;
   /** Breaker + adaptive timeout state: the JevState Durable Object namespace (env.JEV_STATE), the namespace
@@ -48,10 +48,10 @@ export interface Options {
    *  both idFromName and get. */
   state?: StateTarget | Store;
   /** Store for per-subject trajectories: KV, the JevState Durable Object (namespace, `{ namespace, name }`
-   *  or stub, as for `state`; its incr is atomic) or any Store. Memory (per isolate) if absent; the Cloudflare
-   *  presets pass their Durable Object when config.subject.reputation is on. Only used with
-   *  config.subject.enabled. KV loses concurrent increments, so reputation counted there is best effort
-   *  (logged once). */
+   *  or stub, as for `state`; its incr is atomic) or any Store. Memory (per isolate, the 50000 most recently
+   *  used entries) if absent; the Cloudflare presets pass their Durable Object when config.subject.reputation
+   *  is on. Only used with config.subject.enabled. KV loses concurrent increments, so reputation counted
+   *  there is best effort (logged once). */
   subjectStore?: KVLike | StateTarget | Store;
   /** Header carrying the client IP, set by a proxy you trust to overwrite it.
    *  Default: cf-connecting-ip on Cloudflare (a preset, or a request with the
@@ -96,11 +96,17 @@ function isKV(x: unknown): x is KVLike {
  * and would pass for KV; a namespace has `get` and would pass for a Store,
  * and fail on every request.
  */
-function storeOption(x: KVLike | StateTarget | Store | undefined, clock: () => number): Store {
+function storeOption(x: KVLike | StateTarget | Store | undefined, clock: () => number, maxEntries: number): Store {
   if (isStateTarget(x)) return durableStore(x);
   if (isKV(x)) return kvStore(x);
-  return (x as Store | undefined) ?? memoryStore(clock);
+  return (x as Store | undefined) ?? memoryStore(clock, { maxEntries });
 }
+
+/** Caps of the default memory stores (least recently used out past them):
+ *  one cache entry per judged text, and a subject's ring takes max_entries
+ *  + 1 keys. `state` has none, so breaker and adaptive keys stay. */
+const MEMORY_CACHE_ENTRIES = 20000;
+const MEMORY_SUBJECT_ENTRIES = 50000;
 
 const warnedKv = new WeakSet<object>();
 
@@ -132,8 +138,8 @@ export function createRuntime(opts: Options): Runtime {
   const rules = ((opts.rules ?? config.rules) as RuleSpec[]).map(resolveRule);
   const provider = opts.provider ?? loadProvider(config.jev.provider ?? "jev");
   const clock = () => Date.now() / 1000;
-  const cache = storeOption(opts.cache, clock);
-  const subjectStore = storeOption(opts.subjectStore, clock);
+  const cache = storeOption(opts.cache, clock, MEMORY_CACHE_ENTRIES);
+  const subjectStore = storeOption(opts.subjectStore, clock, MEMORY_SUBJECT_ENTRIES);
   warnKvReputation(config, opts.subjectStore);
   let state: Store;
   let breaker: BreakerLike;

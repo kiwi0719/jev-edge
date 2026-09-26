@@ -51,33 +51,74 @@ export function kvStore(kv: KVLike, prefix = "jev:"): Store {
 
 interface Entry { v: unknown; exp: number }
 
-export function memoryStore(clock: () => number = () => Date.now() / 1000): Store {
+export interface MemoryStoreOptions {
+  /** Most entries kept; past it the least recently used goes. Unbounded (sweep only) when absent. */
+  maxEntries?: number;
+}
+
+/** How many of the oldest entries each write looks at for expired ones. */
+const SWEEP = 8;
+
+/**
+ * A Store in this isolate's (or process's) memory. A Map kept in use
+ * order: a read of a live entry and every write move it to the end, so the
+ * first entries are the least recently used. Each write deletes the expired
+ * ones among the SWEEP oldest, so a key never read again does not stay
+ * forever, and with `maxEntries` evicts the oldest past it: a flood of
+ * distinct texts cannot grow the map without bound. The runtime caps its
+ * default cache and subject store and leaves `state` uncapped, so breaker
+ * and adaptive keys are never evicted.
+ */
+export function memoryStore(clock: () => number = () => Date.now() / 1000, opts: MemoryStoreOptions = {}): Store & { readonly size: number } {
   const m = new Map<string, Entry>();
+  const max = typeof opts.maxEntries === "number" && opts.maxEntries >= 1 ? Math.floor(opts.maxEntries) : Infinity;
+  const dead = (e: Entry, now: number) => e.exp !== 0 && e.exp <= now;
+  const put = (k: string, e: Entry) => {
+    m.delete(k); // to the end: the most recently used
+    m.set(k, e);
+    const now = clock();
+    let seen = 0;
+    for (const [key, old] of m) {
+      if (++seen > SWEEP) break;
+      if (key !== k && dead(old, now)) m.delete(key);
+    }
+    while (m.size > max) {
+      const oldest = m.keys().next().value as string;
+      if (oldest === k) break;
+      m.delete(oldest);
+    }
+  };
   return {
     get: (k) => {
       const e = m.get(k);
       if (!e) return undefined;
-      if (e.exp && e.exp <= clock()) {
+      if (dead(e, clock())) {
         m.delete(k);
         return undefined;
       }
+      m.delete(k);
+      m.set(k, e);
       return e.v;
     },
     set: (k, v, ttl) => {
       if (v === null || v === undefined) m.delete(k);
-      else m.set(k, { v, exp: ttl > 0 ? clock() + ttl : 0 });
+      else put(k, { v, exp: ttl > 0 ? clock() + ttl : 0 });
     },
     // synchronous, so atomic within the isolate; the ttl applies on creation only
     incr: (k, by, ttl) => {
       const e = m.get(k);
-      const live = e !== undefined && !(e.exp && e.exp <= clock());
+      const live = e !== undefined && !dead(e, clock());
       const n = (live ? Number(e.v) || 0 : 0) + by;
-      m.set(k, { v: n, exp: live ? e.exp : ttl > 0 ? clock() + ttl : 0 });
+      put(k, { v: n, exp: live ? e.exp : ttl > 0 ? clock() + ttl : 0 });
       return n;
     },
     expire: (k, ttl) => {
       const e = m.get(k);
-      if (e && !(e.exp && e.exp <= clock())) e.exp = ttl > 0 ? clock() + ttl : 0;
+      if (e && !dead(e, clock())) e.exp = ttl > 0 ? clock() + ttl : 0;
+    },
+    /** Entries held, expired ones not swept yet included. */
+    get size() {
+      return m.size;
     },
   };
 }

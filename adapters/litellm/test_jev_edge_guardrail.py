@@ -719,14 +719,37 @@ def test_pass_through_bodies_the_guardrail_cannot_read_are_unjudged(call_type, d
     ("allm_passthrough_route", bedrock({})),  # a GET
     ("allm_passthrough_route", bedrock(None)),
     ("allm_passthrough_route", bedrock({"messages": [{"role": "user", "content": [{"image": {"source": {"bytes": "AAAA"}}}]}]})),
-    ("pass_through_endpoint", {"litellm_logging_obj": object()}),  # a GET
-    ("pass_through_endpoint", {"litellm_logging_obj": object(), "metadata": {"guardrails": ["jev-edge"]}}),
+    ("pass_through_endpoint", {"messages": [{"role": "user", "content": None}], "litellm_logging_obj": object()}),
 ])
 def test_pass_through_without_text_is_skipped(call_type, data):
     transport, seen = fake_authz()
     out = run(guard(transport, unjudged="block").async_pre_call_hook({}, None, dict(data), call_type))
     assert seen["calls"] == 0
     assert out[jg._metadata_key(out)]["jev_verdict"]["reason"] == "no text"
+
+
+@pytest.mark.parametrize("data", [{"litellm_logging_obj": object()},
+                                  {"litellm_logging_obj": object(), "metadata": {"guardrails": ["jev-edge"]}}])
+def test_pass_through_without_a_body_the_guardrail_sees_is_unjudged(data):
+    # LiteLLM 1.102 does not parse a multipart pass-through (a file upload):
+    # the hook gets LiteLLM's own keys and no body, as for a GET
+    transport, seen = fake_authz()
+    out = run(guard(transport).async_pre_call_hook({}, None, dict(data), "pass_through_endpoint"))
+    reason = "unjudgeable: call type pass_through_endpoint: no body visible to the guardrail (a multipart form, or none)"
+    assert out["metadata"]["jev_verdict"] == {"verdict": "skipped", "score": "0.00", "source": "adapter",
+                                              "reason": reason, "action": "pass"}
+    with pytest.raises(Exception) as ei:
+        run(guard(transport, unjudged="block").async_pre_call_hook({}, None, dict(data), "pass_through_endpoint"))
+    assert ei.value.status_code == 403 and ei.value.detail["jev"]["reason"] == reason
+    assert seen["calls"] == 0
+    # LiteLLM 1.80 parses the form: its fields are the body
+    out = run(guard(transport).async_pre_call_hook({}, None, {"purpose": "batch", "file": object(),
+                                                              "litellm_logging_obj": object()}, "pass_through_endpoint"))
+    assert out["metadata"]["jev_verdict"]["reason"] == \
+        "unjudgeable: call type pass_through_endpoint: no field the guardrail reads in the body"
+    out = run(guard(transport).async_pre_call_hook({}, None, {"prompt": ATTACK, "image": object(),
+                                                              "litellm_logging_obj": object()}, "pass_through_endpoint"))
+    assert seen["calls"] == 1 and seen["body"] == {"prompt": ATTACK}
 
 
 def gigachat(body, **client_keys):

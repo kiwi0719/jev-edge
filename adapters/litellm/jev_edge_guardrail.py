@@ -193,8 +193,9 @@ NOT_VISIBLE_CALLS = {
 # model of the config) under `json`. The generic pass-through (/anthropic,
 # /openai, /gemini, /vertex_ai, /vllm, ..., and a config's
 # pass_through_endpoints; call type pass_through_endpoint) hands the client's
-# body itself with LiteLLM's logging object added, and a WebSocket
-# pass-through (Vertex AI Live) an empty dict.
+# body itself with LiteLLM's logging object added (no body for a multipart
+# form on 1.102, as for a GET), and a WebSocket pass-through (Vertex AI Live)
+# an empty dict.
 NESTED_PASSTHROUGH_CALLS = frozenset({"allm_passthrough_route", "llm_passthrough_route"})
 PASSTHROUGH_CALL = "pass_through_endpoint"
 # Keys LiteLLM adds next to a generic pass-through's body (its `metadata` is
@@ -786,6 +787,12 @@ class JevEdgeGuardrail(_ApplyGuardrailBase):
                 return "unjudged", (f"unjudgeable: call type {name}: "
                                     "a WebSocket pass-through's messages are not visible to the guardrail")
             client = {k: v for k, v in data.items() if k not in LITELLM_OWN_KEYS}
+            if not client:
+                # LiteLLM 1.102 does not parse a multipart form here: it
+                # hands the hook no body, as for a request without one (a
+                # GET), and the two cannot be told apart
+                return "unjudged", (f"unjudgeable: call type {name}: "
+                                    "no body visible to the guardrail (a multipart form, or none)")
             return self._plan_passthrough(name, client, "body")
         if name in ("create_file", "acreate_file"):
             # LiteLLM passes the file's name, type and size, not its content
@@ -809,7 +816,7 @@ class JevEdgeGuardrail(_ApplyGuardrailBase):
         like any request's. One with none of the fields the guardrail reads
         (Titan's `inputText`, Cohere's `message`, a batch's `requests`, ...)
         is unjudgeable, not "no text": the format is not one it knows. An
-        empty one (a GET) has no text."""
+        empty one (a Bedrock GET) has no text."""
         judged = _body_dict(body, self.extra_fields)
         if judged is not None:
             return "judge", judged

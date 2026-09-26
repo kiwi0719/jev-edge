@@ -476,8 +476,8 @@ location /_jev/authz/ { content_by_lua_block { require("resty.jev.edge").authz()
 location /v1/chat/completions { $::Access $::Echo }
 location = /_t/points { content_by_lua_block {
     local n = 0
-    for _, k in ipairs(ngx.shared.jev_subject:get_keys(0)) do
-        if k:find("^srep:header:abc123:b:") then n = n + ngx.shared.jev_subject:get(k) end
+    for _, k in ipairs(ngx.shared.jev_subject_rep:get_keys(0)) do
+        if k:find("^srep:header:abc123:b:") then n = n + ngx.shared.jev_subject_rep:get(k) end
     end
     ngx.say("points=", n)
 } }

@@ -44,7 +44,7 @@ export function buildSample(cfg: Config, v: Verdict, req: Req, rules: Rule[], ri
     // scored it; JSON the decoder refused is scanned for them, as L1 scans it
     if (rule.tool_fields && rule.tool_fields.length > 0) {
       let values: string[] = [];
-      if (decoded !== undefined) [values] = normalize.extractTools(decoded, rule.tool_fields, (s) => JSON.parse(s) as normalize.JsonValue);
+      if (decoded !== undefined) [values] = normalize.extractTools(decoded, rule.tool_fields, normalize.jsonDecode);
       else if (kind === "scan") values = normalize.scanTools(req.body, normalize.fieldKeys(rule.tool_fields), []);
       if (values.length > 0) tools = normalize.normalize(values.join("\n"), { prefix_bytes: n });
     }

@@ -998,7 +998,8 @@ export async function evaluate(
 /**
  * Port of rules.rule_for: the first rule whose path (json_only_paths
  * included), method and content type all match. `ctx.json_decode`, as
- * evaluateAll had it, decides a json_only_paths path (JSON.parse without one).
+ * evaluateAll had it, decides a json_only_paths path (normalize.jsonDecode
+ * without one).
  */
 export function ruleFor(req: Req, rules: Rule[] | undefined, ctx?: Pick<RulesCtx, "json_decode">): Rule | undefined {
   const ct = contentType(req.headers);

@@ -20,7 +20,8 @@ function load(name: string): Doc {
 }
 
 const reFind = core.rules.reFind;
-const jsonDecode = (s: string) => JSON.parse(s);
+// what H.body_decode takes (core/spec/helper.lua): NaN, Infinity and -Infinity too
+const jsonDecode = core.normalize.jsonDecode;
 
 function storeFrom(map: Record<string, unknown>) {
   const s = memoryStore();

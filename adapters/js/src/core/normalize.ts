@@ -1212,6 +1212,60 @@ export function jsonLike(s: string | undefined | null, contentType: string | und
   return first === "{" || first === "[";
 }
 
+// The body with each bare NaN, Infinity and -Infinity token outside strings
+// read as 0, or undefined when it has none. A token stands alone, as Python
+// reads it: after the start, JSON white space, '[', ',' or ':' ("-" for
+// -Infinity), and before the end, white space, ',', ']' or '}'; so "-NaN"
+// and "1NaN" are left as they are. As non_finite in core/spec/helper.lua.
+function nonFinite(s: string): string | undefined {
+  const before = (k: number) => k < 0 || " \t\n\r[,:".includes(s[k]);
+  const after = (k: number) => k >= s.length || " \t\n\r,]}".includes(s[k]);
+  let out = "";
+  let from = 0;
+  let found = false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === '"') {
+      // skip the string: a backslash escapes the character after it
+      for (i++; i < s.length && s[i] !== '"'; i++) if (s[i] === "\\") i++;
+    } else if (c === "N" && s.startsWith("NaN", i) && before(i - 1) && after(i + 3)) {
+      out += s.slice(from, i) + "0";
+      from = i + 3;
+      i += 2;
+      found = true;
+    } else if (c === "I" && s.startsWith("Infinity", i) && after(i + 8)
+      && (before(i - 1) || (s[i - 1] === "-" && before(i - 2)))) {
+      out += s.slice(from, i) + "0";
+      from = i + 8;
+      i += 7;
+      found = true;
+    }
+  }
+  return found ? out + s.slice(from) : undefined;
+}
+
+/**
+ * The JSON decoder the JS runtime gives core (ctx.json_decode) and extract()'s
+ * default: JSON.parse, and when it refuses the text, JSON.parse again with
+ * each bare NaN, Infinity and -Infinity outside strings read as 0. Python's
+ * json.loads takes those three (and cjson in the Lua adapters takes them and
+ * more), so a body a Python backend decodes is read as JSON here too, not
+ * scanned or read as text past a json_only_paths route. A number carries no
+ * text, so 0 stands for it; a number in a text field is still noted (token
+ * ids), as the Lua core notes cjson's NaN.
+ */
+export function jsonDecode(s: string): JsonValue {
+  try {
+    return JSON.parse(s) as JsonValue;
+  } catch (e) {
+    const t = nonFinite(s);
+    if (t === undefined) throw e;
+    return JSON.parse(t) as JsonValue;
+  }
+}
+// extract()'s parameter of the same name would shadow it in its default
+const defaultDecode = jsonDecode;
+
 /**
  * Extract text from a raw body. Returns the text (values joined with "\n"),
  * the kind, the values in order (newest last) for window(), the decoded
@@ -1223,7 +1277,7 @@ export function extract(
   body: string | undefined | null,
   contentType: string | undefined | null,
   fields: string[],
-  jsonDecode: (s: string) => JsonValue = (s) => JSON.parse(s) as JsonValue,
+  jsonDecode: (s: string) => JsonValue = defaultDecode,
 ): [string, ExtractKind, string[], JsonValue?, boolean?, boolean?] {
   if (typeof body !== "string" || body === "") return ["", "none", []];
   const rawCt = typeof contentType === "string" ? contentType : "";

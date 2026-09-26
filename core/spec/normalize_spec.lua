@@ -359,6 +359,23 @@ end)
 
 -- JSON a strict decoder (cjson, emulated by H.body_decode) refuses but a
 -- backend's parser reads: never "no text"
+-- The same table is in adapters/js/test/body.test.ts (normalize.jsonDecode).
+describe("H.body_decode: NaN and Infinity as Python and cjson take them (r5 json_only_miss)", function()
+  local H = require "core.spec.helper"
+  it("reads each bare token outside strings as 0", function()
+    assert.same({ x = 0 }, H.body_decode('{"x":NaN}'))
+    assert.same({ x = "NaN", y = 0, z = 0 }, H.body_decode('{"x":"NaN","y":Infinity,"z":-Infinity}'))
+    assert.same({ 0, 0 }, H.body_decode("[ NaN , -Infinity ]"))
+    assert.same({ ['a"NaN'] = 1 }, H.body_decode('{"a\\"NaN":1}'))
+    assert.same({ 1 }, H.body_decode("[1]"))
+  end)
+  it("refuses what Python refuses", function()
+    for _, s in ipairs({ "[-NaN]", "[NaN1]", "[1NaN]", "[--Infinity]", "[nan]", "[inf]", "{NaN:1}", "[NaN" }) do
+      assert.is_nil(H.body_decode(s), s)
+    end
+  end)
+end)
+
 describe("normalize.extract: JSON the decoder refuses", function()
   local H = require "core.spec.helper"
   local FIELDS = { "messages[*].content", "prompt" }

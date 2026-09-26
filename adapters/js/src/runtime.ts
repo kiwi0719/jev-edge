@@ -510,7 +510,9 @@ async function evaluateInner(request: Request, rt: Runtime, requestId: string, r
     // sha256, not djb2: the fingerprint keys the verdict cache and the trust
     // store, and a linear hash lets a few appended bytes hit a chosen value.
     hash: core.sha256Hex,
-    json_decode: (s) => JSON.parse(s),
+    // JSON.parse, and NaN, Infinity and -Infinity as Python's json.loads
+    // and cjson take them (normalize.jsonDecode)
+    json_decode: core.normalize.jsonDecode,
     re_find: core.rules.reFind,
     judge: {
       call: judgeOnce,

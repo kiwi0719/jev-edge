@@ -340,6 +340,8 @@ async function readReq(request: Request, rt: Runtime): Promise<[core.Req, Provid
   return [req, { method: request.method, path, headers: request.headers, body, clientIp }, candidate];
 }
 
+let warnedLong = false;
+
 /** Subject context for this request, or undefined: hashed id, the history
  *  (read only for a request a rule watches), a sink that writes without being
  *  awaited. */
@@ -354,6 +356,11 @@ async function subjectCtx(
     ip: clientIp,
     header: (n) => request.headers.get(n),
     cookieHeader: request.headers.get("cookie"),
+  }, (why) => {
+    // once per isolate: a subject value past the limit names no trajectory
+    if (warnedLong) return;
+    warnedLong = true;
+    console.warn(`jev-edge: ${why}, dropped (subject.from = ${scfg.from ?? "ip"})`);
   });
   const ids = await subjectMod.hashIds(scfg, raws, subjectMod.sha256Hex);
   const id = ids[0];

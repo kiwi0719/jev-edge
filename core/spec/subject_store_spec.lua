@@ -24,14 +24,17 @@ describe("subject extraction and hashing", function()
     local run = string.rep(" ", 32 * 1024)
     local view = { header = function() return "k" .. run .. "x" .. run end,
                    cookie_header = "sid=k" .. run .. "x" .. run }
-    for _, c in ipairs({ { { enabled = true, from = "header", name = "x-api-key" }, {} },
+    local kept = "k" .. run .. "x"
+    for _, c in ipairs({ { { enabled = true, from = "header", name = "x-api-key", hashed = true }, {} },
+                         { { enabled = true, from = "header", name = "x-api-key" }, { kept } },
                          -- the credentials after the scheme, which one space now separates
                          { { enabled = true, from = "header", name = "authorization" }, { "k x" } },
-                         { { enabled = true, from = "cookie", name = "sid" }, {} } }) do
+                         { { enabled = true, from = "cookie", name = "sid", hashed = true }, {} },
+                         { { enabled = true, from = "cookie", name = "sid" }, { kept } } }) do
       local t0 = os.clock()
       local out = subject.extract_all(c[1], view)
       local ms = (os.clock() - t0) * 1000
-      assert.same(c[2], out, "longer than MAX_VALUE_BYTES once trimmed")
+      assert.same(c[2], out, "longer than MAX_VALUE_BYTES once trimmed, hashed")
       assert.is_true(ms < 50, ("%s took %.1f ms"):format(c[1].name, ms))
     end
   end)
@@ -43,10 +46,46 @@ describe("subject extraction and hashing", function()
     assert.equals("header:abc123", subject.hash_id({ hashed = true }, "header:abc123", hash))
     assert.is_nil(subject.hash_id({ hashed = true }, "not a hash; drop table", hash),
       "hashed = true only accepts our own id shape")
-    assert.is_nil(subject.extract({ enabled = true, from = "header", name = "x" },
-      { header = function() return string.rep("k", 600) end }), "oversize values are dropped")
+    local long = { header = function() return string.rep("k", 600) end }
+    local v, why = subject.extract({ enabled = true, from = "header", name = "x", hashed = true }, long)
+    assert.is_nil(v, "an oversize id is dropped")
+    assert.equals(subject.TOO_LONG, why)
+    assert.equals(string.rep("k", 600), subject.extract({ enabled = true, from = "header", name = "x" }, long))
     assert.equals("cookie:abc", subject.hash_id({ from = "header", hashed = true }, "cookie:abc", hash))
     assert.is_nil(subject.hash_id({ from = "ip", salt = "x" }, nil, hash))
+  end)
+
+  -- g1-subject-id-evasion#3: MAX_VALUE_BYTES bounds only a value that is the
+  -- id (hashed = true); a salted value is hashed, up to MAX_SALTED_BYTES. The
+  -- same cases are in adapters/js/test/subject.test.ts.
+  it("hashes a long bearer token or cookie in salted mode, and drops it when it is the id", function()
+    local bearer = "Bearer eyJ" .. string.rep("a", 562)
+    assert.equals(572, #bearer)
+    local cookie = "sid=" .. string.rep("c", 4096)
+    local hcfg = { enabled = true, from = "header", name = "authorization", salt = "pepper" }
+    local ccfg = { enabled = true, from = "cookie", name = "sid", salt = "pepper" }
+    local hv = subject.extract(hcfg, { header = function() return bearer end })
+    assert.equals("bearer eyJ" .. string.rep("a", 562), hv)
+    assert.equals("header:H(pepper\0" .. hv .. ")", subject.hash_id(hcfg, hv, hash))
+    local cv = subject.extract_all(ccfg, { cookie_header = cookie })
+    assert.same({ string.rep("c", 4096) }, cv)
+    -- past MAX_SALTED_BYTES: dropped, and said so
+    local all, why = subject.extract_all(ccfg, { cookie_header = "sid=" .. string.rep("c", 65537) })
+    assert.same({}, all)
+    assert.equals(subject.TOO_LONG, why)
+    -- with hashed = true the value is the id: 512 bytes at most
+    for _, c in ipairs({ { hcfg, { header = function() return bearer end } }, { ccfg, { cookie_header = cookie } } }) do
+      local h = { enabled = true, from = c[1].from, name = c[1].name, hashed = true }
+      local v, w = subject.extract(h, c[2])
+      assert.is_nil(v)
+      assert.equals(subject.TOO_LONG, w)
+    end
+    -- a scheme padded past 512 bytes is the unpadded credential
+    local padded = subject.extract(hcfg, { header = function() return "Bearer" .. string.rep(" ", 510) .. "tok" end })
+    assert.equals("bearer tok", padded)
+    assert.equals(subject.extract(hcfg, { header = function() return "Bearer tok" end }), padded)
+    local _, none = subject.extract_all(hcfg, { header = function() return "Bearer tok" end })
+    assert.is_nil(none)
   end)
 
   -- The same table is in adapters/js/test/subject.test.ts: both cores must

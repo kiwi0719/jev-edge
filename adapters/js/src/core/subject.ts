@@ -26,6 +26,10 @@ export const KEY_PREFIX = "subj:";
  *  for the store, but with `hashed: true` the value IS the key and the log
  *  field, so an unbounded header would be an unbounded store key. */
 export const MAX_VALUE_BYTES = 512;
+/** Longest raw subject value accepted otherwise: it is hashed, so its length does not reach the store. */
+export const MAX_SALTED_BYTES = 65536;
+/** What extractAll reports when it dropped a value for its length. */
+export const TOO_LONG = "subject value too long";
 
 export interface SubjectConfig {
   enabled?: boolean;
@@ -115,8 +119,10 @@ function canonicalCredentials(v: string): string {
 }
 
 /** Every raw subject value for this request (one for ip and header, up to
- *  MAX_IDS for cookie). Mirrors core/subject.lua extract_all(). */
-export function extractAll(scfg: SubjectConfig | undefined, view: RequestView): string[] {
+ *  MAX_IDS for cookie). Mirrors core/subject.lua extract_all(): none longer
+ *  than MAX_VALUE_BYTES with `hashed`, MAX_SALTED_BYTES otherwise; `dropped`
+ *  hears TOO_LONG when a value was left out for its length. */
+export function extractAll(scfg: SubjectConfig | undefined, view: RequestView, dropped?: (reason: string) => void): string[] {
   if (!scfg?.enabled) return [];
   const from = scfg.from ?? "ip";
   let raw: (string | null | undefined)[] = [];
@@ -128,19 +134,23 @@ export function extractAll(scfg: SubjectConfig | undefined, view: RequestView): 
       : [view.cookie?.(scfg.name ?? "")];
   }
   const creds = from === "header" && CREDENTIAL_HEADERS.has(String(scfg.name ?? "").toLowerCase());
+  const max = scfg.hashed ? MAX_VALUE_BYTES : MAX_SALTED_BYTES;
   const out: string[] = [];
+  let long = false;
   for (const r of raw) {
     if (typeof r !== "string") continue;
     let v = trim(r);
     if (creds) v = canonicalCredentials(v);
-    if (v !== "" && new TextEncoder().encode(v).length <= MAX_VALUE_BYTES && !out.includes(v)) out.push(v);
+    if (new TextEncoder().encode(v).length > max) long = true;
+    else if (v !== "" && !out.includes(v)) out.push(v);
   }
+  if (long) dropped?.(TOO_LONG);
   return out;
 }
 
 /** The raw subject value for this request, or null: the first of extractAll. */
-export function extract(scfg: SubjectConfig | undefined, view: RequestView): string | null {
-  return extractAll(scfg, view)[0] ?? null;
+export function extract(scfg: SubjectConfig | undefined, view: RequestView, dropped?: (reason: string) => void): string | null {
+  return extractAll(scfg, view, dropped)[0] ?? null;
 }
 
 /** `<from>:<hash(salt \0 value)>`; the raw value never leaves this function. `hashed` means the value already is the complete id. */

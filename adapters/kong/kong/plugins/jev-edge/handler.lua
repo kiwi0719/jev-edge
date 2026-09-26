@@ -137,6 +137,7 @@ end
 -- request mapping
 -- ---------------------------------------------------------------------------
 
+local warned_long = false
 local function subject_ctx(rt, req)
   local scfg = rt.cfg.subject
   if not scfg or not scfg.enabled then return nil end
@@ -145,11 +146,17 @@ local function subject_ctx(rt, req)
   -- backend may read another. Every candidate is an id (core/subject.lua
   -- cookie_values); reputation checks and charges each, ids[1] names the
   -- trajectory and the logs.
-  local ids = subject_m.hash_ids(scfg, subject_m.extract_all(scfg, {
+  local raws, long = subject_m.extract_all(scfg, {
     ip = req.client_ip,
     header = function(n) return req.headers[n] end,
     cookie_header = req.headers["cookie"],
-  }), sha256_hex)
+  })
+  if long and not warned_long then
+    -- once per worker: a subject value past the limit names no trajectory
+    warned_long = true
+    kong.log.warn("jev-edge: ", long, ", dropped (subject.from = ", tostring(scfg.from), ")")
+  end
+  local ids = subject_m.hash_ids(scfg, raws, sha256_hex)
   local id = ids[1]
   if not id then return nil end
   subject_store = subject_store or cache_m.new(SUBJECT_DICT)

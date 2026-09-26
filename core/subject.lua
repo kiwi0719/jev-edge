@@ -299,7 +299,12 @@ end
 
 --- Every raw subject value for this request: one for `ip` and `header`,
 -- up to MAX_IDS for `cookie` (cookie_values), trimmed, distinct, none empty
--- or longer than MAX_VALUE_BYTES. Empty when there is none.
+-- or too long: MAX_VALUE_BYTES with `hashed = true`, where the value is the
+-- id, MAX_SALTED_BYTES otherwise, where it is hashed (an RS256 bearer token
+-- or a session cookie is often past 512 bytes, and dropping it left the
+-- request with no subject at all). Empty when there is none; then, or
+-- beside the rest, TOO_LONG when a value was dropped for its length, so the
+-- adapter can say so once.
 -- @param scfg cfg.subject
 -- @param view { ip = string|nil, header = fn(name) -> string|list|nil,
 --   cookie_header = the raw Cookie header(s), string|list|nil;
@@ -321,27 +326,39 @@ function _M.extract_all(scfg, view)
   end
   if type(raw[1]) == "table" then raw[1] = raw[1][1] end
   local creds = from == "header" and CREDENTIAL_HEADERS[tostring(scfg.name):lower()]
-  local out, seen = {}, {}
+  local max = scfg.hashed and _M.MAX_VALUE_BYTES or _M.MAX_SALTED_BYTES
+  local out, seen, long = {}, {}, nil
   for i = 1, #raw do
     local v = raw[i]
     if type(v) == "string" then
       v = trim(v)
       if creds then v = canonical_credentials(v) end
-      if v ~= "" and #v <= _M.MAX_VALUE_BYTES and not seen[v] then seen[v], out[#out + 1] = true, v end
+      if #v > max then
+        long = _M.TOO_LONG
+      elseif v ~= "" and not seen[v] then
+        seen[v], out[#out + 1] = true, v
+      end
     end
   end
-  return out
+  return out, long
 end
 
---- The raw subject value for this request, or nil: the first of extract_all.
+--- The raw subject value for this request, or nil and TOO_LONG when the
+-- value was dropped for its length: the first of extract_all.
 function _M.extract(scfg, view)
-  return _M.extract_all(scfg, view)[1]
+  local all, long = _M.extract_all(scfg, view)
+  if all[1] then return all[1] end
+  return nil, long
 end
 
---- Longest raw subject value accepted. Hashing makes the length irrelevant
---- for the store, but with `hashed = true` the value IS the key and the log
---- field, so an unbounded header would be an unbounded dict key.
+--- Longest raw subject value accepted with `hashed = true`: the value IS
+--- the key and the log field, so an unbounded header would be an unbounded
+--- dict key.
 _M.MAX_VALUE_BYTES = 512
+--- Longest raw subject value accepted otherwise: it is hashed, so its
+--- length does not reach the store; the bound only caps the hashing work.
+_M.MAX_SALTED_BYTES = 65536
+_M.TOO_LONG = "subject value too long"
 
 --- The id core and the store see: `<from>:<hash(salt .. value)>`. The raw
 -- value never leaves this function. With `hashed = true` the value is used as

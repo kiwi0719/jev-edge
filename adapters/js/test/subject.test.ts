@@ -156,19 +156,71 @@ describe("subject: cookie candidates (g1-subject-id-evasion#1)", () => {
   it("trims a header or cookie with a long whitespace run in linear time (lead-openresty-runtime#20)", () => {
     const run = " ".repeat(32 * 1024);
     const view = { header: () => "k" + run + "x" + run, cookieHeader: "sid=k" + run + "x" + run };
+    const kept = "k" + run + "x";
     const cases: [core.subject.SubjectConfig, string[]][] = [
-      [{ enabled: true, from: "header", name: "x-api-key" }, []],
+      [{ enabled: true, from: "header", name: "x-api-key", hashed: true }, []],
+      [{ enabled: true, from: "header", name: "x-api-key" }, [kept]],
       // the credentials after the scheme, which one space now separates
       [{ enabled: true, from: "header", name: "authorization" }, ["k x"]],
-      [{ enabled: true, from: "cookie", name: "sid" }, []],
+      [{ enabled: true, from: "cookie", name: "sid", hashed: true }, []],
+      [{ enabled: true, from: "cookie", name: "sid" }, [kept]],
     ];
     for (const [c, want] of cases) {
       const t0 = performance.now();
       const out = core.subject.extractAll(c, view);
       const ms = performance.now() - t0;
-      expect(out, "longer than MAX_VALUE_BYTES once trimmed").toEqual(want);
+      expect(out, "longer than MAX_VALUE_BYTES once trimmed, hashed").toEqual(want);
       expect(ms, `${c.name} took ${ms.toFixed(1)} ms`).toBeLessThan(50);
     }
+  });
+
+  // g1-subject-id-evasion#3, as in core/spec/subject_store_spec.lua:
+  // MAX_VALUE_BYTES bounds only a value that is the id (hashed); a salted
+  // value is hashed, up to MAX_SALTED_BYTES.
+  it("hashes a long bearer token or cookie in salted mode, and drops it when it is the id", async () => {
+    const bearer = "Bearer eyJ" + "a".repeat(562);
+    expect(bearer.length).toBe(572);
+    const cookie = "sid=" + "c".repeat(4096);
+    const hcfg = { enabled: true, from: "header" as const, name: "authorization", salt: "pepper" };
+    const hv = core.subject.extract(hcfg, { header: () => bearer });
+    expect(hv).toBe("bearer eyJ" + "a".repeat(562));
+    expect(await core.subject.hashId(hcfg, hv, hash)).toBe("header:H(pepper" + String.fromCharCode(0) + hv + ")");
+    expect(core.subject.extractAll(scfg, { cookieHeader: cookie })).toEqual(["c".repeat(4096)]);
+    const why: string[] = [];
+    expect(core.subject.extractAll(scfg, { cookieHeader: "sid=" + "c".repeat(65537) }, (w) => why.push(w))).toEqual([]);
+    expect(why).toEqual([core.subject.TOO_LONG]);
+    for (const [c, view] of [[hcfg, { header: () => bearer }], [scfg, { cookieHeader: cookie }]] as const) {
+      const w: string[] = [];
+      expect(core.subject.extract({ enabled: true, from: c.from, name: c.name, hashed: true }, view, (x) => w.push(x))).toBeNull();
+      expect(w).toEqual([core.subject.TOO_LONG]);
+    }
+    const padded = core.subject.extract(hcfg, { header: () => "Bearer" + " ".repeat(510) + "tok" });
+    expect(padded).toBe("bearer tok");
+    const none: string[] = [];
+    expect(core.subject.extract(hcfg, { header: () => "Bearer tok" }, (x) => none.push(x))).toBe(padded);
+    expect(none).toEqual([]);
+  });
+
+  it("the runtime warns once when a subject value is too long", async () => {
+    const { createRuntime, handle } = await import("../src");
+    const rt = createRuntime({
+      config: {
+        jev: { provider: "mock", mock_score: 0.1, timeout_ms: 400 }, policy: { mode: "enforce" },
+        subject: { enabled: true, from: "header", name: "x-sub", hashed: true },
+      },
+    });
+    const warns: string[] = [];
+    const orig = console.warn;
+    console.warn = (m: string) => { warns.push(String(m)); };
+    try {
+      for (let i = 0; i < 3; i++) {
+        await handle(new Request("https://edge.example/healthz", { headers: { "x-sub": "header:" + "a".repeat(600) } }), rt,
+          async () => new Response("ok"));
+      }
+    } finally {
+      console.warn = orig;
+    }
+    expect(warns.filter((w) => w.includes(core.subject.TOO_LONG))).toHaveLength(1);
   });
 
   // The same table is in core/spec/subject_store_spec.lua.

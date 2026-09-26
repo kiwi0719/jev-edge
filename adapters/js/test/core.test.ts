@@ -606,7 +606,10 @@ describe("subject id hygiene", () => {
     expect(await core.subject.hashId({ from: "header", salt: "pepper" }, "key-1", hash)).toBe("header:H(pepper\0key-1)");
   });
   it("drops oversize values", () => {
-    expect(core.subject.extract({ enabled: true, from: "header", name: "x" }, { header: () => "k".repeat(600) })).toBeNull();
+    // an id (hashed) past 512 bytes; a salted value past 64 KiB
+    expect(core.subject.extract({ enabled: true, from: "header", name: "x", hashed: true }, { header: () => "k".repeat(600) })).toBeNull();
+    expect(core.subject.extract({ enabled: true, from: "header", name: "x" }, { header: () => "k".repeat(600) })).toBe("k".repeat(600));
+    expect(core.subject.extract({ enabled: true, from: "header", name: "x" }, { header: () => "k".repeat(65537) })).toBeNull();
     expect(core.subject.extract({ enabled: true, from: "header", name: "x" }, { header: () => "  k-1 \n" })).toBe("k-1");
   });
 });

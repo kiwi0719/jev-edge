@@ -235,6 +235,8 @@ end
 local COUNTED_TTL = 30
 local function counted_key(id, fp) return subject_m.REP_PREFIX .. id .. ":a:" .. tostring(fp) end
 
+local warned_long = false
+
 -- Per-subject trajectory: id extracted per cfg.subject, hashed with the salt
 -- before anything stores or logs it; history read once here; the write is a
 -- ring append (see core/subject.lua) and does not yield.
@@ -246,11 +248,17 @@ local function subject_ctx(cfg, req, leg)
   -- backend may read another. Every candidate is an id (core/subject.lua
   -- cookie_values); reputation checks and charges each, ids[1] names the
   -- trajectory and the logs.
-  local ids = subject_m.hash_ids(scfg, subject_m.extract_all(scfg, {
+  local raws, long = subject_m.extract_all(scfg, {
     ip = req.client_ip,
     header = function(n) return req.headers[n] end,
     cookie_header = req.headers["cookie"],
-  }), sha256_hex)
+  })
+  if long and not warned_long then
+    -- once per worker: a subject value past the limit names no trajectory
+    warned_long = true
+    ngx.log(ngx.WARN, "jev-edge: ", long, ", dropped (subject.from = ", tostring(scfg.from), ")")
+  end
+  local ids = subject_m.hash_ids(scfg, raws, sha256_hex)
   local id = ids[1]
   if not id then return nil end
   subject_store = subject_store or cache_m.new(SUBJECT_DICT)

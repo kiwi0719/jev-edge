@@ -94,14 +94,67 @@ local function lone_surrogate_escape(s)
   end
 end
 
+-- True when the commas and colons of JSON text are where RFC 8259 puts them.
+-- dkjson reads `[1,2,]`, `{"a":1,}`, `[1 2]` and `{"a":1 "b":2}`; cjson and
+-- JSON.parse refuse all four. Strings are skipped, scalars taken as a run of
+-- the characters they are made of (dkjson has already checked them).
+local function well_formed(s)
+  -- what may come next: "v" a value, "v]" a value or "]", "k" a key,
+  -- "k}" a key or "}", ":" a colon, "," a comma or the closer (after a value)
+  local want, stack, i = "v", {}, 1
+  while true do
+    i = s:find("[^ \t\n\r]", i)
+    if not i then return want == "," and #stack == 0 end
+    local c = s:sub(i, i)
+    local top = stack[#stack]
+    if c == '"' then
+      if want ~= "v" and want ~= "v]" and want ~= "k" and want ~= "k}" then return false end
+      local k = i + 1
+      while true do
+        local q = s:find('["\\]', k)
+        if not q then return false end
+        if s:sub(q, q) == '"' then i = q break end
+        k = q + 2
+      end
+      want = (want == "k" or want == "k}") and ":" or ","
+    elseif c == "{" or c == "[" then
+      if want ~= "v" and want ~= "v]" then return false end
+      stack[#stack + 1] = c
+      want = c == "{" and "k}" or "v]"
+    elseif c == "}" or c == "]" then
+      local open = c == "}" and "{" or "["
+      if top ~= open or not (want == "," or want == (c == "}" and "k}" or "v]")) then return false end
+      stack[#stack] = nil
+      want = ","
+    elseif c == ":" then
+      if want ~= ":" then return false end
+      want = "v"
+    elseif c == "," then
+      if want ~= "," or not top then return false end
+      want = top == "{" and "k" or "v"
+    else
+      if want ~= "v" and want ~= "v]" then return false end
+      i = (s:find("[^%w%.%+%-]", i) or #s + 1) - 1
+      want = ","
+    end
+    if #stack == 0 and want == "," then
+      -- the value is complete: only white space may follow
+      return s:find("^[ \t\n\r]*$", i + 1) ~= nil
+    end
+    i = i + 1
+  end
+end
+H.well_formed = well_formed
+
 -- Request bodies are decoded the way cjson.safe decodes them in production:
 -- JSON null is a non-nil value (cjson.null), so `[null, {...}]` does not end
 -- the array at the hole dkjson would otherwise leave; and what cjson refuses
 -- and dkjson accepts (anything after the value, nesting past 1000, a lone
--- surrogate escape) is refused, returning nil.
+-- surrogate escape, a trailing or missing comma) is refused, returning nil.
 function H.body_decode(s)
   local v, pos = H.json.decode(s, 1, H.json.null)
-  if v == nil or not s:find("^[ \t\n\r]*$", pos) or json_depth(s) > 1000 or lone_surrogate_escape(s) then
+  if v == nil or not s:find("^[ \t\n\r]*$", pos) or json_depth(s) > 1000 or lone_surrogate_escape(s)
+     or not well_formed(s) then
     return nil
   end
   return v

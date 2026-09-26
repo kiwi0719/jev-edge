@@ -293,25 +293,48 @@ rule("rule-parity", function(r)
   local chunk = loadfile("rules/llm-endpoints.lua")
   local luarule = chunk and chunk() or {}
   local luapats = luarule.always_suspect or {}
-  -- watch_paths, json_only_paths and text_fields: the same entries in the
-  -- same order (a route left out of one copy is "path not watched" on that
-  -- runtime only; the order of text_fields is the order of the judged text).
-  -- resolve() fills in the same text_fields for an inline rule that lists none.
+  -- watch_paths, json_only_paths, text_fields and tool_fields: the same
+  -- entries in the same order (a route left out of one copy is "path not
+  -- watched" on that runtime only; the order of the fields is the order of
+  -- the judged text). resolve() fills in the same text_fields and
+  -- tool_fields for an inline rule that lists none.
   local function strings(s)
     local out = {}
     for v in (s or ""):gmatch('"([^"]*)"') do out[#out + 1] = v end
     return out
   end
-  local want = table.concat(luarule.text_fields or {}, ",")
-  for _, k in ipairs({ "watch_paths", "json_only_paths", "text_fields" }) do
+  for _, k in ipairs({ "watch_paths", "json_only_paths", "text_fields", "tool_fields" }) do
     if table.concat(luarule[k] or {}, ",") ~= table.concat(strings(tsrule:match(k .. ":%s*(%b[])")), ",") then
       fail(r, k .. " differ between rules/llm-endpoints.lua and src/rules/index.ts")
     end
   end
-  if table.concat(strings((read("core/rules.lua") or ""):match("out%.text_fields = (%b{})")), ",") ~= want
-     or table.concat(strings(ts:match("out%.text_fields %?%?= (%b[])")), ",") ~= want then
-    fail(r, "resolve() default text_fields differ from llm-endpoints (core/rules.lua, src/rules/index.ts)")
+  for _, k in ipairs({ "text_fields", "tool_fields" }) do
+    local want = table.concat(luarule[k] or {}, ",")
+    if want == ""
+       or table.concat(strings((read("core/rules.lua") or ""):match("out%." .. k .. " = (%b{})")), ",") ~= want
+       or table.concat(strings(ts:match("out%." .. k .. " %?%?= (%b[])")), ",") ~= want then
+      fail(r, "resolve() default " .. k .. " differ from llm-endpoints (core/rules.lua, src/rules/index.ts)")
+    end
   end
+  -- the walk over tool-call arguments and tool definitions: the same bounds
+  -- (a cut is "(window)" or unjudgeable in one core only otherwise) and the
+  -- same JSON Schema type names left out of a tool definition
+  local nlua, nts = code("core/normalize.lua"), code("adapters/js/src/core/normalize.ts")
+  local depth, nodes, count = nts:match("export const DEEP = { depth: (%d+), nodes: (%d+), count: (%d+) }")
+  if not depth or nlua:match("\n_M%.DEEP_DEPTH = (%d+)") ~= depth
+     or nlua:match("\n_M%.DEEP_NODES = (%d+)") ~= nodes
+     or nlua:match("\n_M%.DEEP_COUNT = (%d+)") ~= count then
+    fail(r, "DEEP_DEPTH / DEEP_NODES / DEEP_COUNT differ between core/normalize.lua and src/core/normalize.ts")
+  end
+  local function sorted_words(s)
+    local out = {}
+    for w in (s or ""):gmatch("[%a_]+") do out[#out + 1] = w end
+    table.sort(out)
+    return table.concat(out, ",")
+  end
+  local lt = sorted_words((nlua:match("\n_M%.SCHEMA_TYPES = (%b{})") or ""):gsub("= true", ""))
+  local tt = sorted_words(nts:match("SCHEMA_TYPES: ReadonlySet<string> = new Set%((%b[])%)"))
+  if lt == "" or lt ~= tt then fail(r, "SCHEMA_TYPES differ between core/normalize.lua and src/core/normalize.ts") end
   local tspats = {}
   for p in (tsrule:match("always_suspect:%s*%[(.-)\n%s*%],") or ""):gmatch("String%.raw`([^`]*)`") do
     tspats[#tspats + 1] = p

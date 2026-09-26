@@ -3,6 +3,7 @@
 // fails a named case when the two drift.
 import { patternError, type Rule } from "../core/rules.js";
 import { validateUntrusted } from "../core/defaults.js";
+import { pathError } from "../core/normalize.js";
 
 export const llmEndpoints: Rule = {
   id: "llm-endpoints",
@@ -36,16 +37,27 @@ export const llmEndpoints: Rule = {
   max_body_bytes: 1048576,
   max_judge_bytes: 32768,
   max_judge_chunks: 1,
-  // oldest first: the judging window keeps the last ones first
+  // oldest first: the judging window keeps the last ones first. The paths
+  // are walked together, in document order (each message's content and tool
+  // calls together); ".**": every key and string below, a string of JSON
+  // read decoded.
   text_fields: [
     "system", "instructions", "preamble", "system_prompt", "systemInstruction.parts",
-    "system_instruction.parts", "documents", "template", "messages[*].content",
-    "messages[*].parts", "contents[*].parts", "contents.parts", "chat_history[*].message",
-    "message", "prompt", "prompt.prompt_string", "prompt[*].prompt_string", "prompt.variables",
-    "input", "input[*].output", "inputs", "instances[*].inputs",
-    "instances[*].messages[*].content", "query", "text", "suffix", "input_prefix",
-    "input_suffix", "input_extra[*].text",
+    "system_instruction.parts", "documents", "template",
+    "messages[*].content", "messages[*].tool_calls[*].function.arguments.**",
+    "messages[*].tool_calls[*].custom.input", "messages[*].function_call.arguments.**",
+    "messages[*].content[*].input.**", "messages[*].parts",
+    "messages[*].parts[*].input.**", "messages[*].parts[*].output.**",
+    "contents[*].parts", "contents.parts", "chat_history[*].message", "message",
+    "prompt", "prompt.prompt_string", "prompt[*].prompt_string", "prompt.variables.**",
+    "input", "input[*].arguments.**", "input[*].input", "input[*].output",
+    "inputs", "instances[*].inputs", "instances[*].messages[*].content",
+    "query", "text", "suffix", "input_prefix", "input_suffix", "input_extra[*].text",
   ],
+  // tool definitions and output schemas (Gemini's functionDeclarations are
+  // under tools), judged as a part of their own with their own verdict-cache
+  // entry (see rules/llm-endpoints.lua)
+  tool_fields: ["tools", "functions", "response_format.json_schema", "text.format"],
   min_text_chars: 20,
   always_suspect: [
     String.raw`\b(ignore|disregard|forget)\b.{0,20}\b(previous|prior|above|earlier|all)\b.{0,20}\b(instructions?|rules?|prompts?)\b`,
@@ -73,6 +85,7 @@ export const defaultRule: Rule = {
   watch_paths: [],
   methods: { POST: true },
   text_fields: ["prompt", "instructions", "input", "input[*].output", "text"],
+  tool_fields: [],
   templates: ["injection"],
 };
 
@@ -114,13 +127,26 @@ export function resolve(spec: RuleSpec): Rule {
   if (!uok) throw new Error(uerr);
   out.text_fields ??= [
     "system", "instructions", "preamble", "system_prompt", "systemInstruction.parts",
-    "system_instruction.parts", "documents", "template", "messages[*].content",
-    "messages[*].parts", "contents[*].parts", "contents.parts", "chat_history[*].message",
-    "message", "prompt", "prompt.prompt_string", "prompt[*].prompt_string", "prompt.variables",
-    "input", "input[*].output", "inputs", "instances[*].inputs",
-    "instances[*].messages[*].content", "query", "text", "suffix", "input_prefix",
-    "input_suffix", "input_extra[*].text",
+    "system_instruction.parts", "documents", "template",
+    "messages[*].content", "messages[*].tool_calls[*].function.arguments.**",
+    "messages[*].tool_calls[*].custom.input", "messages[*].function_call.arguments.**",
+    "messages[*].content[*].input.**", "messages[*].parts",
+    "messages[*].parts[*].input.**", "messages[*].parts[*].output.**",
+    "contents[*].parts", "contents.parts", "chat_history[*].message", "message",
+    "prompt", "prompt.prompt_string", "prompt[*].prompt_string", "prompt.variables.**",
+    "input", "input[*].arguments.**", "input[*].input", "input[*].output",
+    "inputs", "instances[*].inputs", "instances[*].messages[*].content",
+    "query", "text", "suffix", "input_prefix", "input_suffix", "input_extra[*].text",
   ];
+  out.tool_fields ??= ["tools", "functions", "response_format.json_schema", "text.format"];
+  for (const k of ["text_fields", "tool_fields"] as const) {
+    const paths = out[k];
+    if (!Array.isArray(paths)) throw new Error(`rule ${out.id}: ${k} must be a list of paths`);
+    paths.forEach((p, i) => {
+      const perr = pathError(p);
+      if (perr) throw new Error(`rule ${out.id}: ${k}[${i + 1}] ${perr}`);
+    });
+  }
   out.templates ??= ["injection"];
   return out;
 }

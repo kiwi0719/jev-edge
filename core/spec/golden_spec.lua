@@ -52,8 +52,14 @@ end)
 describe("golden: extract", function()
   for _, c in ipairs(load("extract").cases) do
     it(c.name, function()
-      local text, kind = normalize.extract(c.input.body, c.input.content_type, c.input.fields, H.body_decode)
-      same(c.expect, { text = text, kind = kind })
+      local text, kind, _, decoded, cut = normalize.extract(c.input.body, c.input.content_type, c.input.fields,
+        H.body_decode)
+      local tools
+      if c.input.tool_fields then
+        local ttext, _, capped = normalize.extract_tools(decoded, c.input.tool_fields, H.body_decode)
+        tools = { text = ttext, capped = capped or nil }
+      end
+      same(c.expect, { text = text, kind = kind, cut = cut or nil, tools = tools })
     end)
   end
 end)
@@ -61,13 +67,17 @@ end)
 describe("golden: rules", function()
   for _, c in ipairs(load("rules").cases) do
     it(c.name, function()
-      local rule = require("jev.rules." .. c.input.rule)
+      -- a rule set id, or an inline spec resolved the way a config's `rules` list is
+      local rule = type(c.input.rule) == "table"
+        and assert(rules_mod.resolve(c.input.rule, function(x) return require("jev.rules." .. x) end))
+        or require("jev.rules." .. c.input.rule)
       local ctx = {
         cache = store_from(c.input.cache), clock = function() return c.input.clock end,
         json_decode = H.body_decode, re_find = H.re_find,
       }
-      local r, text, reason = rules_mod.evaluate(c.input.req, rule, ctx)
-      same(c.expect, { result = r, text = text, reason = reason })
+      local r, text, reason, _, _, _, _, tools = rules_mod.evaluate(c.input.req, rule, ctx)
+      same(c.expect, { result = r, text = text, reason = reason,
+        tools = tools and { text = tools.text, windowed = tools.windowed, hit = tools.hit, only = tools.only } })
     end)
   end
 end)

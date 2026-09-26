@@ -183,24 +183,15 @@ local function maybe_async(cfg, v, req, rules)
   -- L3 exists to get an answer L2 could not; while the breaker is open the
   -- provider is the reason, and hammering it from timers only keeps it open.
   if breaker and breaker:state() ~= breaker_m.CLOSED then return end
-  -- rebuild the prompt from the request; core does not hand it back. The
-  -- same text L2 judged: the window, not the whole body.
-  local rctx = { json_decode = cjson.decode, re_find = re_find }
-  local rule = rules_mod.rule_for(req, rules, rctx)
-  if not rule then return end
-  local text = rules_mod.judged_text(req, rule, rctx)
-  if text == "" then return end
-  -- Same prompt L2 built, deployment context included: L3's verdict replaces
-  -- L2's in the cache, so it must not be judged with less context.
-  local prompt = judge_mod.build(rule.templates, text, {
-    path = req.path, method = req.method,
-    deployment = rule.deployment_context or cfg.jev.deployment_context or "",
-  })
-  if not prompt then return end
+  -- rebuild what L2 judged from the request; core does not hand it back. The
+  -- same parts, prompts (deployment context included) and cache keys: L3's
+  -- answers replace L2's in the cache, and the whole request's entry only
+  -- when every part answered (core.l3_job, core.l3_result).
+  local job = core.l3_job(req, { config = cfg, rules = rules, hash = sha256_hex,
+                                 json_decode = cjson.decode, re_find = re_find })
+  if not job then return end
   local ok, err = async.schedule({
-    cfg = cfg, cache = cache, state = state_store(), judge = judge, prompt = prompt,
-    fingerprint = v.fingerprint, client_ip = req.client_ip,
-    cache_key = v.fingerprint ~= "" and core.cache_key(v.fingerprint, rule, cfg, sha256_hex) or nil,
+    cfg = cfg, cache = cache, state = state_store(), judge = judge, job = job, client_ip = req.client_ip,
   })
   if not ok and err ~= "disabled" then metrics.incr_async_dropped() end
 end

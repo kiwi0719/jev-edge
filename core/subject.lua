@@ -131,14 +131,22 @@ end
 --- Add this verdict's points and block the subject when it crosses block_at.
 -- Only judged verdicts count (L2, cache): an L1 block is the consequence, and
 -- counting it would extend the block by itself. Errors are swallowed.
-function _M.rep_record(ctx, v)
+-- Reputation charges the subject for its own text only: a request whose
+-- score came from retrieved content or the tool definitions (which an agent
+-- loads from pages, mailboxes and servers the user may not control) is
+-- charged at `charge`, the label its own text earned, and with
+-- `charge == false` (none of its own text judged, which with untrusted
+-- judging on includes a text that holds retrieved content) not at all.
+-- @param charge optional: the label to charge instead of v.verdict, or false
+function _M.rep_record(ctx, v, charge)
   local r, at = rep_cfg(ctx)
-  if not r or v.source == "l1" then return nil end
+  if not r or v.source == "l1" or charge == false then return nil end
   local id, store = _M.id_of(ctx), rep_store(ctx)
   if not id or not store then return nil end
+  local label = charge or v.verdict
   local w = 0
-  if v.verdict == "malicious" then w = tonumber(r.malicious) or 3
-  elseif v.verdict == "suspicious" then w = tonumber(r.suspicious) or 1 end
+  if label == "malicious" then w = tonumber(r.malicious) or 3
+  elseif label == "suspicious" then w = tonumber(r.suspicious) or 1 end
   if w <= 0 then return nil end
   local ok, points = pcall(function()
     local win = tonumber(r.window_s) or 600

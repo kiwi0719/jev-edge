@@ -2,6 +2,7 @@
 import type { Policy } from "./policy.js";
 import type { BreakerConfig } from "./breaker.js";
 import type { FeedbackConfig } from "./trust.js";
+import { pathError } from "./normalize.js";
 
 export interface QuestionWording {
   instructions?: string;
@@ -216,6 +217,9 @@ export function validateUntrusted(u: unknown, where: string): [true, null] | [nu
     if (!Array.isArray(v)) return [null, `${where}.${k} must be a list of strings`];
     for (let i = 0; i < v.length; i++) {
       if (typeof v[i] !== "string" || v[i] === "") return [null, `${where}.${k}[${i + 1}] must be a non-empty string`];
+      // a field path is checked the way a rule's text_fields are
+      const perr = k === "fields" ? pathError(v[i]) : null;
+      if (perr) return [null, `${where}.${k}[${i + 1}] ${perr}`];
     }
   }
   if (Array.isArray(t.templates) && t.templates.length === 0) return [null, `${where}.templates must not be empty`];

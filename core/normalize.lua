@@ -6,13 +6,18 @@ local _M = {}
 
 -- ---------------------------------------------------------------------------
 -- Path extraction: "messages[*].content", "prompt", "input.text"
+-- A last segment "**" reads every key and string below the value, whatever
+-- its shape: tool-call arguments are a string of JSON in OpenAI's APIs (read
+-- decoded) and an object in Ollama's and Anthropic's; see deep_value.
 -- ---------------------------------------------------------------------------
 
 local function split_path(path)
   local segs = {}
   for seg in path:gmatch("[^%.]+") do
     local name = seg:match("^([^%[]*)%[%*%]$")
-    if name then
+    if seg == "**" then
+      segs[#segs + 1] = { key = seg, deep = true }
+    elseif name then
       segs[#segs + 1] = { key = name, each = true }
     else
       segs[#segs + 1] = { key = seg, each = false }
@@ -21,9 +26,19 @@ local function split_path(path)
   return segs
 end
 
+--- Why `path` (a text_fields or tool_fields entry) is not one, or nil.
+function _M.path_error(path)
+  if type(path) ~= "string" or path == "" then return "must be a non-empty string" end
+  local segs = split_path(path)
+  for i, s in ipairs(segs) do
+    if s.deep and i < #segs then return "\"**\" must be the last segment" end
+  end
+  return nil
+end
+
 -- ---------------------------------------------------------------------------
 -- Values the model reads whole: a Gemini function response, a Cohere
--- document, a Responses stored prompt's variables. A template renders them
+-- document (WHOLE_FIELDS below). A template renders them
 -- as JSON or as "key: value" lines, so an instruction can sit under any key,
 -- or be one: every key and string below the value is read, object keys in
 -- byte order (a Lua table has none, and both cores must produce the same
@@ -139,37 +154,273 @@ _M.fold = fold
 
 -- A folded key starts with the folded name's first byte, or with that
 -- letter's other case, or with the first byte of U+017F / U+212A.
-local FIRST = { s = { [0x53] = true, [0x73] = true, [0xC5] = true },
-                k = { [0x4B] = true, [0x6B] = true, [0xE2] = true } }
+local FIRST = { s = 0xC5, k = 0xE2 }
 
--- The keys of object `node` other than `key` itself that fold to `key`, in
--- byte order; nil when there are none (nearly always).
-local function variants(node, key)
-  if node[1] ~= nil then return nil end   -- an array
-  local want = fold(key)
+-- Marks in `first` the bytes a key that folds to `name` can start with.
+local function first_bytes(name, first)
+  local want = fold(name)
   local b = want:byte(1)
-  local first = FIRST[want:sub(1, 1)]
-  local others
+  if not b then return end
+  first[b] = true
+  if b >= 0x61 and b <= 0x7A then first[b - 32] = true end
+  local extra = FIRST[want:sub(1, 1)]
+  if extra then first[extra] = true end
+end
+
+-- ---------------------------------------------------------------------------
+-- Bounded walks over JSON of any shape: tool-call arguments ("**") and tool
+-- definitions (rule.tool_fields). The client picks the shape, so the walk is
+-- bounded: DEEP_NODES object keys and array items per extraction (sorting
+-- the keys of one big object is what costs: 20k keys take about 5 ms under
+-- LuaJIT and in Node), and DEEP_DEPTH levels below the path's value, which is
+-- cjson's own nesting limit: JSON either core decodes is never cut by depth,
+-- the bound only guards the recursion. Object keys are read in byte order: a
+-- Lua table has none, and both cores must produce the same text. One
+-- oversized node must not starve what comes after it, whether its own keys
+-- and items are too many or only what is below them (an enum of small
+-- arrays, a list of small objects): before a node is read, the nodes below
+-- it are counted, up to what the budget has left. A node that fits is read
+-- whole. One that does not spends at most half of what is left, so what
+-- follows it keeps the other half: an array its newest items that fit whole
+-- (the last ones) and, with what remains, the one before them; an object
+-- its keys, unless they alone are more than its half (reading any of them
+-- means sorting all of them, so it is skipped whole), then each value in
+-- key order by the same rule. Counting is bounded too, or a chain of
+-- nodes over the budget would be counted again at every level: past
+-- DEEP_COUNT times DEEP_NODES nodes counted, a node is taken not to fit.
+-- Whatever a bound leaves out, `capped` says so. An empty object or array
+-- (and a decoder's null, which may be an empty table) adds nothing and is
+-- not counted.
+-- ---------------------------------------------------------------------------
+
+_M.DEEP_DEPTH = 1000
+_M.DEEP_NODES = 20000
+_M.DEEP_COUNT = 4
+
+-- @param decode json_decode, for "**" values that are a string of JSON
+local function new_state(decode)
+  return { out = {}, nodes = _M.DEEP_NODES, counts = _M.DEEP_COUNT * _M.DEEP_NODES, capped = false,
+           decode = decode, defer = {} }
+end
+
+-- The string keys of object `node` in byte order, counted against the node
+-- budget; nil (and nothing spent) when there are more than it has left.
+local function keys_of(node, st)
+  local keys, n = {}, 0
   for k in pairs(node) do
-    if type(k) == "string" and k ~= key and #k >= #want then
-      local c = k:byte(1)
-      if (c == b or (first and first[c]) or (c and c >= 0x41 and c <= 0x5A and c + 32 == b))
-         and fold(k) == want then
-        others = others or {}
-        others[#others + 1] = k
+    if type(k) == "string" then
+      n = n + 1
+      if n > st.nodes then
+        st.capped = true
+        return nil
+      end
+      keys[n] = k
+    end
+  end
+  st.nodes = st.nodes - n
+  table.sort(keys)
+  return keys
+end
+
+local function take(st, s)
+  if s ~= "" then st.out[#st.out + 1] = s end
+end
+
+-- The values of a JSON Schema `type` a tool definition's walk leaves out: the
+-- seven type names, a fixed vocabulary that carries no instruction (a
+-- template renders "type": "string" for every parameter). Any other value of
+-- `type`, and every other key and string, is read.
+_M.SCHEMA_TYPES = { string = true, number = true, integer = true, boolean = true, object = true,
+                    array = true, null = true }
+
+local function schema_type(v)
+  if type(v) == "string" then return _M.SCHEMA_TYPES[v] == true end
+  if type(v) ~= "table" or v[1] == nil then return false end
+  for _, t in ipairs(v) do
+    if type(t) ~= "string" or not _M.SCHEMA_TYPES[t] then return false end
+  end
+  return true
+end
+
+-- The nodes the walk spends below `node` (at `depth`): its keys or items,
+-- and theirs, as keys_of and every_string count them. The count stops as
+-- soon as it is over `limit`, and returns a number over it: that only says
+-- the node does not fit.
+local function nodes_below(node, limit, depth, schema)
+  if type(node) ~= "table" or next(node) == nil or depth > _M.DEEP_DEPTH then return 0 end
+  local n = 0
+  if node[1] ~= nil then
+    n = #node
+    if n > limit then return n end
+    for i = 1, #node do
+      local v = node[i]
+      if type(v) == "table" then
+        n = n + nodes_below(v, limit - n, depth + 1, schema)
+        if n > limit then return n end
+      end
+    end
+    return n
+  end
+  for k, v in pairs(node) do
+    if type(k) == "string" then
+      n = n + 1
+      if n > limit then return n end
+      if type(v) == "table" and not (schema and k == "type" and schema_type(v)) then
+        n = n + nodes_below(v, limit - n, depth + 1, schema)
+        if n > limit then return n end
       end
     end
   end
-  if others then table.sort(others) end
-  return others
+  return n
 end
+
+-- nodes_below(), charged to the walk's counting allowance (st.counts) at what it
+-- counted, or limit + 1 when it stopped: the same charge whatever order the
+-- keys come in. Once the allowance is spent a table does not fit.
+local function counted(st, node, limit, depth, schema)
+  if type(node) ~= "table" or next(node) == nil or depth > _M.DEEP_DEPTH then return 0 end
+  if st.counts <= 0 then return limit + 1 end
+  local n = nodes_below(node, limit, depth, schema)
+  st.counts = st.counts - math.min(n, limit + 1)
+  return n
+end
+
+local partial
+
+--- Every key and string value below `node`, keys in byte order: what a
+-- template that renders the value as JSON shows the model. With `schema`
+-- (tool definitions) a `type` whose value is a JSON Schema type name is
+-- left out, key and value. `fits`: the caller counted this node and it fits
+-- the budget, so nothing below it is counted again. `last`: nothing after
+-- it in its object needs the budget, so a node over it may spend all of it.
+local function every_string(node, st, depth, schema, fits, last)
+  if type(node) == "string" then return take(st, node) end
+  if type(node) ~= "table" or next(node) == nil then return end
+  if depth > _M.DEEP_DEPTH then
+    st.capped = true
+    return
+  end
+  if not fits and counted(st, node, st.nodes, depth, schema) > st.nodes then
+    -- over the budget: at most half of what is left, the rest kept for what follows
+    st.capped = true
+    local keep = last and 0 or st.nodes - math.floor(st.nodes / 2)
+    st.nodes = st.nodes - keep
+    partial(node, st, depth, schema)
+    st.nodes = st.nodes + keep
+    return
+  end
+  if node[1] ~= nil then
+    st.nodes = st.nodes - #node
+    for i = 1, #node do every_string(node[i], st, depth + 1, schema, true) end
+    return
+  end
+  for _, k in ipairs(keys_of(node, st)) do
+    local v = node[k]
+    if not (schema and k == "type" and schema_type(v)) then
+      take(st, k)
+      every_string(v, st, depth + 1, schema, true)
+    end
+  end
+end
+
+-- A node over the budget (st.nodes, its share), read as far as it goes. An
+-- array: its newest items that fit whole, walking back from the last, and
+-- the one before them with what is left (a table, over it by then). An
+-- object: its keys, unless there are more than the budget has left, then
+-- each value as every_string reads one; the values after the last table
+-- among them are strings and scalars, which cost nothing, so that table
+-- keeps nothing back for them.
+partial = function(node, st, depth, schema)
+  if node[1] ~= nil then
+    local n, left = #node, st.nodes
+    local first = n + 1
+    while first > 1 and left > 0 do
+      local c = 1 + counted(st, node[first - 1], left - 1, depth + 1, schema)
+      if c > left then break end
+      left, first = left - c, first - 1
+    end
+    local whole = st.nodes - left
+    st.nodes = left
+    if first > 1 and left > 0 then
+      st.nodes = left - 1
+      partial(node[first - 1], st, depth + 1, schema)
+    end
+    st.nodes = st.nodes + whole
+    for i = first, n do
+      st.nodes = st.nodes - 1
+      every_string(node[i], st, depth + 1, schema, true)
+    end
+    return
+  end
+  local keys = keys_of(node, st)
+  if not keys then return end
+  local last = 0
+  for i, k in ipairs(keys) do
+    local v = node[k]
+    if type(v) == "table" and next(v) ~= nil and not (schema and k == "type" and schema_type(v)) then last = i end
+  end
+  for i, k in ipairs(keys) do
+    local v = node[k]
+    if not (schema and k == "type" and schema_type(v)) then
+      take(st, k)
+      every_string(v, st, depth + 1, schema, false, i == last)
+    end
+  end
+end
+
+-- The value a tool_fields path ends at: a string whole, anything else (a
+-- tool definition, a JSON Schema, a list of them) every key and string in
+-- it but JSON Schema type names. vLLM, llama.cpp and SGLang render tools
+-- with `tojson`, so the model reads extension keys, $comment, pattern,
+-- required entries and $defs names as much as a description.
+local function tool_leaf(node, st)
+  if type(node) == "string" then return take(st, node) end
+  every_string(node, st, 1, true)
+end
+
+-- The value a "**" path ends at. A string that holds a JSON object or array
+-- (OpenAI tool-call arguments) is read decoded, as the chat templates that
+-- render arguments read it: its keys and strings, escapes resolved, and no
+-- "{}" of an empty call. Anything else, and JSON the decoder refuses, is
+-- read as it is.
+local function deep_value(node, st)
+  if type(node) == "string" and st.decode and node:find("^[ \t\n\r]*[%[{]") then
+    local ok, v = pcall(st.decode, _M.lone_surrogates(node))
+    if ok and type(v) == "table" then return every_string(v, st, 1) end
+  end
+  every_string(node, st, 1)
+end
+
+-- ---------------------------------------------------------------------------
+-- Field paths are walked together, not one after another: the paths that go
+-- through the same key go through it once, and an array one of them goes
+-- through item by item is read item by item for all of them. The values come
+-- out in document order, a message's content and its tool calls together,
+-- so the judging window (newest first) keeps the newest turn whole, tool
+-- calls included. Each "**" value is read after the walk, newest first, so
+-- the node budget goes to the most recent tool calls and a bound cuts the
+-- oldest.
+--
+-- A list of paths is compiled once into a plan (plan_of), so the walk itself
+-- allocates nothing but the "**" slots: at a node, what to do there, in the
+-- order the first path for it comes. An op is a path that ends here
+-- ({ kind = END, depth, whole, keyed }: collect()'s or read_whole()'s depth,
+-- 2 for a path that ends at an array read item by item; field_path's flags),
+-- a "**" here ({ kind = DEEP }), or a key the
+-- paths go on through ({ kind = KEY, key, whole, whole_arr, items_arr }):
+-- the plan for the value under the key when it is not an array (`whole`),
+-- and when it is, the plans for the array itself and for each of its items.
+-- ---------------------------------------------------------------------------
 
 -- Field paths whose values are read whole (read_whole), whatever their
 -- shape, instead of as content parts: `documents`, retrieved documents
 -- (Cohere v1 maps of title, snippet, text or any other key, Cohere v2
 -- strings or { id, data }, vLLM chat's `documents`), and `prompt.variables`,
 -- the values a Responses API stored prompt is filled with (strings or
--- input_text parts, under names the client picks).
+-- input_text parts, under names the client picks). The shipped rules read
+-- the variables as "prompt.variables.**", which the walk's node budget
+-- bounds like tool-call arguments; the whole field stays for a rule that
+-- lists it.
 local WHOLE_FIELDS = { documents = true, ["prompt.variables"] = true }
 
 -- Field paths whose value, when it is an object and not a list, is read as
@@ -180,8 +431,8 @@ local WHOLE_FIELDS = { documents = true, ["prompt.variables"] = true }
 -- after the part's own text, in byte order (object_keys).
 local KEY_FIELDS = { ["contents[*].parts"] = true, ["contents.parts"] = true }
 
--- The segments of field path `f`; `whole` when its value is read whole,
--- `keyed` when an object value is read by its keys too.
+-- The segments of field path `f` (split_path); `whole` when its value is
+-- read whole, `keyed` when an object value is read by its keys too.
 local function field_path(f)
   local segs = split_path(f)
   segs.whole = WHOLE_FIELDS[f] == true
@@ -189,54 +440,231 @@ local function field_path(f)
   return segs
 end
 
-local NONE = {}
-local walk
-local function descend(child, segs, i, out)
-  if segs[i].each then
-    if type(child) ~= "table" then return end
-    for _, item in ipairs(child) do
-      walk(item, segs, i + 1, out)
+local END, DEEP, KEY = 1, 2, 3
+
+-- `cursors`: the paths at one node, { segs, i (the next segment), depth }.
+-- `leaf`: tool_fields, whose paths read an array that ends them whole.
+local function compile(cursors, leaf)
+  local ops, groups = {}, {}
+  for _, c in ipairs(cursors) do
+    local seg = c.segs[c.i]
+    if not seg then
+      -- keyed: only the value the path ends at, not the items of an array there
+      ops[#ops + 1] = { kind = END, depth = c.depth or 1, whole = c.segs.whole, keyed = c.segs.keyed and not c.depth }
+    elseif seg.deep then
+      ops[#ops + 1] = { kind = DEEP }
+    else
+      local g = groups[seg.key]
+      if not g then
+        g = { kind = KEY, key = seg.key, cursors = {} }
+        groups[seg.key] = g
+        ops[#ops + 1] = g
+      end
+      g.cursors[#g.cursors + 1] = c
     end
-  else
-    walk(child, segs, i + 1, out)
+  end
+  for i, op in ipairs(ops) do
+    if op.kind == KEY then
+      local whole, whole_arr, items_arr = {}, {}, {}
+      for _, c in ipairs(op.cursors) do
+        local nxt = { segs = c.segs, i = c.i + 1 }
+        if c.segs[c.i].each then
+          items_arr[#items_arr + 1] = nxt
+        else
+          whole[#whole + 1] = nxt
+          if c.i == #c.segs and not leaf then
+            -- a path that ends at an array: collect() reads it item by item, one level down
+            items_arr[#items_arr + 1] = { segs = c.segs, i = c.i + 1, depth = 2 }
+          else
+            whole_arr[#whole_arr + 1] = nxt
+          end
+        end
+      end
+      op.cursors = nil
+      if #whole > 0 then op.whole = compile(whole, leaf) end
+      if #whole_arr > 0 then op.whole_arr = compile(whole_arr, leaf) end
+      if #items_arr > 0 then op.items_arr = compile(items_arr, leaf) end
+      if op.key ~= "" then
+        -- for variants_of: the ops by folded key, the bytes a key can start
+        -- with, and the lengths an ASCII key can have (U+017F and U+212A
+        -- take 2 and 3 bytes for one)
+        ops.folded, ops.first, ops.lens = ops.folded or {}, ops.first or {}, ops.lens or {}
+        local f = fold(op.key)
+        local list = ops.folded[f] or {}
+        list[#list + 1] = i
+        ops.folded[f] = list
+        first_bytes(op.key, ops.first)
+        ops.lens[#f] = true
+        ops.maxlen = math.max(ops.maxlen or 0, 3 * #f)
+      end
+    end
+  end
+  if ops.folded then
+    -- a key that is an op's own, and that no other op's key folds to, needs no look
+    ops.exact = {}
+    for _, op in ipairs(ops) do
+      if op.kind == KEY and op.key ~= "" then
+        local same = true
+        for _, j in ipairs(ops.folded[fold(op.key)]) do
+          if ops[j].key ~= op.key then same = false end
+        end
+        if same then ops.exact[op.key] = true end
+      end
+    end
+  end
+  return ops
+end
+
+-- The keys of object `node` that fold to an op's key without being it, by
+-- op index, each list in byte order; nil when there are none (nearly
+-- always). One pass over the keys, for all the plan's keys at once.
+local function variants_of(node, plan)
+  local first, folded, exact, lens, maxlen, found = plan.first, plan.folded, plan.exact, plan.lens, plan.maxlen, nil
+  for k in pairs(node) do
+    if type(k) == "string" and not exact[k] and first[k:byte(1) or 0]
+       and (lens[#k] or (#k <= maxlen and k:find("[\128-\255]"))) then
+      local ops = folded[fold(k)]
+      if ops then
+        for _, i in ipairs(ops) do
+          if plan[i].key ~= k then
+            found = found or {}
+            local list = found[i] or {}
+            list[#list + 1] = k
+            found[i] = list
+          end
+        end
+      end
+    end
+  end
+  if found then
+    for _, list in pairs(found) do table.sort(list) end
+  end
+  return found
+end
+
+-- Plans by list of paths; a rule's lists are few, and the cache starts over
+-- past PLANS_MAX rather than grow with lists a caller makes per request.
+local PLANS, NPLANS, PLANS_MAX = {}, 0, 64
+local NONE = {}
+
+local function plan_of(fields, leaf)
+  fields = fields or NONE
+  local key = (leaf and "t" or "c") .. "\0" .. table.concat(fields, "\0")
+  local plan = PLANS[key]
+  if not plan then
+    local cursors = {}
+    for i, f in ipairs(fields) do cursors[i] = { segs = field_path(f), i = 1 } end
+    plan = compile(cursors, leaf)
+    if NPLANS >= PLANS_MAX then PLANS, NPLANS = {}, 0 end
+    PLANS[key], NPLANS = plan, NPLANS + 1
+  end
+  return plan
+end
+
+local walk
+
+-- `child`, the value under one key (or the node itself for "[*]"), for the
+-- paths that go on through that key.
+local function through(child, op, st)
+  if child == nil then return end
+  if type(child) == "table" and child[1] ~= nil then
+    if op.whole_arr then walk(child, op.whole_arr, st) end
+    local items = op.items_arr
+    if items then
+      for _, item in ipairs(child) do walk(item, items, st) end
+    end
+  elseif op.whole then
+    walk(child, op.whole, st)
   end
 end
 
-walk = function(node, segs, i, out)
+-- st.out collects the values; st.leaf, when set, reads the value a path
+-- ends at (tool_fields), read_whole() or collect() otherwise. A "**" value leaves a slot
+-- for settle() to fill.
+walk = function(node, plan, st)
   if node == nil then return end
-  if i > #segs then
-    if segs.whole then
-      read_whole(node, out, 1)
-      return
-    end
-    collect(node, out, 1)
-    if segs.keyed and type(node) == "table" and node[1] == nil then
-      for _, k in ipairs(object_keys(node)) do
-        if k ~= "" then out[#out + 1] = k end
+  local found = plan.folded and type(node) == "table" and node[1] == nil and variants_of(node, plan)
+  for i = 1, #plan do
+    local op = plan[i]
+    local kind = op.kind
+    if kind == END then
+      if st.leaf then
+        st.leaf(node, st)
+      elseif op.whole then
+        read_whole(node, st.out, op.depth)
+      else
+        collect(node, st.out, op.depth)
+        if op.keyed and type(node) == "table" and node[1] == nil then
+          for _, k in ipairs(object_keys(node)) do take(st, k) end
+        end
+      end
+    elseif kind == DEEP then
+      local slot = { node = node }
+      st.out[#st.out + 1] = slot
+      st.defer[#st.defer + 1] = slot
+    elseif op.key == "" then
+      through(node, op, st)
+    elseif type(node) == "table" then
+      through(node[op.key], op, st)
+      local others = found and found[i]
+      if others then
+        for _, k in ipairs(others) do through(node[k], op, st) end
       end
     end
-    return
   end
-  local key = segs[i].key
-  if key == "" then return descend(node, segs, i, out) end
-  if type(node) ~= "table" then return end
-  descend(node[key], segs, i, out)
-  for _, k in ipairs(variants(node, key) or NONE) do
-    descend(node[k], segs, i, out)
+end
+
+-- Reads the "**" values, newest first, and returns every value in document order.
+local function settle(st)
+  for k = #st.defer, 1, -1 do
+    local slot, saved = st.defer[k], st.out
+    st.out = {}
+    deep_value(slot.node, st)
+    slot.values, st.out = st.out, saved
   end
+  if #st.defer == 0 then return st.out end
+  local out = {}
+  for _, v in ipairs(st.out) do
+    if type(v) == "table" then
+      for _, s in ipairs(v.values) do out[#out + 1] = s end
+    else
+      out[#out + 1] = v
+    end
+  end
+  return out
 end
 
 --- Extract candidate text from a decoded JSON value using the given field paths.
--- @param decoded table (decoded JSON)
--- @param fields  list of path strings
--- @return string (joined with "\n"), may be ""; and the list of strings found
-function _M.extract_json(decoded, fields)
-  local out = {}
+-- @param decoded     table (decoded JSON)
+-- @param fields      list of path strings
+-- @param json_decode optional: reads a "**" value that is a string of JSON
+-- @return string (joined with "\n"), may be ""; the list of strings found,
+--         in document order; and true when a "**" walk hit a bound and left
+--         something out
+function _M.extract_json(decoded, fields, json_decode)
+  local st = new_state(json_decode)
   sort_left = WHOLE_SORT
-  for _, f in ipairs(fields or {}) do
-    walk(decoded, field_path(f), 1, out)
-  end
-  return table.concat(out, "\n"), out
+  walk(decoded, plan_of(fields, false), st)
+  local out = settle(st)
+  return table.concat(out, "\n"), out, st.capped
+end
+
+--- Tool definitions in a decoded JSON body (rule.tool_fields): what the
+-- model reads of the tools it may call and of the schema its answer must
+-- follow. A path ending at a string takes it; one ending at a table reads
+-- every key and string in it but JSON Schema type names (tool_leaf). A "**"
+-- path reads everything below it.
+-- @param decoded     table (decoded JSON)
+-- @param fields      list of path strings (text_fields syntax)
+-- @param json_decode optional, as for extract_json
+-- @return string (joined with "\n"), may be ""; the list of strings; and
+--         true when a bound (depth, nodes) left something out
+function _M.extract_tools(decoded, fields, json_decode)
+  local st = new_state(json_decode)
+  st.leaf = tool_leaf
+  if type(decoded) == "table" then walk(decoded, plan_of(fields, true), st) end
+  local out = settle(st)
+  return table.concat(out, "\n"), out, st.capped
 end
 
 -- Tool results in the chat shapes gateways see:
@@ -246,6 +674,9 @@ end
 --                            (function_call_output, custom_tool_call_output,
 --                            local_shell_call_output, ...) or "mcp_call": output;
 --                            "file_search_call": results[*].text
+--   AI SDK 5 UIMessages      messages[*].parts[*] with type "tool-<name>" or
+--                            "dynamic-tool": output, whatever its state (the
+--                            client sets it), read as a "**" path reads it
 --   Gemini                   contents[*].parts[*].functionResponse.response
 --                            (contents and parts may each be one object, as
 --                            LiteLLM takes them), read whole
@@ -255,7 +686,14 @@ local function responses_result(item)
   return type(t) == "string" and (t:sub(-12) == "_call_output" or t == "mcp_call")
 end
 
-local function tool_results(decoded, out)
+local function sdk_tool_part(part)
+  local t = part.type
+  return type(t) == "string" and (t:sub(1, 5) == "tool-" or t == "dynamic-tool")
+end
+
+-- `st`: a walk state; a tool part's output leaves a slot for settle() to fill.
+local function tool_results(decoded, st)
+  local out = st.out
   local msgs = decoded.messages
   if type(msgs) == "table" then
     for _, m in ipairs(msgs) do
@@ -265,6 +703,15 @@ local function tool_results(decoded, out)
         elseif type(m.content) == "table" then
           for _, block in ipairs(m.content) do
             if type(block) == "table" and block.type == "tool_result" then collect(block.content, out, 1) end
+          end
+        end
+        if type(m.parts) == "table" then
+          for _, part in ipairs(m.parts) do
+            if type(part) == "table" and part.output ~= nil and sdk_tool_part(part) then
+              local slot = { node = part.output }
+              out[#out + 1] = slot
+              st.defer[#st.defer + 1] = slot
+            end
           end
         end
       end
@@ -301,33 +748,53 @@ end
 -- field value the tool results already hold is not added again: tool
 -- results read `documents` whole, and `documents[*].text` was the field an
 -- app listed for them before.
--- @param decoded table
--- @param spec    { tool_results = bool, fields = { path, ... } }
--- @return string (joined with "\n"), may be ""; and the list of strings found
-function _M.extract_untrusted(decoded, spec)
-  local out = {}
+-- @param decoded     table
+-- @param spec        { tool_results = bool, fields = { path, ... } }
+-- @param json_decode optional, as for extract_json ("**" fields)
+-- @return string (joined with "\n"), may be ""; the list of strings found;
+--         and true when a "**" field hit a bound and left something out
+function _M.extract_untrusted(decoded, spec, json_decode)
+  local st = new_state(json_decode)
   sort_left = WHOLE_SORT
-  if type(decoded) ~= "table" or type(spec) ~= "table" then return "", out end
-  if spec.tool_results ~= false then tool_results(decoded, out) end
-  local fields = spec.fields or {}
-  if #fields > 0 then
-    local seen, more = {}, {}
-    for _, v in ipairs(out) do seen[v] = true end
-    for _, f in ipairs(fields) do walk(decoded, field_path(f), 1, more) end
-    for _, v in ipairs(more) do
-      if not seen[v] then out[#out + 1] = v end
+  if type(decoded) ~= "table" or type(spec) ~= "table" then return "", st.out, false end
+  if spec.tool_results ~= false then tool_results(decoded, st) end
+  local fields = spec.fields or NONE
+  if #fields == 0 then
+    local out = settle(st)
+    return table.concat(out, "\n"), out, st.capped
+  end
+  -- the fields' values in a list of their own, "**" slots included, so
+  -- that settle() reads every "**" value (newest first, as ever) and the
+  -- tool results' values are known before the fields' are added
+  local results = st.out
+  st.out = {}
+  walk(decoded, plan_of(fields, false), st)
+  local more = st.out
+  st.out = results
+  local out = settle(st)
+  local seen = {}
+  for _, v in ipairs(out) do seen[v] = true end
+  for _, v in ipairs(more) do
+    if type(v) == "table" then
+      for _, s in ipairs(v.values) do
+        if not seen[s] then out[#out + 1] = s end
+      end
+    elseif not seen[v] then
+      out[#out + 1] = v
     end
   end
-  return table.concat(out, "\n"), out
+  return table.concat(out, "\n"), out, st.capped
 end
 
 -- ---------------------------------------------------------------------------
 -- Format detection. The Content-Type a client sends is a hint, not a fact:
 -- Ollama decodes JSON whatever the header says, and FastAPI parses a body
 -- without one as JSON. So the body decides: JSON when it parses as JSON,
--- form or multipart when declared (or form-shaped with no header), text when
--- it reads as text, and "binary" otherwise, which L1 reports as unjudgeable
--- instead of letting it through as "no text".
+-- scanned when it starts like JSON and the decoder refuses it (under a form
+-- or multipart type read that way as well), form or multipart when declared
+-- (or form-shaped with no header), text when it reads as text, and "binary"
+-- otherwise, which L1 reports as unjudgeable instead of letting it through
+-- as "no text".
 -- ---------------------------------------------------------------------------
 
 local BOM = "\239\187\191"
@@ -447,7 +914,8 @@ end
 -- @return text string (the values joined with "\n"),
 --         kind ("json"|"scan"|"invalid"|"form"|"multipart"|"text"|"binary"|"none"),
 --         list of the values found (newest last), for window(),
---         and the decoded JSON value when kind is "json"
+--         the decoded JSON value when kind is "json", and true when a "**"
+--         walk hit a bound and left something out
 function _M.extract(body, content_type, fields, json_decode)
   if type(body) ~= "string" or body == "" then return "", "none", {} end
   local raw_ct = type(content_type) == "string" and content_type or ""
@@ -456,34 +924,45 @@ function _M.extract(body, content_type, fields, json_decode)
   -- bytes and Express's body-parser skip it: judge what the backend reads.
   if body:sub(1, 3) == BOM then body = body:sub(4) end
   local declared_json = declares_json(ct)
+  local form = ct:find("application/x-www-form-urlencoded", 1, true)
+    or (ct == "" and body:find("^[%w%.%-_~%%%+%[%]]+=[^%s]*$"))
+  local multipart = ct:find("multipart/form-data", 1, true)
   local first = body:match("^%s*(.)")
   if first == "{" or first == "[" or declared_json then
     if not json_decode then return "", "none", {} end
     local ok, decoded = pcall(json_decode, _M.lone_surrogates(body))
     if ok and type(decoded) == "table" then
-      local text, out = _M.extract_json(decoded, fields)
-      return text, "json", out, decoded
+      local text, out, capped = _M.extract_json(decoded, fields, json_decode)
+      return text, "json", out, decoded, capped
     end
-    if declared_json then
-      -- a JSON scalar has no text fields
-      if ok and decoded ~= nil then return "", "none", {} end
-      -- The decoder refused it; the backend's parser may not (cjson refuses
-      -- nesting past 1000 and bytes after the value, Go and Node do not).
-      -- The text fields' string values, read by the tolerant scanner past
-      -- max_body_bytes uses, are judged; a body with none is unjudgeable,
-      -- never "no text".
-      local out = _M.scan_strings(body, _M.field_keys(fields), {})
-      if #out == 0 then return "", "invalid", {} end
+    -- a JSON scalar has no text fields
+    if declared_json and ok and decoded ~= nil then return "", "none", {} end
+    -- The decoder refused it; the backend's parser may not (cjson refuses
+    -- nesting past 1000 and bytes after the value, Go and Node do not, and
+    -- Ollama decodes JSON whatever the Content-Type says: curl -d sends
+    -- form-urlencoded). So the tolerant scanner past max_body_bytes uses
+    -- reads it, declared JSON or not: the text fields' string values and the
+    -- objects under a "**" path's key. Under a form or multipart type the
+    -- values that reading gives follow, since a backend of that kind reads
+    -- the body so. Declared JSON with nothing to scan is unjudgeable, never
+    -- "no text"; any other body with nothing to scan is read as before.
+    local out = _M.scan_strings(body, _M.field_keys(fields), {}, _M.deep_keys(fields))
+    if #out > 0 then
+      if form and not declared_json then
+        form_values(body, out)
+      elseif multipart and not declared_json then
+        multipart_values(body, raw_ct, out)
+      end
       return table.concat(out, "\n"), "scan", out
     end
+    if declared_json then return "", "invalid", {} end
   end
   local out = {}
-  if ct:find("application/x-www-form-urlencoded", 1, true)
-     or (ct == "" and body:find("^[%w%.%-_~%%%+%[%]]+=[^%s]*$")) then
+  if form then
     form_values(body, out)
     return table.concat(out, "\n"), "form", out
   end
-  if ct:find("multipart/form-data", 1, true) then
+  if multipart then
     multipart_values(body, raw_ct, out)
     return table.concat(out, "\n"), "multipart", out
   end
@@ -495,7 +974,9 @@ end
 -- Partial bodies. Past max_body_bytes the body is not parsed; the adapter
 -- hands over the bytes it has (the head, and the tail where it can seek) and
 -- this tolerant scanner pulls the JSON string values of the text-field keys
--- out of them, truncated JSON included.
+-- out of them, truncated JSON included, and every key and string of an
+-- object under a "**" path's key (tool-call arguments that are an object).
+-- It is linear in the bytes: no value is read twice.
 -- ---------------------------------------------------------------------------
 
 local function utf8_char(cp)
@@ -551,12 +1032,30 @@ end
 function _M.field_keys(fields)
   local keys = {}
   for _, f in ipairs(fields or {}) do
-    local last = f:match("([^%.%[%]%*]+)[%[%]%*]*$")
+    -- "arguments.**": the strings under "arguments"
+    local last = f:gsub("%.%*%*$", ""):match("([^%.%[%]%*]+)[%[%]%*]*$")
     if last then keys[fold(last)] = true end
   end
   -- content parts carry their text under "text"
   if keys.content then keys.text = true end
   return keys
+end
+
+--- The last key of each "**" text-field path, folded, for scan_strings:
+-- "messages[*].tool_calls[*].function.arguments.**" -> arguments = "any";
+-- "object" instead when a path without "**" ends at the same key too
+-- ("input": a tool_use input, and the Responses input list).
+function _M.deep_keys(fields)
+  local deep, plain = {}, {}
+  for _, f in ipairs(fields or {}) do
+    local last = f:gsub("%.%*%*$", ""):match("([^%.%[%]%*]+)[%[%]%*]*$")
+    if last then
+      if f:find("%.%*%*$") then deep[fold(last)] = true else plain[fold(last)] = true end
+    end
+  end
+  local out = {}
+  for k in pairs(deep) do out[k] = plain[k] and "object" or "any" end
+  return out
 end
 
 -- True when `key` is ASCII word characters, U+017F and U+212A only: the
@@ -567,21 +1066,128 @@ local function key_chars(key)
   return key:gsub("\197\191", "s"):gsub("\226\132\170", "k"):find("^[%w_%-]+$") ~= nil
 end
 
+local scan_value
+
 --- Collect the string values of `keys` (from field_keys) from possibly
 -- truncated JSON. Keys match the way walk() matches them: folded, so every
--- spelling a case-insensitive backend reads is collected.
-function _M.scan_strings(s, keys, out)
+-- spelling a case-insensitive backend reads is collected. With `deep` (from
+-- deep_keys), the value of a "**" path's key is read as the walk reads it,
+-- every key and string in it, in the order they come: an object (Ollama and
+-- Anthropic tool-call arguments), and an array when no other path ends at
+-- that key; otherwise the scan goes on inside it, as for any other key.
+function _M.scan_strings(s, keys, out, deep)
   local i = 1
   while true do
-    -- key bytes: ASCII word characters and the bytes of U+017F and U+212A
-    local a, b, key = s:find('"([%w_%-\197\191\226\132\170]+)"%s*:%s*"', i)
+    -- key bytes: ASCII word characters and the bytes of U+017F and U+212A;
+    -- `b` is the value's first byte (a number or a literal is passed over)
+    local a, b, key = s:find('"([%w_%-\197\191\226\132\170]+)"%s*:%s*["{%[]', i)
     if not a then break end
-    if key_chars(key) then
+    local c = s:byte(b)
+    if not key_chars(key) then
+      i = a + 1   -- not a key: look again from the next byte
+    elseif c == 34 then
       local value, nexti = read_string(s, b + 1)
       if keys[fold(key)] and value ~= "" then out[#out + 1] = value end
       i = nexti
     else
-      i = a + 1   -- not a key: look again from the next byte
+      local d = deep and deep[fold(key)]
+      if d and (c == 123 or d == "any") then
+        i = scan_value(s, b, out, false)
+      else
+        i = b + 1
+      end
+    end
+  end
+  return out
+end
+
+-- The index after a JSON Schema type name, or a list of them, that starts
+-- at or after `i` (past the colon of a "type" key); nil when the value is
+-- anything else.
+local function type_names(s, i)
+  local q = s:find("[^ \t\n\r]", i)
+  if not q then return nil end
+  local c = s:sub(q, q)
+  if c == '"' then
+    local v, after = read_string(s, q + 1)
+    return _M.SCHEMA_TYPES[v] and after or nil
+  end
+  if c ~= "[" then return nil end
+  local p, any = q + 1, false
+  while true do
+    p = s:find("[^ \t\n\r]", p)
+    if not p then return nil end
+    c = s:sub(p, p)
+    if c == "]" then return any and p + 1 or nil end
+    if c ~= '"' then return nil end
+    local v, after = read_string(s, p + 1)
+    if not _M.SCHEMA_TYPES[v] then return nil end
+    any = true
+    p = s:find("[^ \t\n\r]", after)
+    if not p then return nil end
+    c = s:sub(p, p)
+    if c == "," then
+      p = p + 1
+    elseif c ~= "]" then
+      return nil
+    end
+  end
+end
+
+-- Every key and string of the JSON value that starts at `i` (a `{` or `[`),
+-- to its end or the end of `s`, in the order they come; with `schema` (tool
+-- definitions) a "type" key whose value is a JSON Schema type name is left
+-- out with it, as tool_leaf does. Returns the index after the value.
+scan_value = function(s, i, out, schema)
+  local depth, n = 0, #s
+  while true do
+    local j = s:find('[{}%[%]"]', i)
+    if not j then return n + 1 end
+    local c = s:byte(j)
+    if c == 34 then
+      local v, nexti = read_string(s, j + 1)
+      local k = s:find("[^ \t\n\r]", nexti)
+      local skip = schema and v == "type" and k and s:byte(k) == 58 and type_names(s, k + 1)
+      if skip then
+        i = skip
+      else
+        if v ~= "" then out[#out + 1] = v end
+        i = nexti
+      end
+    elseif c == 123 or c == 91 then
+      depth, i = depth + 1, j + 1
+    else
+      depth, i = depth - 1, j + 1
+      if depth <= 0 then return i end
+    end
+  end
+end
+
+--- The tool definitions (rule.tool_fields) in possibly truncated JSON, past
+-- max_body_bytes: every key and string of the value of each key that folds
+-- to a tool_fields path's last key (see field_keys), JSON Schema type names
+-- left out, in the order they come. There is no structure to walk, so a key
+-- is found wherever it is, and keys are not sorted.
+function _M.scan_tools(s, keys, out)
+  local i = 1
+  while true do
+    local a, b, key = s:find('"([%w_%-\197\191\226\132\170]+)"%s*:%s*', i)
+    if not a then break end
+    if not key_chars(key) then
+      i = a + 1
+    elseif not keys[fold(key)] then
+      i = b + 1
+    else
+      local c = s:sub(b + 1, b + 1)
+      if c == '"' then
+        local v, nexti = read_string(s, b + 2)
+        if v ~= "" then out[#out + 1] = v end
+        i = nexti
+      elseif c == "{" or c == "[" then
+        i = scan_value(s, b + 1, out, true)
+      else
+        i = b + 1
+      end
     end
   end
   return out

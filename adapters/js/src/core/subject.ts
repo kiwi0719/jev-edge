@@ -239,17 +239,23 @@ async function incrBy(store: Store, key: string, by: number, ttl: number): Promi
 }
 
 /** Add this verdict's points and block the subject when it crosses block_at.
- *  Only judged verdicts count (not L1). Never throws. Returns the points, or null. */
-export async function repRecord(ctx: RepCtx, v: Verdict): Promise<number | null> {
+ *  Only judged verdicts count (not L1). `charge`: the label to charge instead
+ *  of v.verdict (the subject's own text's, when retrieved content or the tool
+ *  definitions decided), or false for nothing (none of its own text judged,
+ *  which with untrusted judging on includes a text that holds retrieved
+ *  content). Never throws. Returns the points, or null. */
+export async function repRecord(ctx: RepCtx, v: Verdict, charge?: string | false): Promise<number | null> {
   const c = repCfg(ctx);
-  if (!c || v.source === "l1") return null;
+  if (!c || v.source === "l1" || charge === false) return null;
   const [r, at] = c;
   const id = idOf(ctx);
   const store = ctx.subject?.store;
   if (!id || !store) return null;
+  // the subject is charged for its own text only (see core/subject.lua)
+  const label = charge ?? v.verdict;
   let w = 0;
-  if (v.verdict === "malicious") w = r.malicious ?? 3;
-  else if (v.verdict === "suspicious") w = r.suspicious ?? 1;
+  if (label === "malicious") w = r.malicious ?? 3;
+  else if (label === "suspicious") w = r.suspicious ?? 1;
   if (!(w > 0)) return null;
   try {
     const win = r.window_s ?? 600;

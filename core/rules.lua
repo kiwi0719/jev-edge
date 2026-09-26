@@ -206,18 +206,64 @@ local function json_only_miss(req, rule, ct, ctx)
   return ex[2] ~= "json" and ex[2] ~= "scan", ex
 end
 
+local function untrusted_on(rule, ctx)
+  return defaults.untrusted_spec(ctx and ctx.config, rule).enabled == true
+end
+
 -- Retrieved content (tool results, untrusted.fields) when untrusted judging is
 -- on for `rule`, cut to its own judging window. Only from a body parsed whole:
 -- past max_body_bytes there is no JSON structure to find it in.
--- @return { text, windowed } or nil
+-- @return { text, windowed } or nil; true when a walk bound left some of it
+--         unread (the part, if any, is then a window); and the values read,
+--         whole, when untrusted judging is on and the body was parsed
 local function untrusted_part(decoded, rule, ctx)
   local spec = defaults.untrusted_spec(ctx and ctx.config, rule)
   if not spec.enabled or type(decoded) ~= "table" then return nil end
-  local utext, uvalues = normalize.extract_untrusted(decoded, spec)
-  if utext == "" then return nil end
+  local utext, uvalues, capped = normalize.extract_untrusted(decoded, spec, ctx and ctx.json_decode)
+  if utext == "" then return nil, capped, uvalues end
   local windowed
   utext, windowed = normalize.window(utext, uvalues, rule.max_judge_bytes or _M.MAX_JUDGE_BYTES)
-  return { text = utext, windowed = windowed and true or false }
+  return { text = utext, windowed = (windowed or capped) and true or false }, capped, uvalues
+end
+
+-- With untrusted judging on, true when the text's values (`values`) hold
+-- retrieved content: one of `uvalues` (tool results and untrusted.fields
+-- values read whole), or some of it went unread (`ucut`) and may be there.
+-- The text's score is then not the subject's own, and reputation charges
+-- none of it (core/init.lua rep_of), window and chunks included.
+local function holds_retrieved(values, uvalues, ucut)
+  if ucut then return true end
+  local seen, any = {}, false
+  for _, v in ipairs(uvalues) do
+    if v ~= "" then seen[v], any = true, true end
+  end
+  if not any then return false end
+  for _, v in ipairs(values) do
+    if seen[v] then return true end
+  end
+  return false
+end
+
+-- The tool definitions the model reads (rule.tool_fields), judged as their
+-- own part: all of them scanned by always_suspect, cut to their own judging
+-- window, so they never take the room of the messages. From a body parsed
+-- whole they are walked (normalize.extract_tools); past max_body_bytes, and
+-- in JSON the decoder refused (normalize.extract's kind "scan"), the bytes
+-- are scanned for them (normalize.scan_tools) and the part is a window.
+-- @param values the strings read, in order
+-- @param cut    true when a bound, or the body's size, left some out
+-- @return { text, windowed, hit } or nil
+local function tools_part(values, cut, rule, ctx)
+  local ttext = table.concat(values, "\n")
+  if ttext == "" then return nil end
+  local hit, from, to = text_matches(ttext, rule.always_suspect, ctx)
+  local windowed
+  ttext, windowed = normalize.window(ttext, values, rule.max_judge_bytes or _M.MAX_JUDGE_BYTES, from, to)
+  return { text = ttext, windowed = (windowed or cut) and true or false, hit = hit }
+end
+
+local function has_tool_fields(rule)
+  return type(rule.tool_fields) == "table" and #rule.tool_fields > 0
 end
 
 -- Text to judge from the body (or, past max_body_bytes, from the head and
@@ -226,15 +272,19 @@ end
 -- @return text, reason-or-nil, hit pattern, windowed, chunks (list, when
 --         judged in more than one piece), capped (chunks did not cover it all),
 --         untrusted ({ text, windowed } when untrusted judging is on and the
---         body carries retrieved content)
+--         body carries retrieved content), tools (tools_part), bound
+--         (true when a walk bound left text fields, retrieved content or
+--         tool definitions unread), and retrieved (untrusted judging is on
+--         and the text holds retrieved content: holds_retrieved, or the body
+--         was scanned, not walked, and nothing tells the two apart)
 local function judged(req, rule, ctx, ct, size, ex)
   local max = rule.max_body_bytes or _M.MAX_BODY_BYTES
   -- a media type is taken at its word only when the bytes agree (or there
   -- are none to look at): anything that reads as JSON or text is judged
   local media = ct_watched(ct, rule) == "media"
   local values, text
-  local partial = false
-  local untrusted
+  local partial, bound, retrieved = false, false, false
+  local untrusted, tools
   -- the gateway in front forwarded only the first part of the body: what the
   -- adapter has is a head, whatever its size, never a whole document
   local gateway_cut = req.body_partial == true
@@ -255,25 +305,51 @@ local function judged(req, rule, ctx, ct, size, ex)
     -- unread, and policy.unjudgeable decides
     local pol = ctx and ctx.config and ctx.config.policy
     if gateway_cut and pol and pol.partial == "unjudgeable" then return nil, "unjudgeable: partial body" end
-    local keys = normalize.field_keys(rule.text_fields)
-    values = normalize.scan_strings(head, keys, {})
-    if tail then normalize.scan_strings(tail, keys, values) end
+    local keys, deep = normalize.field_keys(rule.text_fields), normalize.deep_keys(rule.text_fields)
+    values = normalize.scan_strings(head, keys, {}, deep)
+    if tail then normalize.scan_strings(tail, keys, values, deep) end
     if #values == 0 then return nil, "unjudgeable: body too large" end
     text, partial = table.concat(values, "\n"), true
+    retrieved = untrusted_on(rule, ctx)
+    if has_tool_fields(rule) then
+      local tkeys = normalize.field_keys(rule.tool_fields)
+      local tvalues = normalize.scan_tools(head, tkeys, {})
+      if tail then normalize.scan_tools(tail, tkeys, tvalues) end
+      tools = tools_part(tvalues, true, rule, ctx)
+    end
   else
-    local kind, decoded
+    local kind, decoded, cut
     if ex then
-      text, kind, values, decoded = ex[1], ex[2], ex[3], ex[4]
+      text, kind, values, decoded, cut = ex[1], ex[2], ex[3], ex[4], ex[5]
     else
-      text, kind, values, decoded = normalize.extract(req.body, ct, rule.text_fields, ctx and ctx.json_decode)
+      text, kind, values, decoded, cut = normalize.extract(req.body, ct, rule.text_fields, ctx and ctx.json_decode)
     end
     if media and (kind == "binary" or kind == "none") then return nil, CT_NOT_WATCHED end
     if kind == "binary" then return nil, "unjudgeable: binary body" end
     -- declared JSON the decoder refused, with no text-field value to scan
     if kind == "invalid" then return nil, "unjudgeable: invalid json" end
-    untrusted = untrusted_part(decoded, rule, ctx)
+    -- a "**" field hit its bound: the text is not all there
+    if cut then partial, bound = true, true end
+    local ucut, uvalues
+    untrusted, ucut, uvalues = untrusted_part(decoded, rule, ctx)
+    if ucut then bound = true end
+    if uvalues then
+      retrieved = holds_retrieved(values, uvalues, ucut)
+    elseif kind == "scan" then
+      retrieved = untrusted_on(rule, ctx)
+    end
+    if has_tool_fields(rule) and type(decoded) == "table" then
+      local _, tvalues, tcut = normalize.extract_tools(decoded, rule.tool_fields, ctx and ctx.json_decode)
+      tools = tools_part(tvalues, tcut, rule, ctx)
+      if tcut then bound = true end
+    elseif has_tool_fields(rule) and kind == "scan" then
+      -- JSON the decoder refused (nesting past 1000, bytes after the
+      -- value), declared or not, which the backend's parser may take:
+      -- scanned for the tool definitions as past max_body_bytes
+      tools = tools_part(normalize.scan_tools(req.body, normalize.field_keys(rule.tool_fields), {}), true, rule, ctx)
+    end
   end
-  if text == "" then return "", nil, nil, nil, nil, nil, untrusted end
+  if text == "" then return "", nil, nil, nil, nil, nil, untrusted, tools, bound, false end
   local hit, from, to = text_matches(text, rule.always_suspect, ctx)
   local budget = rule.max_judge_bytes or _M.MAX_JUDGE_BYTES
   local maxc = math.floor(tonumber(rule.max_judge_chunks) or 1)
@@ -283,7 +359,7 @@ local function judged(req, rule, ctx, ct, size, ex)
     -- window over everything older (capped: some of the text is not judged)
     local pieces, starts = normalize.chunks(text, budget)
     if #pieces <= maxc then
-      return table.concat(pieces, "\n"), nil, hit, partial, pieces, false, untrusted
+      return table.concat(pieces, "\n"), nil, hit, partial, pieces, false, untrusted, tools, bound, retrieved
     end
     local first_kept = #pieces - (maxc - 1) + 1
     local older = text:sub(1, starts[first_kept] - 1):gsub("\n$", "")
@@ -291,12 +367,16 @@ local function judged(req, rule, ctx, ct, size, ex)
     local win = normalize.window(older, { older }, budget, inside and from or nil, inside and to or nil)
     local out = { win }
     for k = first_kept, #pieces do out[#out + 1] = pieces[k] end
-    return table.concat(out, "\n"), nil, hit, true, out, true, untrusted
+    return table.concat(out, "\n"), nil, hit, true, out, true, untrusted, tools, bound, retrieved
   end
   local windowed
   text, windowed = normalize.window(text, values, budget, from, to)
-  return text, nil, hit, windowed or partial, nil, nil, untrusted
+  return text, nil, hit, windowed or partial, nil, nil, untrusted, tools, bound, retrieved
 end
+
+-- A request the walk bounds cut and that would otherwise pass unjudged for
+-- lack of text: what was left unread may be what the model reads.
+local BOUND_REASON = "unjudgeable: json over the walk bounds"
 
 --- Evaluate one rule set against a request.
 -- @param req  { method, path, headers, body, body_size, client_ip }, and
@@ -306,7 +386,11 @@ end
 -- @param ctx  { cache = {get=fn}, json_decode = fn, clock = fn,
 --               re_find = fn(subject, pcre) -> truthy on match (case-insensitive) }
 -- @return result, text, reason, windowed, chunks, capped, untrusted ({ text,
---         windowed } of retrieved content to judge on its own, or nil)
+--         windowed } of retrieved content to judge on its own, or nil), tools
+--         ({ text, windowed, hit } of the tool definitions, or nil). `only`
+--         on either: the text alone would have passed and is not judged.
+--         Then retrieved: true when untrusted judging is on and the text
+--         holds retrieved content, so its score is not the subject's own.
 function _M.evaluate(req, rule, ctx)
   -- 1. path watch list; a json_only_paths path only for a JSON body (what
   --    extract() reads it as, or the Content-Type when there is no body)
@@ -365,43 +449,62 @@ function _M.evaluate(req, rule, ctx)
 
   -- 6+7. extract text (whole body, or head + tail past max_body_bytes), regex
   --      prefilter over all of it, judging window, natural-language length
-  local text, unj, hit, windowed, chunks, capped, untrusted = judged(req, rule, ctx, ct, size, ex)
+  local text, unj, hit, windowed, chunks, capped, untrusted, tools, bound, retrieved =
+    judged(req, rule, ctx, ct, size, ex)
   if unj == CT_NOT_WATCHED then return _M.PASS, "", unj end
   if unj then return _M.UNJUDGEABLE, "", unj end
   local min_chars = rule.min_text_chars or 20
   -- retrieved content is judged on its own when there is enough of it, even
   -- beside a short message or none (an untrusted.fields value outside text_fields)
   if untrusted and #untrusted.text < min_chars then untrusted = nil end
-  if text == "" and not untrusted then
+  -- so are the tool definitions, and short ones an always_suspect pattern hit
+  if tools and not tools.hit and #tools.text < min_chars then tools = nil end
+  if text == "" and not untrusted and not tools then
+    if bound then return _M.UNJUDGEABLE, "", BOUND_REASON end
     return _M.PASS, "", "no text"
   end
+  local judged_too = hit or #text >= min_chars
+  if not judged_too then
+    if not (untrusted or tools) then
+      if bound then return _M.UNJUDGEABLE, "", BOUND_REASON end
+      return _M.PASS, "", "text too short"
+    end
+    -- the text alone would have passed: only the retrieved content and the
+    -- tool definitions are judged
+    if untrusted then untrusted.only = true end
+    if tools then tools.only = true end
+  end
+  -- a walk bound cut what is judged: the reason says so, as for any window
+  if bound then windowed = true end
   local tag = windowed and " (window)" or ""
-  if chunks and not capped then tag = " (" .. #chunks .. " chunks)" end
+  if chunks and not capped then tag = " (" .. #chunks .. " chunks" .. (windowed and ", window" or "") .. ")" end
+  local why
   if hit then
-    return _M.SUSPECT, text, "pattern: " .. hit .. tag, windowed, chunks, capped, untrusted
+    why = "pattern: " .. hit .. tag
+  elseif tools and tools.hit then
+    why = "pattern: " .. tools.hit .. " (tools" .. (tools.windowed and ", window" or "") .. ")"
+  elseif judged_too then
+    why = "natural language" .. tag
+  elseif untrusted then
+    why = "retrieved content" .. (untrusted.windowed and " (window)" or "")
+  else
+    why = "tool definitions" .. (tools.windowed and " (window)" or "")
   end
-  if #text >= min_chars then
-    return _M.SUSPECT, text, "natural language" .. tag, windowed, chunks, capped, untrusted
-  end
-  if untrusted then
-    -- the text alone would have passed: only the retrieved content is judged
-    untrusted.only = true
-    return _M.SUSPECT, text, "retrieved content" .. (untrusted.windowed and " (window)" or ""),
-      windowed, chunks, capped, untrusted
-  end
-  return _M.PASS, "", "text too short"
+  return _M.SUSPECT, text, why, windowed, chunks, capped, untrusted, tools, retrieved
 end
 
---- The text evaluate() judges for this request under `rule`: the same
--- extraction and window, for adapters that rebuild the prompt off the
--- request path (L3) or sample it. "" when there is none.
+--- The text evaluate() judges for this request under `rule`, in one window:
+-- the same extraction, for an adapter that wants the request's text off the
+-- request path. "" when there is none. Only the text: a request judged in
+-- parts (chunks, retrieved content, tool definitions) is more than this, and
+-- L3 judges all of them (core.l3_job).
 function _M.judged_text(req, rule, ctx)
   if not rule or not req then return "" end
   local size = math.max(tonumber(req.body_size) or 0, req.body and #req.body or 0)
   local ct = _M.content_type(req.headers)
   local miss, ex = json_only_miss(req, rule, ct, ctx)
   if miss then return "" end
-  -- one window, never chunks: L3 re-judges off the request path with one call
+  -- one window, never chunks
   local one = setmetatable({ max_judge_chunks = 1 }, { __index = rule })
   local text = judged(req, one, ctx, ct, size, ex)
   return text or ""
@@ -520,12 +623,26 @@ function _M.resolve(spec, load)
   if not uok then return nil, uerr end
   if not out.text_fields then
     out.text_fields = { "system", "instructions", "preamble", "system_prompt", "systemInstruction.parts",
-                        "system_instruction.parts", "documents", "template", "messages[*].content",
-                        "messages[*].parts", "contents[*].parts", "contents.parts", "chat_history[*].message",
-                        "message", "prompt", "prompt.prompt_string", "prompt[*].prompt_string", "prompt.variables",
-                        "input", "input[*].output", "inputs", "instances[*].inputs",
-                        "instances[*].messages[*].content", "query", "text", "suffix", "input_prefix",
-                        "input_suffix", "input_extra[*].text" }
+                        "system_instruction.parts", "documents", "template",
+                        "messages[*].content", "messages[*].tool_calls[*].function.arguments.**",
+                        "messages[*].tool_calls[*].custom.input", "messages[*].function_call.arguments.**",
+                        "messages[*].content[*].input.**", "messages[*].parts",
+                        "messages[*].parts[*].input.**", "messages[*].parts[*].output.**",
+                        "contents[*].parts", "contents.parts", "chat_history[*].message", "message",
+                        "prompt", "prompt.prompt_string", "prompt[*].prompt_string", "prompt.variables.**",
+                        "input", "input[*].arguments.**", "input[*].input", "input[*].output",
+                        "inputs", "instances[*].inputs", "instances[*].messages[*].content",
+                        "query", "text", "suffix", "input_prefix", "input_suffix", "input_extra[*].text" }
+  end
+  if not out.tool_fields then
+    out.tool_fields = { "tools", "functions", "response_format.json_schema", "text.format" }
+  end
+  for _, k in ipairs({ "text_fields", "tool_fields" }) do
+    if type(out[k]) ~= "table" then return nil, "rule " .. out.id .. ": " .. k .. " must be a list of paths" end
+    for i, p in ipairs(out[k]) do
+      local perr = normalize.path_error(p)
+      if perr then return nil, "rule " .. out.id .. ": " .. k .. "[" .. i .. "] " .. perr end
+    end
   end
   if not out.templates then out.templates = { "injection" } end
   return out
@@ -566,8 +683,8 @@ end
 function _M.evaluate_all(req, rules, ctx)
   local last_reason = "no rules"
   for _, rule in ipairs(rules or {}) do
-    local r, text, reason, windowed, chunks, capped, untrusted = _M.evaluate(req, rule, ctx)
-    if r ~= _M.PASS then return r, text, reason, rule, windowed, chunks, capped, untrusted end
+    local r, text, reason, windowed, chunks, capped, untrusted, tools, retrieved = _M.evaluate(req, rule, ctx)
+    if r ~= _M.PASS then return r, text, reason, rule, windowed, chunks, capped, untrusted, tools, retrieved end
     last_reason = reason
   end
   return _M.PASS, "", last_reason, nil

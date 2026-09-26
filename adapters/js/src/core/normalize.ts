@@ -39,9 +39,12 @@ export type JsonValue = null | boolean | number | string | JsonValue[] | { [k: s
 
 // ---------------------------------------------------------------------------
 // Path extraction: "messages[*].content", "prompt", "input.text"
+// A last segment "**" reads every key and string below the value, whatever
+// its shape: tool-call arguments are a string of JSON in OpenAI's APIs (read
+// decoded) and an object in Ollama's and Anthropic's; see deepValue.
 // ---------------------------------------------------------------------------
 
-interface Seg { key: string; each: boolean }
+interface Seg { key: string; each: boolean; deep?: boolean }
 /** A field path's segments; `whole` when its value is read whole (WHOLE_FIELDS), `keyed` when an object value is read by its keys too (KEY_FIELDS). */
 type Segs = Seg[] & { whole?: boolean; keyed?: boolean };
 
@@ -50,10 +53,21 @@ function splitPath(path: string): Seg[] {
   for (const seg of path.split(".")) {
     if (seg === "") continue; // Lua's gmatch("[^%.]+") skips empty segments
     const m = /^([^[]*)\[\*\]$/.exec(seg);
-    if (m) segs.push({ key: m[1], each: true });
+    if (seg === "**") segs.push({ key: seg, each: false, deep: true });
+    else if (m) segs.push({ key: m[1], each: true });
     else segs.push({ key: seg, each: false });
   }
   return segs;
+}
+
+/** Port of normalize.path_error: why `path` (a text_fields or tool_fields entry) is not one, or null. */
+export function pathError(path: unknown): string | null {
+  if (typeof path !== "string" || path === "") return "must be a non-empty string";
+  const segs = splitPath(path);
+  for (let i = 0; i < segs.length; i++) {
+    if (segs[i].deep && i < segs.length - 1) return '"**" must be the last segment';
+  }
+  return null;
 }
 
 function isObj(v: unknown): v is { [k: string]: JsonValue } | JsonValue[] {
@@ -61,8 +75,8 @@ function isObj(v: unknown): v is { [k: string]: JsonValue } | JsonValue[] {
 }
 
 // Port of read_whole() in core/normalize.lua. Values the model reads whole: a
-// Gemini function response, a Cohere document, a Responses stored prompt's
-// variables. Every key and string below the value, object keys in byte order
+// Gemini function response, a Cohere document (WHOLE_FIELDS below). Every key
+// and string below the value, object keys in byte order
 // (as Lua sorts them), arrays in order, empty strings left out. Bounded:
 // WHOLE_DEPTH levels below the value (cjson's nesting limit), and sorting:
 // one extraction sorts WHOLE_SORT keys in all, and an object with more keys
@@ -73,22 +87,6 @@ const WHOLE_SORT = 20000;
 // keys one extraction may still sort; extractJsonValues and
 // extractUntrustedValues reset it (extraction is synchronous)
 let sortLeft = WHOLE_SORT;
-
-// Byte order of the UTF-8 encodings, i.e. code point order: UTF-16 order
-// differs only where a surrogate (a code point past U+FFFF) meets U+E000..U+FFFF.
-function byteOrder(a: string, b: string): number {
-  const n = Math.min(a.length, b.length);
-  for (let i = 0; i < n; i++) {
-    const x = a.charCodeAt(i);
-    const y = b.charCodeAt(i);
-    if (x === y) continue;
-    const xs = x >= 0xd800 && x <= 0xdfff;
-    const ys = y >= 0xd800 && y <= 0xdfff;
-    if (xs !== ys) return xs ? 1 : -1;
-    return x - y;
-  }
-  return a.length - b.length;
-}
 
 // Port of object_keys() in core/normalize.lua: the keys of object `node`, in
 // byte order while the extraction's sort budget lasts, in the object's own
@@ -181,28 +179,277 @@ export function fold(s: string): string {
   return asciiLower(s).replace(/\u017F/g, "s").replace(/\u212A/g, "k");
 }
 
-// The keys of object `node` other than `key` itself that fold to `key`, in
-// byte order (UTF-16 order is the same for the characters that can fold to
-// a field name); undefined when there are none (nearly always).
-function variants(node: { [k: string]: JsonValue }, key: string): string[] | undefined {
-  const want = fold(key);
+// Port of first_bytes: marks in `first` the UTF-16 units a key that folds to
+// `name` can start with: the folded name's first, that letter's other case,
+// U+017F for s and U+212A for k.
+function firstUnits(name: string, first: Set<number>): void {
+  const want = fold(name);
+  if (want === "") return;
   const b = want.charCodeAt(0);
-  let others: string[] | undefined;
-  for (const k of Object.keys(node)) {
-    if (k === key) continue;
-    const c = k.charCodeAt(0);
-    if ((c === b || (c >= 0x41 && c <= 0x5a && c + 32 === b) || (b === 0x73 && c === 0x17f) || (b === 0x6b && c === 0x212a))
-      && fold(k) === want) (others ??= []).push(k);
-  }
-  return others?.sort();
+  first.add(b);
+  if (b >= 0x61 && b <= 0x7a) first.add(b - 32);
+  if (b === 0x73) first.add(0x17f);
+  if (b === 0x6b) first.add(0x212a);
 }
+
+// ---------------------------------------------------------------------------
+// Bounded walks over JSON of any shape (port of the Lua ones): tool-call
+// arguments ("**") and tool definitions (rule.tool_fields). The client picks
+// the shape, so the walk is bounded: DEEP.nodes object keys and array items
+// per extraction, and DEEP.depth levels below the path's value (cjson's
+// nesting limit, which tooDeep() applies here: JSON either core decodes is
+// never cut by depth). Object keys are read in UTF-8 byte order, as Lua's
+// table.sort orders them. One oversized node must not starve what comes
+// after it, whether its own keys and items are too many or only what is
+// below them: the nodes below a node are counted (nodesBelow) up to what the
+// budget has left. A node that fits is read whole; one that does not spends
+// at most half of what is left: an array its newest items that fit whole
+// and, with what remains, the one before them; an object its keys (skipped
+// whole when they alone are more than that), then each value by the same
+// rule. Counting is bounded too: past DEEP.count times DEEP.nodes nodes
+// counted, a node is taken not to fit. `capped` says so. An empty object or
+// array (and null) adds nothing and is not counted. Tests lower the bounds.
+// ---------------------------------------------------------------------------
+
+export const DEEP = { depth: 1000, nodes: 20000, count: 4 };
+
+type Decode = (s: string) => JsonValue;
+
+/** A "**" value's place in the output, filled after the walk (settle). */
+interface Slot { node: JsonValue; values: string[] }
+
+interface WalkState {
+  out: (string | Slot)[];
+  /** reads the value a path ends at (tool_fields); collect() otherwise */
+  leaf?: (node: JsonValue, st: WalkState) => void;
+  nodes: number;
+  /** what nodesBelow() may still count (see counted) */
+  counts: number;
+  capped: boolean;
+  /** json_decode, for "**" values that are a string of JSON */
+  decode?: Decode;
+  /** the "**" values, in document order */
+  defer: Slot[];
+}
+
+function newState(decode?: Decode): WalkState {
+  return { out: [], nodes: DEEP.nodes, counts: DEEP.count * DEEP.nodes, capped: false, decode, defer: [] };
+}
+
+/** Lua string order (bytes): UTF-16 order except that a character above U+FFFF sorts after all others. */
+export function byteOrder(a: string, b: string): number {
+  const n = Math.min(a.length, b.length);
+  for (let i = 0; i < n; i++) {
+    const x = a.charCodeAt(i);
+    const y = b.charCodeAt(i);
+    if (x !== y) {
+      const xs = x >= 0xd800 && x <= 0xdfff;
+      const ys = y >= 0xd800 && y <= 0xdfff;
+      if (xs !== ys) return xs ? 1 : -1;
+      return x - y;
+    }
+  }
+  return a.length - b.length;
+}
+
+const SURROGATE = /[\ud800-\udfff]/;
+
+// Port of keys_of: the keys of object `node` in byte order, counted against
+// the node budget; undefined (and nothing spent) when there are more than it
+// has left. Without a character above U+FFFF, UTF-16 order is byte order and
+// the engine's own sort (no comparator) is the cheap one.
+function keysOf(node: { [k: string]: JsonValue }, st: WalkState): string[] | undefined {
+  // Object.keys is linear in the object, as JSON.parse was; the sort is what the bound caps
+  const keys = Object.keys(node);
+  if (keys.length > st.nodes) {
+    st.capped = true;
+    return undefined;
+  }
+  st.nodes -= keys.length;
+  return keys.some((k) => SURROGATE.test(k)) ? keys.sort(byteOrder) : keys.sort();
+}
+
+function take(st: WalkState, s: string): void {
+  if (s !== "") st.out.push(s);
+}
+
+function hasKey(o: object): boolean {
+  for (const _ in o) return true;
+  return false;
+}
+
+/** Port of SCHEMA_TYPES: the values of a JSON Schema `type` a tool definition's walk leaves out. */
+export const SCHEMA_TYPES: ReadonlySet<string> = new Set(["string", "number", "integer", "boolean", "object", "array", "null"]);
+
+function schemaType(v: JsonValue | undefined): boolean {
+  if (typeof v === "string") return SCHEMA_TYPES.has(v);
+  if (!Array.isArray(v) || v.length === 0) return false;
+  return v.every((t) => typeof t === "string" && SCHEMA_TYPES.has(t));
+}
+
+// Port of nodes_below: the nodes the walk spends below `node` (at `depth`), its keys
+// or items and theirs; the count stops as soon as it is over `limit` and
+// returns a number over it, which only says the node does not fit.
+function nodesBelow(node: JsonValue | undefined, limit: number, depth: number, schema: boolean): number {
+  if (!isObj(node) || depth > DEEP.depth) return 0;
+  let n = 0;
+  if (Array.isArray(node)) {
+    n = node.length;
+    if (n > limit) return n;
+    for (const v of node) {
+      if (isObj(v)) {
+        n += nodesBelow(v, limit - n, depth + 1, schema);
+        if (n > limit) return n;
+      }
+    }
+    return n;
+  }
+  for (const k of Object.keys(node)) {
+    n++;
+    if (n > limit) return n;
+    const v = node[k];
+    if (isObj(v) && !(schema && k === "type" && schemaType(v))) {
+      n += nodesBelow(v, limit - n, depth + 1, schema);
+      if (n > limit) return n;
+    }
+  }
+  return n;
+}
+
+// Port of counted: nodesBelow(), charged to the walk's counting allowance at what
+// it counted, or limit + 1 when it stopped (the same whatever the key order);
+// once the allowance is spent a table does not fit.
+function counted(st: WalkState, node: JsonValue | undefined, limit: number, depth: number, schema: boolean): number {
+  if (!isObj(node) || (Array.isArray(node) ? node.length === 0 : !hasKey(node)) || depth > DEEP.depth) return 0;
+  if (st.counts <= 0) return limit + 1;
+  const n = nodesBelow(node, limit, depth, schema);
+  st.counts -= Math.min(n, limit + 1);
+  return n;
+}
+
+// Port of every_string: every key and string value below `node`, keys in
+// byte order; with `schema` (tool definitions) a `type` whose value is a JSON
+// Schema type name is left out, key and value. `fits`: the caller counted
+// this node and it fits the budget, so nothing below it is counted again.
+// `last`: nothing after it in its object needs the budget, so a node over it
+// may spend all of it.
+function everyString(node: JsonValue | undefined, st: WalkState, depth: number, schema = false, fits = false, last = false): void {
+  if (typeof node === "string") return take(st, node);
+  if (!isObj(node)) return;
+  if (Array.isArray(node) ? node.length === 0 : !hasKey(node)) return;
+  if (depth > DEEP.depth) {
+    st.capped = true;
+    return;
+  }
+  if (!fits && counted(st, node, st.nodes, depth, schema) > st.nodes) {
+    // over the budget: at most half of what is left, the rest kept for what follows
+    st.capped = true;
+    const keep = last ? 0 : st.nodes - Math.floor(st.nodes / 2);
+    st.nodes -= keep;
+    partial(node, st, depth, schema);
+    st.nodes += keep;
+    return;
+  }
+  if (Array.isArray(node)) {
+    st.nodes -= node.length;
+    for (const v of node) everyString(v, st, depth + 1, schema, true);
+    return;
+  }
+  for (const k of keysOf(node, st)!) {
+    const v = node[k];
+    if (schema && k === "type" && schemaType(v)) continue;
+    take(st, k);
+    everyString(v, st, depth + 1, schema, true);
+  }
+}
+
+// Port of partial: a node over the budget (st.nodes, its share), read as far
+// as it goes. An array: its newest items that fit whole, walking back from
+// the last, and the one before them with what is left. An object: its keys,
+// unless there are more than the budget has left, then each value as
+// everyString reads one; the last table among them keeps nothing back for
+// the strings and scalars after it, which cost nothing.
+function partial(node: JsonValue[] | { [k: string]: JsonValue }, st: WalkState, depth: number, schema: boolean): void {
+  if (Array.isArray(node)) {
+    const n = node.length;
+    let left = st.nodes;
+    let first = n;
+    while (first > 0 && left > 0) {
+      const c = 1 + counted(st, node[first - 1], left - 1, depth + 1, schema);
+      if (c > left) break;
+      left -= c;
+      first--;
+    }
+    const whole = st.nodes - left;
+    st.nodes = left;
+    if (first > 0 && left > 0) {
+      st.nodes = left - 1;
+      partial(node[first - 1] as JsonValue[] | { [k: string]: JsonValue }, st, depth + 1, schema);
+    }
+    st.nodes += whole;
+    for (let i = first; i < n; i++) {
+      st.nodes--;
+      everyString(node[i], st, depth + 1, schema, true);
+    }
+    return;
+  }
+  const keys = keysOf(node, st);
+  if (!keys) return;
+  let last = -1;
+  keys.forEach((k, i) => {
+    const v = node[k];
+    if (isObj(v) && (Array.isArray(v) ? v.length > 0 : hasKey(v)) && !(schema && k === "type" && schemaType(v))) last = i;
+  });
+  keys.forEach((k, i) => {
+    const v = node[k];
+    if (schema && k === "type" && schemaType(v)) return;
+    take(st, k);
+    everyString(v, st, depth + 1, schema, false, i === last);
+  });
+}
+
+// Port of tool_leaf: a string whole, anything else every key and string in
+// it but JSON Schema type names.
+function toolLeaf(node: JsonValue, st: WalkState): void {
+  if (typeof node === "string") return take(st, node);
+  everyString(node, st, 1, true);
+}
+
+// Port of deep_value: the value a "**" path ends at; a string holding a JSON
+// object or array is read decoded, anything else (and JSON the decoder
+// refuses, cjson's depth limit included) as it is.
+function deepValue(node: JsonValue, st: WalkState): void {
+  if (typeof node === "string" && st.decode && /^[ \t\n\r]*[[{]/.test(node) && !tooDeep(node)) {
+    let v: JsonValue | undefined;
+    try {
+      v = st.decode(loneSurrogates(node));
+    } catch {
+      v = undefined;
+    }
+    if (isObj(v)) return everyString(v, st, 1);
+  }
+  everyString(node, st, 1);
+}
+
+// ---------------------------------------------------------------------------
+// Field paths walked together (port of the Lua walk): the paths that go
+// through the same key go through it once, and an array one of them goes
+// through item by item is read item by item for all of them, so the values
+// come out in document order (a message's content and its tool calls
+// together). Each "**" value is read after the walk, newest first, so the
+// node budget goes to the most recent tool calls. A list of paths is
+// compiled once into a plan (planOf), so the walk allocates nothing but the
+// "**" slots.
+// ---------------------------------------------------------------------------
 
 // Port of WHOLE_FIELDS in core/normalize.lua: field paths whose values are
 // read whole (readWhole), whatever their shape, instead of as content parts:
 // `documents`, retrieved documents (Cohere v1 maps of title, snippet, text or
 // any other key, Cohere v2 strings or { id, data }, vLLM chat's `documents`),
 // and `prompt.variables`, the values a Responses API stored prompt is filled
-// with (strings or input_text parts, under names the client picks).
+// with (strings or input_text parts, under names the client picks). The
+// shipped rules read the variables as "prompt.variables.**"; the whole field
+// stays for a rule that lists it.
 const WHOLE_FIELDS = new Set(["documents", "prompt.variables"]);
 
 // Port of KEY_FIELDS in core/normalize.lua: field paths whose value, when it
@@ -221,52 +468,212 @@ function fieldPath(f: string): Segs {
   return segs;
 }
 
-function descend(child: JsonValue | undefined, segs: Segs, i: number, out: string[]): void {
-  if (segs[i].each) {
-    // Lua ipairs over a cjson array: null is a value, skipped, not the end
-    if (!Array.isArray(child)) return;
-    for (const item of child) {
-      if (item === null || item === undefined) continue;
-      walk(item, segs, i + 1, out);
+const OP_END = 1, OP_DEEP = 2, OP_KEY = 3;
+/** A path that ends here; `depth`: collect()'s or readWhole()'s, 2 for a path that ends at an array read item by item; `whole`, `keyed`: fieldPath's flags (`keyed` only for the value the path ends at). */
+interface EndOp { kind: typeof OP_END; depth: number; whole?: boolean; keyed?: boolean }
+/** A "**" here. */
+interface DeepOp { kind: typeof OP_DEEP }
+/** A key the paths go on through: the plan for its value when that is not an array (`whole`), and when it is, the plans for the array and for each item. */
+interface KeyOp { kind: typeof OP_KEY; key: string; whole?: Plan; wholeArr?: Plan; itemsArr?: Plan }
+type Op = EndOp | DeepOp | KeyOp;
+/** What to do at a node, in the order the first path for each op comes; `folded`, `first`, `lens`, `exact`: for variantsOf. */
+interface Plan { ops: Op[]; folded?: Map<string, number[]>; first?: Set<number>; lens?: Set<number>; exact?: Set<string> }
+
+/** One path from a node: its segments and the next one's index; `depth`: collect()'s, for a path read item by item. */
+interface Cursor { segs: Segs; i: number; depth?: number }
+
+// Port of compile: `leaf` (tool_fields) reads an array that ends a path whole.
+function compile(cursors: Cursor[], leaf: boolean): Plan {
+  const ops: Op[] = [];
+  const groups = new Map<string, Cursor[]>();
+  for (const c of cursors) {
+    const seg = c.segs[c.i];
+    if (seg === undefined) {
+      ops.push({ kind: OP_END, depth: c.depth ?? 1, whole: c.segs.whole, keyed: c.segs.keyed && c.depth === undefined });
+    } else if (seg.deep) {
+      ops.push({ kind: OP_DEEP });
+    } else {
+      let g = groups.get(seg.key);
+      if (!g) {
+        g = [];
+        groups.set(seg.key, g);
+        ops.push({ kind: OP_KEY, key: seg.key });
+      }
+      g.push(c);
     }
-  } else {
-    walk(child, segs, i + 1, out);
+  }
+  const plan: Plan = { ops };
+  ops.forEach((op, i) => {
+    if (op.kind !== OP_KEY) return;
+    const whole: Cursor[] = [];
+    const wholeArr: Cursor[] = [];
+    const itemsArr: Cursor[] = [];
+    for (const c of groups.get(op.key)!) {
+      const nxt = { segs: c.segs, i: c.i + 1 };
+      if (c.segs[c.i].each) {
+        itemsArr.push(nxt);
+      } else {
+        whole.push(nxt);
+        // a path that ends at an array: collect() reads it item by item, one level down
+        if (c.i === c.segs.length - 1 && !leaf) itemsArr.push({ segs: c.segs, i: c.i + 1, depth: 2 });
+        else wholeArr.push(nxt);
+      }
+    }
+    if (whole.length > 0) op.whole = compile(whole, leaf);
+    if (wholeArr.length > 0) op.wholeArr = compile(wholeArr, leaf);
+    if (itemsArr.length > 0) op.itemsArr = compile(itemsArr, leaf);
+    if (op.key !== "") {
+      const folded = (plan.folded ??= new Map());
+      const f = fold(op.key);
+      folded.set(f, [...(folded.get(f) ?? []), i]);
+      firstUnits(op.key, (plan.first ??= new Set()));
+      // fold() maps one UTF-16 unit to one: a key that folds to f is as long
+      (plan.lens ??= new Set()).add(f.length);
+    }
+  });
+  if (plan.folded) {
+    // a key that is an op's own, and that no other op's key folds to, needs no look
+    plan.exact = new Set();
+    for (const op of ops) {
+      if (op.kind !== OP_KEY || op.key === "") continue;
+      if (plan.folded.get(fold(op.key))!.every((j) => (ops[j] as KeyOp).key === op.key)) plan.exact.add(op.key);
+    }
+  }
+  return plan;
+}
+
+// Port of plan_of: plans by list of paths, the cache started over past PLANS_MAX.
+const PLANS = new Map<string, Plan>();
+const PLANS_MAX = 64;
+function planOf(fields: string[] | undefined, leaf: boolean): Plan {
+  const list = fields ?? [];
+  const key = (leaf ? "t" : "c") + "\0" + list.join("\0");
+  let plan = PLANS.get(key);
+  if (!plan) {
+    plan = compile(list.map((f) => ({ segs: fieldPath(f), i: 0 })), leaf);
+    if (PLANS.size >= PLANS_MAX) PLANS.clear();
+    PLANS.set(key, plan);
+  }
+  return plan;
+}
+
+// Port of variants_of: the keys of object `node` that fold to an op's key
+// without being it, by op index, each list in byte order (UTF-16 order is
+// the same for the characters that can fold to a field name); undefined when
+// there are none (nearly always). One pass over the keys.
+function variantsOf(node: { [k: string]: JsonValue }, plan: Plan): (string[] | undefined)[] | undefined {
+  const { folded, first, lens, exact } = plan as Required<Plan>;
+  let found: (string[] | undefined)[] | undefined;
+  for (const k in node) {
+    if (exact.has(k) || !first.has(k.charCodeAt(0)) || !lens.has(k.length)) continue;
+    const ops = folded.get(fold(k));
+    // for-in walks inherited keys too; JSON.parse makes none, but a polluted prototype could
+    if (!ops || !Object.hasOwn(node, k)) continue;
+    for (const i of ops) {
+      if ((plan.ops[i] as KeyOp).key !== k) ((found ??= [])[i] ??= []).push(k);
+    }
+  }
+  if (found) for (const list of found) list?.sort();
+  return found;
+}
+
+// Port of through: `child`, the value under one key (or the node itself for
+// "[*]"), for the paths going on through that key. Lua ipairs over a cjson
+// array: null is a value, skipped, not the end.
+function through(child: JsonValue | undefined, op: KeyOp, st: WalkState): void {
+  if (child === undefined || child === null) return;
+  if (Array.isArray(child) && child.length > 0) {
+    if (op.wholeArr) walk(child, op.wholeArr, st);
+    const items = op.itemsArr;
+    if (items) {
+      for (const item of child) {
+        if (item === null || item === undefined) continue;
+        walk(item, items, st);
+      }
+    }
+  } else if (op.whole) {
+    walk(child, op.whole, st);
   }
 }
 
-// A path key is matched the way fold() says, and every key that folds to it
-// is read, since with several the backend may take any one: the exact key
-// first, the others in byte order.
-function walk(node: JsonValue | undefined, segs: Segs, i: number, out: string[]): void {
+// Port of walk: a path that ends here, a "**" here, or the paths that go on
+// through one key. A key is matched the way fold() says, and every key that
+// folds to it is read: the exact key first, the others in byte order.
+function walk(node: JsonValue | undefined, plan: Plan, st: WalkState): void {
   if (node === undefined || node === null) return;
-  if (i >= segs.length) {
-    if (segs.whole) {
-      readWhole(node, out, 1);
-      return;
+  const obj = isObj(node) && !Array.isArray(node) ? node : undefined;
+  const found = plan.folded && obj ? variantsOf(obj, plan) : undefined;
+  const ops = plan.ops;
+  for (let i = 0; i < ops.length; i++) {
+    const op = ops[i];
+    if (op.kind === OP_END) {
+      if (st.leaf) st.leaf(node, st);
+      else if (op.whole) readWhole(node, st.out as string[], op.depth);
+      else {
+        collect(node, st.out as string[], op.depth);
+        if (op.keyed && isObj(node) && !Array.isArray(node)) for (const k of objectKeys(node)) take(st, k);
+      }
+    } else if (op.kind === OP_DEEP) {
+      const slot: Slot = { node, values: [] };
+      st.out.push(slot);
+      st.defer.push(slot);
+    } else if (op.key === "") {
+      through(node, op, st);
+    } else if (obj) {
+      through(obj[op.key], op, st);
+      const others = found?.[i];
+      if (others) for (const k of others) through(obj[k], op, st);
     }
-    collect(node, out, 1);
-    if (segs.keyed && isObj(node) && !Array.isArray(node)) {
-      for (const k of objectKeys(node)) if (k !== "") out.push(k);
-    }
-    return;
   }
-  const key = segs[i].key;
-  if (key === "") return descend(node, segs, i, out);
-  if (!isObj(node) || Array.isArray(node)) return;
-  descend(node[key], segs, i, out);
-  for (const k of variants(node, key) ?? []) descend(node[k], segs, i, out);
 }
 
-export function extractJson(decoded: JsonValue, fields: string[]): string {
-  return extractJsonValues(decoded, fields).join("\n");
-}
-
-/** The strings extractJson joins, in order (newest last), for window(). */
-export function extractJsonValues(decoded: JsonValue, fields: string[]): string[] {
+// Port of settle: reads the "**" values, newest first, and returns every value in document order.
+function settle(st: WalkState): string[] {
+  for (let k = st.defer.length - 1; k >= 0; k--) {
+    const slot = st.defer[k];
+    const saved = st.out;
+    st.out = [];
+    deepValue(slot.node, st);
+    slot.values = st.out as string[];
+    st.out = saved;
+  }
+  if (st.defer.length === 0) return st.out as string[];
   const out: string[] = [];
-  sortLeft = WHOLE_SORT;
-  for (const f of fields ?? []) walk(decoded, fieldPath(f), 0, out);
+  for (const v of st.out) {
+    if (typeof v === "string") out.push(v);
+    else for (const s of v.values) out.push(s);
+  }
   return out;
+}
+
+export function extractJson(decoded: JsonValue, fields: string[], jsonDecode?: Decode): string {
+  return extractJsonValues(decoded, fields, jsonDecode).join("\n");
+}
+
+/** The strings extractJson joins, in document order (newest last), for window(). */
+export function extractJsonValues(decoded: JsonValue, fields: string[], jsonDecode?: Decode): string[] {
+  return extractJsonState(decoded, fields, jsonDecode).out;
+}
+
+function extractJsonState(decoded: JsonValue, fields: string[], jsonDecode?: Decode): { out: string[]; capped: boolean } {
+  const st = newState(jsonDecode);
+  sortLeft = WHOLE_SORT;
+  walk(decoded, planOf(fields, false), st);
+  return { out: settle(st), capped: st.capped };
+}
+
+/**
+ * Port of extract_tools: tool definitions in a decoded JSON body
+ * (rule.tool_fields), what the model reads of the tools it may call and of
+ * the schema its answer must follow: every key and string but JSON Schema
+ * type names. Returns the strings (in order), and true when a bound (depth,
+ * nodes) left something out.
+ */
+export function extractTools(decoded: JsonValue | undefined, fields: string[] | undefined, jsonDecode?: Decode): [string[], boolean] {
+  const st = newState(jsonDecode);
+  st.leaf = toolLeaf;
+  if (isObj(decoded)) walk(decoded, planOf(fields, true), st);
+  return [settle(st), st.capped];
 }
 
 // Port of tool_results() in core/normalize.lua. Tool results in the chat shapes
@@ -277,14 +684,20 @@ export function extractJsonValues(decoded: JsonValue, fields: string[]): string[
 //                            (function_call_output, custom_tool_call_output,
 //                            local_shell_call_output, ...) or "mcp_call": output;
 //                            "file_search_call": results[*].text
+//   AI SDK 5 UIMessages      messages[*].parts[*] with type "tool-<name>" or
+//                            "dynamic-tool": output, whatever its state (the
+//                            client sets it), read as a "**" path reads it
 //   Gemini                   contents[*].parts[*].functionResponse.response
 //                            (contents and parts may each be one object, as
 //                            LiteLLM takes them), read whole
 // and retrieved documents, read whole: `documents` (Cohere v1 and v2, vLLM).
 const responsesResult = (t: unknown) => typeof t === "string" && (t.endsWith("_call_output") || t === "mcp_call");
+const sdkToolPart = (t: unknown) => typeof t === "string" && (t.startsWith("tool-") || t === "dynamic-tool");
 
-function toolResults(decoded: JsonValue, out: string[]): void {
+// `st`: a walk state; a tool part's output leaves a slot for settle() to fill.
+function toolResults(decoded: JsonValue, st: WalkState): void {
   if (!isObj(decoded) || Array.isArray(decoded)) return;
+  const out = st.out as string[];
   const msgs = decoded.messages;
   if (Array.isArray(msgs)) {
     for (const m of msgs) {
@@ -294,6 +707,15 @@ function toolResults(decoded: JsonValue, out: string[]): void {
       } else if (Array.isArray(m.content)) {
         for (const block of m.content) {
           if (isObj(block) && !Array.isArray(block) && block.type === "tool_result") collect(block.content, out, 1);
+        }
+      }
+      if (Array.isArray(m.parts)) {
+        for (const part of m.parts) {
+          if (!isObj(part) || Array.isArray(part) || part.output === undefined || part.output === null) continue;
+          if (!sdkToolPart(part.type)) continue;
+          const slot: Slot = { node: part.output, values: [] };
+          st.out.push(slot);
+          st.defer.push(slot);
         }
       }
     }
@@ -323,21 +745,43 @@ function toolResults(decoded: JsonValue, out: string[]): void {
  * Port of extract_untrusted: retrieved content in a decoded JSON body, tool
  * results (unless `spec.tool_results` is false) and the values of
  * `spec.fields`, in that order; a field value the tool results already hold
- * is not added again (see the Lua original). Returns the values (newest last).
+ * is not added again (see the Lua original). Returns the values (newest
+ * last), and true when a "**" field hit a bound and left something out.
  */
-export function extractUntrustedValues(decoded: JsonValue | undefined, spec: { tool_results?: boolean; fields?: string[] }): string[] {
-  const out: string[] = [];
-  if (!isObj(decoded)) return out;
+export function extractUntrusted(
+  decoded: JsonValue | undefined, spec: { tool_results?: boolean; fields?: string[] }, jsonDecode?: Decode,
+): [string[], boolean] {
+  const st = newState(jsonDecode);
   sortLeft = WHOLE_SORT;
-  if (spec.tool_results !== false) toolResults(decoded, out);
+  if (!isObj(decoded)) return [[], false];
+  if (spec.tool_results !== false) toolResults(decoded, st);
   const fields = spec.fields ?? [];
-  if (fields.length > 0) {
-    const seen = new Set(out);
-    const more: string[] = [];
-    for (const f of fields) walk(decoded, fieldPath(f), 0, more);
-    for (const v of more) if (!seen.has(v)) out.push(v);
+  if (fields.length === 0) return [settle(st), st.capped];
+  // the fields' values in a list of their own, "**" slots included, so that
+  // settle() reads every "**" value (newest first) and the tool results'
+  // values are known before the fields' are added
+  const results = st.out;
+  st.out = [];
+  walk(decoded, planOf(fields, false), st);
+  const more = st.out;
+  st.out = results;
+  const out = settle(st);
+  const seen = new Set(out);
+  for (const v of more) {
+    if (typeof v === "string") {
+      if (!seen.has(v)) out.push(v);
+    } else {
+      for (const s of v.values) if (!seen.has(s)) out.push(s);
+    }
   }
-  return out;
+  return [out, st.capped];
+}
+
+/** The values extractUntrusted finds. */
+export function extractUntrustedValues(
+  decoded: JsonValue | undefined, spec: { tool_results?: boolean; fields?: string[] }, jsonDecode?: Decode,
+): string[] {
+  return extractUntrusted(decoded, spec, jsonDecode)[0];
 }
 
 export type ExtractKind = "json" | "scan" | "invalid" | "text" | "form" | "multipart" | "binary" | "none";
@@ -363,9 +807,11 @@ function formDecode(v: string): string {
 
 // ---------------------------------------------------------------------------
 // Format detection (port of normalize.extract in core/normalize.lua): the
-// body decides, the Content-Type is a hint. JSON when it parses as JSON, form
-// or multipart when declared (or form-shaped with no header), text when it
-// reads as text, "binary" otherwise.
+// body decides, the Content-Type is a hint. JSON when it parses as JSON,
+// scanned when it starts like JSON and the decoder refuses it (under a form
+// or multipart type read that way as well), form or multipart when declared
+// (or form-shaped with no header), text when it reads as text, "binary"
+// otherwise.
 // ---------------------------------------------------------------------------
 
 /** Lua is_text: no NUL, control bytes other than \t \n \r under 1% of the bytes. */
@@ -495,15 +941,16 @@ export function jsonLike(s: string | undefined | null, contentType: string | und
 
 /**
  * Extract text from a raw body. Returns the text (values joined with "\n"),
- * the kind, the values in order (newest last) for window(), and the decoded
- * JSON value when the kind is "json".
+ * the kind, the values in order (newest last) for window(), the decoded
+ * JSON value when the kind is "json", and true when a "**" walk hit a bound
+ * and left something out.
  */
 export function extract(
   body: string | undefined | null,
   contentType: string | undefined | null,
   fields: string[],
   jsonDecode: (s: string) => JsonValue = (s) => JSON.parse(s) as JsonValue,
-): [string, ExtractKind, string[], JsonValue?] {
+): [string, ExtractKind, string[], JsonValue?, boolean?] {
   if (typeof body !== "string" || body === "") return ["", "none", []];
   const rawCt = typeof contentType === "string" ? contentType : "";
   const ct = asciiLower(rawCt);
@@ -511,6 +958,8 @@ export function extract(
   // body-parser skip it: judge what the backend reads.
   if (body.startsWith("﻿")) body = body.slice(1);
   const declaredJson = declaresJson(ct);
+  const form = ct.includes("application/x-www-form-urlencoded") || (ct === "" && /^[A-Za-z0-9._~%+[\]-]+=[^ \t\n\v\f\r]*$/.test(body));
+  const multipart = ct.includes("multipart/form-data");
   const first = /^[ \t\n\v\f\r]*([\s\S])/.exec(body)?.[1];
   if (first === "{" || first === "[" || declaredJson) {
     let decoded: JsonValue | undefined;
@@ -522,28 +971,34 @@ export function extract(
     }
     if (ok && isObj(decoded) && tooDeep(body)) ok = false;
     if (ok && isObj(decoded)) {
-      const values = extractJsonValues(decoded as JsonValue, fields);
-      return [values.join("\n"), "json", values, decoded as JsonValue];
+      const st = extractJsonState(decoded as JsonValue, fields, jsonDecode);
+      return [st.out.join("\n"), "json", st.out, decoded as JsonValue, st.capped];
     }
-    if (declaredJson) {
-      // a JSON scalar has no text fields
-      if (ok && decoded !== undefined) return ["", "none", []];
-      // The decoder refused it; the backend's parser may not (cjson refuses
-      // nesting past 1000 and bytes after the value, Go and Node do not).
-      // The text fields' string values, read by the tolerant scanner past
-      // max_body_bytes uses, are judged; a body with none is unjudgeable,
-      // never "no text".
-      const out = scanStrings(body, fieldKeys(fields), []);
-      if (out.length === 0) return ["", "invalid", []];
+    // a JSON scalar has no text fields
+    if (declaredJson && ok && decoded !== undefined) return ["", "none", []];
+    // The decoder refused it; the backend's parser may not (cjson refuses
+    // nesting past 1000 and bytes after the value, Go and Node do not, and
+    // Ollama decodes JSON whatever the Content-Type says: curl -d sends
+    // form-urlencoded). So the tolerant scanner past max_body_bytes uses
+    // reads it, declared JSON or not: the text fields' string values and the
+    // objects under a "**" path's key. Under a form or multipart type the
+    // values that reading gives follow, since a backend of that kind reads
+    // the body so. Declared JSON with nothing to scan is unjudgeable, never
+    // "no text"; any other body with nothing to scan is read as before.
+    const out = scanStrings(body, fieldKeys(fields), [], deepKeys(fields));
+    if (out.length > 0) {
+      if (form && !declaredJson) formValues(body, out);
+      else if (multipart && !declaredJson) multipartValues(body, rawCt, out);
       return [out.join("\n"), "scan", out];
     }
+    if (declaredJson) return ["", "invalid", []];
   }
   const out: string[] = [];
-  if (ct.includes("application/x-www-form-urlencoded") || (ct === "" && /^[A-Za-z0-9._~%+[\]-]+=[^ \t\n\v\f\r]*$/.test(body))) {
+  if (form) {
     formValues(body, out);
     return [out.join("\n"), "form", out];
   }
-  if (ct.includes("multipart/form-data")) {
+  if (multipart) {
     multipartValues(body, rawCt, out);
     return [out.join("\n"), "multipart", out];
   }
@@ -552,7 +1007,8 @@ export function extract(
 }
 
 // ---------------------------------------------------------------------------
-// Partial bodies: tolerant scan of JSON string values (port of scan_strings)
+// Partial bodies: tolerant scan of JSON string values, and of the objects
+// under a "**" path's key (port of scan_strings)
 // ---------------------------------------------------------------------------
 
 const ESC: Record<string, string> = { '"': '"', "\\": "\\", "/": "/", b: "\b", f: "\f", n: "\n", r: "\r", t: "\t" };
@@ -593,19 +1049,27 @@ function readString(s: string, i: number): [string, number] {
   return [buf, n];
 }
 
+// The last key of a field path, folded, or undefined. Lua:
+// f:gsub("%.%*%*$", ""):match("([^%.%[%]%*]+)[%[%]%*]*$") -- the last run of
+// name characters before any trailing "[", "]" or "*". A linear scan, not a
+// regex: the unanchored pattern backtracks quadratically on long input.
+function lastKey(f: string): string | undefined {
+  const special = (c: string) => c === "." || c === "[" || c === "]" || c === "*";
+  // "arguments.**": the strings under "arguments"
+  if (f.endsWith(".**")) f = f.slice(0, -3);
+  let end = f.length;
+  while (end > 0 && (f[end - 1] === "[" || f[end - 1] === "]" || f[end - 1] === "*")) end--;
+  let start = end;
+  while (start > 0 && !special(f[start - 1])) start--;
+  return end > start ? fold(f.slice(start, end)) : undefined;
+}
+
 /** The last key of each text-field path, folded: "messages[*].content" -> "content". */
 export function fieldKeys(fields: string[] | undefined): Set<string> {
   const keys = new Set<string>();
-  // Lua: f:match("([^%.%[%]%*]+)[%[%]%*]*$") -- the last run of name
-  // characters before any trailing "[", "]" or "*". A linear scan, not a
-  // regex: the unanchored pattern backtracks quadratically on long input.
-  const special = (c: string) => c === "." || c === "[" || c === "]" || c === "*";
   for (const f of fields ?? []) {
-    let end = f.length;
-    while (end > 0 && (f[end - 1] === "[" || f[end - 1] === "]" || f[end - 1] === "*")) end--;
-    let start = end;
-    while (start > 0 && !special(f[start - 1])) start--;
-    if (end > start) keys.add(fold(f.slice(start, end)));
+    const k = lastKey(f);
+    if (k !== undefined) keys.add(k);
   }
   // content parts carry their text under "text"
   if (keys.has("content")) keys.add("text");
@@ -613,17 +1077,138 @@ export function fieldKeys(fields: string[] | undefined): Set<string> {
 }
 
 /**
- * Collect the string values of `keys` (from fieldKeys) from possibly
- * truncated JSON. Keys match the way walk() matches them: folded.
+ * Port of deep_keys: the last key of each "**" text-field path, folded, for
+ * scanStrings: "any", or "object" when a path without "**" ends at the same
+ * key too ("input": a tool_use input, and the Responses input list).
  */
-export function scanStrings(s: string, keys: Set<string>, out: string[]): string[] {
-  // key characters: ASCII word characters, U+017F and U+212A
-  const re = /"([A-Za-z0-9_\-\u017F\u212A]+)"[ \t\n\v\f\r]*:[ \t\n\v\f\r]*"/g;
+export function deepKeys(fields: string[] | undefined): Map<string, "any" | "object"> {
+  const deep = new Set<string>();
+  const plain = new Set<string>();
+  for (const f of fields ?? []) {
+    const k = lastKey(f);
+    if (k !== undefined) (f.endsWith(".**") ? deep : plain).add(k);
+  }
+  const out = new Map<string, "any" | "object">();
+  for (const k of deep) out.set(k, plain.has(k) ? "object" : "any");
+  return out;
+}
+
+/**
+ * Collect the string values of `keys` (from fieldKeys) from possibly
+ * truncated JSON. Keys match the way walk() matches them: folded. With
+ * `deep` (from deepKeys), the value of a "**" path's key is read as the walk
+ * reads it, every key and string in it in the order they come: an object,
+ * and an array when no other path ends at that key; otherwise the scan goes
+ * on inside it, as for any other key.
+ */
+export function scanStrings(s: string, keys: Set<string>, out: string[], deep?: Map<string, "any" | "object">): string[] {
+  // key characters: ASCII word characters, U+017F and U+212A; the value
+  // starts with a quote or a bracket (a number or a literal is passed over)
+  const re = /"([A-Za-z0-9_\-\u017F\u212A]+)"[ \t\n\v\f\r]*:[ \t\n\v\f\r]*(?=["{[])/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(s)) !== null) {
-    const [value, next] = readString(s, m.index + m[0].length);
-    if (keys.has(fold(m[1])) && value !== "") out.push(value);
-    re.lastIndex = next;
+    const at = m.index + m[0].length;
+    if (s[at] === '"') {
+      const [value, next] = readString(s, at + 1);
+      if (keys.has(fold(m[1])) && value !== "") out.push(value);
+      re.lastIndex = next;
+    } else {
+      const d = deep?.get(fold(m[1]));
+      if (d !== undefined && (s[at] === "{" || d === "any")) re.lastIndex = scanValue(s, at, out, false);
+    }
+  }
+  return out;
+}
+
+// The first index at or after `i` of a character other than JSON white space, or -1.
+function nonSpace(s: string, i: number): number {
+  for (; i < s.length; i++) {
+    const c = s[i];
+    if (c !== " " && c !== "\t" && c !== "\n" && c !== "\r") return i;
+  }
+  return -1;
+}
+
+// Port of type_names: the index after a JSON Schema type name, or a list of
+// them, that starts at or after `i`; undefined for anything else.
+function typeNames(s: string, i: number): number | undefined {
+  const q = nonSpace(s, i);
+  if (q === -1) return undefined;
+  if (s[q] === '"') {
+    const [v, after] = readString(s, q + 1);
+    return SCHEMA_TYPES.has(v) ? after : undefined;
+  }
+  if (s[q] !== "[") return undefined;
+  let p = q + 1;
+  let any = false;
+  for (;;) {
+    p = nonSpace(s, p);
+    if (p === -1) return undefined;
+    if (s[p] === "]") return any ? p + 1 : undefined;
+    if (s[p] !== '"') return undefined;
+    const [v, after] = readString(s, p + 1);
+    if (!SCHEMA_TYPES.has(v)) return undefined;
+    any = true;
+    p = nonSpace(s, after);
+    if (p === -1) return undefined;
+    if (s[p] === ",") p++;
+    else if (s[p] !== "]") return undefined;
+  }
+}
+
+// Port of scan_value: every key and string of the JSON value that starts at
+// `i` (a `{` or `[`), to its end or the end of `s`; with `schema` (tool
+// definitions) a "type" key whose value is a JSON Schema type name is left
+// out with it. Returns the index after it.
+function scanValue(s: string, i: number, out: string[], schema: boolean): number {
+  let depth = 0;
+  const re = /[{}[\]"]/g;
+  for (;;) {
+    re.lastIndex = i;
+    const m = re.exec(s);
+    if (!m) return s.length;
+    const j = m.index;
+    const c = s[j];
+    if (c === '"') {
+      const [v, next] = readString(s, j + 1);
+      const k = nonSpace(s, next);
+      const skip = schema && v === "type" && k !== -1 && s[k] === ":" ? typeNames(s, k + 1) : undefined;
+      if (skip !== undefined) {
+        i = skip;
+      } else {
+        if (v !== "") out.push(v);
+        i = next;
+      }
+    } else if (c === "{" || c === "[") {
+      depth++;
+      i = j + 1;
+    } else {
+      depth--;
+      i = j + 1;
+      if (depth <= 0) return i;
+    }
+  }
+}
+
+/**
+ * Port of scan_tools: the tool definitions (rule.tool_fields) in possibly
+ * truncated JSON, past max_body_bytes: every key and string of the value of
+ * each key that folds to a tool_fields path's last key, JSON Schema type
+ * names left out, in the order they come.
+ */
+export function scanTools(s: string, keys: Set<string>, out: string[]): string[] {
+  const re = /"([A-Za-z0-9_\-ſK]+)"[ \t\n\v\f\r]*:[ \t\n\v\f\r]*/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(s)) !== null) {
+    const at = m.index + m[0].length;
+    if (!keys.has(fold(m[1]))) continue;
+    if (s[at] === '"') {
+      const [v, next] = readString(s, at + 1);
+      if (v !== "") out.push(v);
+      re.lastIndex = next;
+    } else if (s[at] === "{" || s[at] === "[") {
+      re.lastIndex = scanValue(s, at, out, true);
+    }
   }
   return out;
 }

@@ -287,8 +287,9 @@ describe("metrics: L2 errors by kind", function()
     assert.matches('jev_l2_errors_total{kind="busy"} 2', out, 1, true)
     assert.matches("jev_l2_latency_ms_count 2\n", out, 1, true)
     assert.matches("jev_l2_latency_ms_sum 480\n", out, 1, true)
-    -- the busy verdicts' 0 ms would have filled the lowest bucket
-    assert.is_nil(out:find('jev_l2_latency_ms_bucket{le="25"}', 1, true))
+    -- the busy verdicts' 0 ms would have filled the lowest bucket (emitted
+    -- at 0: render() writes every bucket)
+    assert.matches('jev_l2_latency_ms_bucket{le="25"} 0\n', out, 1, true)
     assert.matches('jev_l2_latency_ms_bucket{le="200"} 1', out, 1, true)
     assert.matches('jev_l2_latency_ms_bucket{le="+Inf"} 2', out, 1, true)
     assert.matches('jev_cache_hits_total{kind="fp"} 1', out, 1, true)

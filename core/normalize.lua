@@ -1290,40 +1290,81 @@ end
 
 local ESC = { ['"'] = '"', ["\\"] = "\\", ["/"] = "/", b = "\b", f = "\f", n = "\n", r = "\r", t = "\t" }
 
--- Decode one JSON string body starting at `i` (just after the opening quote);
--- returns the value and the index after the closing quote (or #s + 1).
-local function read_string(s, i)
-  local buf, n = {}, #s
-  while i <= n do
-    local j = s:find('["\\]', i)
-    if not j then buf[#buf + 1] = s:sub(i); return table.concat(buf), n + 1 end
-    buf[#buf + 1] = s:sub(i, j - 1)
-    if s:sub(j, j) == '"' then return table.concat(buf), j + 1 end
-    local e = s:sub(j + 1, j + 1)
-    if e == "u" then
-      local hex = s:match("^%x%x%x%x", j + 2)
-      if not hex then return table.concat(buf), n + 1 end
-      local cp = tonumber(hex, 16)
-      i = j + 6
-      if cp >= 0xD800 and cp <= 0xDBFF then
-        local lo = s:match("^\\u(%x%x%x%x)", i)
-        local lcp = lo and tonumber(lo, 16)
-        if lcp and lcp >= 0xDC00 and lcp <= 0xDFFF then
-          cp = 0x10000 + (cp - 0xD800) * 0x400 + (lcp - 0xDC00)
-          i = i + 6
-        end
-      end
-      -- a lone surrogate is U+FFFD, as in lone_surrogates()
-      if cp >= 0xD800 and cp <= 0xDFFF then cp = 0xFFFD end
-      buf[#buf + 1] = utf8_char(cp)
-    elseif e == "" then
-      return table.concat(buf), n + 1
-    else
-      buf[#buf + 1] = ESC[e] or e
-      i = j + 2
-    end
+-- The index of the first '"' at or after `i` that no backslash escapes (a
+-- backslash escapes the byte after it), or nil. A quote is escaped when the
+-- run of backslashes right before it, from `i` on, is odd: each quote is
+-- found with a plain search and each backslash is counted once, so a string
+-- of escapes costs no more than a search per quote.
+local function next_quote(s, i)
+  local from = i
+  while true do
+    local j = s:find('"', i, true)
+    if not j then return nil end
+    local k = j - 1
+    while k >= from and s:byte(k) == 92 do k = k - 1 end
+    if (j - 1 - k) % 2 == 0 then return j end
+    i = j + 1
   end
-  return table.concat(buf), n + 1
+end
+
+-- Every byte after a backslash, decoded as read_string decodes it: the JSON
+-- escapes, and any other byte as itself (the backslash dropped).
+local ESC_ALL = {}
+for b = 0, 255 do
+  local c = string.char(b)
+  ESC_ALL[c] = ESC[c] or c
+end
+
+-- Decode one JSON string body starting at `i` (just after the opening quote);
+-- returns the value and the index after the closing quote (or #s + 1). A
+-- string without escapes is the bytes up to its quote; one with escapes is
+-- decoded in one gsub, and a \u escape without four hex digits (or a
+-- string that ends in a lone backslash) ends the value there and the scan
+-- at the end of `s`.
+local read_string
+read_string = function(s, i)
+  local n = #s
+  local j = s:find('["\\]', i)
+  if not j then return s:sub(i), n + 1 end
+  if s:byte(j) == 34 then return s:sub(i, j - 1), j + 1 end
+  local e = next_quote(s, j)
+  local raw, after
+  if e then
+    raw, after = s:sub(i, e - 1), e + 1
+  else
+    raw, after = s:sub(i), n + 1
+    -- a lone backslash at the very end escapes nothing: dropped
+    local t = #raw
+    while t > 0 and raw:byte(t) == 92 do t = t - 1 end
+    if (#raw - t) % 2 == 1 then raw = raw:sub(1, -2) end
+  end
+  if not raw:find("\\u", 1, true) then
+    return (raw:gsub("\\(.)", ESC_ALL)), after
+  end
+  local bad, skip
+  local out = raw:gsub("()\\(.)(%x?%x?%x?%x?)", function(p, c, hex)
+    if bad then return "" end
+    if p == skip then skip = nil; return "" end
+    if c ~= "u" then return ESC_ALL[c] .. hex end
+    if #hex < 4 then bad = p; return "" end
+    local cp = tonumber(hex, 16)
+    if cp >= 0xD800 and cp <= 0xDBFF then
+      local lo = raw:match("^\\u(%x%x%x%x)", p + 6)
+      local lcp = lo and tonumber(lo, 16)
+      if lcp and lcp >= 0xDC00 and lcp <= 0xDFFF then
+        cp = 0x10000 + (cp - 0xD800) * 0x400 + (lcp - 0xDC00)
+        skip = p + 6
+      end
+    end
+    -- a lone surrogate is U+FFFD, as in lone_surrogates()
+    if cp >= 0xD800 and cp <= 0xDFFF then cp = 0xFFFD end
+    return utf8_char(cp)
+  end)
+  if bad then
+    -- what came before the broken escape, decoded; the scan ends here
+    return (read_string(raw:sub(1, bad - 1) .. '"', 1)), n + 1
+  end
+  return out, after
 end
 
 --- The last key of each text-field path, folded (see fold):
@@ -1395,16 +1436,6 @@ function _M.deep_keys(fields)
   return out
 end
 
--- The index of the first '"' at or after `i` that no backslash escapes (a
--- backslash escapes the byte after it), or nil.
-local function next_quote(s, i)
-  while true do
-    local j = s:find('["\\]', i)
-    if not j then return nil end
-    if s:byte(j) == 34 then return j end
-    i = j + 2
-  end
-end
 
 -- The keys of possibly truncated JSON, one at a time. `q` is an unescaped
 -- '"'; the string it opens ends at the next one, and it is a key when a
@@ -1420,11 +1451,22 @@ end
 -- the next string starts with a colon (["x",":"]); it never names a field
 -- (a comma or a colon is in it), and the scans read only the value of a key
 -- they look for, so it cannot swallow the key after it.
+local function is_space(c)
+  -- Lua's %s: space, \t, \n, \v, \f, \r
+  return c == 32 or (c ~= nil and c >= 9 and c <= 13)
+end
 local function key_at(s, q, start)
   local e = next_quote(s, q + 1)
   if not e then return nil end
-  local b = s:match(start and '^%s*:%s*()["{%[]' or "^%s*:%s*()", e + 1)
-  if not b then return nil, nil, e end
+  -- '^%s*:%s*()["{%[]' (or without the value start), as byte loops
+  local b = e + 1
+  local c = s:byte(b)
+  while is_space(c) do b = b + 1; c = s:byte(b) end
+  if c ~= 58 then return nil, nil, e end
+  b = b + 1
+  c = s:byte(b)
+  while is_space(c) do b = b + 1; c = s:byte(b) end
+  if start and c ~= 34 and c ~= 123 and c ~= 91 then return nil, nil, e end
   return fold((read_string(s, q + 1))), b
 end
 
@@ -1656,14 +1698,23 @@ end
 -- value.
 scan_value = function(s, i, out, schema, nodata)
   local depth, n, key = 0, #s, nil
+  -- byte loops rather than pattern searches: LuaJIT compiles them, and a
+  -- value made of many short strings is read at memory speed
+  local byte = string.byte
   while true do
-    local j = s:find('[{}%[%]"]', i)
-    if not j then return n + 1 end
-    local c = s:byte(j)
+    local j, c = i, byte(s, i)
+    while c and c ~= 34 and c ~= 123 and c ~= 125 and c ~= 91 and c ~= 93 do j = j + 1; c = byte(s, j) end
+    if not c then return n + 1 end
     if c == 34 then
-      local v, nexti = read_string(s, j + 1)
-      local k = s:find("[^ \t\n\r]", nexti)
-      local colon = k and s:byte(k) == 58
+      local e, b = j + 1, byte(s, j + 1)
+      while b and b ~= 34 and b ~= 92 do e = e + 1; b = byte(s, e) end
+      local v, nexti
+      if b == 34 then v, nexti = s:sub(j + 1, e - 1), e + 1 else v, nexti = read_string(s, j + 1) end
+      -- the next byte that is not JSON white space (a byte loop: LuaJIT
+      -- compiles it, not a pattern search)
+      local k, w = nexti, s:byte(nexti)
+      while w == 32 or w == 9 or w == 10 or w == 13 do k = k + 1; w = s:byte(k) end
+      local colon = w == 58
       local skip = schema and v == "type" and colon and type_names(s, k + 1)
       if skip then
         i, key = skip, nil

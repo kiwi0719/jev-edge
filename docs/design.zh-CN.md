@@ -227,7 +227,7 @@ monthly cost ≈ QPS × L2 share × 2.63M s/month × tokens per call × price pe
 
 在实网运行中测得，带部署上下文时，一次使用 `injection` 模板的 L2 调用大约是 610 个输入 token、39 个输出 token。开启 [`untrusted`](#检索内容) 后，带 tool 内容的请求还会多一次调用；带[工具定义](#工具定义)的请求，在第一次见到这套工具时也会多一次。价格会变；[docs/cost.zh-CN.md](cost.zh-CN.md) 里有一张按撰写时公布的价格算好的表，还介绍了两个指标：在 `monitor` 模式下跑上一天，用它们就能得到你真实的 L2 占比和 token 数。
 
-**worker 的 CPU。** 普通请求过 L1 只要几微秒，读一个普通的 1 MiB 聊天请求体大约 20 ms。专门构造来消耗资源的请求体，在默认的 `max_body_bytes` 下每个请求最多要花大约十分之一秒的 worker CPU：在 OpenResty 的 LuaJIT 下实测，一个由 25 万个短字符串组成、解码器拒收（或超过 `max_body_bytes`）的 1 MiB 请求体大约要 110 ms，转义字符密集的大约 90 ms。扫描和模式遍历都有上限、是线性的，所以开销只随请求体增长，不会更快，但持续发这种请求体的客户端能占住一个 worker。对任何人都能访问的路由，调低 `max_body_bytes`（开销和它成正比），并在 jev-edge 前面用 `limit_req` 限流。
+**worker 的 CPU。** 普通请求过 L1 只要几微秒，读一个普通的 1 MiB 聊天请求体大约 15 ms。专门构造来消耗资源的请求体，在默认的 `max_body_bytes` 下每个请求要花几十毫秒的 worker CPU：在 OpenResty 的 LuaJIT 下实测，一个由 25 万个短字符串组成、解码器拒收（或超过 `max_body_bytes`）的 1 MiB 请求体大约要 65 ms，全是引号的大约 60 ms，转义字符密集的大约 30 ms。扫描和模式遍历都有上限、是线性的，所以开销只随请求体增长，不会更快，但持续发这种请求体的客户端能占住一个 worker。对任何人都能访问的路由，调低 `max_body_bytes`（开销和它成正比），并在 jev-edge 前面用 `limit_req` 限流。
 
 ## 仓库结构
 

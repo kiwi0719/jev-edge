@@ -442,6 +442,23 @@ def _has_text(body: dict) -> bool:
     return False
 
 
+def _has_token_ids(body: dict) -> bool:
+    """Whether a text key of `body` holds token ids: a number in a list, or
+    in a list of lists (the OpenAI completions API, vLLM and SGLang take a
+    prompt as token ids, which the model reads as the text they stand for).
+    That is no text, but not nothing: jev-edge reports it unjudgeable, and a
+    rule's token_prompts = "block" refuses it, so the body goes to jev-edge.
+    Lists only, without recursion, as _clean."""
+    stack = [v for k, v in body.items() if isinstance(v, list) and (k in TEXT_KEYS or k not in READ_KEYS)]
+    while stack:
+        for v in stack.pop():
+            if isinstance(v, list):
+                stack.append(v)
+            elif isinstance(v, (int, float)) and not isinstance(v, bool):
+                return True
+    return False
+
+
 def _system_messages(data: dict) -> list:
     """The request's system prompt as messages: Anthropic's top-level
     `system` (a string or text blocks) and the Responses API's
@@ -536,7 +553,7 @@ def _body_dict(data: dict, extra_fields: tuple = ()) -> Optional[dict]:
         c = _clean(value, key=key)
         if c is not _DROP:
             body[key] = c
-    return body if _has_text(body) else None
+    return body if _has_text(body) or _has_token_ids(body) else None
 
 
 # JSON string tokens in compact JSON bytes
@@ -824,7 +841,8 @@ class JevEdgeGuardrail(_ApplyGuardrailBase):
         with the system prompt (`system`, `instructions`) as the first
         message, and Gemini's `contents` (a `parts` object followed by its
         keys as text parts); media payloads removed outside the tool calls
-        and tool results sent whole. None when no value holds any text."""
+        and tool results sent whole. None when no value holds any text or
+        token ids."""
         body = _body_dict(data, _parse_fields(extra_fields) if extra_fields else ())
         return None if body is None else _dumps(body)
 

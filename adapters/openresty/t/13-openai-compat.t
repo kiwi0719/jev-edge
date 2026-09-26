@@ -5,7 +5,12 @@ use Cwd qw(cwd);
 # in for it): spec/openai_compat_vectors.json, which the TS provider replays too.
 my $pwd = cwd();
 our $Vectors = "$pwd/spec/openai_compat_vectors.json";
-our $HttpConfig = qq{ lua_package_path "$pwd/lib/?.lua;$pwd/../../?.lua;;"; };
+# the loader maps jev.core.* to core/ on this path: the provider reads
+# jev.core.defaults
+our $HttpConfig = qq{
+    lua_package_path "$pwd/lib/?.lua;$pwd/../../?.lua;;";
+    init_by_lua_block { require("resty.jev.loader")() }
+};
 
 plan 'no_plan';
 workers(1);

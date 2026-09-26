@@ -7,6 +7,7 @@ import { luaPatternToRegExp, patternError, pathMatches, canonicalPath, evaluate 
 import { resolve, load } from "../src/rules";
 import { truncateBytes, normalize, fingerprint, djb2 } from "../src/core/normalize";
 import { encodeReason } from "../src/core/verdict";
+import { buildSample } from "../src/sampling";
 import { Breaker, memoryStore, OPEN, CLOSED } from "../src/core/breaker";
 
 describe("luaPatternToRegExp", () => {
@@ -190,6 +191,20 @@ describe("rules: json_only_paths (twin of core/spec/rules_spec.lua)", () => {
     expect((await rulesEvaluate(root(undefined, "\x1f\b\0\0 bytes", { headers: plain }), rule, ctx()))[0]).toBe("pass");
   });
 
+  it("is how the sampler picks its rule, as rules.rule_for", () => {
+    const cfg = core.defaults.merge(core.defaults.config, { sampling: { enabled: true, rate: 1 } });
+    const v = core.verdict.newVerdict({ verdict: "malicious", source: "l2" });
+    // JSON to / is llm-endpoints'; a form POST to / is no rule's (it watches / for JSON only)
+    const json = root("application/json", JSON.stringify({ note: ASK, inputs: "Tell me a story." }));
+    expect(buildSample(cfg, v, json, [rule], "r1").text).toBe(normalize("Tell me a story."));
+    expect(buildSample(cfg, v, root("application/x-www-form-urlencoded", FORM), [rule], "r2").text).toBe("");
+    expect(buildSample(cfg, v, root("text/plain", "{" + ASK + "}"), [rule], "r2").text).toBe("");
+    // a tenant rule that matches the path but not the method hands it on
+    const tenant = resolve({ id: "t", watch_paths: ["^/v1/chat"], methods: { PUT: true }, text_fields: ["other"] });
+    const chat = { method: "POST", path: "/v1/chat/completions", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ messages: [{ role: "user", content: ASK }] }) };
+    expect(buildSample(cfg, v, chat, [tenant, rule], "r3").text).toBe(normalize(ASK));
+  });
 
   it("applies only to the paths it lists", async () => {
     const form = { "content-type": "application/x-www-form-urlencoded" };

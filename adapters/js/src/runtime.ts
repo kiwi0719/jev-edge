@@ -48,8 +48,10 @@ export interface Options {
    *  both idFromName and get. */
   state?: StateTarget | Store;
   /** Store for per-subject trajectories: KV, the JevState Durable Object (namespace, `{ namespace, name }`
-   *  or stub, as for `state`; its incr is atomic) or any Store. Memory (per isolate) if absent. Only used
-   *  with config.subject.enabled. */
+   *  or stub, as for `state`; its incr is atomic) or any Store. Memory (per isolate) if absent; the Cloudflare
+   *  presets pass their Durable Object when config.subject.reputation is on. Only used with
+   *  config.subject.enabled. KV loses concurrent increments, so reputation counted there is best effort
+   *  (logged once). */
   subjectStore?: KVLike | StateTarget | Store;
   /** Header carrying the client IP, set by a proxy you trust to overwrite it.
    *  Default: cf-connecting-ip on Cloudflare (a preset, or a request with the
@@ -99,6 +101,30 @@ function storeOption(x: KVLike | StateTarget | Store | undefined, clock: () => n
   if (isKV(x)) return kvStore(x);
   return (x as Store | undefined) ?? memoryStore(clock);
 }
+
+const warnedKv = new WeakSet<object>();
+
+/**
+ * Subject reputation counts with the store's incr. KV has none: kvStore's
+ * incr is a get and a put, a put takes seconds to land and KV takes about one
+ * write a second per key, so concurrent increments for one subject are mostly
+ * lost (19 of 20 in a live test) and block_at may never be reached. Warned
+ * once per KV binding in each isolate, not refused: such a config keeps
+ * working as it did, best effort.
+ */
+function warnKvReputation(config: core.Config, store: unknown): void {
+  const s = config.subject;
+  if (!s?.enabled || !(Number(s.reputation?.block_at) > 0)) return;
+  if (isStateTarget(store) || !isKV(store) || warnedKv.has(store)) return;
+  warnedKv.add(store);
+  console.warn(
+    "jev-edge: subject.reputation with a KV subjectStore is best effort, not enforcement: KV has no atomic " +
+    "increment (a get and a put, about one write a second per key), so concurrent increments for one subject " +
+    "are lost and block_at may never be reached. Pass subjectStore: env.JEV_STATE (the JevState Durable " +
+    "Object), whose increment is atomic.",
+  );
+}
+
 export function createRuntime(opts: Options): Runtime {
   const config = core.defaults.merge(core.defaults.config, opts.config ?? {});
   const [ok, err] = core.defaults.validate(config);
@@ -108,6 +134,7 @@ export function createRuntime(opts: Options): Runtime {
   const clock = () => Date.now() / 1000;
   const cache = storeOption(opts.cache, clock);
   const subjectStore = storeOption(opts.subjectStore, clock);
+  warnKvReputation(config, opts.subjectStore);
   let state: Store;
   let breaker: BreakerLike;
   let adaptive: AdaptiveLike;

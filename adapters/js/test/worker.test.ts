@@ -655,6 +655,44 @@ describe("stores", () => {
     expect([...objects.get("cache")!.mem.keys()].some((k) => k.startsWith("fp:"))).toBe(true);
   });
 
+  it("a preset with JEV_STATE bound counts subject reputation in the Durable Object, for every isolate", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ upstream: true })));
+    try {
+      const { ns, objects } = namespaces();
+      const opts = {
+        provider: providers.mock,
+        config: { ...ENFORCE95, jev: { ...ENFORCE95.jev, mock_header: "x-jev-mock-score" }, subject: { ...SUBJECTS.subject, reputation: { block_at: 5 } } },
+      };
+      // two Workers, as two isolates: each has its own runtime and memory
+      const one = fullWorker({ upstream: "https://app.internal", ...opts });
+      const two = fullWorker({ upstream: "https://app.internal", ...opts });
+      const env = { JEV_STATE: ns };
+      expect((await one.fetch(chat(attack(0)), env)).status).toBe(403);
+      expect((await two.fetch(chat(attack(1)), env)).status).toBe(403);
+      // 3 + 3 points from one subject across the two: blocked in both
+      const blocked = await one.fetch(chat(BENIGN, { "x-jev-mock-score": "0.1" }), env);
+      expect(blocked.status).toBe(403);
+      expect(blocked.headers.get("x-jev-reason")).toBe("subject+reputation");
+      expect([...objects.get("jev-edge")!.mem.keys()].some((k) => k.startsWith("srep:ip:"))).toBe(true);
+      // options that name a subjectStore keep it
+      const fresh = namespaces();
+      const mem = memoryStore();
+      const counted: string[] = [];
+      const own = { ...mem, incr: (k: string, by: number, ttl: number) => { counted.push(k); return mem.incr!(k, by, ttl); } };
+      const three = fullWorker({ upstream: "https://app.internal", ...opts, subjectStore: own });
+      expect((await three.fetch(chat(attack(2)), { JEV_STATE: fresh.ns })).status).toBe(403);
+      expect(counted.some((k) => k.startsWith("srep:ip:"))).toBe(true);
+      expect([...(fresh.objects.get("jev-edge")?.mem.keys() ?? [])].some((k) => k.startsWith("srep:"))).toBe(false);
+      // without reputation the subject store stays the runtime's default
+      const plain = namespaces();
+      const four = fullWorker({ upstream: "https://app.internal", provider: providers.mock, config: { ...ENFORCE95, subject: SUBJECTS.subject } });
+      expect((await four.fetch(chat(attack(3)), { JEV_STATE: plain.ns })).status).toBe(403);
+      expect([...(plain.objects.get("jev-edge")?.mem.keys() ?? [])].some((k) => k.startsWith("subj:"))).toBe(false);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("a stub as cache or subjectStore goes through fetch, not taken for KV by the put it answers", async () => {
     const { evaluate } = await import("../src/runtime");
     const cache = dobj();

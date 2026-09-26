@@ -12,7 +12,7 @@
 //   pagesMiddleware(opts) same as fullWorker, exported as a Pages Functions
 //                         middleware: `export const onRequest = pagesMiddleware({...})`.
 import { createRuntime, handle, type Options, type Runtime, type RequestCtx } from "./runtime.js";
-import { JevState, type KVLike, type DONamespaceLike } from "./cf/stores.js";
+import { JevState, isStateTarget, type KVLike, type DONamespaceLike } from "./cf/stores.js";
 
 export { JevState };
 
@@ -36,10 +36,20 @@ function runtimeFor<E extends WorkerEnv>(resolve: Resolve<E>, env: E, cache: Wea
   // the namespace, not a stub: this runtime lives as long as the isolate,
   // and a stub only as long as the request that made it (cf/stores.ts)
   if (!o.state && env.JEV_STATE) o.state = env.JEV_STATE;
+  // Subject reputation counts with the store's incr: atomic in the Durable
+  // Object, lost under concurrency in KV, per isolate in memory. So with the
+  // object bound (or named in `state`), the subject store is that object
+  // unless the options name one.
+  if (!o.subjectStore && isStateTarget(o.state) && reputationOn(o)) o.subjectStore = o.state;
   if (env.TYPESAFE_API_KEY) o.config = { ...o.config, jev: { api_key: env.TYPESAFE_API_KEY, ...o.config?.jev } };
   const rt = createRuntime(o);
   cache.set(env, rt);
   return rt;
+}
+
+function reputationOn(o: Options): boolean {
+  const s = o.config?.subject;
+  return s?.enabled === true && Number(s.reputation?.block_at) > 0;
 }
 
 /**

@@ -94,4 +94,17 @@ routes:
       nodes:
         "app:8081": 1
       type: roundrobin
+# A global rule, active only for requests that carry X-E2e-Global: 1 so the
+# other checks do not see it. It watches every path; the mock takes 400 ms.
+global_rules:
+  - id: 1
+    plugins:
+      jev-edge:
+        _meta:
+          filter:
+            - ["http_x_e2e_global", "==", "1"]
+        jev: { provider: mock, mock_score: 0.2, mock_header: x-jev-mock-score, mock_delay_ms: 400, timeout_ms: 1000 }
+        rules: [{ id: g, extends: llm-endpoints, watch_paths: ["^/"] }]
+        policy: { mode: enforce, block_threshold: 0.7, suspect_threshold: 0.5 }
+        cache: { fp_ttl: 0.001 }
 #END

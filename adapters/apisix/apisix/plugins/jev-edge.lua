@@ -364,6 +364,10 @@ end
 -- ---------------------------------------------------------------------------
 
 function _M.access(conf, ctx)
+  -- A global rule also runs for a request that matched no route, just before
+  -- APISIX answers it 404. It never reaches a model: no judge call, no
+  -- reputation charge, no headers.
+  if ctx.conf_type == "global_rule" and not ctx.matched_route then return end
   local rt = runtime_for(conf)
   for _, h in ipairs(HEADER_NAMES) do core.request.set_header(ctx, h, nil) end
 

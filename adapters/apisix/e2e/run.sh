@@ -46,6 +46,16 @@ check "over the limit: no X-Jev-* on the answer" "0" "$(printf '%s\n' "$out" | g
 check "over the limit: no judge call (the mock takes 700 ms)" "fast" \
   "$(printf '%s\n' "$out" | sed -n 's/.*ms=\([0-9.]*\).*/\1/p' | awk '{ print ($1 < 0.5) ? "fast" : "slow " $1 }')"
 
+# A global rule judges a request that matched a route, but not one that
+# matched none: APISIX answers that 404 and it never reaches a model
+code=$(curl -s -o /dev/null -w '%{http_code}' -H 'X-E2e-Global: 1' -H 'Content-Type: application/json' -H 'X-Jev-Mock-Score: 0.95' -d "$ATTACK" $base/plain)
+check "a global rule judges a request that matched a route" "403" "$code"
+out=$(curl -s -o /dev/null -D - -w 'status=%{http_code} ms=%{time_total}\n' -H 'X-E2e-Global: 1' -H 'Content-Type: application/json' -H 'X-Jev-Mock-Score: 0.95' -d "$ATTACK" $base/nomatch/v1/chat/completions | tr -d '\r')
+check "no route: 404, not a block from the global rule" "status=404" "$(printf '%s\n' "$out" | grep -o 'status=[0-9]*')"
+check "no route: no X-Jev-* on the answer" "0" "$(printf '%s\n' "$out" | grep -ci '^x-jev-' || true)"
+check "no route: no judge call (the mock takes 400 ms)" "fast" \
+  "$(printf '%s\n' "$out" | sed -n 's/.*ms=\([0-9.]*\).*/\1/p' | awk '{ print ($1 < 0.3) ? "fast" : "slow " $1 }')"
+
 # jev_cache exists (custom_lua_shared_dict): the same text is answered from
 # the verdict cache the second time
 CACHED='{"messages":[{"role":"user","content":"Please list three facts about the moon for a school project."}]}'

@@ -1147,6 +1147,9 @@ describe("reads before the judge are best effort", () => {
   const ENFORCE95 = { jev: { provider: "mock", mock_score: 0.95, mock_delay_ms: 2, timeout_ms: 400 }, policy: { mode: "enforce" as const } };
   const attack = (i: number) => ATTACK.replace("prompt.", "prompt, read " + i + ".");
 
+  /** The breaker's counters in the object's storage, whatever window they fell in. */
+  const window = (mem: Map<string, unknown>) => [...mem.entries()].find(([k]) => k.startsWith("brk:w:"))?.[1];
+
   function jevState() {
     const mem = new Map<string, unknown>();
     const d = new JevState({ storage: { get: async (k) => mem.get(k), put: async (k, v) => { mem.set(k, v); }, delete: async (k) => mem.delete(k) } });
@@ -1224,7 +1227,7 @@ describe("reads before the judge are best effort", () => {
     expect(res.status).toBe(403);
     expect(paths).toEqual(["/pre", "/post"]);
     expect(mem.get("adapt")).toMatchObject({ v: { n: 1 } });
-    expect(mem.get("brk:w:" + Math.floor(Date.now() / 1000 / 60))).toMatchObject({ v: { ok: 1, fail: 0 } });
+    expect(window(mem)).toMatchObject({ v: { ok: 1, fail: 0 } });
   });
 
   it("the record after the judge goes to waitUntil, off the request path", async () => {
@@ -1248,7 +1251,7 @@ describe("reads before the judge are best effort", () => {
     expect(j).toMatchObject({ verdict: "error", source: "l2" });
     expect(paths).toEqual(["/pre", "/post"]);
     expect(mem.get("adapt")).toMatchObject({ v: { n: 1, mean: 12 } }); // fired * 1.2
-    expect(mem.get("brk:w:" + Math.floor(Date.now() / 1000 / 60))).toMatchObject({ v: { ok: 0, fail: 1 } });
+    expect(window(mem)).toMatchObject({ v: { ok: 0, fail: 1 } });
   });
 
   it("an open breaker: /pre says no, nothing is judged or recorded", async () => {

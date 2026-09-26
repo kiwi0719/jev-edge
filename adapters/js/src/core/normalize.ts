@@ -1375,7 +1375,10 @@ function nextQuote(s: string, i: number): number {
 // when a colon follows (then, with `start`, a quote or a bracket). Returns
 // the key decoded and folded and the index of the value's first character,
 // or, when it opens no key, the next '"' to try (the string's closing
-// quote); null at the end of the text.
+// quote); null at the end of the text. So the text between two strings is
+// tried as a key too, and it is one when the next string starts with a
+// colon (["x",":"]); it never names a field, and the scans read only the
+// value of a key they look for, so it cannot swallow the key after it.
 function keyAt(s: string, q: number, start: boolean): { key?: string; at: number } | null {
   const e = nextQuote(s, q + 1);
   if (e === -1) return null;
@@ -1406,6 +1409,8 @@ function endsValue(s: string, i: number): boolean {
  * with a number: token ids. With `opts.tail`, the text before the first
  * unescaped '"' is the end of a value cut at its start: kept when that quote
  * ends a value and it reads as natural text (white space in it, and isText).
+ * The value of a key that is not one of `keys` is not read: the scan goes on
+ * at its first character, as from any other string (see keyAt).
  */
 export function scanStrings(
   s: string, keys: Set<string>, out: string[], deep?: Map<string, "any" | "object">, seen?: { tokenIds?: boolean },
@@ -1424,14 +1429,14 @@ export function scanStrings(
       continue;
     }
     const at = k.at;
-    if (s[at] === '"') {
+    if (s[at] === '"' && keys.has(k.key)) {
       const [value, next] = readString(s, at + 1);
-      if (keys.has(k.key) && value !== "") out.push(value);
+      if (value !== "") out.push(value);
       q = nextQuote(s, next);
     } else {
       if (seen && s[at] === "[" && keys.has(k.key) && startsWithNumber(s, at + 1)) seen.tokenIds = true;
       const d = deep?.get(k.key);
-      q = nextQuote(s, d !== undefined && (s[at] === "{" || d === "any") ? scanValue(s, at, out, false) : at + 1);
+      q = nextQuote(s, d !== undefined && (s[at] === "{" || d === "any") ? scanValue(s, at, out, false) : at);
     }
   }
   return out;

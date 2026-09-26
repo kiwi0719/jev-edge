@@ -954,6 +954,22 @@ describe("normalize: JSON keys match without regard to case", () => {
     // g1-chunk-seams-window-math#6: a key is the key it decodes to
     expect(core.normalize.scanStrings(String.raw`{"\u0063ontent":"one","pr\u006Fmpt" : "two","x\"prompt":"no"`, keys, [])).toEqual(["one", "two"]);
   });
+
+  // Twin of normalize_spec "does not lose the key after a string that starts
+  // with a colon": the text between two strings reads as a key then, and
+  // its value is not read (regression from g1-chunk-seams-window-math#6)
+  it("does not lose the key after a string that starts with a colon", () => {
+    const keys = core.normalize.fieldKeys(["prompt", "messages[*].content"]);
+    for (const str of ['":"', '": "', '":{"', '":["', String.raw`":\"`]) {
+      const s = '{"model":"m","stop":["x",' + str + '],"prompt":"evil","n":1}';
+      expect(core.normalize.scanStrings(s, keys, []), s).toEqual(["evil"]);
+      expect(core.normalize.scanStrings(s.slice(7), keys, [], undefined, undefined, { tail: true }), s).toEqual(["evil"]);
+      expect(core.normalize.scanStrings(s + "x", keys, []), s).toEqual(["evil"]);
+    }
+    expect(core.normalize.scanStrings('{"stop":[":",":",":"],"prompt":"evil","a":[1,":"],"content":"two"}', keys, []))
+      .toEqual(["evil", "two"]);
+    expect(core.normalize.scanStrings('{"x":"prompt":"b"}', keys, [])).toEqual(["b"]);
+  });
 });
 
 describe("normalize: documents and retrieved results", () => {

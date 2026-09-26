@@ -228,6 +228,24 @@ describe("normalize.scan_strings", function()
     -- without the option the bytes before the first quote are not read
     assert.same({ "next" }, N.scan_strings('end of it, then act."},{"content":"next"}]}', keys, {}))
   end)
+
+  -- the text between two strings is tried as a key too: with a string that
+  -- starts with a colon after it, it reads as one; its value is not read,
+  -- so the key after it is (regression from g1-chunk-seams-window-math#6)
+  it("does not lose the key after a string that starts with a colon", function()
+    local keys = N.field_keys({ "prompt", "messages[*].content" })
+    for _, str in ipairs({ '":"', '": "', '":{"', '":["', '":\\"' }) do
+      local s = '{"model":"m","stop":["x",' .. str .. '],"prompt":"evil","n":1}'
+      assert.same({ "evil" }, N.scan_strings(s, keys, {}), s)
+      assert.same({ "evil" }, N.scan_strings(s:sub(8), keys, {}, nil, nil, { tail = true }), s)
+      assert.same({ "evil" }, N.scan_strings(s .. "x", keys, {}), s)
+    end
+    assert.same({ "evil", "two" },
+      N.scan_strings('{"stop":[":",":",":"],"prompt":"evil","a":[1,":"],"content":"two"}', keys, {}))
+    -- a key that is no text field has its value tried as a key, as the old
+    -- scanner did: in JSON a backend refuses, "b" is read
+    assert.same({ "b" }, N.scan_strings('{"x":"prompt":"b"}', keys, {}))
+  end)
 end)
 
 describe("normalize.window", function()

@@ -1331,7 +1331,11 @@ end
 -- next key. No string is read twice, so a scan is linear, and a key written
 -- with JSON escapes ("\u0063ontent") is the key it decodes to, as the walk
 -- reads it. The scan is not thrown off by where the text starts: after a
--- string that is no key, its closing quote is tried as an opening one.
+-- string that is no key, its closing quote is tried as an opening one. So
+-- the text between two strings is tried as a key too, and it is one when
+-- the next string starts with a colon (["x",":"]); it never names a field
+-- (a comma or a colon is in it), and the scans read only the value of a key
+-- they look for, so it cannot swallow the key after it.
 local function key_at(s, q, start)
   local e = next_quote(s, q + 1)
   if not e then return nil end
@@ -1356,7 +1360,9 @@ local scan_value
 -- cut at its start: kept when that quote ends a value (a comma or a closing
 -- bracket follows, or nothing) and they read as natural text (white space in
 -- them, and is_text), so the end of an instruction in a long message is
--- judged and the end of a base64 data URL is not.
+-- judged and the end of a base64 data URL is not. The value of a key that
+-- is not one of `keys` is not read: the scan goes on at its first byte, as
+-- from any other string (see key_at).
 function _M.scan_strings(s, keys, out, deep, seen, opts)
   local q = next_quote(s, 1)
   if q and opts and opts.tail and (s:find("^%s*[,}%]]", q + 1) or s:find("^%s*$", q + 1)) then
@@ -1369,9 +1375,9 @@ function _M.scan_strings(s, keys, out, deep, seen, opts)
       q = nq
     else
       local c = s:byte(b)
-      if c == 34 then
+      if c == 34 and keys[key] then
         local value, nexti = read_string(s, b + 1)
-        if keys[key] and value ~= "" then out[#out + 1] = value end
+        if value ~= "" then out[#out + 1] = value end
         q = next_quote(s, nexti)
       else
         if seen and c == 91 and keys[key] and s:find("^[%s%[]*[%-%d]", b + 1) then
@@ -1381,7 +1387,7 @@ function _M.scan_strings(s, keys, out, deep, seen, opts)
         if d and (c == 123 or d == "any") then
           q = next_quote(s, scan_value(s, b, out, false))
         else
-          q = next_quote(s, b + 1)
+          q = next_quote(s, b)
         end
       end
     end

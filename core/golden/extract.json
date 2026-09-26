@@ -1443,6 +1443,24 @@
     {
       "expect": {
         "kind": "scan",
+        "text": "after a colon string\nafter a colon and a space"
+      },
+      "input": {
+        "body": "{\"model\":\"m\",\"stop\":[\"x\",\":\"],\"prompt\":\"after a colon string\",\"n\":1,\"stop2\":[\"y\",\": \"],\"text\":\"after a colon and a space\"}x",
+        "content_type": "application/json",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "a string array whose last string starts with a colon does not hide the next key"
+    },
+    {
+      "expect": {
+        "kind": "scan",
         "text": "scanned upper"
       },
       "input": {

@@ -18,7 +18,7 @@ gateway depends on:
                 connect budget (30% of --budget-ms) and is answered 200,
                 the slowest with 2x headroom. A listen backlog smaller than
                 the burst drops connections, and the gateway sees each as a
-                timeout
+                timeout; a server out of workers answers 503
   latency       --samples sequential short requests; p99 with 2x headroom
   worst case    the longest text the gateway sends (--judge-bytes, the
                 profile's max_judge_bytes), built to tokenize at about one
@@ -302,7 +302,8 @@ def check_burst(t: Target, vectors, n: int, budget_ms: float) -> tuple[str | Non
     gateway's connect budget and be answered 200, the slowest with the
     headroom. The client retries a SYN that the server's listen queue
     dropped only after about a second, far past the connect budget, so the
-    gateway sees a timeout."""
+    gateway sees a timeout. A 503 is a server that could not score n short
+    texts at once in time."""
     body = short_body(t, vectors)
     connect_s = max(0.01, CONNECT_SHARE * budget_ms / 1000)
     start = threading.Barrier(n)
@@ -341,8 +342,15 @@ def check_burst(t: Target, vectors, n: int, budget_ms: float) -> tuple[str | Non
     info = f"{n} at once, slowest {slowest:.1f} ms"
     if bad:
         what = ", ".join(f"{k}: {v}" for k, v in sorted(bad.items(), key=str))
-        return (f"{sum(bad.values())} of {n} not answered 200 ({what}). A connect failure means a "
-                f"listen backlog under the burst (laya-server: LAYA_BACKLOG)"), info
+        why = []
+        if any(str(k).startswith("connect") for k in bad):
+            why.append("A connect failure means a listen backlog under the burst (laya-server: LAYA_BACKLOG).")
+        if 503 in bad:
+            why.append("A 503 means the server could not score that many at once in time: add capacity "
+                       "(laya-server: LAYA_WORKERS, CPUs), keep laya-server's LAYA_GATEWAY_TIMEOUT_MS at the "
+                       "gateway's timeout_ms, or lower max_inflight. laya-server also answers 503 past "
+                       "LAYA_MAX_CONNECTIONS.")
+        return f"{sum(bad.values())} of {n} not answered 200 ({what}). {' '.join(why)}".rstrip(), info
     if over_headroom(slowest, budget_ms):
         return f"slowest answer {slowest:.1f} ms {needs(slowest, budget_ms)} ({info})", info
     return None, info

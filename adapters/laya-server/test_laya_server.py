@@ -433,6 +433,8 @@ class Load(unittest.TestCase):
     def test_a_small_backlog_fails_the_burst_check(self):
         err, _ = self.burst({"LAYA_BACKLOG": "1"})
         self.assertRegex(err or "", r"not answered 200 \(connect")
+        self.assertIn("(laya-server: LAYA_BACKLOG)", err)
+        self.assertNotIn("A 503", err)
 
     def test_backlog_is_configurable(self):
         srv, _ = serve({"LAYA_BACKLOG": "200"})
@@ -642,6 +644,19 @@ class Pool(unittest.TestCase):
         self.assertEqual(status, 503, data)
         self.assertEqual(json.loads(data)["error"]["code"], "overloaded")
         self.assertLess(ms, 60)
+
+    def test_burst_503s_are_blamed_on_the_workers_not_the_backlog(self):
+        srv, url = serve({"LAYA_WORKERS": "1"}, backend=SlowBatch(0, short_ms=40))
+        try:
+            t = conformance.Target(url, None, "laya", 5)
+            conformance.timed(t, conformance.short_body(t, VECTORS), 2)
+            with contextlib.redirect_stderr(io.StringIO()):
+                err, _ = conformance.check_burst(t, VECTORS, 16, 500)  # 640 ms of work for 250
+        finally:
+            stop(srv)
+        self.assertRegex(err or "", r"not answered 200 \(503: \d+\)\. A 503 means the server could not score "
+                                    r"that many at once in time: add capacity \(laya-server: LAYA_WORKERS")
+        self.assertNotIn("LAYA_BACKLOG", err)
 
 
 class ClientGone(unittest.TestCase):

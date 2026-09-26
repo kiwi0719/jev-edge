@@ -538,16 +538,24 @@ function toolResults(decoded: JsonValue, out: string[]): void {
 /**
  * Port of extract_untrusted: retrieved content in a decoded JSON body, tool
  * results (unless `spec.tool_results` is false) and the values of
- * `spec.fields`, in that order. Returns the values (newest last).
+ * `spec.fields`, in that order. Returns the values (newest last), and true
+ * when a "**" field hit a bound and left something out.
  */
+export function extractUntrusted(
+  decoded: JsonValue | undefined, spec: { tool_results?: boolean; fields?: string[] }, jsonDecode?: Decode,
+): [string[], boolean] {
+  const st = newState(jsonDecode);
+  if (!isObj(decoded)) return [[], false];
+  if (spec.tool_results !== false) toolResults(decoded, st.out as string[]);
+  walk(decoded, planOf(spec.fields, false), st);
+  return [settle(st), st.capped];
+}
+
+/** The values extractUntrusted finds. */
 export function extractUntrustedValues(
   decoded: JsonValue | undefined, spec: { tool_results?: boolean; fields?: string[] }, jsonDecode?: Decode,
 ): string[] {
-  const st = newState(jsonDecode);
-  if (!isObj(decoded)) return [];
-  if (spec.tool_results !== false) toolResults(decoded, st.out as string[]);
-  walk(decoded, planOf(spec.fields, false), st);
-  return settle(st);
+  return extractUntrusted(decoded, spec, jsonDecode)[0];
 }
 
 export type ExtractKind = "json" | "scan" | "invalid" | "text" | "form" | "multipart" | "binary" | "none";

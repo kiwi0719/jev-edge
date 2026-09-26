@@ -1,5 +1,5 @@
 // Port of core/rules.lua: L1, cheap and short-circuiting.
-import { extract, extractTools, extractUntrustedValues, isText, byteLength, head, tail, fieldKeys, scanStrings, scanTools, window, chunks as splitChunks, utf8Bytes, type JsonValue } from "./normalize.js";
+import { extract, extractTools, extractUntrusted, isText, byteLength, head, tail, fieldKeys, scanStrings, scanTools, window, chunks as splitChunks, utf8Bytes, type JsonValue } from "./normalize.js";
 import { untrustedSpec, type UntrustedConfig } from "./defaults.js";
 import { repBlocked, type SubjectCtx, type ReputationConfig } from "./subject.js";
 
@@ -362,15 +362,16 @@ export function reFind(subject: string, pattern: string): readonly [number, numb
 }
 
 // Port of untrusted_part() in core/rules.lua: retrieved content when untrusted
-// judging is on for `rule`, from a body parsed whole, cut to its own window.
-function untrustedPart(decoded: JsonValue | undefined, rule: Rule, ctx: RulesCtx | undefined): UntrustedPart | undefined {
+// judging is on for `rule`, from a body parsed whole, cut to its own window;
+// and true when a walk bound left some of it unread (the part is a window).
+function untrustedPart(decoded: JsonValue | undefined, rule: Rule, ctx: RulesCtx | undefined): [UntrustedPart | undefined, boolean] {
   const spec = untrustedSpec(ctx?.config, rule);
-  if (!spec.enabled || decoded === undefined || decoded === null || typeof decoded !== "object") return undefined;
-  const values = extractUntrustedValues(decoded, spec, ctx?.json_decode);
+  if (!spec.enabled || decoded === undefined || decoded === null || typeof decoded !== "object") return [undefined, false];
+  const [values, capped] = extractUntrusted(decoded, spec, ctx?.json_decode);
   const utext = values.join("\n");
-  if (utext === "") return undefined;
+  if (utext === "") return [undefined, capped];
   const [w, cut] = window(utext, values, rule.max_judge_bytes ?? MAX_JUDGE_BYTES);
-  return { text: w, windowed: cut };
+  return [{ text: w, windowed: cut || capped }, capped];
 }
 
 // Port of tools_part() in core/rules.lua: the tool definitions the model
@@ -440,7 +441,9 @@ async function judged(
     if (kind === "invalid") return { text: "", unj: "unjudgeable: invalid json" };
     // a "**" field hit its bound: the text is not all there
     if (cut) partial = bound = true;
-    untrusted = untrustedPart(decoded, rule, ctx);
+    let ucut: boolean;
+    [untrusted, ucut] = untrustedPart(decoded, rule, ctx);
+    if (ucut) bound = true;
     if (hasToolFields(rule) && decoded !== undefined && decoded !== null && typeof decoded === "object") {
       const [tvalues, tcut] = extractTools(decoded, rule.tool_fields, ctx?.json_decode);
       tools = toolsPart(tvalues, tcut, rule, ctx);

@@ -509,14 +509,15 @@ end
 -- @param decoded     table
 -- @param spec        { tool_results = bool, fields = { path, ... } }
 -- @param json_decode optional, as for extract_json ("**" fields)
--- @return string (joined with "\n"), may be ""; and the list of strings found
+-- @return string (joined with "\n"), may be ""; the list of strings found;
+--         and true when a "**" field hit a bound and left something out
 function _M.extract_untrusted(decoded, spec, json_decode)
   local st = new_state(json_decode)
-  if type(decoded) ~= "table" or type(spec) ~= "table" then return "", st.out end
+  if type(decoded) ~= "table" or type(spec) ~= "table" then return "", st.out, false end
   if spec.tool_results ~= false then tool_results(decoded, st.out) end
   walk(decoded, plan_of(spec.fields, false), st)
   local out = settle(st)
-  return table.concat(out, "\n"), out
+  return table.concat(out, "\n"), out, st.capped
 end
 
 -- ---------------------------------------------------------------------------

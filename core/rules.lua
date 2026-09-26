@@ -181,15 +181,16 @@ local CT_NOT_WATCHED = "content-type not watched"
 -- Retrieved content (tool results, untrusted.fields) when untrusted judging is
 -- on for `rule`, cut to its own judging window. Only from a body parsed whole:
 -- past max_body_bytes there is no JSON structure to find it in.
--- @return { text, windowed } or nil
+-- @return { text, windowed } or nil; and true when a walk bound left some
+--         of it unread (the part, if any, is then a window)
 local function untrusted_part(decoded, rule, ctx)
   local spec = defaults.untrusted_spec(ctx and ctx.config, rule)
   if not spec.enabled or type(decoded) ~= "table" then return nil end
-  local utext, uvalues = normalize.extract_untrusted(decoded, spec, ctx and ctx.json_decode)
-  if utext == "" then return nil end
+  local utext, uvalues, capped = normalize.extract_untrusted(decoded, spec, ctx and ctx.json_decode)
+  if utext == "" then return nil, capped end
   local windowed
   utext, windowed = normalize.window(utext, uvalues, rule.max_judge_bytes or _M.MAX_JUDGE_BYTES)
-  return { text = utext, windowed = windowed and true or false }
+  return { text = utext, windowed = (windowed or capped) and true or false }, capped
 end
 
 -- The tool definitions the model reads (rule.tool_fields), judged as their
@@ -220,7 +221,8 @@ end
 --         judged in more than one piece), capped (chunks did not cover it all),
 --         untrusted ({ text, windowed } when untrusted judging is on and the
 --         body carries retrieved content), tools (tools_part), and bound
---         (true when a walk bound left text fields or tool definitions unread)
+--         (true when a walk bound left text fields, retrieved content or
+--         tool definitions unread)
 local function judged(req, rule, ctx, ct, size)
   local max = rule.max_body_bytes or _M.MAX_BODY_BYTES
   -- a media type is taken at its word only when the bytes agree (or there
@@ -261,7 +263,9 @@ local function judged(req, rule, ctx, ct, size)
     if kind == "invalid" then return nil, "unjudgeable: invalid json" end
     -- a "**" field hit its bound: the text is not all there
     if cut then partial, bound = true, true end
-    untrusted = untrusted_part(decoded, rule, ctx)
+    local ucut
+    untrusted, ucut = untrusted_part(decoded, rule, ctx)
+    if ucut then bound = true end
     if has_tool_fields(rule) and type(decoded) == "table" then
       local _, tvalues, tcut = normalize.extract_tools(decoded, rule.tool_fields, ctx and ctx.json_decode)
       tools = tools_part(tvalues, tcut, rule, ctx)

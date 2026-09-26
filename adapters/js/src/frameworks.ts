@@ -3,7 +3,9 @@
 // only the request shape and the stores differ (memory per process unless you
 // pass a Store).
 import { Buffer } from "node:buffer";
-import { createRuntime, evaluate, withVerdictHeaders, copyRequest, healthResponse, type Options, type Runtime } from "./runtime.js";
+import {
+  createRuntime, evaluate, withVerdictHeaders, copyRequest, healthResponse, failOpen, errorForward, type Options, type Runtime,
+} from "./runtime.js";
 import { headers as verdictHeaders, newVerdict, ERROR, SRC_ADAPTER, type Verdict } from "./core/verdict.js";
 
 const HEADERS = ["x-jev-verdict", "x-jev-score", "x-jev-source", "x-jev-reason", "x-jev-request-id", "x-jev-subject"];
@@ -76,8 +78,20 @@ function nextJudged(request: Request, url: URL): Request {
 export function nextMiddleware(opts: Options, NextResponse: NextResponseLike) {
   const rt = runtimeOnce(opts);
   return async (request: Request, event?: NextFetchEventLike): Promise<Response> => {
-    const r = rt();
-    const judged = nextJudged(request, new URL(request.url));
+    const pass = async (fwd: Request) => NextResponse.next({ request: { headers: fwd.headers } });
+    let r: Runtime;
+    try {
+      r = rt();
+    } catch (e) {
+      return failOpen(request, pass, e);
+    }
+    let judged: Request;
+    try {
+      judged = nextJudged(request, new URL(request.url));
+    } catch (e) {
+      console.error("jev-edge: next middleware error, failing open: " + (e instanceof Error ? e.message : String(e)));
+      return pass(errorForward(request));
+    }
     const url = new URL(judged.url);
     if (r.opts.health !== false && url.pathname === "/_jev/health" && request.method === "GET") return healthResponse(r);
     // the event is a RequestCtx as is: evaluate calls event.waitUntil(p)

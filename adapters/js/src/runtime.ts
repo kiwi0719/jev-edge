@@ -606,6 +606,50 @@ export function healthResponse(rt: Runtime): Response {
 }
 
 /**
+ * The request to forward when the adapter failed: X-Jev-Verdict: error /
+ * X-Jev-Source: adapter, every client-supplied X-Jev-* gone. Never throws:
+ * when even that copy cannot be made, the request itself, its X-Jev-*
+ * deleted where its headers allow it.
+ */
+export function errorForward(request: Request): Request {
+  let rid: string;
+  try {
+    rid = crypto.randomUUID();
+  } catch {
+    rid = String(Date.now());
+  }
+  try {
+    return withVerdictHeaders(request, errorVerdict(), rid);
+  } catch {
+    /* the last resort below */
+  }
+  try {
+    for (const h of [...HEADER_NAMES, SUBJECT_HEADER]) request.headers.delete(h);
+  } catch {
+    /* immutable headers: forwarded as they came */
+  }
+  return request;
+}
+
+const buildFailures = new Set<string>();
+
+/**
+ * A host whose runtime cannot be built (a config createRuntime refuses, a
+ * preset missing its origin) fails open like any other adapter error:
+ * `next` gets the request with X-Jev-Verdict: error / X-Jev-Source: adapter.
+ * Each distinct error is logged once per isolate, not per request; a failed
+ * build is never cached, so the next request tries again.
+ */
+export function failOpen(request: Request, next: (req: Request) => Promise<Response>, err: unknown): Promise<Response> {
+  const key = err instanceof Error ? err.message : String(err);
+  if (!buildFailures.has(key) && buildFailures.size < 32) {
+    buildFailures.add(key);
+    console.error("jev-edge: cannot build the runtime, failing open (logged once): " + describe(err));
+  }
+  return next(errorForward(request));
+}
+
+/**
  * Generic handler: evaluate, then either return the block or call `next` with
  * the request carrying X-Jev-* headers. Works for any framework that gives
  * you a Request and a way to continue. A throw anywhere before `next` fails
@@ -621,17 +665,7 @@ export async function handle(request: Request, rt: Runtime, next: (req: Request)
     forwarded = withVerdictHeaders(request, verdict, requestId, subjectId);
   } catch (e) {
     console.error("jev-edge: handle error, failing open: " + describe(e));
-    let rid = "";
-    try {
-      rid = crypto.randomUUID();
-    } catch {
-      rid = String(Date.now());
-    }
-    try {
-      forwarded = withVerdictHeaders(request, errorVerdict(), rid);
-    } catch {
-      forwarded = request;
-    }
+    forwarded = errorForward(request);
   }
   return next(forwarded);
 }

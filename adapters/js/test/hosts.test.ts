@@ -102,6 +102,24 @@ describe("nextMiddleware", () => {
     expect(res.status).toBe(403);
   });
 
+  it("fails open with the client's X-Jev-* replaced when the runtime cannot be built", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      let seen: Headers | undefined;
+      const mw = nextMiddleware({ config: { policy: { mode: "bogus" as never } } }, {
+        next: (init?: { request?: { headers?: Headers } }) => { seen = init?.request?.headers; return Response.json({ next: true }); },
+      });
+      const res = await mw(chat(ATTACK, { "x-jev-verdict": "safe", "x-jev-subject": "header:x" }));
+      expect(await res.json()).toEqual({ next: true });
+      expect(seen?.get("x-jev-verdict")).toBe("error");
+      expect(seen?.get("x-jev-source")).toBe("adapter");
+      expect(seen?.get("x-jev-subject")).toBeNull();
+      expect(error.mock.calls.some((c) => String(c[0]).includes("cannot build the runtime, failing open"))).toBe(true);
+    } finally {
+      error.mockRestore();
+    }
+  });
+
   it("hands the subject write to the event's waitUntil", async () => {
     const { memoryStore } = await import("../src/cf/stores");
     const { ringLoad } = await import("../src/core/subject");

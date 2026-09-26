@@ -11,7 +11,7 @@
 //                         OpenAI-compatible endpoint) as the provider.
 //   pagesMiddleware(opts) same as fullWorker, exported as a Pages Functions
 //                         middleware: `export const onRequest = pagesMiddleware({...})`.
-import { createRuntime, handle, normalizePath, type Options, type Runtime, type RequestCtx } from "./runtime.js";
+import { createRuntime, handle, failOpen, normalizePath, type Options, type Runtime, type RequestCtx } from "./runtime.js";
 import { JevState, isStateTarget, type KVLike, type DONamespaceLike } from "./cf/stores.js";
 
 export { JevState };
@@ -90,18 +90,24 @@ export function thinWorker<E extends WorkerEnv = WorkerEnv>(
   return {
     async fetch(request, env, ctx) {
       const jevPath = originEndpoint(request);
-      const o = typeof opts === "function" ? opts(env) : opts;
       const origin = (opts as { origin?: string }).origin ?? env.JEV_ORIGIN;
-      if (!origin) throw new Error("thinWorker: origin (or env.JEV_ORIGIN) is required");
-      const rt = runtimeFor(() => ({
-        ...o,
-        config: { ...o.config, jev: { provider: "backend", endpoint: origin, ...o.config?.jev } },
-      }), env, cache);
-      if (jevPath && !ownHealth(request, rt)) return NOT_FOUND();
       const upstream = (opts as { upstream?: string }).upstream ?? origin;
-      return handle(request, rt, (req) => {
-        return fetch(new Request(upstreamUrl(req.url, upstream), req));
-      }, ctx);
+      const forward = (req: Request) => fetch(upstream ? new Request(upstreamUrl(req.url, upstream), req) : req);
+      let rt: Runtime;
+      try {
+        const o = typeof opts === "function" ? opts(env) : opts;
+        if (!origin) throw new Error("thinWorker: origin (or env.JEV_ORIGIN) is required");
+        rt = runtimeFor(() => ({
+          ...o,
+          config: { ...o.config, jev: { provider: "backend", endpoint: origin, ...o.config?.jev } },
+        }), env, cache);
+      } catch (e) {
+        // unjudged, but never the origin's own endpoints
+        if (jevPath) return NOT_FOUND();
+        return failOpen(request, forward, e);
+      }
+      if (jevPath && !ownHealth(request, rt)) return NOT_FOUND();
+      return handle(request, rt, forward, ctx);
     },
   };
 }
@@ -127,10 +133,14 @@ export function fullWorker<E extends WorkerEnv = WorkerEnv>(
   const cache = new WeakMap<object, Runtime>();
   return {
     async fetch(request, env, ctx) {
-      const rt = runtimeFor(opts, env, cache);
-      return handle(request, rt, (req) => {
-        return fetch(new Request(upstreamUrl(req.url, opts.upstream), req));
-      }, ctx);
+      const forward = (req: Request) => fetch(new Request(upstreamUrl(req.url, opts.upstream), req));
+      let rt: Runtime;
+      try {
+        rt = runtimeFor(opts, env, cache);
+      } catch (e) {
+        return failOpen(request, forward, e);
+      }
+      return handle(request, rt, forward, ctx);
     },
   };
 }
@@ -141,7 +151,12 @@ export function pagesMiddleware<E extends WorkerEnv = WorkerEnv>(
 ): (context: { request: Request; env: E; next: (req?: Request) => Promise<Response>; waitUntil?: (p: Promise<unknown>) => void }) => Promise<Response> {
   const cache = new WeakMap<object, Runtime>();
   return async (context) => {
-    const rt = runtimeFor(opts, context.env, cache);
+    let rt: Runtime;
+    try {
+      rt = runtimeFor(opts, context.env, cache);
+    } catch (e) {
+      return failOpen(context.request, (req) => context.next(req), e);
+    }
     const ctx: RequestCtx | undefined = context.waitUntil ? { waitUntil: (p) => context.waitUntil!(p) } : undefined;
     return handle(context.request, rt, (req) => context.next(req), ctx);
   };

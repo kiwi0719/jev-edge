@@ -21,7 +21,7 @@
 // br request bodies: decodeBody imports `node:zlib` dynamically, and Deno
 // resolves `node:` specifiers through its Node compatibility layer (Deploy
 // included), so brotli decoding works here as it does on Node.
-import { createRuntime, handle, type Options, type Runtime } from "./runtime.js";
+import { createRuntime, handle, failOpen, type Options, type Runtime } from "./runtime.js";
 import { upstreamUrl } from "./cloudflare.js";
 import type { Store } from "./core/breaker.js";
 
@@ -174,9 +174,18 @@ export function denoHandler(opts: DenoOptions): (req: Request, info?: DenoServeI
     }
     return (rt = createRuntime(o));
   };
+  const forward = (fwd: Request) => fetch(new Request(new Request(upstreamUrl(fwd.url, opts.upstream), fwd), { redirect: "manual" }));
   return async (req, info) => {
-    const request = withPeer(req, info);
+    let request = req;
+    let r: Runtime;
+    try {
+      request = withPeer(req, info);
+      r = runtime();
+    } catch (e) {
+      // a config createRuntime refuses: forwarded unjudged, as on any adapter error
+      return failOpen(request, forward, e);
+    }
     // no waitUntil on Deno.serve: the subject write is fire-and-forget
-    return handle(request, runtime(), (fwd) => fetch(new Request(new Request(upstreamUrl(fwd.url, opts.upstream), fwd), { redirect: "manual" })));
+    return handle(request, r, forward);
   };
 }

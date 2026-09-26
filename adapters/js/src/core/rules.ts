@@ -1,5 +1,5 @@
 // Port of core/rules.lua: L1, cheap and short-circuiting.
-import { extract, extractTools, extractUntrusted, isText, byteLength, head, tail, fieldKeys, scanStrings, scanTools, window, chunks as splitChunks, utf8Bytes, type JsonValue } from "./normalize.js";
+import { extract, extractTools, extractUntrusted, isText, byteLength, head, tail, fieldKeys, deepKeys, scanStrings, scanTools, window, chunks as splitChunks, utf8Bytes, type JsonValue } from "./normalize.js";
 import { untrustedSpec, type UntrustedConfig } from "./defaults.js";
 import { repBlocked, type SubjectCtx, type ReputationConfig } from "./subject.js";
 
@@ -420,8 +420,9 @@ async function judged(
     if (media && !(hd !== undefined && isText(hd))) return { text: "", unj: CT_NOT_WATCHED };
     if (hd === undefined) return { text: "", unj: "unjudgeable: body too large" };
     const keys = fieldKeys(rule.text_fields);
-    values = scanStrings(hd, keys, []);
-    if (tl !== undefined) scanStrings(tl, keys, values);
+    const deep = deepKeys(rule.text_fields);
+    values = scanStrings(hd, keys, [], deep);
+    if (tl !== undefined) scanStrings(tl, keys, values, deep);
     if (values.length === 0) return { text: "", unj: "unjudgeable: body too large" };
     text = values.join("\n");
     partial = true;

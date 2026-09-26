@@ -753,7 +753,7 @@ function _M.extract(body, content_type, fields, json_decode)
       -- The text fields' string values, read by the tolerant scanner past
       -- max_body_bytes uses, are judged; a body with none is unjudgeable,
       -- never "no text".
-      local out = _M.scan_strings(body, _M.field_keys(fields), {})
+      local out = _M.scan_strings(body, _M.field_keys(fields), {}, _M.deep_keys(fields))
       if #out == 0 then return "", "invalid", {} end
       return table.concat(out, "\n"), "scan", out
     end
@@ -776,7 +776,9 @@ end
 -- Partial bodies. Past max_body_bytes the body is not parsed; the adapter
 -- hands over the bytes it has (the head, and the tail where it can seek) and
 -- this tolerant scanner pulls the JSON string values of the text-field keys
--- out of them, truncated JSON included.
+-- out of them, truncated JSON included, and every key and string of an
+-- object under a "**" path's key (tool-call arguments that are an object).
+-- It is linear in the bytes: no value is read twice.
 -- ---------------------------------------------------------------------------
 
 local function utf8_char(cp)
@@ -841,6 +843,23 @@ function _M.field_keys(fields)
   return keys
 end
 
+--- The last key of each "**" text-field path, folded, for scan_strings:
+-- "messages[*].tool_calls[*].function.arguments.**" -> arguments = "any";
+-- "object" instead when a path without "**" ends at the same key too
+-- ("input": a tool_use input, and the Responses input list).
+function _M.deep_keys(fields)
+  local deep, plain = {}, {}
+  for _, f in ipairs(fields or {}) do
+    local last = f:gsub("%.%*%*$", ""):match("([^%.%[%]%*]+)[%[%]%*]*$")
+    if last then
+      if f:find("%.%*%*$") then deep[fold(last)] = true else plain[fold(last)] = true end
+    end
+  end
+  local out = {}
+  for k in pairs(deep) do out[k] = plain[k] and "object" or "any" end
+  return out
+end
+
 -- True when `key` is ASCII word characters, U+017F and U+212A only: the
 -- byte class scan_strings finds keys with also matches other sequences of
 -- those bytes (U+0144 is \197\132), which are not keys to either core.
@@ -849,21 +868,36 @@ local function key_chars(key)
   return key:gsub("\197\191", "s"):gsub("\226\132\170", "k"):find("^[%w_%-]+$") ~= nil
 end
 
+local scan_value
+
 --- Collect the string values of `keys` (from field_keys) from possibly
 -- truncated JSON. Keys match the way walk() matches them: folded, so every
--- spelling a case-insensitive backend reads is collected.
-function _M.scan_strings(s, keys, out)
+-- spelling a case-insensitive backend reads is collected. With `deep` (from
+-- deep_keys), the value of a "**" path's key is read as the walk reads it,
+-- every key and string in it, in the order they come: an object (Ollama and
+-- Anthropic tool-call arguments), and an array when no other path ends at
+-- that key; otherwise the scan goes on inside it, as for any other key.
+function _M.scan_strings(s, keys, out, deep)
   local i = 1
   while true do
-    -- key bytes: ASCII word characters and the bytes of U+017F and U+212A
-    local a, b, key = s:find('"([%w_%-\197\191\226\132\170]+)"%s*:%s*"', i)
+    -- key bytes: ASCII word characters and the bytes of U+017F and U+212A;
+    -- `b` is the value's first byte (a number or a literal is passed over)
+    local a, b, key = s:find('"([%w_%-\197\191\226\132\170]+)"%s*:%s*["{%[]', i)
     if not a then break end
-    if key_chars(key) then
+    local c = s:byte(b)
+    if not key_chars(key) then
+      i = a + 1   -- not a key: look again from the next byte
+    elseif c == 34 then
       local value, nexti = read_string(s, b + 1)
       if keys[fold(key)] and value ~= "" then out[#out + 1] = value end
       i = nexti
     else
-      i = a + 1   -- not a key: look again from the next byte
+      local d = deep and deep[fold(key)]
+      if d and (c == 123 or d == "any") then
+        i = scan_value(s, b, out, false)
+      else
+        i = b + 1
+      end
     end
   end
   return out
@@ -903,10 +937,10 @@ local function type_names(s, i)
 end
 
 -- Every key and string of the JSON value that starts at `i` (a `{` or `[`),
--- to its end or the end of `s`, in the order they come; a "type" key whose
--- value is a JSON Schema type name is left out with it, as tool_leaf does.
--- Returns the index after the value.
-local function scan_value(s, i, out)
+-- to its end or the end of `s`, in the order they come; with `schema` (tool
+-- definitions) a "type" key whose value is a JSON Schema type name is left
+-- out with it, as tool_leaf does. Returns the index after the value.
+scan_value = function(s, i, out, schema)
   local depth, n = 0, #s
   while true do
     local j = s:find('[{}%[%]"]', i)
@@ -915,7 +949,7 @@ local function scan_value(s, i, out)
     if c == 34 then
       local v, nexti = read_string(s, j + 1)
       local k = s:find("[^ \t\n\r]", nexti)
-      local skip = v == "type" and k and s:byte(k) == 58 and type_names(s, k + 1)
+      local skip = schema and v == "type" and k and s:byte(k) == 58 and type_names(s, k + 1)
       if skip then
         i = skip
       else
@@ -952,7 +986,7 @@ function _M.scan_tools(s, keys, out)
         if v ~= "" then out[#out + 1] = v end
         i = nexti
       elseif c == "{" or c == "[" then
-        i = scan_value(s, b + 1, out)
+        i = scan_value(s, b + 1, out, true)
       else
         i = b + 1
       end

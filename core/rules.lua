@@ -243,9 +243,9 @@ local function judged(req, rule, ctx, ct, size)
     end
     if media and not (head and normalize.is_text(head)) then return nil, CT_NOT_WATCHED end
     if not head then return nil, "unjudgeable: body too large" end
-    local keys = normalize.field_keys(rule.text_fields)
-    values = normalize.scan_strings(head, keys, {})
-    if tail then normalize.scan_strings(tail, keys, values) end
+    local keys, deep = normalize.field_keys(rule.text_fields), normalize.deep_keys(rule.text_fields)
+    values = normalize.scan_strings(head, keys, {}, deep)
+    if tail then normalize.scan_strings(tail, keys, values, deep) end
     if #values == 0 then return nil, "unjudgeable: body too large" end
     text, partial = table.concat(values, "\n"), true
     if has_tool_fields(rule) then

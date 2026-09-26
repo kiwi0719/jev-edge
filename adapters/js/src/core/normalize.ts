@@ -825,7 +825,7 @@ export function extract(
       // The text fields' string values, read by the tolerant scanner past
       // max_body_bytes uses, are judged; a body with none is unjudgeable,
       // never "no text".
-      const out = scanStrings(body, fieldKeys(fields), []);
+      const out = scanStrings(body, fieldKeys(fields), [], deepKeys(fields));
       if (out.length === 0) return ["", "invalid", []];
       return [out.join("\n"), "scan", out];
     }
@@ -844,7 +844,8 @@ export function extract(
 }
 
 // ---------------------------------------------------------------------------
-// Partial bodies: tolerant scan of JSON string values (port of scan_strings)
+// Partial bodies: tolerant scan of JSON string values, and of the objects
+// under a "**" path's key (port of scan_strings)
 // ---------------------------------------------------------------------------
 
 const ESC: Record<string, string> = { '"': '"', "\\": "\\", "/": "/", b: "\b", f: "\f", n: "\n", r: "\r", t: "\t" };
@@ -885,21 +886,27 @@ function readString(s: string, i: number): [string, number] {
   return [buf, n];
 }
 
+// The last key of a field path, folded, or undefined. Lua:
+// f:gsub("%.%*%*$", ""):match("([^%.%[%]%*]+)[%[%]%*]*$") -- the last run of
+// name characters before any trailing "[", "]" or "*". A linear scan, not a
+// regex: the unanchored pattern backtracks quadratically on long input.
+function lastKey(f: string): string | undefined {
+  const special = (c: string) => c === "." || c === "[" || c === "]" || c === "*";
+  // "arguments.**": the strings under "arguments"
+  if (f.endsWith(".**")) f = f.slice(0, -3);
+  let end = f.length;
+  while (end > 0 && (f[end - 1] === "[" || f[end - 1] === "]" || f[end - 1] === "*")) end--;
+  let start = end;
+  while (start > 0 && !special(f[start - 1])) start--;
+  return end > start ? fold(f.slice(start, end)) : undefined;
+}
+
 /** The last key of each text-field path, folded: "messages[*].content" -> "content". */
 export function fieldKeys(fields: string[] | undefined): Set<string> {
   const keys = new Set<string>();
-  // Lua: f:match("([^%.%[%]%*]+)[%[%]%*]*$") -- the last run of name
-  // characters before any trailing "[", "]" or "*". A linear scan, not a
-  // regex: the unanchored pattern backtracks quadratically on long input.
-  const special = (c: string) => c === "." || c === "[" || c === "]" || c === "*";
-  for (let f of fields ?? []) {
-    // "arguments.**": the strings under "arguments"
-    if (f.endsWith(".**")) f = f.slice(0, -3);
-    let end = f.length;
-    while (end > 0 && (f[end - 1] === "[" || f[end - 1] === "]" || f[end - 1] === "*")) end--;
-    let start = end;
-    while (start > 0 && !special(f[start - 1])) start--;
-    if (end > start) keys.add(fold(f.slice(start, end)));
+  for (const f of fields ?? []) {
+    const k = lastKey(f);
+    if (k !== undefined) keys.add(k);
   }
   // content parts carry their text under "text"
   if (keys.has("content")) keys.add("text");
@@ -907,17 +914,45 @@ export function fieldKeys(fields: string[] | undefined): Set<string> {
 }
 
 /**
- * Collect the string values of `keys` (from fieldKeys) from possibly
- * truncated JSON. Keys match the way walk() matches them: folded.
+ * Port of deep_keys: the last key of each "**" text-field path, folded, for
+ * scanStrings: "any", or "object" when a path without "**" ends at the same
+ * key too ("input": a tool_use input, and the Responses input list).
  */
-export function scanStrings(s: string, keys: Set<string>, out: string[]): string[] {
-  // key characters: ASCII word characters, U+017F and U+212A
-  const re = /"([A-Za-z0-9_\-\u017F\u212A]+)"[ \t\n\v\f\r]*:[ \t\n\v\f\r]*"/g;
+export function deepKeys(fields: string[] | undefined): Map<string, "any" | "object"> {
+  const deep = new Set<string>();
+  const plain = new Set<string>();
+  for (const f of fields ?? []) {
+    const k = lastKey(f);
+    if (k !== undefined) (f.endsWith(".**") ? deep : plain).add(k);
+  }
+  const out = new Map<string, "any" | "object">();
+  for (const k of deep) out.set(k, plain.has(k) ? "object" : "any");
+  return out;
+}
+
+/**
+ * Collect the string values of `keys` (from fieldKeys) from possibly
+ * truncated JSON. Keys match the way walk() matches them: folded. With
+ * `deep` (from deepKeys), the value of a "**" path's key is read as the walk
+ * reads it, every key and string in it in the order they come: an object,
+ * and an array when no other path ends at that key; otherwise the scan goes
+ * on inside it, as for any other key.
+ */
+export function scanStrings(s: string, keys: Set<string>, out: string[], deep?: Map<string, "any" | "object">): string[] {
+  // key characters: ASCII word characters, U+017F and U+212A; the value
+  // starts with a quote or a bracket (a number or a literal is passed over)
+  const re = /"([A-Za-z0-9_\-\u017F\u212A]+)"[ \t\n\v\f\r]*:[ \t\n\v\f\r]*(?=["{[])/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(s)) !== null) {
-    const [value, next] = readString(s, m.index + m[0].length);
-    if (keys.has(fold(m[1])) && value !== "") out.push(value);
-    re.lastIndex = next;
+    const at = m.index + m[0].length;
+    if (s[at] === '"') {
+      const [value, next] = readString(s, at + 1);
+      if (keys.has(fold(m[1])) && value !== "") out.push(value);
+      re.lastIndex = next;
+    } else {
+      const d = deep?.get(fold(m[1]));
+      if (d !== undefined && (s[at] === "{" || d === "any")) re.lastIndex = scanValue(s, at, out, false);
+    }
   }
   return out;
 }
@@ -959,9 +994,10 @@ function typeNames(s: string, i: number): number | undefined {
 }
 
 // Port of scan_value: every key and string of the JSON value that starts at
-// `i` (a `{` or `[`), to its end or the end of `s`; a "type" key whose value
-// is a JSON Schema type name is left out with it. Returns the index after it.
-function scanValue(s: string, i: number, out: string[]): number {
+// `i` (a `{` or `[`), to its end or the end of `s`; with `schema` (tool
+// definitions) a "type" key whose value is a JSON Schema type name is left
+// out with it. Returns the index after it.
+function scanValue(s: string, i: number, out: string[], schema: boolean): number {
   let depth = 0;
   const re = /[{}[\]"]/g;
   for (;;) {
@@ -973,7 +1009,7 @@ function scanValue(s: string, i: number, out: string[]): number {
     if (c === '"') {
       const [v, next] = readString(s, j + 1);
       const k = nonSpace(s, next);
-      const skip = v === "type" && k !== -1 && s[k] === ":" ? typeNames(s, k + 1) : undefined;
+      const skip = schema && v === "type" && k !== -1 && s[k] === ":" ? typeNames(s, k + 1) : undefined;
       if (skip !== undefined) {
         i = skip;
       } else {
@@ -1008,7 +1044,7 @@ export function scanTools(s: string, keys: Set<string>, out: string[]): string[]
       if (v !== "") out.push(v);
       re.lastIndex = next;
     } else if (s[at] === "{" || s[at] === "[") {
-      re.lastIndex = scanValue(s, at, out);
+      re.lastIndex = scanValue(s, at, out, true);
     }
   }
   return out;

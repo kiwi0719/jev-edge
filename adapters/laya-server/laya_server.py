@@ -60,9 +60,12 @@ Configuration (environment):
   LAYA_ORT_PROVIDERS onnx: execution providers, comma-separated, in order of
                      preference; each must be in this onnxruntime build
                                                    (CPUExecutionProvider)
-  LAYA_ORT_THREADS   onnx: intra-op threads per session, 0 = onnxruntime's
-                     default                                      (0)
-  LAYA_WORKERS       requests scored at once       (CPU count; python: 1)
+  LAYA_ORT_THREADS   onnx: threads in the model's intra-op pool, which the
+                     requests being scored share; 0 = onnxruntime's own
+                     choice, one per core of the host
+                     (CPUs / LAYA_WORKERS; neither set: CPUs / 2, at most 4)
+  LAYA_WORKERS       requests scored at once
+                     (onnx: CPUs / LAYA_ORT_THREADS; mock: CPUs; python: 1)
   LAYA_QUEUE_MS      wait for a free worker before 503            (1000)
   LAYA_BACKLOG       listen backlog: at least the sum of jev.max_inflight of
                      the gateways calling this server; the kernel caps it at
@@ -71,6 +74,11 @@ Configuration (environment):
   LAYA_IDLE_TIMEOUT_S a connection silent this long is closed, 0 = never;
                      keep it above the gateway's keepalive idle time (60 s)
                                                                   (120)
+
+CPUs means the CPUs this process may use: the ones it may run on
+(sched_getaffinity), capped by the container's CPU quota (cgroup cpu.max),
+not the host's count. By default LAYA_WORKERS x LAYA_ORT_THREADS stays
+within them (pool_sizes), and the server says at start what it chose.
 """
 
 from __future__ import annotations
@@ -166,6 +174,9 @@ class OnnxBackend:
 
     def __init__(self, model_dir: str, positive: int = 1, providers: str | None = None,
                  threads: int = 0):
+        # threads: the session's intra-op pool. Requests scored at once
+        # share it, each adding its own calling thread. 0 = onnxruntime's
+        # own choice, which counts the host's cores, not a container's quota
         import numpy as np
         import onnxruntime as ort
         from tokenizers import Tokenizer
@@ -269,17 +280,145 @@ class MockBackend:
         return 4.0 if "ATTACK" in second.split() else -4.0
 
 
-def load_backend(env=os.environ):
+def load_backend(env=os.environ, threads: int | None = None):
+    """The backend LAYA_BACKEND names. threads: onnxruntime's intra-op
+    threads, by default pool_sizes' for the CPUs this process may use."""
     kind = env.get("LAYA_BACKEND", "onnx")
     if kind == "onnx":
+        if threads is None:
+            threads = pool_sizes("onnx", env, cpu_budget()[0])[1]
         return OnnxBackend(env.get("LAYA_MODEL_DIR", "/model"), int(env.get("LAYA_POSITIVE", "1")),
-                           providers=env.get("LAYA_ORT_PROVIDERS"),
-                           threads=int(env.get("LAYA_ORT_THREADS") or "0"))
+                           providers=env.get("LAYA_ORT_PROVIDERS"), threads=threads)
     if kind == "python":
         return PythonBackend(env["LAYA_SCORER"])
     if kind == "mock":
         return MockBackend()
     raise SystemExit(f"LAYA_BACKEND must be onnx | python | mock, not {kind!r}")
+
+
+# ---------------------------------------------------------------------------
+# CPUs
+# ---------------------------------------------------------------------------
+#
+# os.cpu_count() is the host's count. In a container limited to 2 CPUs on a
+# 64-core host it said 64: 64 workers, each running onnxruntime with its
+# default pool of one thread per host core, all taking turns on 2 CPUs, so
+# every request in flight slowed down together, past the gateway's timeout.
+
+
+def _cpu_max(d: str) -> float | None:
+    # cgroup v2: "max 100000" (no quota) or "<quota> <period>"
+    try:
+        with open(os.path.join(d, "cpu.max")) as f:
+            quota, period = f.read().split()[:2]
+        return None if quota == "max" else int(quota) / int(period)
+    except (OSError, ValueError):
+        return None
+
+
+def _cfs_quota(d: str) -> float | None:
+    # cgroup v1: cpu.cfs_quota_us is -1 without a quota
+    try:
+        with open(os.path.join(d, "cpu.cfs_quota_us")) as f:
+            quota = int(f.read())
+        with open(os.path.join(d, "cpu.cfs_period_us")) as f:
+            period = int(f.read())
+        return None if quota <= 0 or period <= 0 else quota / period
+    except (OSError, ValueError):
+        return None
+
+
+def cgroup_cpus(root: str = "/sys/fs/cgroup", proc: str = "/proc/self/cgroup") -> float | None:
+    """The CPUs the cgroup CPU quota allows this process: the lowest quota
+    over its cgroup and each parent (v2 cpu.max; v1 cpu.cfs_quota_us over
+    cpu.cfs_period_us). None without a quota or without cgroups (not Linux)."""
+    try:
+        with open(proc) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return None
+    best = None
+    for line in lines:
+        hid, ctrls, path = (line.split(":", 2) + ["", ""])[:3]
+        if hid == "0" and not ctrls:
+            mounts, read = [root], _cpu_max
+        elif "cpu" in ctrls.split(","):
+            mounts, read = [os.path.join(root, ctrls), os.path.join(root, "cpu")], _cfs_quota
+        else:
+            continue
+        # a container sees its own cgroup at the mount point, whatever the
+        # path says; a process on the host is at mount/path under parents
+        parts = [p for p in path.split("/") if p and p != ".."]
+        for m in mounts:
+            for i in range(len(parts), -1, -1):
+                q = read(os.path.join(m, *parts[:i]))
+                if q is not None and (best is None or q < best):
+                    best = q
+    return best
+
+
+def cpu_budget(root: str = "/sys/fs/cgroup", proc: str = "/proc/self/cgroup") -> tuple[int, str]:
+    """(CPUs this process may use, where that number comes from): the CPUs
+    it may run on, capped by the cgroup quota rounded down, at least 1.
+    Rounded down because threads past a fractional quota are throttled for
+    the rest of each period, which is latency the gateway waits for."""
+    try:
+        n, src = len(os.sched_getaffinity(0)), "CPUs this process may run on"
+    except (AttributeError, OSError):  # not Linux
+        n, src = os.cpu_count() or 1, "CPUs of the host"
+    q = cgroup_cpus(root, proc)
+    if q is not None and max(1, int(q)) < n:
+        return max(1, int(q)), f"cgroup CPU quota {q:g}, of {n} {src}"
+    return n, src
+
+
+# onnxruntime's intra-op threads when neither LAYA_WORKERS nor
+# LAYA_ORT_THREADS is set: half the CPUs, up to this. A transformer gains
+# little per thread past a few (the worst-case text on a MiniLM-sized model,
+# 10 CPUs: 4 threads took about two thirds of the time 1 did, 10 about as
+# long as 1), and the rest of the CPUs score more requests at once.
+ORT_THREADS_DEFAULT_MAX = 4
+
+
+def _count_env(env, name: str) -> int | None:
+    v = env.get(name)
+    if v is None or v == "":
+        return None
+    n = int(v)
+    if n < 0:
+        raise ValueError(f"{name} must be >= 0")
+    return n
+
+
+def pool_sizes(kind: str, env, cpus: int) -> tuple[int, int]:
+    """(workers, onnxruntime intra-op threads; 0 when unused).
+
+    onnx keeps workers x threads within `cpus`. The requests being scored
+    share the session's pool of `threads`, each adding its own worker
+    thread, so at most workers + threads - 1 threads compute at once; the
+    product bound keeps that within the CPUs with room to spare for the
+    Python side (tokenizing, HTTP). Past the CPUs, the requests in flight
+    take turns and all of them slow down together, and a timeout at the
+    gateway passes the request unjudged.
+
+    With neither LAYA_WORKERS nor LAYA_ORT_THREADS set, threads is half the
+    CPUs up to ORT_THREADS_DEFAULT_MAX, so the worst-case text alone stays
+    fast and, from two CPUs on, at least two requests are scored at once: a
+    short text is not stuck behind a long one. Set one and the other
+    divides the CPUs by it. LAYA_ORT_THREADS=0 hands the choice to
+    onnxruntime, which counts the host's cores, and gets one worker.
+
+    mock gets one worker per CPU. python gets one, because your scorer may
+    not be thread-safe."""
+    workers, threads = _count_env(env, "LAYA_WORKERS"), _count_env(env, "LAYA_ORT_THREADS")
+    if kind != "onnx":
+        return (workers if workers is not None else 1 if kind == "python" else cpus), 0
+    if threads is None:
+        threads = (min(ORT_THREADS_DEFAULT_MAX, max(1, cpus // 2)) if workers is None
+                   else max(1, cpus // max(1, workers)))
+    if workers is None:
+        workers = max(1, cpus // (threads or cpus))
+    return workers, threads
 
 
 # ---------------------------------------------------------------------------
@@ -641,8 +780,16 @@ def somaxconn() -> int | None:
         return None
 
 
-def make_server(env=os.environ, backend=None) -> Server:
-    backend = backend or load_backend(env)
+def make_server(env=os.environ, backend=None, cpus: tuple[int, str] | None = None) -> Server:
+    """cpus: (count, where it comes from), by default cpu_budget()."""
+    cpus = cpus or cpu_budget()
+    if backend is None:
+        kind = env.get("LAYA_BACKEND", "onnx")
+    else:
+        kind = ("onnx" if isinstance(backend, OnnxBackend) else
+                "python" if isinstance(backend, PythonBackend) else "mock")
+    workers, threads = pool_sizes(kind, env, cpus[0])
+    backend = backend or load_backend(env, threads=threads)
     scorer = Scorer(
         backend,
         temperature=float(env.get("LAYA_TEMPERATURE", "1.0")),
@@ -650,13 +797,9 @@ def make_server(env=os.environ, backend=None) -> Server:
         overlap=int(env.get("LAYA_WINDOW_OVERLAP", "64")),
         max_windows=int(env.get("LAYA_MAX_WINDOWS", "8")),
     )
-    # onnxruntime sessions are thread-safe; a Python scorer may not be, so it
-    # gets one worker unless LAYA_WORKERS says it can take more
-    default_workers = 1 if isinstance(backend, PythonBackend) else (os.cpu_count() or 1)
     attrs = {
         "scorer": scorer,
-        "workers": Workers(int(env.get("LAYA_WORKERS") or default_workers),
-                           float(env.get("LAYA_QUEUE_MS", "1000"))),
+        "workers": Workers(workers, float(env.get("LAYA_QUEUE_MS", "1000"))),
         "model_name": env.get("LAYA_MODEL_NAME", "laya"),
         "api_key": env.get("LAYA_API_KEY") or None,
         "max_body": int(env.get("LAYA_MAX_BODY_BYTES", "262144")),
@@ -664,23 +807,47 @@ def make_server(env=os.environ, backend=None) -> Server:
         "timeout": float(env.get("LAYA_IDLE_TIMEOUT_S", "120")) or None,
     }
     handler = type("LayaHandler", (Handler,), attrs)
-    return Server((env.get("LAYA_HOST", "0.0.0.0"), int(env.get("LAYA_PORT", "8080"))), handler,
-                  backlog=int(env.get("LAYA_BACKLOG", "1024")),
-                  max_connections=int(env.get("LAYA_MAX_CONNECTIONS", "1024")))
+    srv = Server((env.get("LAYA_HOST", "0.0.0.0"), int(env.get("LAYA_PORT", "8080"))), handler,
+                 backlog=int(env.get("LAYA_BACKLOG", "1024")),
+                 max_connections=int(env.get("LAYA_MAX_CONNECTIONS", "1024")))
+    srv.cpus, srv.cpu_source, srv.ort_threads = cpus[0], cpus[1], threads if kind == "onnx" else None
+    return srv
+
+
+def startup_lines(srv: Server) -> list[str]:
+    """What main() writes to stderr before serving: the sizes in effect,
+    and a warning for each that works against the gateway."""
+    host, port = srv.server_address[:2]
+    h = srv.RequestHandlerClass
+    providers = getattr(h.scorer.b, "providers", None)
+    t = srv.ort_threads
+
+    def count(n, what):
+        return f"{n} {what}" + ("" if n == 1 else "s")
+
+    threads = "" if t is None else ", " + (count(t, "onnxruntime thread") if t else "onnxruntime's own threads")
+    pool = count(h.workers.n, "worker") + threads
+    out = [f"laya-server on {host}:{port}{PATH}: {pool} on {count(srv.cpus, 'CPU')} ({srv.cpu_source}), "
+           f"queue wait {h.workers.wait_ms:g} ms, backlog {srv.request_queue_size}, "
+           f"at most {srv.max_connections} connections"
+           + (f", providers {','.join(providers)}" if providers else "")]
+    if t == 0:
+        out.append("laya-server: LAYA_ORT_THREADS=0 lets onnxruntime size its pool from the host's "
+                   f"cores, not the {srv.cpus} CPUs this process may use")
+    elif t is not None and h.workers.n * t > srv.cpus:
+        out.append(f"laya-server: LAYA_WORKERS x LAYA_ORT_THREADS = {h.workers.n * t}, over the "
+                   f"{srv.cpus} CPUs this process may use: requests in flight slow each other down")
+    cap = somaxconn()
+    if cap is not None and cap < srv.request_queue_size:
+        out.append(f"laya-server: the kernel caps the listen backlog at {cap} "
+                   f"(net.core.somaxconn), under LAYA_BACKLOG={srv.request_queue_size}")
+    return out
 
 
 def main() -> None:
     srv = make_server()
-    host, port = srv.server_address[:2]
-    h = srv.RequestHandlerClass
-    providers = getattr(h.scorer.b, "providers", None)
-    sys.stderr.write(f"laya-server on {host}:{port}{PATH}: {h.workers.n} workers, "
-                     f"backlog {srv.request_queue_size}, at most {srv.max_connections} connections"
-                     + (f", providers {','.join(providers)}" if providers else "") + "\n")
-    cap = somaxconn()
-    if cap is not None and cap < srv.request_queue_size:
-        sys.stderr.write(f"laya-server: the kernel caps the listen backlog at {cap} "
-                         f"(net.core.somaxconn), under LAYA_BACKLOG={srv.request_queue_size}\n")
+    for line in startup_lines(srv):
+        sys.stderr.write(line + "\n")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

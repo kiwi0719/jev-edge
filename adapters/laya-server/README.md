@@ -30,12 +30,14 @@ docker run --rm -p 8080:8080 -v /path/to/finetuned:/model:ro \
 | `LAYA_API_KEY` | unset | when set, `Authorization: Bearer <key>` is required |
 | `LAYA_ACCESS_LOG` | `1` | `0` drops the per-request line on stderr |
 | `LAYA_ORT_PROVIDERS` | `CPUExecutionProvider` | onnx: execution providers, comma-separated, in order of preference, e.g. `CUDAExecutionProvider,CPUExecutionProvider` with `onnxruntime-gpu` installed. A provider missing from the installed build stops the server at start |
-| `LAYA_ORT_THREADS` | `0` | onnx: intra-op threads per session; `0` leaves onnxruntime's default |
-| `LAYA_WORKERS` | CPU count | requests scored at once. `python` defaults to `1`, because your scorer may not be thread-safe |
+| `LAYA_ORT_THREADS` | CPUs / `LAYA_WORKERS` | onnx: threads in the model's intra-op pool, shared by the requests being scored. With neither this nor `LAYA_WORKERS` set, half the CPUs, at most 4. `0` leaves the choice to onnxruntime, which counts the host's cores |
+| `LAYA_WORKERS` | CPUs / `LAYA_ORT_THREADS` | requests scored at once. `mock` defaults to the CPUs, `python` to `1`, because your scorer may not be thread-safe |
 | `LAYA_QUEUE_MS` | `1000` | how long a request waits for a free worker before `503 overloaded` |
 | `LAYA_BACKLOG` | `1024` | listen backlog: at least the sum of `jev.max_inflight` over the gateways that call this server. The kernel caps it (`net.core.somaxconn` on Linux, logged at start when lower) |
 | `LAYA_MAX_CONNECTIONS` | `1024` | open connections; the next one is answered `503 overloaded` and closed |
 | `LAYA_IDLE_TIMEOUT_S` | `120` | a connection silent this long is closed, `0` never. Keep it above the gateway's keepalive idle time (60 s) |
+
+CPUs are the CPUs the server may use: the ones it may run on, capped by the container's CPU quota (cgroup `cpu.max`, or `cpu.cfs_quota_us` on cgroup v1), not the host's count. By default `LAYA_WORKERS` x `LAYA_ORT_THREADS` stays within them. Past them, the requests in flight take turns on the CPUs and all slow down together. The server logs the sizes it chose at start, and warns when the ones you set go past the CPUs.
 
 ## What the server guarantees
 

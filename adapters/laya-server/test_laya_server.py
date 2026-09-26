@@ -389,7 +389,7 @@ class Load(unittest.TestCase):
     def test_workers_default(self):
         py = L.PythonBackend.__new__(L.PythonBackend)
         py.spans, py.count, py.logit, py.pair_overhead = L.MockBackend().spans, len, lambda f, s: 0.0, 0
-        for env, backend, want in (({}, None, os.cpu_count() or 1),
+        for env, backend, want in (({}, None, L.cpu_budget()[0]),
                                    ({}, py, 1),                      # may not be thread-safe
                                    ({"LAYA_WORKERS": "3"}, py, 3)):
             srv, _ = serve(env, backend=backend)
@@ -442,6 +442,102 @@ class ClientGone(unittest.TestCase):
         self.assertRegex(log, r"client gone mid-request: hung up after \d+ of \d+ body bytes")
 
 
+class Cpus(unittest.TestCase):
+    """Pool sizes come from the CPUs this process may use, not the host's
+    count: a container limited to 2 CPUs on a 64-core host got 64 workers,
+    each with onnxruntime's pool of one thread per host core."""
+
+    def tree(self, files: dict) -> str:
+        d = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, d)
+        for path, text in files.items():
+            os.makedirs(os.path.dirname(os.path.join(d, path)), exist_ok=True)
+            with open(os.path.join(d, path), "w") as f:
+                f.write(text)
+        return d
+
+    def quota(self, files):
+        d = self.tree(files)
+        return L.cgroup_cpus(os.path.join(d, "sys"), os.path.join(d, "proc"))
+
+    def test_cgroup_v2_container(self):
+        self.assertEqual(self.quota({"proc": "0::/\n", "sys/cpu.max": "150000 100000\n"}), 1.5)
+        self.assertIsNone(self.quota({"proc": "0::/\n", "sys/cpu.max": "max 100000\n"}))
+
+    def test_cgroup_v2_nested_takes_the_lowest(self):
+        self.assertEqual(self.quota({"proc": "0::/a/b\n", "sys/a/b/cpu.max": "max 100000\n",
+                                     "sys/a/cpu.max": "200000 100000\n", "sys/cpu.max": "800000 100000\n"}), 2.0)
+
+    def test_cgroup_v1_container_sees_its_group_at_the_mount(self):
+        # without a cgroup namespace the path names the host's group
+        self.assertEqual(self.quota({"proc": "12:memory:/docker/x\n4:cpu,cpuacct:/docker/x\n",
+                                     "sys/cpu,cpuacct/cpu.cfs_quota_us": "300000\n",
+                                     "sys/cpu,cpuacct/cpu.cfs_period_us": "100000\n"}), 3.0)
+        self.assertIsNone(self.quota({"proc": "4:cpu,cpuacct:/\n",
+                                      "sys/cpu,cpuacct/cpu.cfs_quota_us": "-1\n",
+                                      "sys/cpu,cpuacct/cpu.cfs_period_us": "100000\n"}))
+
+    def test_no_cgroups(self):
+        self.assertIsNone(L.cgroup_cpus("/nonexistent", "/nonexistent/cgroup"))
+
+    def test_budget_is_affinity_capped_by_the_quota_rounded_down(self):
+        d = self.tree({"proc": "0::/\n", "sys/cpu.max": "250000 100000\n"})
+        args = (os.path.join(d, "sys"), os.path.join(d, "proc"))
+        with mock.patch.object(os, "sched_getaffinity", create=True, return_value=set(range(8))):
+            self.assertEqual(L.cpu_budget(*args), (2, "cgroup CPU quota 2.5, of 8 CPUs this process may run on"))
+        with mock.patch.object(os, "sched_getaffinity", create=True, return_value={0, 1}):
+            self.assertEqual(L.cpu_budget(*args), (2, "CPUs this process may run on"))
+        d = self.tree({"proc": "0::/\n", "sys/cpu.max": "50000 100000\n"})
+        with mock.patch.object(os, "sched_getaffinity", create=True, return_value=set(range(8))):
+            self.assertEqual(L.cpu_budget(os.path.join(d, "sys"), os.path.join(d, "proc"))[0], 1)
+
+    def test_pool_sizes(self):
+        for kind, env, cpus, want in (
+                ("onnx", {}, 1, (1, 1)), ("onnx", {}, 2, (2, 1)), ("onnx", {}, 4, (2, 2)),
+                ("onnx", {}, 8, (2, 4)), ("onnx", {}, 10, (2, 4)), ("onnx", {}, 64, (16, 4)),
+                ("onnx", {"LAYA_WORKERS": "4"}, 8, (4, 2)),
+                ("onnx", {"LAYA_WORKERS": "16"}, 8, (16, 1)),     # oversubscribed: warned at start
+                ("onnx", {"LAYA_ORT_THREADS": "1"}, 8, (8, 1)),
+                ("onnx", {"LAYA_ORT_THREADS": "0"}, 8, (1, 0)),   # onnxruntime's choice: the host's cores
+                ("onnx", {"LAYA_WORKERS": "3", "LAYA_ORT_THREADS": "5"}, 8, (3, 5)),
+                ("mock", {}, 6, (6, 0)), ("python", {}, 6, (1, 0)), ("python", {"LAYA_WORKERS": "2"}, 6, (2, 0))):
+            self.assertEqual(L.pool_sizes(kind, env, cpus), want, (kind, env, cpus))
+            w, t = want
+            if kind == "onnx" and not env:
+                self.assertLessEqual(w * t, cpus)
+        with self.assertRaises(ValueError):
+            L.pool_sizes("onnx", {"LAYA_ORT_THREADS": "-1"}, 4)
+
+    def onnx_server(self, env, cpus=8):
+        got = {}
+
+        def fake_load(e, threads=None):
+            got["threads"] = threads
+            return L.MockBackend()
+
+        e = {"LAYA_HOST": "127.0.0.1", "LAYA_PORT": "0", "LAYA_BACKEND": "onnx", **env}
+        with mock.patch.object(L, "load_backend", fake_load):
+            srv = L.make_server(e, cpus=(cpus, "test CPUs"))
+        self.addCleanup(srv.server_close)
+        return srv, got["threads"]
+
+    def test_server_sizes_onnx_from_the_cpus(self):
+        srv, threads = self.onnx_server({})
+        self.assertEqual((srv.RequestHandlerClass.workers.n, threads), (2, 4))
+        lines = L.startup_lines(srv)
+        self.assertRegex(lines[0], r": 2 workers, 4 onnxruntime threads on 8 CPUs \(test CPUs\), queue wait 1000 ms")
+        self.assertFalse(any("slow each other down" in x or "LAYA_ORT_THREADS=0" in x for x in lines), lines)
+
+    def test_startup_warns_when_the_pool_outgrows_the_cpus(self):
+        srv, _ = self.onnx_server({"LAYA_WORKERS": "8", "LAYA_ORT_THREADS": "2"})
+        self.assertTrue(any("LAYA_WORKERS x LAYA_ORT_THREADS = 16, over the 8 CPUs" in x
+                            for x in L.startup_lines(srv)))
+        srv, threads = self.onnx_server({"LAYA_ORT_THREADS": "0"})
+        self.assertEqual(threads, 0)
+        self.assertTrue(any("LAYA_ORT_THREADS=0 lets onnxruntime size its pool from the host's cores" in x
+                            for x in L.startup_lines(srv)))
+
+
 class OrtOptions(unittest.TestCase):
     def test_providers(self):
         have = ["CUDAExecutionProvider", "CPUExecutionProvider"]
@@ -458,6 +554,13 @@ class OrtOptions(unittest.TestCase):
             L.load_backend({"LAYA_BACKEND": "onnx", "LAYA_ORT_PROVIDERS": "CUDAExecutionProvider",
                             "LAYA_ORT_THREADS": "2"})
         onnx.assert_called_once_with("/model", 1, providers="CUDAExecutionProvider", threads=2)
+
+    def test_threads_default_to_the_cpu_budget(self):
+        # fit_temperature.py loads the backend without a server
+        with mock.patch.object(L, "OnnxBackend") as onnx, \
+             mock.patch.object(L, "cpu_budget", return_value=(8, "test")):
+            L.load_backend({"LAYA_BACKEND": "onnx"})
+        onnx.assert_called_once_with("/model", 1, providers=None, threads=4)
 
 
 if __name__ == "__main__":

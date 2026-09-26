@@ -793,3 +793,47 @@ location = /burst {
  '(?s)(?=.*# TYPE jev_async_total counter\n)(?=.*\njev_async_total\{result="ok"\} 1\n)(?!.*jev_async_total\{result="(?!ok))']
 --- no_error_log
 L3 judge failed
+
+
+
+=== TEST 38: /_jev/metrics has each family in one block, and every L2 bucket in ascending le
+--- http_config eval: $::HttpConfig
+--- user_files eval: ::conf('jev = { provider = "mock", mock_header = "x-jev-mock-score", mock_score = 0.2, mock_delay_ms = 110, timeout_ms = 400 }, async = { enabled = false },')
+--- config eval
+qq{
+location /v1/chat/completions { $::Access $::Echo }
+location = /_jev/metrics { content_by_lua_block { require("resty.jev.edge").metrics() } }
+location = /check {
+    content_by_lua_block {
+        -- every sample right under its own family's TYPE line, each TYPE
+        -- once; then the histogram's lines as scraped
+        local body = ngx.location.capture("/_jev/metrics").body
+        local seen, cur, hist = {}, nil, {}
+        for line in body:gmatch("[^\\n]+") do
+            local fam = line:match("^# TYPE (%S+) ")
+            if fam then
+                if seen[fam] then ngx.say("TYPE twice: ", fam) end
+                seen[fam], cur = true, fam
+            else
+                local name = line:match("^([%w_]+)")
+                local base = name:gsub("_bucket\$", ""):gsub("_sum\$", ""):gsub("_count\$", "")
+                if base ~= cur then ngx.say("outside its block: ", line) end
+                if base == "jev_l2_latency_ms" then hist[#hist + 1] = line:gsub(" [0-9]+\$", "") end
+            end
+        end
+        ngx.say(table.concat(hist, "\\n"))
+    }
+}
+}
+--- request eval
+["POST /v1/chat/completions\n{\"messages\":[{\"role\":\"user\",\"content\":\"Please summarise the attached quarterly report for me.\"}]}",
+ "POST /v1/chat/completions\n{\"messages\":[{\"role\":\"user\",\"content\":\"Please translate the following paragraph into formal French.\"}]}",
+ "POST /v1/chat/completions\n{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}",
+ "GET /check"]
+--- more_headers
+Content-Type: application/json
+--- response_body_like eval
+["source=l2", "source=l2", "source=l1",
+ '^jev_l2_latency_ms_bucket\{le="25"\}\njev_l2_latency_ms_bucket\{le="50"\}\njev_l2_latency_ms_bucket\{le="100"\}\njev_l2_latency_ms_bucket\{le="200"\}\njev_l2_latency_ms_bucket\{le="300"\}\njev_l2_latency_ms_bucket\{le="500"\}\njev_l2_latency_ms_bucket\{le="1000"\}\njev_l2_latency_ms_bucket\{le="\+Inf"\}\njev_l2_latency_ms_sum\njev_l2_latency_ms_count\n$']
+--- no_error_log
+[error]

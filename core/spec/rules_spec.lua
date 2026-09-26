@@ -268,6 +268,29 @@ describe("rules.path_matches", function()
     assert.is_nil(R.path_matches("/v1/\195\137", { "^/v1/\195\169" }))   -- É is not é
   end)
 
+  it("matches Gemini's camelCase routes with and without folding", function()
+    for _, p in ipairs({ "/v1beta/models/gemini-2.0-flash:generateContent", "/models/gpt-4o:streamGenerateContent",
+                         "/v1/projects/p/locations/l/publishers/google/models/g:generateContent" }) do
+      assert.is_not_nil(R.path_matches(p, W), p)
+      assert.is_not_nil(R.path_matches(p, W, true), p)
+    end
+    assert.is_nil(R.path_matches("/v1beta/models/g:countTokens", W, true))
+  end)
+
+  it("anchors Cohere's /v2/chat", function()
+    assert.is_not_nil(R.path_matches("/v2/chat", W))
+    assert.is_not_nil(R.path_matches("/v2/chat/", W))
+    assert.is_nil(R.path_matches("/v2/chatbots", W))
+    assert.is_nil(R.path_matches("/v2/chat/history", W))
+  end)
+
+  it("matches any byte with '.', line terminators included", function()
+    for _, p in ipairs({ "/models/a\nb:generateContent", "/models/a\rb:generateContent",
+                         "/models/a\226\128\168b:generateContent", "/models/a\226\128\169b:generateContent" }) do
+      assert.is_not_nil(R.path_matches(p, W), p)
+    end
+  end)
+
   it("is what rule_for uses", function()
     local req = H.chat_req("summarise this long document please", { path = "/V1;x=y/Chat/Completions" })
     assert.equals("llm-endpoints", R.rule_for(req, { rule }).id)

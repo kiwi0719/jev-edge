@@ -27,9 +27,10 @@ return {
     -- Gemini generateContent and streamGenerateContent: the Gemini API
     -- (/v1beta/models/<m>:..., /v1/..., tunedModels, Vertex AI's
     -- /v1/projects/.../models/<m>:...), and LiteLLM, which serves them for
-    -- every model, also as /models/<m>:... (<m> may hold a slash). Gemini's
-    -- OpenAI-compatible route.
-    "^/v1%w*/.+:%a*generatecontent/?$", "^/models/.+:%a*generatecontent/?$",
+    -- every model, also as /models/<m>:... (<m> may hold a slash). Written
+    -- in the real camelCase so that a rule with paths_case_sensitive = true
+    -- watches them too. Gemini's OpenAI-compatible route.
+    "^/v1%w*/.+:%a*[Gg]enerate[Cc]ontent/?$", "^/models/.+:%a*[Gg]enerate[Cc]ontent/?$",
     "^/v1beta/openai/chat/completions",
     -- Inference servers' native routes, beside their /v1 ones: SGLang
     -- /generate; TGI / (POST), /generate, /generate_stream, /vertex and
@@ -44,7 +45,7 @@ return {
     "^/openai/chat/completions", "^/openai/completions", "^/openai/responses", "^/openai/messages",
     -- LM Studio's REST API; Cohere /v2/chat and /v1/generate (/v1/chat is above).
     "^/api/v0/chat/completions", "^/api/v0/completions", "^/api/v1/chat/?$",
-    "^/v2/chat", "^/v1/generate/?$",
+    "^/v2/chat/?$", "^/v1/generate/?$",
   },
   methods = { POST = true, PUT = true, PATCH = true },
   -- Media types that are never a prompt. Any other Content-Type (or none) is

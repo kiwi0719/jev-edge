@@ -152,7 +152,9 @@ const LUA_CLASSES: Record<string, string> = {
  * those classes and ranges inside). Anything else in a watch path is
  * unsupported on this adapter and throws at load time rather than silently
  * matching differently. `-` is Lua's lazy `*?` outside a set and a plain
- * range/literal inside one.
+ * range/literal inside one. `.` is any character, as any byte in Lua: JS's
+ * `.` stops at a line terminator (\n, \r, U+2028, U+2029), which a
+ * percent-decoded path can hold.
  */
 const luaPatternCache = new Map<string, RegExp>();
 export function luaPatternToRegExp(p: string): RegExp {
@@ -199,8 +201,11 @@ export function luaPatternToRegExp(p: string): RegExp {
     } else if ("\\{}|".includes(c)) {
       out += "\\" + c; // literal in Lua, special in JS
       i++;
+    } else if (c === ".") {
+      out += "[\\s\\S]";
+      i++;
     } else {
-      out += c; // ^ $ . * + ? ( ) mean the same in both for this subset
+      out += c; // ^ $ * + ? ( ) mean the same in both for this subset
       i++;
     }
   }

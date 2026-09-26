@@ -15,7 +15,7 @@ export const llmEndpoints: Rule = {
     "^/openai/deployments/[^/]+/chat/completions", "^/openai/deployments/[^/]+/completions",
     "^/openai/v1/chat", "^/openai/v1/completions", "^/openai/v1/responses",
     // Gemini generateContent and streamGenerateContent (the Gemini API, Vertex AI, LiteLLM), Gemini's OpenAI route
-    "^/v1%w*/.+:%a*generatecontent/?$", "^/models/.+:%a*generatecontent/?$",
+    "^/v1%w*/.+:%a*[Gg]enerate[Cc]ontent/?$", "^/models/.+:%a*[Gg]enerate[Cc]ontent/?$",
     "^/v1beta/openai/chat/completions",
     // inference servers' native routes: SGLang, TGI (root POST included), vLLM and SageMaker-style /invocations
     "^/$", "^/generate/?$", "^/generate_stream/?$", "^/vertex/?$", "^/invocations/?$",
@@ -26,7 +26,7 @@ export const llmEndpoints: Rule = {
     "^/openai/chat/completions", "^/openai/completions", "^/openai/responses", "^/openai/messages",
     // LM Studio REST API; Cohere v2 chat and v1 generate
     "^/api/v0/chat/completions", "^/api/v0/completions", "^/api/v1/chat/?$",
-    "^/v2/chat", "^/v1/generate/?$",
+    "^/v2/chat/?$", "^/v1/generate/?$",
   ],
   methods: { POST: true, PUT: true, PATCH: true },
   skip_content_types: ["image/", "audio/", "video/", "font/", "application/pdf", "application/zip", "application/gzip"],

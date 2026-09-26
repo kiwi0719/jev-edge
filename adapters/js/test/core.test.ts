@@ -33,6 +33,20 @@ describe("luaPatternToRegExp", () => {
     expect(() => luaPatternToRegExp("^/%g")).toThrow(/unsupported/);
   });
 
+  it("reads '.' as any character, line terminators included, as Lua reads it as any byte", () => {
+    // Lua: ("/a\nb"):find("^/a.b$") and the same for \r, U+2028 and U+2029
+    for (const t of ["\n", "\r", "\u2028", "\u2029", "x"]) {
+      expect(luaPatternToRegExp("^/a.b$").test(`/a${t}b`), JSON.stringify(t)).toBe(true);
+      expect(luaPatternToRegExp("^/a.-b$").test(`/a${t}${t}b`), JSON.stringify(t)).toBe(true);
+    }
+    expect(luaPatternToRegExp("^/a[.]b$").test("/a\nb")).toBe(false);
+    expect(luaPatternToRegExp("^/a%.b$").test("/a\nb")).toBe(false);
+    const W = load("llm-endpoints").watch_paths;
+    for (const t of ["\n", "\r", "\u2028", "\u2029"]) {
+      expect(pathMatches(`/models/a${t}b:generateContent`, W), JSON.stringify(t)).not.toBeNull();
+    }
+  });
+
   it("patternError mirrors core/rules.lua", () => {
     expect(patternError("^/v1/chat")).toBeNull();
     expect(patternError("^/v1/[a-z]+")).toBeNull();
@@ -85,6 +99,22 @@ describe("pathMatches (twin of core/spec/rules_spec.lua)", () => {
   it("folds ASCII only, like the Lua core", () => {
     expect(pathMatches("/v1/É", ["^/v1/é"])).toBeNull();
     expect(canonicalPath("/V1/É;x")).toBe("/v1/É");
+  });
+
+  it("matches Gemini's camelCase routes with and without folding", () => {
+    for (const p of ["/v1beta/models/gemini-2.0-flash:generateContent", "/models/gpt-4o:streamGenerateContent",
+      "/v1/projects/p/locations/l/publishers/google/models/g:generateContent"]) {
+      expect(pathMatches(p, W), p).not.toBeNull();
+      expect(pathMatches(p, W, true), p).not.toBeNull();
+    }
+    expect(pathMatches("/v1beta/models/g:countTokens", W, true)).toBeNull();
+  });
+
+  it("anchors Cohere's /v2/chat", () => {
+    expect(pathMatches("/v2/chat", W)).not.toBeNull();
+    expect(pathMatches("/v2/chat/", W)).not.toBeNull();
+    expect(pathMatches("/v2/chatbots", W)).toBeNull();
+    expect(pathMatches("/v2/chat/history", W)).toBeNull();
   });
 });
 

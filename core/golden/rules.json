@@ -2103,6 +2103,52 @@
         "cache": {},
         "clock": 1000,
         "req": {
+          "body": "{\"messages\":[{\"role\":\"user\",\"content\":\"Please write a detailed summary of the attached quarterly report.\"}]}",
+          "body_size": 108,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/v2/chat/"
+        },
+        "rule": "llm-endpoints"
+      },
+      "name": "route: Cohere /v2/chat/"
+    },
+    {
+      "expect": {
+        "reason": "path not watched",
+        "result": "pass",
+        "text": ""
+      },
+      "input": {
+        "cache": {},
+        "clock": 1000,
+        "req": {
+          "body": "{\"messages\":[{\"role\":\"user\",\"content\":\"Please write a detailed summary of the attached quarterly report.\"}]}",
+          "body_size": 108,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/v2/chatbots"
+        },
+        "rule": "llm-endpoints"
+      },
+      "name": "route: /v2/chat is anchored at both ends"
+    },
+    {
+      "expect": {
+        "reason": "natural language",
+        "result": "suspect",
+        "text": "Please write a detailed summary of the attached quarterly report."
+      },
+      "input": {
+        "cache": {},
+        "clock": 1000,
+        "req": {
           "body": "{\"model\":\"command\",\"prompt\":\"Please write a detailed summary of the attached quarterly report.\"}",
           "body_size": 96,
           "client_ip": "203.0.113.7",
@@ -2115,6 +2161,75 @@
         "rule": "llm-endpoints"
       },
       "name": "route: Cohere /v1/generate"
+    },
+    {
+      "expect": {
+        "reason": "natural language",
+        "result": "suspect",
+        "text": "Please write a detailed summary of the attached quarterly report."
+      },
+      "input": {
+        "cache": {},
+        "clock": 1000,
+        "req": {
+          "body": "{\"contents\":[{\"role\":\"user\",\"parts\":[{\"text\":\"Please write a detailed summary of the attached quarterly report.\"}]}]}",
+          "body_size": 117,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/v1beta/models/gem\nini:generateContent"
+        },
+        "rule": "llm-endpoints"
+      },
+      "name": "route: a newline in the model name"
+    },
+    {
+      "expect": {
+        "reason": "natural language",
+        "result": "suspect",
+        "text": "Please write a detailed summary of the attached quarterly report."
+      },
+      "input": {
+        "cache": {},
+        "clock": 1000,
+        "req": {
+          "body": "{\"contents\":[{\"role\":\"user\",\"parts\":[{\"text\":\"Please write a detailed summary of the attached quarterly report.\"}]}]}",
+          "body_size": 117,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/models/gpt\r4o:streamGenerateContent"
+        },
+        "rule": "llm-endpoints"
+      },
+      "name": "route: a carriage return in the model name"
+    },
+    {
+      "expect": {
+        "reason": "natural language",
+        "result": "suspect",
+        "text": "Please write a detailed summary of the attached quarterly report."
+      },
+      "input": {
+        "cache": {},
+        "clock": 1000,
+        "req": {
+          "body": "{\"contents\":[{\"role\":\"user\",\"parts\":[{\"text\":\"Please write a detailed summary of the attached quarterly report.\"}]}]}",
+          "body_size": 117,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/v1beta/models/gem ini:generateContent"
+        },
+        "rule": "llm-endpoints"
+      },
+      "name": "route: U+2028 in the model name"
     },
     {
       "expect": {

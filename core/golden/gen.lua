@@ -459,7 +459,13 @@ rules_case("field: Cohere v1 preamble, chat history and message, oldest first", 
 rules_case("field: Cohere v1 preamble",
   raw("/v1/chat", '{"model":"command-r-plus","preamble":' .. SYS .. ',"message":' .. HI .. '}'))
 rules_case("route: Cohere /v2/chat", req(LONG, { path = "/v2/chat" }))
+rules_case("route: Cohere /v2/chat/", req(LONG, { path = "/v2/chat/" }))
+rules_case("route: /v2/chat is anchored at both ends", req(LONG, { path = "/v2/chatbots" }))
 rules_case("route: Cohere /v1/generate", raw("/v1/generate", '{"model":"command","prompt":' .. ASK .. '}'))
+-- watch paths match every character, line terminators included, on both cores
+rules_case("route: a newline in the model name", raw("/v1beta/models/gem\nini:generateContent", GEM))
+rules_case("route: a carriage return in the model name", raw("/models/gpt\r4o:streamGenerateContent", GEM))
+rules_case("route: U+2028 in the model name", raw("/v1beta/models/gem\226\128\168ini:generateContent", GEM))
 
 -- a media Content-Type is the client's word, not the body's: Ollama and
 -- llama.cpp parse JSON whatever the header says. The body is still read, and
@@ -936,6 +942,13 @@ eval_case("paths_case_sensitive: the path is matched as sent",
 eval_case("paths_case_sensitive: path parameters are still dropped",
   { req = req(ATTACK, { path = "/v1;a=b/chat/completions" }), rules = { STRICT },
     judge = { answers = { injection = 0.9 } } })
+eval_case("paths_case_sensitive: Gemini's camelCase route is watched", {
+  req = raw("/v1beta/models/gemini-2.0-flash:streamGenerateContent",
+    '{"contents":[{"parts":[{"text":' .. escape(ATTACK) .. '}]}]}'), rules = { STRICT },
+  judge = { answers = { injection = 0.9 } } })
+eval_case("paths_case_sensitive: LiteLLM's Gemini route is watched", {
+  req = raw("/models/gpt-4o:generateContent", '{"contents":[{"parts":[{"text":' .. escape(ATTACK) .. '}]}]}'),
+  rules = { STRICT }, judge = { answers = { injection = 0.9 } } })
 eval_case("a tenant pattern with capitals and a set is folded like the path", {
   req = req(LONG, { path = "/tenants/acme/Chat" }),
   rules = { { id = "tenant", extends = "llm-endpoints", watch_paths = { "^/Tenants/[A-Z]+/chat" },

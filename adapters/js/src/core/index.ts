@@ -78,6 +78,15 @@ async function finish(ctx: Ctx, v: verdict.Verdict, rep?: Rep): Promise<verdict.
   return v;
 }
 
+// Port of unjudgeable_blocks in core/init.lua: an unjudgeable request is
+// blocked only in enforce mode, when policy.unjudgeable = "block", or for a
+// prompt sent as token ids when its rule says token_prompts = "block".
+function unjudgeableBlocks(cfg: Config, rule: Rule | undefined, tokens: boolean | undefined): boolean {
+  if (cfg.policy.mode !== "enforce") return false;
+  if (cfg.policy.unjudgeable === "block") return true;
+  return tokens === true && rule?.token_prompts === "block";
+}
+
 // Port of settle in core/init.lua: tell the breaker how a request it admitted
 // went. Only calls that reached the provider and found it failing count
 // against it (judge.counts); a request that says nothing about its health
@@ -229,7 +238,7 @@ export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
   const cfg = ctx.config;
 
   // L1 --------------------------------------------------------------------
-  const [r, text, reason, rule, windowed, chunks, capped, untrusted, tools, retrieved] = await rulesMod.evaluateAll(req, ctx.rules, ctx);
+  const [r, text, reason, rule, windowed, chunks, capped, untrusted, tools, retrieved, tokens] = await rulesMod.evaluateAll(req, ctx.rules, ctx);
 
   if (r === rulesMod.PASS) {
     return verdict.newVerdict({ verdict: verdict.SKIPPED, source: verdict.SRC_L1, reason });
@@ -237,7 +246,7 @@ export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
   if (r === rulesMod.UNJUDGEABLE) {
     // A watched request nobody read: `skipped`, blocked only when the operator
     // chose that and the gateway enforces.
-    const block = cfg.policy.mode === "enforce" && cfg.policy.unjudgeable === "block";
+    const block = unjudgeableBlocks(cfg, rule, tokens);
     return finish(ctx, verdict.newVerdict({
       action: block ? verdict.ACTION_BLOCK : verdict.ACTION_PASS,
       verdict: verdict.SKIPPED, source: verdict.SRC_L1, reason,
@@ -246,6 +255,17 @@ export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
   if (r === rulesMod.BLOCK) {
     const action = cfg.policy.mode === "enforce" ? verdict.ACTION_BLOCK : verdict.ACTION_PASS;
     return finish(ctx, verdict.newVerdict({ action, verdict: verdict.MALICIOUS, score: 1, source: verdict.SRC_L1, reason }));
+  }
+
+  // Token ids beside the text L1 hands on: the text is judged, the ids never
+  // can be, and the stricter of the two decides. When the ids alone block the
+  // request, it is blocked here, before anything that speaks for the text
+  // only (a trusted fingerprint, a cached score, the breaker) and without a
+  // judge call; otherwise the text is judged as always.
+  if (tokens && unjudgeableBlocks(cfg, rule, true)) {
+    return finish(ctx, verdict.newVerdict({
+      action: verdict.ACTION_BLOCK, verdict: verdict.SKIPPED, source: verdict.SRC_L1, reason: rulesMod.TOKENS,
+    }));
   }
 
   let whole = text;

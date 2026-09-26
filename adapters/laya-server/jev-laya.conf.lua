@@ -22,17 +22,17 @@ return {
     -- of punctuation and rare letters, about one token per byte, needs ~6
     -- windows with the deployment-context wording: ~200 ms at the ~33 ms per
     -- window Laya is reported at on CPU, and 500 ms is 2.5x that, for one
-    -- at a time. A client can also send max_inflight of them at once. Measure
+    -- at a time, which is what max_inflight below lets through. Measure
     -- yours with
-    --   make conformance ENDPOINT=... BUDGET_MS=<timeout_ms>
+    --   make conformance ENDPOINT=... BUDGET_MS=<timeout_ms> CONCURRENCY=<max_inflight>
     -- It times a short text and that worst case, alone and max_inflight
-    -- (--concurrency) at once, passes a p99 of at most half of timeout_ms
+    -- (CONCURRENCY) at once, passes a p99 of at most half of timeout_ms
     -- (the gateway reads for 60% of it), and prints the timeout_ms to set:
     -- 2-3x the worst-case p99 at max_inflight, or the max_inflight the
     -- server holds in time. Size the floor from that line, never from the
     -- short-text p99, which can be 30x smaller. If the result is more than
-    -- one request may add to your latency, lower max_judge_bytes (below) or
-    -- max_inflight and measure again, add CPUs, or run the model on a GPU
+    -- one request may add to your latency, lower max_judge_bytes (below)
+    -- and measure again, add CPUs, or run the model on a GPU
     -- (LAYA_ORT_PROVIDERS), which runs the windows of a batch in parallel.
     -- Give laya-server the same floor (LAYA_GATEWAY_TIMEOUT_MS, default
     -- 500): a request waits for a worker only while it can still be
@@ -43,16 +43,37 @@ return {
     timeout_max_ms   = 800,
     timeout_headroom = 1.5,
     timeout_adaptive = true,
-    -- laya-server's listen backlog (LAYA_BACKLOG, default 1024) must be at
-    -- least the sum of max_inflight over every gateway that calls it. The
-    -- kernel drops connections past the backlog, each dropped connection is
-    -- an L2 timeout, and once half the calls in the breaker's window fail,
-    -- L2 is off for every tenant. conformance/run.py opens --concurrency
-    -- (64) connections at once to check it, and sends that many worst-case
-    -- texts at once: a server that cannot score them in time answers some
-    -- with 503, which also passes the request and counts toward the breaker.
-    -- Lower max_inflight to what the run says the server holds, or add CPUs.
-    max_inflight = 64,
+    -- L2 calls at once from this gateway (all its nginx workers together).
+    -- A request past it is not sent: it passes as an L2 error, "max_inflight
+    -- exceeded", which does not count toward the breaker. What laya-server
+    -- cannot answer in time does count: its 503 "overloaded" and a timeout
+    -- are L2 failures, and once half the calls in the breaker's window fail,
+    -- L2 is off for every tenant for breaker.open_s. So this cap has to shed
+    -- a burst before laya-server must: at most as many calls as the server
+    -- answers at once in time when every one of them is the worst case
+    -- above, since the client picks the text and how many it sends. With
+    -- laya-server's defaults that is one. From 2 CPUs on its pool has 2
+    -- workers or more (the start line says), so a short text is not stuck
+    -- behind a long one, but they share one pool of onnxruntime threads:
+    -- two worst-case texts at once each take about 1.5-2x as long as one,
+    -- from ~200 ms to past the 300 ms the gateway reads at this floor, and
+    -- a call the gateway gave up on keeps its worker busy, so the next one
+    -- gets a 503.
+    -- (Measured with a model at ~30 ms per window: 64 distinct worst-case
+    -- texts at once through this profile opened the breaker at
+    -- max_inflight = 64; at 2 some calls timed out or got a 503; at 1 every
+    -- call was answered in time, the rest passed as "max_inflight exceeded"
+    -- and the breaker stayed closed.)
+    -- One at a time costs throughput: a request that comes while another is
+    -- judged passes unjudged, and a short text takes a few ms. To raise it,
+    -- add capacity (CPUs, LAYA_WORKERS, a GPU) and run the conformance line
+    -- above with CONCURRENCY at the value you want: it passes when that many
+    -- worst-case texts at once are answered in time, and otherwise prints
+    -- how many are. The sum over every gateway that calls the same
+    -- laya-server counts, and laya-server's listen backlog (LAYA_BACKLOG,
+    -- default 1024) must be at least that sum: the kernel drops connections
+    -- past it, and each one dropped is an L2 timeout.
+    max_inflight = 1,
 
     -- Question wording for this provider only. The bundled wording was
     -- validated against jev (jev-sec-bench), not against Laya. Leave these out

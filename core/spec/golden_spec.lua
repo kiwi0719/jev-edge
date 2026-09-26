@@ -52,14 +52,14 @@ end)
 describe("golden: extract", function()
   for _, c in ipairs(load("extract").cases) do
     it(c.name, function()
-      local text, kind, _, decoded, cut = normalize.extract(c.input.body, c.input.content_type, c.input.fields,
-        H.body_decode)
+      local text, kind, _, decoded, cut, tokens = normalize.extract(c.input.body, c.input.content_type,
+        c.input.fields, H.body_decode)
       local tools
       if c.input.tool_fields then
         local ttext, _, capped = normalize.extract_tools(decoded, c.input.tool_fields, H.body_decode)
         tools = { text = ttext, capped = capped or nil }
       end
-      same(c.expect, { text = text, kind = kind, cut = cut or nil, tools = tools })
+      same(c.expect, { text = text, kind = kind, cut = cut or nil, tokens = tokens or nil, tools = tools })
     end)
   end
 end)
@@ -75,8 +75,8 @@ describe("golden: rules", function()
         cache = store_from(c.input.cache), clock = function() return c.input.clock end,
         json_decode = H.body_decode, re_find = H.re_find,
       }
-      local r, text, reason, _, _, _, _, tools = rules_mod.evaluate(c.input.req, rule, ctx)
-      same(c.expect, { result = r, text = text, reason = reason,
+      local r, text, reason, _, _, _, _, tools, _, tokens = rules_mod.evaluate(c.input.req, rule, ctx)
+      same(c.expect, { result = r, text = text, reason = reason, tokens = tokens or nil,
         tools = tools and { text = tools.text, windowed = tools.windowed, hit = tools.hit, only = tools.only } })
     end)
   end

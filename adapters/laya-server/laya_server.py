@@ -891,7 +891,8 @@ class Server(ThreadingHTTPServer):
     """ThreadingHTTPServer with a real listen backlog and a connection cap.
 
     socketserver listens with a backlog of 5. The gateway opens up to
-    jev.max_inflight connections at once (64 in the Laya profile); the kernel
+    jev.max_inflight connections at once (64 by default, 1 in the Laya
+    profile, summed over the gateways that call this server); the kernel
     drops a connection past the backlog, the gateway's connect budget (30% of
     its L2 timeout) runs out before the client retries the SYN, and the call
     is an L2 error that passes the request unjudged. About 20 of those open

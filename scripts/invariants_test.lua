@@ -147,6 +147,10 @@ local cases = {
   { "rules: json_only_paths emptied in the TS copy",
     { [TSRULES] = edit(tsr, 'json_only_paths: %["%^/%$"%]', "json_only_paths: []") },
     "rule-parity", "json_only_paths differ" },
+  -- rule-parity: token prompts refused on one runtime only
+  { "rules: token_prompts differs in the TS copy",
+    { [TSRULES] = edit(tsr, 'token_prompts: "unjudgeable"', 'token_prompts: "block"') },
+    "rule-parity", "token_prompts: Lua unjudgeable vs TS block" },
 }
 
 local bad = 0

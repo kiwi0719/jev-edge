@@ -21,7 +21,7 @@ meant to make.
 | file | suite | what it pins down |
 |---|---|---|
 | `normalize.json` | `normalize` | `normalize()` text canonicalisation and `fingerprint()` with the reference djb2 hash |
-| `extract.json` | `extract` | text extraction and the detected `kind` (`json`, `form`, `multipart`, `text`, `binary`, `none`): the body decides the format, the content type is a hint |
+| `extract.json` | `extract` | text extraction and the detected `kind` (`json`, `form`, `multipart`, `text`, `binary`, `none`): the body decides the format, the content type is a hint; `tokens` (present only when true) when a text field holds token ids, a number that is an item of a list |
 | `rules.json` | `rules` | every L1 decision of the shipped `llm-endpoints` rule set (`pass`, `block`, `suspect`, `unjudgeable`), including one positive per `always_suspect` pattern, head-and-tail scanning past `max_body_bytes` and the `max_judge_bytes` window |
 | `policy.json` | `policy` | score to action / label / async mapping, threshold edges, error and skipped events |
 | `verdict.json` | `verdict` | verdict defaults, clamping, header rendering, reason encoding |
@@ -51,8 +51,8 @@ An implementation replays a case by constructing its IO from `input` exactly as 
 **Covered by the vectors** (must match byte for byte):
 
 - normalisation, fingerprinting with the reference hash, text extraction
-- L1 decisions: path watch list, method and `skip_content_types` / `content_types` filters, body size bounds, reputation lookups, `Content-Encoding` without `decoded`, format detection, head-and-tail scanning past `max_body_bytes`, `unjudgeable` and its reasons, `always_suspect` patterns, natural-language length, the `max_judge_bytes` window and the ` (window)` reason suffix
-- policy: thresholds, mode, the async flag, error and skipped events; an `unjudgeable` L1 result is `skipped` with action `pass`, or `block` only when `policy.unjudgeable = "block"` and the mode is `enforce`; a `body_partial` request is `unjudgeable: partial body` when `policy.partial = "unjudgeable"`
+- L1 decisions: path watch list, method and `skip_content_types` / `content_types` filters, body size bounds, reputation lookups, `Content-Encoding` without `decoded`, format detection, head-and-tail scanning past `max_body_bytes`, `unjudgeable` and its reasons (`unjudgeable: token prompt` for token ids with nothing else to judge; `expect.tokens` when a text field holds them), `always_suspect` patterns, natural-language length, the `max_judge_bytes` window and the ` (window)` reason suffix
+- policy: thresholds, mode, the async flag, error and skipped events; an `unjudgeable` L1 result is `skipped` with action `pass`, or `block` only when `policy.unjudgeable = "block"` (for token ids, or the rule's `token_prompts = "block"`) and the mode is `enforce`; token ids beside judged text block the same way before trust, cache and breaker, with no judge call, and otherwise leave the text judged as always; a `body_partial` request is `unjudgeable: partial body` when `policy.partial = "unjudgeable"`
 - verdict structure, header names and values, reason encoding and truncation
 - the order in which the pipeline consults L1, cache, breaker and L2, and what it writes to the cache
 - what core reports to the breaker: a failure only for a judge error of kind `transport`, `timeout` or `unavailable` (or with no kind), a success for an answer, and a release for anything else (`rejected`, `unusable`, an answer with no scores, `max_inflight exceeded`, no call at all); the reason of a `rejected` or `unusable` error starts with its kind

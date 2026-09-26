@@ -258,6 +258,14 @@ describe("rules.resolve", () => {
     expect(resolve({ id: "any", extends: "llm-endpoints", json_only_paths: [] }).json_only_paths).toEqual([]);
   });
 
+  it("checks token_prompts and fills in unjudgeable", () => {
+    expect(resolve("llm-endpoints").token_prompts).toBe("unjudgeable");
+    expect(resolve({ id: "x", watch_paths: ["^/x"] }).token_prompts).toBe("unjudgeable");
+    expect(resolve({ id: "b", extends: "llm-endpoints", token_prompts: "block" }).token_prompts).toBe("block");
+    expect(() => resolve({ id: "t", extends: "llm-endpoints", token_prompts: "pass" as never })).toThrow("rule t: token_prompts must be unjudgeable|block");
+    expect(() => resolve({ id: "t", watch_paths: ["^/"], token_prompts: true as never })).toThrow(/token_prompts must be/);
+  });
+
   it("llm-endpoints reads every content type but media types", () => {
     const r = load("llm-endpoints");
     expect(r.content_types).toBeUndefined();
@@ -421,6 +429,38 @@ describe("in-flight cap and the breaker", () => {
       expect(v.reason).toBe(core.judge.BUSY);
     }
     expect(await breaker.state()).toBe(CLOSED);
+  });
+});
+
+// Twin of the token-ids case in core/spec/init_spec.lua: ids beside text are
+// blocked under token_prompts = "block" before anything that speaks for the
+// text only (a trusted fingerprint, the breaker) and without a judge call.
+describe("token ids beside text", () => {
+  it("neither a trusted fingerprint nor an open breaker lets them through", async () => {
+    const LONG = "Please write a detailed summary of the attached quarterly report.";
+    let calls = 0;
+    const cache = memoryStore();
+    const ctx = {
+      config: core.defaults.merge(core.defaults.config, { policy: { mode: "enforce" }, feedback: { enabled: true, token: "s3cret" } }),
+      rules: [load("llm-endpoints")], cache, clock: () => 1000, hash: djb2, json_decode: JSON.parse,
+      judge: { call: () => { calls++; return [{ injection: 0.1 }, null] as core.JudgeResult; } },
+    } as core.Ctx;
+    const chat = JSON.stringify({ messages: [{ role: "user", content: LONG }] });
+    const text = { method: "POST", path: "/v1/chat/completions", headers: { "content-type": "application/json" }, body: chat, body_size: chat.length, client_ip: "203.0.113.7" };
+    const fp = (await core.evaluate(text, ctx)).fingerprint;
+    expect(calls).toBe(1);
+    await cache.set("trust:" + fp, { trusted_until: 1000 + 3600, renewals: 0 }, 3600);
+    expect((await core.evaluate(text, ctx)).source).toBe(core.verdict.SRC_TRUST);
+    ctx.rules = [resolve({ id: "noids", extends: "llm-endpoints", token_prompts: "block" })];
+    const breaker = new Breaker(memoryStore(), () => 1000, {});
+    await breaker.trip();
+    ctx.breaker = breaker;
+    const body = `{"prompt":[40,1541,${JSON.stringify(LONG)},6766]}`;
+    const v = await core.evaluate({ method: "POST", path: "/completion", headers: { "content-type": "application/json" }, body, body_size: body.length, client_ip: "203.0.113.7" }, ctx);
+    expect([v.action, v.verdict, v.source, v.reason]).toEqual([core.verdict.ACTION_BLOCK, core.verdict.SKIPPED, core.verdict.SRC_L1, "unjudgeable: token prompt"]);
+    expect(calls).toBe(1);
+    // the same text without the ids is still the trusted one
+    expect((await core.evaluate(text, ctx)).source).toBe(core.verdict.SRC_TRUST);
   });
 });
 

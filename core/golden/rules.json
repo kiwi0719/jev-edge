@@ -1727,6 +1727,229 @@
     },
     {
       "expect": {
+        "reason": "unjudgeable: token prompt",
+        "result": "unjudgeable",
+        "text": "",
+        "tokens": true
+      },
+      "input": {
+        "cache": {},
+        "clock": 1000,
+        "req": {
+          "body": "{\"model\":\"m\",\"prompt\":[40,1541,6766,3435,11,1234,5678]}",
+          "body_size": 55,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/v1/completions"
+        },
+        "rule": "llm-endpoints"
+      },
+      "name": "token ids: /v1/completions prompt as ids is unjudgeable"
+    },
+    {
+      "expect": {
+        "reason": "unjudgeable: token prompt",
+        "result": "unjudgeable",
+        "text": "",
+        "tokens": true
+      },
+      "input": {
+        "cache": {},
+        "clock": 1000,
+        "req": {
+          "body": "{\"model\":\"m\",\"prompt\":[[40,1541,6766],[3435,11,1234]]}",
+          "body_size": 54,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/v1/completions"
+        },
+        "rule": "llm-endpoints"
+      },
+      "name": "token ids: a list of lists of ids is unjudgeable"
+    },
+    {
+      "expect": {
+        "reason": "unjudgeable: token prompt",
+        "result": "unjudgeable",
+        "text": "",
+        "tokens": true
+      },
+      "input": {
+        "cache": {},
+        "clock": 1000,
+        "req": {
+          "body": "{\"prompt\":[40,1541,\" ok then\",6766,3435],\"n_predict\":16}",
+          "body_size": 56,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/completion"
+        },
+        "rule": "llm-endpoints"
+      },
+      "name": "token ids: llama.cpp ids and a short string mixed are unjudgeable, not too short"
+    },
+    {
+      "expect": {
+        "reason": "natural language",
+        "result": "suspect",
+        "text": "Please write a detailed summary of the attached quarterly report.",
+        "tokens": true
+      },
+      "input": {
+        "cache": {},
+        "clock": 1000,
+        "req": {
+          "body": "{\"prompt\":[40,1541,\"Please write a detailed summary of the attached quarterly report.\",6766]}",
+          "body_size": 93,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/completion"
+        },
+        "rule": "llm-endpoints"
+      },
+      "name": "token ids: beside text long enough to judge, the text is judged and the ids flagged"
+    },
+    {
+      "expect": {
+        "reason": "unjudgeable: token prompt",
+        "result": "unjudgeable",
+        "text": "",
+        "tokens": true
+      },
+      "input": {
+        "cache": {},
+        "clock": 1000,
+        "req": {
+          "body": "{\"input_ids\":[40,1541,6766,3435]}",
+          "body_size": 33,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/generate"
+        },
+        "rule": "llm-endpoints"
+      },
+      "name": "token ids: SGLang input_ids on /generate"
+    },
+    {
+      "expect": {
+        "reason": "unjudgeable: token prompt",
+        "result": "unjudgeable",
+        "text": "",
+        "tokens": true
+      },
+      "input": {
+        "cache": {},
+        "clock": 1000,
+        "req": {
+          "body": "{\"input_ids\":[[40,1541],[6766,3435]]}",
+          "body_size": 37,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/generate"
+        },
+        "rule": "llm-endpoints"
+      },
+      "name": "token ids: SGLang input_ids as a batch"
+    },
+    {
+      "expect": {
+        "reason": "no text",
+        "result": "pass",
+        "text": ""
+      },
+      "input": {
+        "cache": {},
+        "clock": 1000,
+        "req": {
+          "body": "{\"model\":\"m\",\"prompt\":42}",
+          "body_size": 25,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/v1/completions"
+        },
+        "rule": "llm-endpoints"
+      },
+      "name": "token ids: a prompt that is one number is no text"
+    },
+    {
+      "expect": {
+        "reason": "natural language (window)",
+        "result": "suspect",
+        "text": "padding padding padding pa",
+        "tokens": true
+      },
+      "input": {
+        "cache": {},
+        "clock": 1000,
+        "req": {
+          "body": "{\"prompt\":[40,1541,6766,3435],\"text\":\"padding padding padding padding padding padding padding padding padding padding padding padding \"}",
+          "body_size": 136,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/v1/completions"
+        },
+        "rule": {
+          "extends": "llm-endpoints",
+          "id": "small",
+          "max_body_bytes": 64
+        }
+      },
+      "name": "token ids: past max_body_bytes the scan finds them"
+    },
+    {
+      "expect": {
+        "reason": "unjudgeable: token prompt",
+        "result": "unjudgeable",
+        "text": "",
+        "tokens": true
+      },
+      "input": {
+        "cache": {},
+        "clock": 1000,
+        "req": {
+          "body": "{\"prompt\":[40,1541,6766,3435],\"x\":\"padding padding padding padding padding padding padding padding padding padding padding padding \"}",
+          "body_size": 133,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/v1/completions"
+        },
+        "rule": {
+          "extends": "llm-endpoints",
+          "id": "small",
+          "max_body_bytes": 64
+        }
+      },
+      "name": "token ids: past max_body_bytes with nothing else to read"
+    },
+    {
+      "expect": {
         "reason": "natural language",
         "result": "suspect",
         "text": "You answer billing questions.\nHello there.\nHi, how can I help?\nPlease write a detailed summary of the attached quarterly report."

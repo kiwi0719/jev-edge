@@ -13399,6 +13399,573 @@
     {
       "expect": {
         "breaker": null,
+        "cache_writes": {},
+        "headers": {
+          "X-Jev-Reason": "unjudgeable%3A+token+prompt",
+          "X-Jev-Score": "0.00",
+          "X-Jev-Source": "l1",
+          "X-Jev-Verdict": "skipped"
+        },
+        "judge_calls": 0,
+        "prompt": null,
+        "subject_record": null,
+        "subject_store_writes": null,
+        "verdict": {
+          "action": "pass",
+          "async": false,
+          "fingerprint": "",
+          "l2_ms": 0,
+          "reason": "unjudgeable: token prompt",
+          "score": 0,
+          "source": "l1",
+          "verdict": "skipped"
+        }
+      },
+      "input": {
+        "breaker": null,
+        "cache": {},
+        "clock": 1000,
+        "config": {
+          "policy": {
+            "mode": "enforce"
+          }
+        },
+        "judge": {
+          "answers": {
+            "injection": 0.9
+          }
+        },
+        "req": {
+          "body": "{\"model\":\"m\",\"prompt\":[40,1541,6766,3435,11,1234]}",
+          "body_size": 50,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/v1/completions"
+        },
+        "rules": [
+          "llm-endpoints"
+        ],
+        "subject": null
+      },
+      "name": "token ids: unjudgeable, passed as skipped by default"
+    },
+    {
+      "expect": {
+        "breaker": null,
+        "cache_writes": {},
+        "headers": {
+          "X-Jev-Reason": "unjudgeable%3A+token+prompt",
+          "X-Jev-Score": "0.00",
+          "X-Jev-Source": "l1",
+          "X-Jev-Verdict": "skipped"
+        },
+        "judge_calls": 0,
+        "prompt": null,
+        "subject_record": null,
+        "subject_store_writes": null,
+        "verdict": {
+          "action": "block",
+          "async": false,
+          "fingerprint": "",
+          "l2_ms": 0,
+          "reason": "unjudgeable: token prompt",
+          "score": 0,
+          "source": "l1",
+          "verdict": "skipped"
+        }
+      },
+      "input": {
+        "breaker": null,
+        "cache": {},
+        "clock": 1000,
+        "config": {
+          "policy": {
+            "mode": "enforce",
+            "unjudgeable": "block"
+          }
+        },
+        "judge": {
+          "answers": {
+            "injection": 0.9
+          }
+        },
+        "req": {
+          "body": "{\"model\":\"m\",\"prompt\":[40,1541,6766,3435,11,1234]}",
+          "body_size": 50,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/v1/completions"
+        },
+        "rules": [
+          "llm-endpoints"
+        ],
+        "subject": null
+      },
+      "name": "token ids: blocked when policy.unjudgeable = block in enforce"
+    },
+    {
+      "expect": {
+        "breaker": null,
+        "cache_writes": {},
+        "headers": {
+          "X-Jev-Reason": "unjudgeable%3A+token+prompt",
+          "X-Jev-Score": "0.00",
+          "X-Jev-Source": "l1",
+          "X-Jev-Verdict": "skipped"
+        },
+        "judge_calls": 0,
+        "prompt": null,
+        "subject_record": null,
+        "subject_store_writes": null,
+        "verdict": {
+          "action": "block",
+          "async": false,
+          "fingerprint": "",
+          "l2_ms": 0,
+          "reason": "unjudgeable: token prompt",
+          "score": 0,
+          "source": "l1",
+          "verdict": "skipped"
+        }
+      },
+      "input": {
+        "breaker": null,
+        "cache": {},
+        "clock": 1000,
+        "config": {
+          "policy": {
+            "mode": "enforce"
+          }
+        },
+        "judge": {
+          "answers": {
+            "injection": 0.1
+          }
+        },
+        "req": {
+          "body": "{\"model\":\"m\",\"prompt\":[40,1541,6766,3435,11,1234]}",
+          "body_size": 50,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/v1/completions"
+        },
+        "rules": [
+          {
+            "extends": "llm-endpoints",
+            "id": "noids",
+            "token_prompts": "block"
+          }
+        ],
+        "subject": null
+      },
+      "name": "token ids: blocked when the rule says token_prompts = block in enforce"
+    },
+    {
+      "expect": {
+        "breaker": null,
+        "cache_writes": {},
+        "headers": {
+          "X-Jev-Reason": "unjudgeable%3A+token+prompt",
+          "X-Jev-Score": "0.00",
+          "X-Jev-Source": "l1",
+          "X-Jev-Verdict": "skipped"
+        },
+        "judge_calls": 0,
+        "prompt": null,
+        "subject_record": null,
+        "subject_store_writes": null,
+        "verdict": {
+          "action": "pass",
+          "async": false,
+          "fingerprint": "",
+          "l2_ms": 0,
+          "reason": "unjudgeable: token prompt",
+          "score": 0,
+          "source": "l1",
+          "verdict": "skipped"
+        }
+      },
+      "input": {
+        "breaker": null,
+        "cache": {},
+        "clock": 1000,
+        "config": {
+          "policy": {
+            "mode": "monitor"
+          }
+        },
+        "judge": {
+          "answers": {
+            "injection": 0.1
+          }
+        },
+        "req": {
+          "body": "{\"model\":\"m\",\"prompt\":[40,1541,6766,3435,11,1234]}",
+          "body_size": 50,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/v1/completions"
+        },
+        "rules": [
+          {
+            "extends": "llm-endpoints",
+            "id": "noids",
+            "token_prompts": "block"
+          }
+        ],
+        "subject": null
+      },
+      "name": "token ids: token_prompts = block never blocks in monitor"
+    },
+    {
+      "expect": {
+        "breaker": null,
+        "cache_writes": {},
+        "headers": {
+          "X-Jev-Reason": "unjudgeable%3A+binary+body",
+          "X-Jev-Score": "0.00",
+          "X-Jev-Source": "l1",
+          "X-Jev-Verdict": "skipped"
+        },
+        "judge_calls": 0,
+        "prompt": null,
+        "subject_record": null,
+        "subject_store_writes": null,
+        "verdict": {
+          "action": "pass",
+          "async": false,
+          "fingerprint": "",
+          "l2_ms": 0,
+          "reason": "unjudgeable: binary body",
+          "score": 0,
+          "source": "l1",
+          "verdict": "skipped"
+        }
+      },
+      "input": {
+        "breaker": null,
+        "cache": {},
+        "clock": 1000,
+        "config": {
+          "policy": {
+            "mode": "enforce"
+          }
+        },
+        "judge": {
+          "answers": {
+            "injection": 0.9
+          }
+        },
+        "req": {
+          "body": "\u0000\u0001\u0002\u0003 binary payload",
+          "body_size": 43,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/octet-stream"
+          },
+          "method": "POST",
+          "path": "/v1/chat/completions"
+        },
+        "rules": [
+          {
+            "extends": "llm-endpoints",
+            "id": "noids",
+            "token_prompts": "block"
+          }
+        ],
+        "subject": null
+      },
+      "name": "token ids: token_prompts = block leaves other unjudgeable requests to policy.unjudgeable"
+    },
+    {
+      "expect": {
+        "breaker": null,
+        "cache_writes": {
+          "fp:e912b53a:cf223bdc": {
+            "ttl": 300,
+            "value": {
+              "reason": "injection 0.90",
+              "score": 0.9
+            }
+          }
+        },
+        "headers": {
+          "X-Jev-Reason": "injection+0.90",
+          "X-Jev-Score": "0.90",
+          "X-Jev-Source": "l2",
+          "X-Jev-Verdict": "malicious"
+        },
+        "judge_calls": 1,
+        "prompt": {
+          "context": {
+            "deployment": "",
+            "method": "POST",
+            "path": "/completion"
+          },
+          "questions": [
+            "injection"
+          ],
+          "text": "Please write a detailed summary of the attached quarterly report."
+        },
+        "subject_record": null,
+        "subject_store_writes": null,
+        "verdict": {
+          "action": "block",
+          "async": false,
+          "fingerprint": "cf223bdc",
+          "l2_ms": 0,
+          "reason": "injection 0.90",
+          "score": 0.9,
+          "source": "l2",
+          "verdict": "malicious"
+        }
+      },
+      "input": {
+        "breaker": null,
+        "cache": {},
+        "clock": 1000,
+        "config": {
+          "policy": {
+            "mode": "enforce"
+          }
+        },
+        "judge": {
+          "answers": {
+            "injection": 0.9
+          }
+        },
+        "req": {
+          "body": "{\"model\":\"m\",\"prompt\":[40,1541,\"Please write a detailed summary of the attached quarterly report.\",6766]}",
+          "body_size": 105,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/completion"
+        },
+        "rules": [
+          "llm-endpoints"
+        ],
+        "subject": null
+      },
+      "name": "token ids beside text: the text is judged by default"
+    },
+    {
+      "expect": {
+        "breaker": null,
+        "cache_writes": {},
+        "headers": {
+          "X-Jev-Reason": "unjudgeable%3A+token+prompt",
+          "X-Jev-Score": "0.00",
+          "X-Jev-Source": "l1",
+          "X-Jev-Verdict": "skipped"
+        },
+        "judge_calls": 0,
+        "prompt": null,
+        "subject_record": null,
+        "subject_store_writes": null,
+        "verdict": {
+          "action": "block",
+          "async": false,
+          "fingerprint": "",
+          "l2_ms": 0,
+          "reason": "unjudgeable: token prompt",
+          "score": 0,
+          "source": "l1",
+          "verdict": "skipped"
+        }
+      },
+      "input": {
+        "breaker": null,
+        "cache": {},
+        "clock": 1000,
+        "config": {
+          "policy": {
+            "mode": "enforce"
+          }
+        },
+        "judge": {
+          "answers": {
+            "injection": 0.1
+          }
+        },
+        "req": {
+          "body": "{\"model\":\"m\",\"prompt\":[40,1541,\"Please write a detailed summary of the attached quarterly report.\",6766]}",
+          "body_size": 105,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/completion"
+        },
+        "rules": [
+          {
+            "extends": "llm-endpoints",
+            "id": "noids",
+            "token_prompts": "block"
+          }
+        ],
+        "subject": null
+      },
+      "name": "token ids beside text: blocked without a judge call when token_prompts = block"
+    },
+    {
+      "expect": {
+        "breaker": null,
+        "cache_writes": {},
+        "headers": {
+          "X-Jev-Reason": "unjudgeable%3A+token+prompt",
+          "X-Jev-Score": "0.00",
+          "X-Jev-Source": "l1",
+          "X-Jev-Verdict": "skipped"
+        },
+        "judge_calls": 0,
+        "prompt": null,
+        "subject_record": null,
+        "subject_store_writes": null,
+        "verdict": {
+          "action": "block",
+          "async": false,
+          "fingerprint": "",
+          "l2_ms": 0,
+          "reason": "unjudgeable: token prompt",
+          "score": 0,
+          "source": "l1",
+          "verdict": "skipped"
+        }
+      },
+      "input": {
+        "breaker": null,
+        "cache": {
+          "fp:e912b53a:cf223bdc": {
+            "reason": "injection 0.05",
+            "score": 0.05
+          }
+        },
+        "clock": 1000,
+        "config": {
+          "policy": {
+            "mode": "enforce",
+            "unjudgeable": "block"
+          }
+        },
+        "judge": {
+          "answers": {
+            "injection": 0.1
+          }
+        },
+        "req": {
+          "body": "{\"model\":\"m\",\"prompt\":[40,1541,\"Please write a detailed summary of the attached quarterly report.\",6766]}",
+          "body_size": 105,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/completion"
+        },
+        "rules": [
+          "llm-endpoints"
+        ],
+        "subject": null
+      },
+      "name": "token ids beside text: a cached score for the text does not speak for them"
+    },
+    {
+      "expect": {
+        "breaker": null,
+        "cache_writes": {
+          "fp:ac14f2b1:cf223bdc": {
+            "ttl": 300,
+            "value": {
+              "reason": "injection 0.90",
+              "score": 0.9
+            }
+          }
+        },
+        "headers": {
+          "X-Jev-Reason": "injection+0.90",
+          "X-Jev-Score": "0.90",
+          "X-Jev-Source": "l2",
+          "X-Jev-Verdict": "malicious"
+        },
+        "judge_calls": 1,
+        "prompt": {
+          "context": {
+            "deployment": "",
+            "method": "POST",
+            "path": "/completion"
+          },
+          "questions": [
+            "injection"
+          ],
+          "text": "Please write a detailed summary of the attached quarterly report."
+        },
+        "subject_record": null,
+        "subject_store_writes": null,
+        "verdict": {
+          "action": "pass",
+          "async": false,
+          "fingerprint": "cf223bdc",
+          "l2_ms": 0,
+          "reason": "injection 0.90",
+          "score": 0.9,
+          "source": "l2",
+          "verdict": "malicious"
+        }
+      },
+      "input": {
+        "breaker": null,
+        "cache": {},
+        "clock": 1000,
+        "config": {
+          "policy": {
+            "mode": "monitor"
+          }
+        },
+        "judge": {
+          "answers": {
+            "injection": 0.9
+          }
+        },
+        "req": {
+          "body": "{\"model\":\"m\",\"prompt\":[40,1541,\"Please write a detailed summary of the attached quarterly report.\",6766]}",
+          "body_size": 105,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/completion"
+        },
+        "rules": [
+          {
+            "extends": "llm-endpoints",
+            "id": "noids",
+            "token_prompts": "block"
+          }
+        ],
+        "subject": null
+      },
+      "name": "token ids beside text: judged in monitor whatever token_prompts says"
+    },
+    {
+      "expect": {
+        "breaker": null,
         "cache_writes": {
           "fp:e912b53a:cf223bdc": {
             "ttl": 60,

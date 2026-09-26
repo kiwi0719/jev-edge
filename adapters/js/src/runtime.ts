@@ -360,6 +360,8 @@ async function readReq(request: Request, rt: Runtime): Promise<[core.Req, Provid
             body = utf8.decode(d[0]);
             req.body_size = d[0].byteLength;
           }
+        } else {
+          warnDecoder(d[1], rt);
         }
       }
     } else if (whole) {
@@ -374,6 +376,25 @@ async function readReq(request: Request, rt: Runtime): Promise<[core.Req, Provid
     req.body_size = core.normalize.byteLength(body);
   }
   return [req, { method: request.method, path, headers: request.headers, body, clientIp }];
+}
+
+const decodersMissing = new Set<string>();
+
+/**
+ * A coding this runtime has no decoder for (decode.ts: br without node:zlib;
+ * gzip and deflate where DecompressionStream is missing or a stub, as on
+ * Next's edge runtime, and node:zlib too) makes every body sent in it
+ * unjudgeable, and the verdict's reason names only the coding. Said once per
+ * coding and isolate.
+ */
+function warnDecoder(reason: string, rt: Runtime): void {
+  if (!reason.includes("not available") || decodersMissing.has(reason) || decodersMissing.size >= 8) return;
+  decodersMissing.add(reason);
+  console.warn(
+    "jev-edge: " + reason + " on this runtime: request bodies sent with that Content-Encoding are unjudgeable, " +
+    "and policy.unjudgeable (" + (rt.config.policy.unjudgeable ?? "pass") + ") decides them. gzip and deflate need " +
+    "DecompressionStream or node:zlib, br needs node:zlib (Next.js: the Node runtime; Workers: nodejs_compat).",
+  );
 }
 
 /** Subject context for this request, or undefined: hashed id, one history read, a sink that writes without being awaited. */

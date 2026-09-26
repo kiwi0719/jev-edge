@@ -66,12 +66,15 @@ function nextJudged(request: Request, url: URL): Request {
  *   import { NextResponse } from "next/server";
  *   import { nextMiddleware } from "@jev-edge/js";
  *   export const middleware = nextMiddleware({ config: { ... } }, NextResponse);
- *   export const config = { matcher: ["/api/chat/:path*", "/api/completion/:path*", "/api/completions/:path*", "/v1/:path*"] };
+ *   export const config = { runtime: "nodejs", matcher: ["/api/chat/:path*", "/api/completion/:path*", "/api/completions/:path*", "/v1/:path*"] };
  *
- * Allowed requests continue with X-Jev-* on the request headers (read them in
- * the route handler); blocked ones get the 403 from the middleware. Next
- * buffers the body for middleware, so `request.text()` works on the edge and
- * Node runtimes alike. Next passes a `NextFetchEvent` as the second
+ * (Next 16: proxy.ts, `export const proxy = ...`, and no `runtime`: a proxy
+ * always runs on Node.) Allowed requests continue with X-Jev-* on the request
+ * headers (read them in the route handler); blocked ones get the 403 from the
+ * middleware. Next buffers the body for middleware, so `request.text()` works
+ * on the edge and Node runtimes alike, but on the edge runtime
+ * DecompressionStream is a stub that throws: a gzip or deflate body is
+ * unjudgeable there (decode.ts), so run it on the Node runtime. Next passes a `NextFetchEvent` as the second
  * argument; its `waitUntil` keeps the subject write alive after the response.
  * The path judged (and matched against /_jev/health) is `nextUrl.pathname`,
  * without next.config's basePath and locale, as Next routes it.

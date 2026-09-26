@@ -1,6 +1,6 @@
 // Bodies L1 used to wave through: compressed, unusual Content-Type,
 // multipart, oversized. Each is judged now, or reported as unjudgeable.
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import { gzipSync, deflateSync, deflateRawSync, brotliCompressSync } from "node:zlib";
 import { createRuntime, handle } from "../src";
 import { decodeBody, gunzipMembers } from "../src/decode";
@@ -92,6 +92,62 @@ describe("Content-Encoding", () => {
     const many = new Uint8Array(Buffer.concat(Array.from({ length: 40 }, () => gzipSync(Buffer.from("x")))));
     await expect(gunzipMembers(many, 1 << 20)).rejects.toThrow(/corrupt gzip body/);
     expect(td.decode((await decodeBody(many, "gzip", 1 << 20))[0]!)).toBe("x".repeat(40)); // node:zlib reads them all
+  });
+
+  describe("where DecompressionStream is a stub that throws (Next's edge runtime)", () => {
+    const stub = () =>
+      vi.stubGlobal("DecompressionStream", function DecompressionStream() {
+        throw new Error("A Node.js API is used (DecompressionStream) which is not supported in the Edge Runtime.");
+      });
+    afterEach(() => {
+      vi.unstubAllGlobals();
+      vi.doUnmock("node:zlib");
+      vi.resetModules();
+    });
+
+    it("reports the decoder as not available, not the body as corrupt", async () => {
+      stub();
+      const gz = new Uint8Array(gzipSync(Buffer.from(ATTACK)));
+      await expect(gunzipMembers(gz, 1 << 20)).rejects.toThrow("gzip decoder not available");
+      // and without node:zlib, as there: every gzip and deflate body
+      vi.resetModules();
+      vi.doMock("node:zlib", () => {
+        throw new Error("No such module: node:zlib");
+      });
+      const bare = await import("../src/decode");
+      expect(await bare.decodeBody(gz, "gzip", 1 << 20)).toEqual([null, "gzip decoder not available"]);
+      expect(await bare.decodeBody(new Uint8Array(deflateSync(Buffer.from(ATTACK))), "deflate", 1 << 20)).toEqual([null, "deflate decoder not available"]);
+      expect(await bare.decodeBody(new Uint8Array(brotliCompressSync(Buffer.from(ATTACK))), "br", 1 << 20)).toEqual([null, "br decoder not available"]);
+      // the runtime says so once, naming the decoder and what policy.unjudgeable does with the body
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const m = await import("../src");
+        const r = m.createRuntime({ config: { jev: { provider: "mock", mock_score: 0.95, timeout_ms: 400 }, policy: { mode: "enforce" } } });
+        for (let i = 0; i < 2; i++) {
+          const j = (await (await m.handle(post(bytes(gzipSync(Buffer.from(ATTACK))), { "content-type": "application/json", "content-encoding": "gzip" }), r, seen)).json()) as Record<string, string>;
+          expect(j.verdict).toBe("skipped");
+        }
+        const said = warn.mock.calls.map((c) => String(c[0])).filter((w) => w.includes("decoder not available"));
+        expect(said).toHaveLength(1);
+        expect(said[0]).toMatch(/gzip decoder not available on this runtime: .*unjudgeable.*policy\.unjudgeable \(pass\)/);
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it("decodes deflate with node:zlib where there is one", async () => {
+      stub();
+      for (const enc of [deflateSync, deflateRawSync]) {
+        const [out] = await decodeBody(new Uint8Array(enc(Buffer.from(ATTACK))), "deflate", 1 << 20);
+        expect(td.decode(out!)).toBe(ATTACK);
+        const res = await handle(post(bytes(enc(Buffer.from(ATTACK))), { "content-type": "application/json", "content-encoding": "deflate" }), rt(), seen);
+        expect(res.status).toBe(403);
+      }
+      // a bomb stops at the cap there too, and corrupt data is still corrupt
+      const [bomb, cut] = await decodeBody(new Uint8Array(deflateSync(Buffer.alloc(8 * 1024 * 1024))), "deflate", 1024);
+      expect([bomb?.byteLength, cut]).toEqual([1025, true]);
+      expect(await decodeBody(new TextEncoder().encode("not really deflate at all"), "deflate", 1 << 20)).toEqual([null, "corrupt deflate body"]);
+    });
   });
 
   it("reports an unknown coding or corrupt data as unjudgeable, passing by default", async () => {

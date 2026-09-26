@@ -58,14 +58,14 @@ Your upstream receives `X-Jev-Verdict`, `X-Jev-Score`, `X-Jev-Source`, `X-Jev-Re
 |---|---|
 | `/etc/nginx/jev-edge.conf.lua` | the plugin conf on the route / service / global rule; same keys, JSON-schema validated |
 | `access_by_lua_block` | `access` phase, priority 2450 (after the auth plugins, before `proxy-rewrite` and the `ai-*` plugins) |
-| `env TYPESAFE_API_KEY;` | `nginx_config.envs`, read through `jev.api_key_env` (default `TYPESAFE_API_KEY`); or `jev.api_key` inline |
+| `env TYPESAFE_API_KEY;` | `nginx_config.envs`, read through `jev.api_key_env` (default `TYPESAFE_API_KEY`); or `jev.api_key` inline, or as an APISIX secret reference (`"$env://NAME"`, `"$secret://vault/1/jev/api_key"`), resolved for each plugin conf and read again every five minutes, so a rotated secret is picked up. A reference that does not resolve is logged and never sent: `jev.api_key_env` applies. `jev.api_key` and `subject.salt` (which takes references too) are `encrypt_fields`: with `apisix.data_encryption` on (the default) etcd keeps them encrypted |
 | `lua_shared_dict jev_cache` | `nginx_config.http.lua_shared_dict.jev_cache`; missing dict = cache and breaker state disabled, with a warning |
 | `$jev_log` | `$jev_log`, registered as an APISIX variable: use it in `log_format` of `http-logger`, `file-logger`, `kafka-logger` |
 | `PUT /_jev/config` hot reload | the Admin API: change the route's plugin conf, APISIX pushes it without a reload |
 | `/_jev/health`, `/_jev/metrics` | not exposed; APISIX's own `prometheus` plugin and the logger carry the verdict fields |
 | L3 side-path, reputation | same modules, same `async` config |
 | inline tenant rules | same: `"rules": [{"id": "billing", "extends": "llm-endpoints", "watch_paths": ["^/v1/billing"], "deployment_context": "..."}, "llm-endpoints"]`; or simply one route per tenant, each with its own `jev.deployment_context` |
-| `subject` | same keys; needs `nginx_config.http.lua_shared_dict.jev_subject` |
+| `subject` | same keys; needs `nginx_config.http.lua_shared_dict.jev_subject` (trajectories: never evicts, drops new entries when full), and `jev_subject_rep` with `reputation` (points and blocks; without it they share `jev_subject`, with a warning) |
 | `client_max_body_size`, `max_body_bytes` | `nginx_config.http.client_max_body_size` in `config.yaml` and `max_body_bytes` in the plugin `rules`; the body is read by the same `resty.jev.body` (whole up to 1 MiB, head and tail past it, `gzip` / `deflate` / `br` decoded; `br` needs `libbrotli1` in the image). See [Body size and what L1 reads](../../docs/design.md#body-size-and-what-l1-reads) |
 | `/_jev/samples` | `sampling` config is honoured and samples land in `jev_cache`; read them with `sampling.log = true` through a logger plugin, or expose `resty.jev.edge.samples()` from a plain OpenResty location on the same box |
 

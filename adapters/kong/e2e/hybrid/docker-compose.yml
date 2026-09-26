@@ -1,0 +1,75 @@
+# Kong hybrid end-to-end: a control plane (PostgreSQL) and a data plane
+# (DB-less, config pushed by the CP), both with the jev-edge plugin, in
+# front of the stub app. The CP has one rule set the DP lacks
+# (cp-only/rules/cp-only.lua on the CP's Lua path only). No host ports: the
+# checks run curl in the app container. Started by ../hybrid.sh.
+name: jev-e2e-kong-hybrid
+x-kong-env: &kong-env
+  KONG_PLUGINS: bundled,jev-edge
+  KONG_NGINX_HTTP_LUA_SHARED_DICT: "jev_cache 16m"
+  KONG_LOG_LEVEL: notice
+  KONG_PROXY_ACCESS_LOG: "off"
+  KONG_PROXY_ERROR_LOG: /dev/stderr
+  KONG_ADMIN_ERROR_LOG: /dev/stderr
+  KONG_CLUSTER_CERT: /certs/cluster.crt
+  KONG_CLUSTER_CERT_KEY: /certs/cluster.key
+x-pg-env: &pg-env
+  KONG_DATABASE: postgres
+  KONG_PG_HOST: db
+  KONG_PG_USER: kong
+  KONG_PG_PASSWORD: kong
+  KONG_PG_DATABASE: kong
+x-cp-path: &cp-path "/opt/jev-edge/adapters/kong/e2e/hybrid/cp-only/?.lua;/opt/jev-edge/adapters/kong/?.lua;/opt/jev-edge/adapters/openresty/lib/?.lua;/opt/jev-edge/?.lua;/opt/jev-edge/?/init.lua;;"
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: kong
+      POSTGRES_PASSWORD: kong
+      POSTGRES_DB: kong
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "kong"]
+      interval: 1s
+      retries: 60
+  migrations:
+    image: kong:3.9
+    command: kong migrations bootstrap
+    volumes:
+      - ../../../..:/opt/jev-edge:ro
+      - ${JEV_E2E_CERTS:-./certs}:/certs:ro
+    environment:
+      <<: [*kong-env, *pg-env]
+      KONG_LUA_PACKAGE_PATH: *cp-path
+    depends_on:
+      db: { condition: service_healthy }
+  cp:
+    image: kong:3.9
+    volumes:
+      - ../../../..:/opt/jev-edge:ro
+      - ${JEV_E2E_CERTS:-./certs}:/certs:ro
+    environment:
+      <<: [*kong-env, *pg-env]
+      KONG_ROLE: control_plane
+      KONG_ADMIN_LISTEN: "0.0.0.0:8001"
+      KONG_LUA_PACKAGE_PATH: *cp-path
+    depends_on:
+      migrations: { condition: service_completed_successfully }
+  dp:
+    image: kong:3.9
+    volumes:
+      - ../../../..:/opt/jev-edge:ro
+      - ${JEV_E2E_CERTS:-./certs}:/certs:ro
+    environment:
+      <<: *kong-env
+      KONG_ROLE: data_plane
+      KONG_DATABASE: "off"
+      KONG_CLUSTER_CONTROL_PLANE: cp:8005
+      KONG_PROXY_LISTEN: "0.0.0.0:8000"
+      KONG_ADMIN_LISTEN: "off"
+      KONG_LUA_PACKAGE_PATH: "/opt/jev-edge/adapters/kong/?.lua;/opt/jev-edge/adapters/openresty/lib/?.lua;/opt/jev-edge/?.lua;/opt/jev-edge/?/init.lua;;"
+    depends_on: [cp]
+  app:
+    image: jev-edge-test
+    volumes:
+      - ../../../envoy/e2e/app.conf:/tmp/app/conf/nginx.conf:ro
+    command: ["sh", "-c", "mkdir -p /tmp/app/logs && openresty -p /tmp/app -c /tmp/app/conf/nginx.conf -g 'daemon off;'"]

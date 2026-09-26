@@ -13,7 +13,7 @@
 // you pass Store implementations (DynamoDB Global Tables is the usual
 // choice; it costs a round trip per lookup). Read the API key from Secrets
 // Manager at cold start and pass it in `config.jev.api_key`.
-import { createRuntime, evaluate, markTruncated, type Options, type Runtime } from "./runtime.js";
+import { createRuntime, evaluate, markTruncated, jevHeaderNames, type Options, type Runtime } from "./runtime.js";
 import { headers as verdictHeaders, newVerdict, ERROR, SRC_ADAPTER } from "./core/verdict.js";
 
 export interface CfHeader { key?: string; value: string }
@@ -86,8 +86,10 @@ const STATUS_TEXT: Record<number, string> = {
   500: "Internal Server Error", 503: "Service Unavailable",
 };
 
+// Every X-Jev-* header the client sent goes, whatever its name (CloudFront
+// keys the map by the lowercased name), then the verdict's own are set.
 function setJevHeaders(cf: CfRequest, hdrs: Record<string, string>, requestId: string, subjectId?: string): void {
-  for (const h of HEADER_NAMES) delete cf.headers[h];
+  for (const h of jevHeaderNames(Object.keys(cf.headers ?? {}))) delete cf.headers[h];
   for (const [k, v] of Object.entries(hdrs)) cf.headers[k.toLowerCase()] = [{ key: k, value: v }];
   cf.headers["x-jev-request-id"] = [{ key: "X-Jev-Request-Id", value: requestId }];
   if (subjectId) cf.headers["x-jev-subject"] = [{ key: "X-Jev-Subject", value: subjectId }];

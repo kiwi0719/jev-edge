@@ -8,10 +8,17 @@ services:
       - ../../..:/opt/jev-edge:ro
       - ./config.yaml:/usr/local/apisix/conf/config.yaml:ro
       - ./apisix.yaml:/usr/local/apisix/conf/apisix.yaml:ro
+    environment:
+      JEV_E2E_KEY: good-key      # apisix.yaml /sec: api_key "$env://JEV_E2E_KEY"
     ports: ["9080:9080"]
-    depends_on: [app]
+    depends_on: [app, judge]
   app:
     image: jev-edge-test
     volumes:
       - ../../envoy/e2e/app.conf:/tmp/app/conf/nginx.conf:ro
     command: ["sh", "-c", "mkdir -p /tmp/app/logs && openresty -p /tmp/app -c /tmp/app/conf/nginx.conf -g 'daemon off;'"]
+  judge:
+    image: jev-edge-test
+    volumes:
+      - ../../kong/e2e/judge-stub.conf:/tmp/judge/conf/nginx.conf:ro
+    command: ["sh", "-c", "mkdir -p /tmp/judge/logs && openresty -p /tmp/judge -c /tmp/judge/conf/nginx.conf -g 'daemon off;'"]

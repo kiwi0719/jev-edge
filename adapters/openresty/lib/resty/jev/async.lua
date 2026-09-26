@@ -6,40 +6,73 @@
 
 local core    = require "jev.core"
 local verdict = require "jev.core.verdict"
+local judge_m = require "jev.core.judge"
+local http    = require "resty.jev.http"
 
 local _M = {}
 
-local INFLIGHT_KEY = "inflight:l3"
-
-local function done(job)
-  local st = job.state or job.cache
-  local n = st:incr(INFLIGHT_KEY, -1)
-  -- The key can be evicted or reset (reload, dict flush); never let the
-  -- counter go negative or the cap silently grows by that much.
-  if n and n < 0 then st:set(INFLIGHT_KEY, 0, 0) end
+-- L3 is the retry L2 could not afford: it gets the ceiling, not the adaptive
+-- estimate that just failed.
+local function l3_timeout(cfg)
+  return cfg.async.timeout_ms or math.max(cfg.jev.timeout_max_ms or 0, 5000)
 end
 
+-- The jobs in flight, counted as leases (resty.jev.http slots): a timer
+-- killed mid-job (a worker past worker_shutdown_timeout) never runs done(),
+-- and its slot comes back with the lease instead of never. A job's parts are
+-- judged at once (call_many), so it runs about one L3 timeout.
+local function slots(cfg, st)
+  return http.slots(st, "inflight:l3", math.ceil(l3_timeout(cfg) / 1000) + 5)
+end
+
+local function done(job)
+  if job.slot then slots(job.cfg, job.state or job.cache).give(job.slot) end
+  job.slot = nil
+end
+
+-- resty.jev.http takes no L2 in-flight slot for these calls: L3 has its own
+-- cap (max_async), and the L2 slots are the ones that just overflowed. Nor
+-- are they adaptive-timeout samples: they run on the L3 timeout.
+local LANE = { lane = "l3", sample = false }
+
 -- One answer (or nil) per part, in order; several parts at once when the
--- judge can (resty.jev.http's call_many, one light thread each).
+-- judge can (resty.jev.http's call_many, one light thread each). The second
+-- value is nil when every part answered, "busy" when the only failures were
+-- a judge's in-flight cap, "failed" otherwise.
 local function judge_all(judge, parts, timeout)
-  local results = {}
+  local results, failed = {}, nil
+  local function fail(err)
+    ngx.log(ngx.WARN, "jev-edge: L3 judge failed: ", tostring(err))
+    if err == judge_m.BUSY and failed ~= "failed" then failed = "busy" else failed = "failed" end
+  end
   if #parts > 1 and type(judge.call_many) == "function" then
     local prompts = {}
     for k, part in ipairs(parts) do prompts[k] = part.prompt end
-    local rs = judge.call_many(prompts, timeout) or {}
+    local rs = judge.call_many(prompts, timeout, LANE) or {}
     for k = 1, #parts do
       local r = rs[k] or {}
-      if not r[1] then ngx.log(ngx.WARN, "jev-edge: L3 judge failed: ", tostring(r[2])) end
+      if not r[1] then fail(r[2]) end
       results[k] = r[1]
     end
-    return results
+    return results, failed
   end
   for k, part in ipairs(parts) do
-    local answers, jerr = judge.call(part.prompt, timeout)
-    if not answers then ngx.log(ngx.WARN, "jev-edge: L3 judge failed: ", tostring(jerr)) end
+    local answers, jerr = judge.call(part.prompt, timeout, LANE)
+    if not answers then fail(jerr) end
     results[k] = answers
   end
-  return results
+  return results, failed
+end
+
+-- How long a reputation entry is kept: cache.rep_ttl, or longer while the
+-- entry carries a block (new or carried over) that outlasts it. A block of
+-- async.rep_block_ttl past cache.rep_ttl would otherwise vanish with the
+-- entry, and a later write for the same IP would cut a running block short.
+local function rep_ttl(cfg, rep)
+  local ttl = tonumber(cfg.cache.rep_ttl) or 0
+  local left = tonumber(rep.blocked_until) and rep.blocked_until - ngx.now()
+  if ttl > 0 and left and left > 0 then ttl = math.max(ttl, math.ceil(left)) end
+  return ttl
 end
 
 local function handler(premature, job)
@@ -48,11 +81,13 @@ local function handler(premature, job)
   if premature then return done(job) end
   local cache = job.cache
   local cfg = job.cfg
+  local result
   local ok, err = pcall(function()
-    -- L3 is the retry L2 could not afford: give it the ceiling, not the
-    -- adaptive estimate that just failed.
-    local timeout = cfg.async.timeout_ms or math.max(cfg.jev.timeout_max_ms or 0, 5000)
-    local res = core.l3_result(job.job, judge_all(job.judge, job.job.parts, timeout), cfg)
+    local answers, failed = judge_all(job.judge, job.job.parts, l3_timeout(cfg))
+    local res = core.l3_result(job.job, answers, cfg)
+    -- a job with a part that got no answer is not a second look, even when
+    -- the other parts' answers are written
+    result = failed or (res and "ok" or "no_scores")
     if not res then
       -- no score in any answer: a provider fault, never a cached SAFE
       ngx.log(ngx.WARN, "jev-edge: L3 got no score for the request")
@@ -85,27 +120,33 @@ local function handler(premature, job)
           ngx.log(ngx.ERR, "jev-edge: ALERT ip=", job.client_ip, " score=", res.score, " reason=", res.reason)
         end
       end
-      cache:set(key, rep, cfg.cache.rep_ttl)
+      cache:set(key, rep, rep_ttl(cfg, rep))
     end
   end)
-  if not ok then ngx.log(ngx.ERR, "jev-edge: L3 error: ", err) end
+  if not ok then
+    result = "error"
+    ngx.log(ngx.ERR, "jev-edge: L3 error: ", err)
+  end
+  if job.on_result then pcall(job.on_result, result) end
   done(job)
 end
 
 --- Schedule an L3 job. Never blocks; drops when over max_async.
--- @param job { cfg, cache, state, judge, job, client_ip, on_alert }
+-- @param job { cfg, cache, state, judge, job, client_ip, on_alert, on_result }
 --   job: core.l3_job() for the request (its parts' prompts and cache keys).
 --   cache: verdict / reputation dict; state: where the in-flight counter lives
 --   (defaults to cache).
+--   on_result: optional function(result) once the job has run, result one of
+--   "ok" (every part answered), "failed" (a part got no answer: provider
+--   error or timeout), "busy" (the judge's in-flight cap, and nothing else,
+--   refused a part), "no_scores" (answers without a score) or "error" (the
+--   job threw).
 function _M.schedule(job)
   local cfg = job.cfg
   if not cfg.async or cfg.async.enabled == false then return false, "disabled" end
-  local st = job.state or job.cache
-  local n = st:incr(INFLIGHT_KEY, 1)
-  if n and n > (cfg.async.max_async or 32) then
-    done(job)
-    return false, "max_async exceeded"
-  end
+  local slot = slots(cfg, job.state or job.cache).take(cfg.async.max_async or 32)
+  if slot == nil then return false, "max_async exceeded" end
+  job.slot = slot
   local ok, err = ngx.timer.at(0, handler, job)
   if not ok then
     done(job)

@@ -53,7 +53,8 @@ function _M.current(self)
   local est = self.headroom * (mean + 2 * math.sqrt(math.max(var, 0)))
   if est < self.floor then return self.floor end
   if est > self.ceil then return self.ceil end
-  return math.floor(est)
+  -- whole ms, never under a fractional floor
+  return math.max(self.floor, math.floor(est))
 end
 
 local function observe(self, ms)

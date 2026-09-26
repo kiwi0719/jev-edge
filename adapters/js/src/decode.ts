@@ -12,7 +12,9 @@
 // DecompressionStream is a stub that throws) is reported as "<coding> decoder
 // not available", and core calls the request unjudgeable. Output is capped at
 // maxOut + 1 bytes: a small compressed body cannot expand into unbounded
-// memory.
+// memory. In tail mode the last coding reads on to a scan bound and keeps
+// only a ring of the last bytes past the cap, so memory stays bounded by
+// cap + tail.
 
 type Coding = "gzip" | "deflate" | "br";
 
@@ -32,39 +34,112 @@ function codings(header: string): Coding[] | string {
   return out;
 }
 
-async function drain(stream: ReadableStream<Uint8Array>, maxOut: number): Promise<[Uint8Array, boolean]> {
+/** What decodeBody's tail mode hands back beside the head (decode.lua's info). */
+export interface DecodeInfo {
+  /** the last `tail` bytes after the first maxOut, or null when there are none */
+  tail: Uint8Array | null;
+  /** bytes the last coding produced */
+  size: number;
+  /** false when the scan bound came before the stream's end: `tail` is not the end */
+  complete: boolean;
+}
+
+/**
+ * Where a coding's output goes (decode.lua's Sink). The first `limit` bytes
+ * are kept whole (the head). With `tail`, every byte past the first
+ * `limit - 1` also goes through a ring that keeps the last `tail` of them,
+ * and the coding stops once it has produced more than `scan` bytes instead
+ * of at the head's end.
+ */
+class Sink {
+  private head: Uint8Array[] = [];
+  private headLen = 0;
+  private ring: Uint8Array = new Uint8Array(0);
+  total = 0;
+  constructor(
+    private readonly limit: number,
+    private readonly tail?: number,
+    private readonly scan?: number,
+  ) {}
+
+  push(c: Uint8Array): void {
+    const cap = this.tail !== undefined ? (this.scan as number) + 1 : this.limit;
+    const v = c.byteLength > cap - this.total ? c.subarray(0, Math.max(0, cap - this.total)) : c;
+    if (this.headLen < this.limit) {
+      const take = Math.min(this.limit - this.headLen, v.byteLength);
+      this.head.push(v.subarray(0, take));
+      this.headLen += take;
+    }
+    if (this.tail !== undefined) {
+      const skip = this.limit - 1 - this.total;
+      if (skip < v.byteLength) {
+        const piece = skip > 0 ? v.subarray(skip) : v;
+        const joined = new Uint8Array(Math.min(this.tail, this.ring.byteLength + piece.byteLength));
+        const fromPiece = Math.min(piece.byteLength, joined.byteLength);
+        const fromRing = joined.byteLength - fromPiece;
+        joined.set(this.ring.subarray(this.ring.byteLength - fromRing), 0);
+        joined.set(piece.subarray(piece.byteLength - fromPiece), fromRing);
+        this.ring = joined;
+      }
+    }
+    this.total += v.byteLength;
+  }
+
+  /** The sink's state, to put back with restore() when a decode it fed fails (gunzipMembers). */
+  mark(): [number, number, Uint8Array, number] {
+    return [this.head.length, this.headLen, this.ring, this.total];
+  }
+
+  restore([n, len, ring, total]: [number, number, Uint8Array, number]): void {
+    this.head.length = n;
+    this.headLen = len;
+    this.ring = ring; // replaced, never written in place, by push()
+    this.total = total;
+  }
+
+  /** true once the coding must stop: the head is full, or in tail mode the scan bound is passed */
+  full(): boolean {
+    return this.tail !== undefined ? this.total > (this.scan as number) : this.total >= this.limit;
+  }
+
+  result(complete: boolean): [Uint8Array, boolean, DecodeInfo?] {
+    const out = new Uint8Array(this.headLen);
+    let off = 0;
+    for (const c of this.head) {
+      out.set(c, off);
+      off += c.byteLength;
+    }
+    const truncated = this.total >= this.limit;
+    if (this.tail === undefined) return [out, truncated];
+    return [out, truncated, { tail: this.ring.byteLength > 0 ? this.ring : null, size: this.total, complete }];
+  }
+}
+
+/** Feed a stream into `sink` until it ends (true) or the sink is full (false). */
+async function drain(stream: ReadableStream<Uint8Array>, sink: Sink): Promise<boolean> {
   const reader = stream.getReader();
-  const chunks: Uint8Array[] = [];
-  let size = 0;
-  let truncated = false;
   try {
     for (;;) {
       const { done, value } = await reader.read();
-      if (done) break;
-      const room = maxOut + 1 - size;
-      if (value.byteLength >= room) {
-        chunks.push(value.subarray(0, room));
-        size += room;
-        truncated = true;
+      if (done) return true;
+      sink.push(value);
+      if (sink.full()) {
         reader.cancel().catch(() => {});
-        break;
+        return false;
       }
-      chunks.push(value);
-      size += value.byteLength;
     }
   } finally {
     reader.releaseLock();
   }
-  return [concat(chunks, size), truncated];
 }
 
-async function viaStream(input: Uint8Array, format: "gzip" | "deflate" | "deflate-raw", maxOut: number): Promise<[Uint8Array, boolean]> {
+async function viaStream(input: Uint8Array, format: "gzip" | "deflate" | "deflate-raw", sink: Sink): Promise<boolean> {
   const ds = new DecompressionStream(format);
   const writer = ds.writable.getWriter();
   // write and close without awaiting: the readable side applies backpressure
   writer.write(input as unknown as BufferSource).catch(() => {});
   writer.close().catch(() => {});
-  return drain(ds.readable as ReadableStream<Uint8Array>, maxOut);
+  return drain(ds.readable as ReadableStream<Uint8Array>, sink);
 }
 
 interface NodeStream {
@@ -92,41 +167,24 @@ async function nodeZlib(): Promise<NodeZlib | null> {
   return zlib;
 }
 
-function concat(chunks: Uint8Array[], size: number): Uint8Array {
-  const all = new Uint8Array(size);
-  let off = 0;
-  for (const c of chunks) {
-    all.set(c, off);
-    off += c.byteLength;
-  }
-  return all;
-}
-
-/** `input` through a node:zlib decompressor, streaming, so a bomb stops at maxOut + 1 bytes like the others. */
-function viaNode(d: NodeStream, input: Uint8Array, maxOut: number): Promise<[Uint8Array, boolean]> {
+/** `input` through a node:zlib decompressor into `sink`, streaming, so a bomb stops where the sink does like the others. Resolves true when the stream ended. */
+function viaNode(d: NodeStream, input: Uint8Array, sink: Sink): Promise<boolean> {
   return new Promise((resolve, reject) => {
-    const chunks: Uint8Array[] = [];
-    let size = 0;
     let settled = false;
-    const finish = (truncated: boolean) => {
-      settled = true;
-      resolve([concat(chunks, size), truncated]);
-    };
-    d.on("data", (c) => {
+    d.on("data", (chunk) => {
       if (settled) return;
-      const room = maxOut + 1 - size;
-      if (c.byteLength >= room) {
-        chunks.push(c.subarray(0, room));
-        size += room;
+      sink.push(chunk);
+      if (sink.full()) {
+        settled = true;
         d.destroy();
-        finish(true);
-        return;
+        resolve(false);
       }
-      chunks.push(c);
-      size += c.byteLength;
     });
     d.on("end", () => {
-      if (!settled) finish(false);
+      if (!settled) {
+        settled = true;
+        resolve(true);
+      }
     });
     d.on("error", (e) => {
       if (!settled) {
@@ -153,8 +211,9 @@ const PROBES: Record<"gzip" | "deflate", number[]> = {
  */
 async function streamDecodes(format: "gzip" | "deflate"): Promise<boolean> {
   try {
-    const [out] = await viaStream(new Uint8Array(PROBES[format]), format, 16);
-    return new TextDecoder().decode(out) === "jev";
+    const sink = new Sink(17);
+    await viaStream(new Uint8Array(PROBES[format]), format, sink);
+    return new TextDecoder().decode(sink.result(true)[0]) === "jev";
   } catch {
     return false;
   }
@@ -170,49 +229,54 @@ const MAX_GZIP_TRIES = 64;
  * ends: the first offset that starts a gzip header (1f 8b 08, reserved flag
  * bits clear) at which the prefix decodes whole. A deflate stream ends at one
  * place and its CRC and size follow it, so only the true end does. The
- * members share one maxOut + 1 budget. After MAX_GZIP_TRIES decodes, or when
- * no offset works (trailing bytes that are not a member), the body is
- * corrupt, as in decode.lua.
+ * members share one sink; what a refused decode fed it is taken back. After
+ * MAX_GZIP_TRIES decodes, or when no offset works (trailing bytes that are
+ * not a member), the body is corrupt, as in decode.lua. Resolves true when
+ * the last member ended, false when the sink filled first.
  */
-export async function gunzipMembers(input: Uint8Array, maxOut: number): Promise<[Uint8Array, boolean]> {
-  const parts: Uint8Array[] = [];
-  let size = 0;
+async function gunzipInto(input: Uint8Array, sink: Sink): Promise<boolean> {
   let tries = 0;
-  const attempt = async (bytes: Uint8Array): Promise<[Uint8Array, boolean] | null> => {
+  // the decode's end (true), the sink full (false), or null when it was refused
+  const attempt = async (bytes: Uint8Array): Promise<boolean | null> => {
     if (++tries > MAX_GZIP_TRIES) throw new Error("corrupt gzip body: too many members");
+    const at = sink.mark();
     try {
-      return await viaStream(bytes, "gzip", maxOut - size);
+      return await viaStream(bytes, "gzip", sink);
     } catch {
+      sink.restore(at);
       return null;
     }
-  };
-  const take = ([out, cut]: [Uint8Array, boolean]): boolean => {
-    parts.push(out);
-    size += out.byteLength;
-    return cut || size > maxOut;
   };
   let off = 0;
   while (off < input.byteLength) {
     const rest = input.subarray(off);
     const whole = await attempt(rest);
-    if (whole) {
-      const cut = take(whole);
-      return [concat(parts, size), cut];
-    }
+    if (whole !== null) return whole;
     if (off === 0 && !(await streamDecodes("gzip"))) throw new Error("gzip decoder not available");
     let next = -1;
     for (let p = 18; p + 3 < rest.byteLength; p++) {
       if (rest[p] !== 0x1f || rest[p + 1] !== 0x8b || rest[p + 2] !== 0x08 || (rest[p + 3] & 0xe0) !== 0) continue;
       const got = await attempt(rest.subarray(0, p));
-      if (!got) continue;
-      if (take(got)) return [concat(parts, size), true];
+      if (got === null) continue;
+      if (!got) return false;
       next = p;
       break;
     }
     if (next < 0) throw new Error("corrupt gzip body");
     off += next;
   }
-  return [concat(parts, size), false];
+  return true;
+}
+
+/**
+ * gunzipInto with a sink of maxOut + 1 bytes: [bytes, truncated], as
+ * decodeBody returns them. Exported for the tests.
+ */
+export async function gunzipMembers(input: Uint8Array, maxOut: number): Promise<[Uint8Array, boolean]> {
+  const sink = new Sink(maxOut + 1);
+  const complete = await gunzipInto(input, sink);
+  const [out, cut] = sink.result(complete);
+  return [out, cut];
 }
 
 /**
@@ -220,7 +284,7 @@ export async function gunzipMembers(input: Uint8Array, maxOut: number): Promise<
  * members as gunzip(1), body-parser and decode.lua do (it also takes zero
  * padding after the last one, as body-parser does; decode.lua does not).
  */
-async function gunzip(input: Uint8Array, maxOut: number): Promise<[Uint8Array, boolean]> {
+async function gunzip(input: Uint8Array, sink: Sink): Promise<boolean> {
   const z = await nodeZlib();
   let d: NodeStream | undefined;
   try {
@@ -228,20 +292,26 @@ async function gunzip(input: Uint8Array, maxOut: number): Promise<[Uint8Array, b
   } catch {
     d = undefined; // a node:zlib without streams: the member walk below
   }
-  return d ? viaNode(d, input, maxOut) : gunzipMembers(input, maxOut);
+  return d ? viaNode(d, input, sink) : gunzipInto(input, sink);
 }
 
-async function one(input: Uint8Array, c: Coding, maxOut: number): Promise<[Uint8Array, boolean]> {
-  if (c === "gzip") return gunzip(input, maxOut);
+/** Decode one coding into a sink from `mk` (a fresh one per attempt). Returns the sink and whether the stream ended. */
+async function one(input: Uint8Array, c: Coding, mk: () => Sink): Promise<[Sink, boolean]> {
+  if (c === "gzip") {
+    const sink = mk();
+    return [sink, await gunzip(input, sink)];
+  }
   if (c === "deflate") {
     // HTTP "deflate" is zlib-wrapped; some clients send raw deflate
     try {
-      return await viaStream(input, "deflate", maxOut);
+      const sink = mk();
+      return [sink, await viaStream(input, "deflate", sink)];
     } catch {
       /* raw deflate, below */
     }
     try {
-      return await viaStream(input, "deflate-raw", maxOut);
+      const sink = mk();
+      return [sink, await viaStream(input, "deflate-raw", sink)];
     } catch (e) {
       if (await streamDecodes("deflate")) throw e;
     }
@@ -251,14 +321,17 @@ async function one(input: Uint8Array, c: Coding, maxOut: number): Promise<[Uint8
       throw new Error("deflate decoder not available");
     }
     try {
-      return await viaNode(z.createInflate(), input, maxOut);
+      const sink = mk();
+      return [sink, await viaNode(z.createInflate(), input, sink)];
     } catch {
-      return viaNode(z.createInflateRaw(), input, maxOut);
+      const sink = mk();
+      return [sink, await viaNode(z.createInflateRaw(), input, sink)];
     }
   }
   const z = await nodeZlib();
   if (!z) throw new Error("br decoder not available");
-  return viaNode(z.createBrotliDecompress(), input, maxOut);
+  const sink = mk();
+  return [sink, await viaNode(z.createBrotliDecompress(), input, sink)];
 }
 
 /**
@@ -266,16 +339,34 @@ async function one(input: Uint8Array, c: Coding, maxOut: number): Promise<[Uint8
  * reverse order of listing. Returns [bytes, truncated] (bytes is at most
  * maxOut + 1 long; truncated means the decoded body is longer), or
  * [null, error] when a coding is unsupported or the data is corrupt.
+ *
+ * Tail mode (`opts.tail`, decode.lua's): the last coding goes on past
+ * maxOut, up to `opts.scan` bytes of output (default 4 x maxOut), and a
+ * third element carries the body's end (DecodeInfo). Every earlier coding
+ * must then decode whole within maxOut, or the body is not decodable ("too
+ * large to decode whole"): a cut one would feed the last a cut stream.
  */
-export async function decodeBody(raw: Uint8Array, header: string, maxOut: number): Promise<[Uint8Array, boolean] | [null, string]> {
+export async function decodeBody(
+  raw: Uint8Array,
+  header: string,
+  maxOut: number,
+  opts?: { tail?: number; scan?: number },
+): Promise<[Uint8Array, boolean, DecodeInfo?] | [null, string]> {
   const cs = codings(header);
   if (typeof cs === "string") return [null, cs];
+  const tail = opts?.tail !== undefined && opts.tail > 0 ? opts.tail : undefined;
+  const limit = maxOut + 1;
   let cur = raw;
   let truncated = false;
   for (let i = cs.length - 1; i >= 0; i--) {
     if (cur.byteLength === 0) break;
+    const last = tail !== undefined && i === 0;
+    const scan = Math.max(opts?.scan ?? 4 * maxOut, limit);
     try {
-      const [out, cut] = await one(cur, cs[i], maxOut);
+      const [sink, complete] = await one(cur, cs[i], () => (last ? new Sink(limit, tail, scan) : new Sink(limit)));
+      if (last) return sink.result(complete);
+      const [out, cut] = sink.result(complete);
+      if (tail !== undefined && cut) return [null, "too large to decode whole"];
       cur = out;
       truncated = truncated || cut;
     } catch (e) {
@@ -283,5 +374,6 @@ export async function decodeBody(raw: Uint8Array, header: string, maxOut: number
       return [null, msg.includes("not available") ? msg : "corrupt " + cs[i] + " body"];
     }
   }
+  if (tail !== undefined && cs.length > 0) return [cur, truncated, { tail: null, size: cur.byteLength, complete: true }];
   return [cur, truncated];
 }

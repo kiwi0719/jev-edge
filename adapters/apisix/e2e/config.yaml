@@ -11,11 +11,16 @@ apisix:
 plugins:
   - jev-edge
   - proxy-rewrite
+  - limit-count
+  - key-auth
 nginx_config:
   error_log_level: warn
   envs:
     - TYPESAFE_API_KEY
+    - JEV_E2E_KEY
   http:
-    lua_shared_dict:
+    # custom_lua_shared_dict: APISIX drops whatever is put under lua_shared_dict
+    custom_lua_shared_dict:
       jev_cache: 16m
       jev_subject: 4m
+      jev_subject_rep: 1m

@@ -44,7 +44,7 @@ plugins:
    KONG_NGINX_MAIN_ENV=TYPESAFE_API_KEY                 # kong.conf: nginx_main_env = TYPESAFE_API_KEY
    ```
 
-   Kong turns each `nginx_http_<directive>` into one `<directive> <value>;` line, so a second dict (for `subject`) rides on the same value: `"jev_cache 64m; lua_shared_dict jev_subject 16m"`. A custom nginx template works too. Instead of the environment variable, `jev.api_key` is referenceable: `api_key: "{vault://env/typesafe-api-key}"`.
+   Kong turns each `nginx_http_<directive>` into one `<directive> <value>;` line, so the dicts for `subject` ride on the same value: `"jev_cache 64m; lua_shared_dict jev_subject 16m; lua_shared_dict jev_subject_rep 4m"` (`jev_subject_rep` holds subject reputation apart from the trajectories, which never evict and drop new entries when full). A custom nginx template works too. Instead of the environment variable, `jev.api_key` is referenceable: `api_key: "{vault://env/typesafe-api-key}"`.
 
 3. Start Kong with `TYPESAFE_API_KEY` in its environment and add the plugin to a route or service (above).
 
@@ -56,6 +56,8 @@ Your upstream receives `X-Jev-Verdict`, `X-Jev-Score`, `X-Jev-Source`, `X-Jev-Re
 |---|---|
 | `/etc/nginx/jev-edge.conf.lua`, APISIX plugin conf | plugin `config`, validated by `schema.lua`; same keys: `jev`, `rules`, `policy`, `cache`, `breaker`, `async`, `subject`, `sampling`. No schema defaults: unset keys take core's defaults (`core/defaults.lua`), and core's cross-field checks (threshold order, `timeout_max_ms >= timeout_ms`, subject salt) run as an entity check, so a bad config is refused at load, not at request time |
 | `rules`: ids or inline tables in one list | `rules`: array of rule set ids; `rules_json`: the full list as a JSON string, ids and inline tables mixed, exactly the APISIX / Lua-config value, and it replaces `rules` when set. Kong's schema has no "string or record" element type. Example: `rules_json: '[{"id":"billing","extends":"llm-endpoints","watch_paths":["^/v1/billing"]},"llm-endpoints"]'` |
+| rule files under `rules/` | on every node that runs the plugin: a rule set id names `rules/<id>.lua` on that node's Lua path. A traditional (DB or DB-less) or control plane node refuses a conf naming a rule set it does not have. A data plane accepts it, since refusing one conf stops its sync for every route, and answers that route with `X-Jev-Verdict: error`, `X-Jev-Source: adapter`, `X-Jev-Reason: rules failed to load: <id>`: a pass, or `policy.block_status` with `policy.unjudgeable = "block"` in enforce; the rule is logged at ERR. Inline rules in `rules_json` travel with the config to every node |
+| `jev.questions`: per-template question wording, a map of tables | `jev.questions_json`: the same map as a JSON object string, checked like core checks `jev.questions`. Example: `questions_json: '{"injection":{"instructions":"..."}}'` |
 | `access_by_lua_block`, APISIX priority 2450 | `access` phase, `PRIORITY = 905`: after authentication (`key-auth` 1250, `jwt` 1450, ...), `ip-restriction` 990, `request-size-limiting` 951, `acl` 950 and `rate-limiting` 910, so refused requests never cost a judge call; before `request-transformer` 801 and the `ai-*` plugins (770s), so the judged body is the client's and `ai-proxy` only sees admitted requests |
 | `env TYPESAFE_API_KEY;` | `nginx_main_env`, read through `jev.api_key_env` (default `TYPESAFE_API_KEY`); or `jev.api_key` inline or as a vault reference |
 | `lua_shared_dict jev_cache` | `nginx_http_lua_shared_dict`; missing dict = cache and breaker state disabled, with a warning |
@@ -66,7 +68,7 @@ Your upstream receives `X-Jev-Verdict`, `X-Jev-Score`, `X-Jev-Source`, `X-Jev-Re
 | `PUT /_jev/config` hot reload | the Admin API or a new declarative config: Kong rebuilds the plugin conf and the plugin builds a new runtime for it |
 | `/_jev/health`, `/_jev/metrics`, `/_jev/feedback` | not exposed; Kong's `prometheus` plugin and the log serializer carry the verdict fields |
 | L3 side-path, reputation | same modules, same `async` config |
-| `subject` | same keys; `from = "ip"` uses the forwarded IP; needs the `jev_subject` dict |
+| `subject` | same keys; `from = "ip"` uses the forwarded IP; `from = "header"` naming a header an auth plugin removed (`key-auth`, `basic-auth` ... with `hide_credentials = true`, which run first) falls back to the credential Kong authenticated, never to an anonymous consumer; needs the `jev_subject` dict, and `jev_subject_rep` with `reputation` (without it reputation shares `jev_subject`, with a warning) |
 | `/_jev/samples` | `sampling` is honoured and samples land in `jev_cache`; read them with `sampling.log = true`, or expose `resty.jev.edge.samples()` from a plain OpenResty location on the same box |
 
 One runtime (provider client, breaker, adaptive timeout) is built per plugin conf table and kept until Kong hands over a new one (config change, declarative reload). Breaker, adaptive timeout and in-flight counters are keyed by provider, endpoint and model, so plugin instances calling the same provider share its health. Verdict-cache keys are scoped by rule, templates, deployment context, provider and model (`core.cache_key`).
@@ -84,4 +86,4 @@ One runtime (provider client, breaker, adaptive timeout) is built per plugin con
 make e2e-kong
 ```
 
-Real Kong (`kong:3.9`, DB-less, declarative [e2e/kong.yml](e2e/kong.yml)) in front of a stub app, mock provider, twenty-one checks: skipped / safe / suspicious / blocked, `/v1%2Fchat/completions` (and `%2f`) judged like `/v1/chat/completions`, block body and headers, inbound header stripping, fail-open on provider failure, GET at L1, gzip bodies decoded and judged, a body spooled to disk read and blocked, an inline tenant rule through `rules_json`, and the decision log line. Configs in [e2e/](e2e/).
+Real Kong (`kong:3.9`, DB-less, declarative [e2e/kong.yml](e2e/kong.yml)) in front of a stub app, mock provider, twenty-one checks: skipped / safe / suspicious / blocked, `/v1%2Fchat/completions` (and `%2f`) judged like `/v1/chat/completions`, block body and headers, inbound header stripping, fail-open on provider failure, GET at L1, gzip bodies decoded and judged, a body spooled to disk read and blocked, an inline tenant rule through `rules_json`, and the decision log line. Then hybrid mode ([e2e/hybrid/](e2e/hybrid/)): a control plane on PostgreSQL and a DB-less data plane that lacks a rule set the control plane has; the data plane keeps syncing and answers the routes naming it with verdict `error`. Configs in [e2e/](e2e/).

@@ -23,6 +23,8 @@ export interface WorkerEnv {
   JEV_STATE?: DONamespaceLike;
   TYPESAFE_API_KEY?: string;
   JEV_ORIGIN?: string;
+  /** thinWorker: the shared secret sent to the origin's /_jev/authz as X-Jev-Origin-Token. */
+  JEV_ORIGIN_TOKEN?: string;
   [k: string]: unknown;
 }
 
@@ -142,18 +144,22 @@ const NOT_FOUND = () => new Response('{"error":"not found"}', { status: 404, hea
  * run. `origin` is that gateway's base URL (or env.JEV_ORIGIN); the Worker
  * proxies to `upstream` (default: the same origin) with X-Jev-* attached.
  * The origin's /_jev/* endpoints answer 404 here, except GET /_jev/health,
- * which the Worker serves itself. `opts` may be a function of env returning
- * the options, origin and upstream included: called once per env, and both
- * addresses checked then. An address it cannot use (missing origin, not an
- * absolute http(s) URL) fails open, logged once.
+ * which the Worker serves itself. The origin's /_jev/authz has to be
+ * reachable from Cloudflare, so from anyone: with `originToken` (or
+ * env.JEV_ORIGIN_TOKEN, a secret) every judgment call carries it as
+ * X-Jev-Origin-Token, and the origin refuses calls without it
+ * (example.nginx.conf). It is never sent upstream. `opts` may be a function
+ * of env returning the options, origin, upstream and originToken included:
+ * called once per env, and both addresses checked then. An address it cannot
+ * use (missing origin, not an absolute http(s) URL) fails open, logged once.
  */
 export function thinWorker<E extends WorkerEnv = WorkerEnv>(
-  opts: Resolve<E, { origin?: string; upstream?: string }> = {},
+  opts: Resolve<E, { origin?: string; upstream?: string; originToken?: string }> = {},
 ): { fetch(request: Request, env: E, ctx?: RequestCtx): Promise<Response> } {
   const cache = new WeakMap<object, Built>();
-  const own = attached<{ origin: string; upstream: string }>(opts);
+  const own = attached<{ origin: string; upstream: string; originToken: string }>(opts);
   const build = (env: E): Built => {
-    let o: Options & { origin?: string; upstream?: string };
+    let o: Options & { origin?: string; upstream?: string; originToken?: string };
     try {
       o = resolveOptions(opts, env);
     } catch (e) {
@@ -165,9 +171,13 @@ export function thinWorker<E extends WorkerEnv = WorkerEnv>(
       const origin = address("thinWorker: origin (or env.JEV_ORIGIN)", named.origin);
       if (!origin) throw new Error("thinWorker: origin (or env.JEV_ORIGIN) is required");
       const upstream = address("thinWorker: upstream", named.upstream) ?? origin;
+      const token = o.originToken ?? own.originToken ?? env.JEV_ORIGIN_TOKEN;
       const rt = presetRuntime({
         ...o,
-        config: { ...o.config, jev: { provider: "backend", endpoint: origin, ...o.config?.jev } },
+        config: {
+          ...o.config,
+          jev: { provider: "backend", endpoint: origin, ...(token ? { origin_token: token } : {}), ...o.config?.jev },
+        },
       }, env);
       return { rt, to: upstream };
     } catch (e) {

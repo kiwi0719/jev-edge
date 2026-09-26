@@ -53,3 +53,15 @@ describe("adaptive timeout", function()
     assert.equals(500, a:current())
   end)
 end)
+
+describe("adaptive timeout: a fractional floor", function()
+  it("is never undercut by the whole-ms estimate", function()
+    local a = A.new(H.store(), { timeout_ms = 300.5, timeout_max_ms = 900, timeout_warmup = 1, timeout_headroom = 1 })
+    for _ = 1, 50 do a:success(300.7) end   -- estimate 300.7: floored, 300 < 300.5
+    assert.is_true(a:current() >= 300.5)
+    assert.equals(300.5, a:current())
+    local b = A.new(H.store(), { timeout_ms = 300.5, timeout_max_ms = 900, timeout_warmup = 1, timeout_headroom = 1 })
+    for _ = 1, 50 do b:success(400.7) end   -- above the floor: whole ms
+    assert.equals(400, b:current())
+  end)
+end)

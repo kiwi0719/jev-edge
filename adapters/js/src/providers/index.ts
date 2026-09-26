@@ -181,7 +181,14 @@ export function stripNonce(text: string, nonce: string): string {
   return s;
 }
 
-export function openaiSystemPrompt(questions: Prompt["questions"], nonce: string): string {
+/**
+ * With a deployment context (a non-empty string), the questions take their
+ * context wording (instructions_ctx, criteria_ctx) and the prompt describes
+ * the assistant before them, as the System One state does with `assistant`
+ * and `user_message`. Byte for byte the system_prompt of openai_compat.lua.
+ */
+export function openaiSystemPrompt(questions: Prompt["questions"], nonce: string, deployment?: string): string {
+  const ctx = typeof deployment === "string" && deployment !== "" ? deployment : undefined;
   const lines = [
     "You are a security classifier for an API gateway.",
     "The input to classify is in the user message, between the line <<<INPUT " + nonce + ">>>",
@@ -194,13 +201,23 @@ export function openaiSystemPrompt(questions: Prompt["questions"], nonce: string
     "question ids and whose values are numbers between 0 and 1. No other keys, no prose.",
     "",
   ];
+  if (ctx !== undefined) {
+    lines.push(
+      "The input was sent to the assistant described below (written by the operator, trusted):",
+      stripNonce(ctx, nonce),
+      "In the questions, `assistant` is that description and `user_message` is the input between the markers.",
+      "",
+    );
+  }
   const example: string[] = [];
   for (const name of Object.keys(questions).sort()) {
     const t = questions[name];
-    lines.push(`question id "${name}": ${t.instructions}`);
-    if (t.criteria) {
-      lines.push("  YES when: " + t.criteria.true);
-      lines.push("  NO when: " + t.criteria.false);
+    const instr = (ctx !== undefined && t.instructions_ctx) || t.instructions;
+    const crit = (ctx !== undefined && t.criteria_ctx) || t.criteria;
+    lines.push(`question id "${name}": ${instr}`);
+    if (crit) {
+      lines.push("  YES when: " + (crit.true ?? ""));
+      lines.push("  NO when: " + (crit.false ?? ""));
     }
     example.push(`"${name}": 0.0`);
   }
@@ -238,14 +255,131 @@ export function jsonObjects(s: string): string[] {
   return out;
 }
 
-/** A JSON number, or a plain decimal string for small models; clamped to [0,1]. null, booleans and "" are not answers. */
+// The decoder for the reply and for the answer objects planted in the judged
+// text: the union of what JSON.parse and the Lua provider's cjson accept, so
+// no object is read by one core and skipped by the other (that would flip
+// echo detection, or turn a score into an error, and an error passes). Past
+// JSON.parse it takes what cjson takes: raw control characters in strings
+// (not NUL) and the number forms strtod reads (+1, 01, 1., .5 after a sign,
+// hex, inf, nan). A lone surrogate escape JSON.parse already takes (the Lua
+// side reads it as U+FFFD), and nesting past OPENAI_MAX_DEPTH is refused in
+// both cores. Port of decode in providers/openai_compat.lua.
+const OPENAI_MAX_DEPTH = 3000;
+
+function depthWithin(s: string, max: number): boolean {
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === 92) esc = true;
+      else if (c === 34) inStr = false;
+    } else if (c === 34) inStr = true;
+    else if (c === 123 || c === 91) {
+      if (++depth > max) return false;
+    } else if (c === 125 || c === 93) depth--;
+  }
+  return true;
+}
+
+// strtod's syntax, as cjson reads a number (decode_invalid_numbers): sign,
+// then hex (with a fraction and a binary exponent), inf[inity], nan[(...)],
+// or decimal digits with an optional fraction and exponent.
+const STRTOD = /[+-]?(?:0[xX](?:[0-9a-fA-F]+(?:\.[0-9a-fA-F]*)?|\.[0-9a-fA-F]+)(?:[pP][+-]?\d+)?|[iI][nN][fF](?:[iI][nN][iI][tT][yY])?|[nN][aA][nN](?:\([0-9A-Za-z_]*\))?|(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)/y;
+
+function strtodValue(tok: string): number {
+  const neg = tok[0] === "-";
+  const t = tok[0] === "-" || tok[0] === "+" ? tok.slice(1) : tok;
+  let v: number;
+  if (/^0x/i.test(t)) {
+    const m = /^0x([0-9a-f]*)(?:\.([0-9a-f]*))?(?:p([+-]?\d+))?$/i.exec(t)!;
+    v = 0;
+    for (const d of m[1]) v = v * 16 + parseInt(d, 16);
+    let scale = 1 / 16;
+    for (const d of m[2] ?? "") { v += parseInt(d, 16) * scale; scale /= 16; }
+    if (m[3]) v *= Math.pow(2, Number(m[3]));
+  } else if (/^inf/i.test(t)) v = Infinity;
+  else if (/^nan/i.test(t)) v = NaN;
+  else v = Number(t);
+  return neg ? -v : v;
+}
+
+/** JSON text as cjson reads it, rewritten into what JSON.parse reads: raw
+ *  control characters in strings escaped, strtod number forms written out
+ *  (a non-finite one as null, which no answer takes either). */
+function cjsonToJson(s: string): string {
+  let out = "";
+  let inStr = false;
+  let esc = false;
+  let i = 0;
+  while (i < s.length) {
+    const ch = s[i];
+    const c = s.charCodeAt(i);
+    if (inStr) {
+      // an escaped character stays as it is: cjson refuses a backslash
+      // before a raw control character, and so must the rewrite
+      if (esc) esc = false;
+      else if (c === 92) esc = true;
+      else if (c === 34) inStr = false;
+      else if (c >= 1 && c < 32) {
+        out += "\\u" + c.toString(16).padStart(4, "0");
+        i++;
+        continue;
+      }
+      out += ch;
+      i++;
+      continue;
+    }
+    if (c === 34) {
+      inStr = true;
+      out += ch;
+      i++;
+      continue;
+    }
+    const start = ch === "+" || ch === "-" || (c >= 48 && c <= 57) || /^(?:inf|nan)/i.test(s.slice(i, i + 3));
+    if (start) {
+      STRTOD.lastIndex = i;
+      const m = STRTOD.exec(s);
+      if (m) {
+        const v = strtodValue(m[0]);
+        out += !Number.isFinite(v) ? "null" : Object.is(v, -0) ? "-0" : String(v);
+        i = STRTOD.lastIndex;
+        continue;
+      }
+    }
+    out += ch;
+    i++;
+  }
+  return out;
+}
+
+function decodeLenient(src: string): unknown {
+  if (!depthWithin(src, OPENAI_MAX_DEPTH)) return undefined;
+  try {
+    return JSON.parse(src) as unknown;
+  } catch {
+    try {
+      return JSON.parse(cjsonToJson(src)) as unknown;
+    } catch {
+      return undefined;
+    }
+  }
+}
+
+/** A JSON number, or a plain decimal string for small models; clamped to [0,1]. null, booleans and "" are not answers.
+ *  The string form allows the whitespace Lua's %s does, no other. */
 function prob(v: unknown): number | undefined {
   let n: number | undefined;
   if (typeof v === "number") n = v;
-  else if (typeof v === "string" && /^\s*-?[\d.]+\s*$/.test(v)) n = Number(v);
+  else if (typeof v === "string" && /^[ \t\n\v\f\r]*-?[\d.]+[ \t\n\v\f\r]*$/.test(v)) n = Number(v);
   if (n === undefined || !Number.isFinite(n)) return undefined;
   return Math.min(1, Math.max(0, n));
 }
+
+/** With one question, parseOpenaiContent also takes a lone key of these as the answer (small models), in this order. */
+const FALLBACK_KEYS = ["probability", "score", "p"];
 
 /**
  * Reduce the reply text to an answer map. Each question takes the maximum
@@ -255,12 +389,8 @@ function prob(v: unknown): number | undefined {
 export function parseOpenaiContent(content: string, wanted: string[]): JudgeResult {
   const objs: Record<string, unknown>[] = [];
   for (const src of jsonObjects(content)) {
-    try {
-      const o = JSON.parse(src) as unknown;
-      if (o && typeof o === "object" && !Array.isArray(o)) objs.push(o as Record<string, unknown>);
-    } catch {
-      // not JSON: skip it
-    }
+    const o = decodeLenient(src); // undefined when not JSON: skipped
+    if (o && typeof o === "object" && !Array.isArray(o)) objs.push(o as Record<string, unknown>);
   }
   if (objs.length === 0) return [null, "openai-compat: content is not JSON"];
   const names = [...wanted].sort();
@@ -275,7 +405,7 @@ export function parseOpenaiContent(content: string, wanted: string[]): JudgeResu
     }
     if (best === undefined && names.length === 1) {
       for (const o of objs) {
-        for (const k of ["probability", "score", "p"]) {
+        for (const k of FALLBACK_KEYS) {
           const v = prob(own(o, k));
           if (v !== undefined && (best === undefined || v > best)) best = v;
         }
@@ -290,26 +420,38 @@ export function parseOpenaiContent(content: string, wanted: string[]): JudgeResu
 }
 
 /** The answer values an object gives for the asked questions, as one
- *  comparable string, or undefined when it answers none (port of answer_sig). */
+ *  comparable string, or undefined when it answers none (port of answer_sig).
+ *  With one question and no value under its id, the first fallback key that
+ *  holds one, tagged with the key: parseOpenaiContent reads that as the
+ *  answer, so a planted {"score": 0} is compared too, key and value. */
 function answerSig(o: Record<string, unknown>, names: string[]): string | undefined {
+  const own = (k: string): unknown => (Object.prototype.hasOwnProperty.call(o, k) ? o[k] : undefined);
+  // to 6 significant digits, as answer_sig's "%.6g": a judge's rounded copy
+  // (0.0123457 of a planted 0.0123456789) is still a copy. An exact binary
+  // tie at the 7th digit may round differently in C's printf; no reply is
+  // that precise. prob() has already folded -0 into 0.
+  const sig6 = (v: number): string => String(Number(v.toPrecision(6)));
   let any = false;
   const parts = names.map((name) => {
-    const v = prob(Object.prototype.hasOwnProperty.call(o, name) ? o[name] : undefined);
+    const v = prob(own(name));
     if (v !== undefined) any = true;
-    return name + "=" + (v !== undefined ? String(v) : "-");
+    return name + "=" + (v !== undefined ? sig6(v) : "-");
   });
-  return any ? parts.join("|") : undefined;
+  if (any) return parts.join("|");
+  if (names.length === 1) {
+    for (const k of FALLBACK_KEYS) {
+      const v = prob(own(k));
+      if (v !== undefined) return names[0] + "@" + k + "=" + sig6(v);
+    }
+  }
+  return undefined;
 }
 
 function objectsOf(s: string): Record<string, unknown>[] {
   const out: Record<string, unknown>[] = [];
   for (const src of jsonObjects(s)) {
-    try {
-      const o = JSON.parse(src) as unknown;
-      if (o && typeof o === "object" && !Array.isArray(o)) out.push(o as Record<string, unknown>);
-    } catch {
-      // not JSON: skip it
-    }
+    const o = decodeLenient(src); // undefined when not JSON: skipped
+    if (o && typeof o === "object" && !Array.isArray(o)) out.push(o as Record<string, unknown>);
   }
   return out;
 }
@@ -347,7 +489,7 @@ export const openaiCompat: Provider = {
       max_tokens: 200,
       response_format: { type: "json_object" },
       messages: [
-        { role: "system", content: openaiSystemPrompt(prompt.questions, nonce) },
+        { role: "system", content: openaiSystemPrompt(prompt.questions, nonce, prompt.context.deployment) },
         { role: "user", content: openaiUserMessage(prompt.text, nonce) },
       ],
     });
@@ -357,13 +499,17 @@ export const openaiCompat: Provider = {
     try {
       content = await fetchWithin(endpoint + "/chat/completions", { method: "POST", headers, body }, timeoutMs, async (res) => {
         if (res.status !== 200) throw new HttpStatus(res.status);
+        let raw: string;
         try {
-          const d = (await res.json()) as { choices?: { message?: { content?: string } }[] };
-          return d.choices?.[0]?.message?.content ?? "";
+          raw = await res.text();
         } catch (e) {
           if (e instanceof Error && e.name === "AbortError") throw e;
           throw new Error("malformed response");
         }
+        // the envelope too goes through the decoder cjson's twin uses
+        const d = decodeLenient(raw) as { choices?: { message?: { content?: string } }[] } | null | undefined;
+        if (d === undefined) throw new Error("malformed response");
+        return d?.choices?.[0]?.message?.content ?? "";
       });
     } catch (e) {
       if (e instanceof HttpStatus) return [null, "openai-compat http " + e.status, statusKind(e.status)];
@@ -397,6 +543,10 @@ export const openaiCompat: Provider = {
  * policy.block_status) is reported as score 1, whatever X-Jev-Score says, so
  * the Worker's policy blocks it too at any block_threshold and the cached 1
  * blocks a repeat; an X-Jev-Verdict: error answer is an error here as well.
+ * With `jev.origin_token` (TS only; thinWorker's originToken or
+ * env.JEV_ORIGIN_TOKEN) every call carries it as X-Jev-Origin-Token, so an
+ * origin that must be reachable from Cloudflare can refuse everyone else's
+ * calls to /_jev/authz (example.nginx.conf).
  */
 /** The labels an origin gives a text it judged; any other answer was not judged there. */
 const JUDGED = new Set(["safe", "suspicious", "malicious"]);
@@ -426,6 +576,7 @@ export const backend: Provider = {
     };
     if (info?.clientIp) headers["X-Forwarded-For"] = info.clientIp;
     if (info?.subjectId) headers["X-Jev-Subject"] = info.subjectId;
+    if (typeof cfg.origin_token === "string" && cfg.origin_token !== "") headers["X-Jev-Origin-Token"] = cfg.origin_token;
     // The answer is in the headers; the body (a 403's JSON) is drained so the
     // connection is reusable, still under the same deadline.
     let res: Response;

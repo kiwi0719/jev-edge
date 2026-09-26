@@ -129,6 +129,35 @@ groups:
             look for a burst of suspicious/error verdicts (requests panel)
             or a slow provider holding async slots (async.timeout_ms).
 
+      # Async (L3) jobs that ran and got no second look (jev_async_total by
+      # result): a part got no answer (provider error, async.timeout_ms), the
+      # answers had no score, the judge's in-flight cap refused it, or the job
+      # threw. Nothing is cached for the request and reputation does not learn
+      # from it.
+      - alert: JevAsyncFailing
+        expr: |
+          sum by (job, instance) (increase(jev_async_total{result!="ok"}[10m]))
+            /
+          sum by (job, instance) (increase(jev_async_total[10m]))
+            > 0.5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "jev-edge async re-judges failing ({{ $value | humanizePercentage }}) on {{ $labels.instance }}"
+          description: >-
+            More than half of the async re-judge jobs that ran on
+            {{ $labels.instance }} in the last 10 minutes got no answer.
+            Suspicious and errored requests are not getting their second look:
+            no cached verdict, and reputation blocking does not learn from them.
+          runbook: >-
+            Break down by result: sum by (result) (increase(jev_async_total[10m])).
+            failed: read the error log for "L3 judge failed" (provider errors,
+            or async.timeout_ms too short for the provider). no_scores: the
+            provider answers without the scores asked for (model, template).
+            busy: a custom judge's own cap. error: "L3 error" in the error log,
+            a bug.
+
       # Requests keep arriving at the L2 stage but none is judged: every one
       # short-circuits at the breaker or fails. Catches a stuck breaker even
       # when the gauge is sampled at the wrong moments.
@@ -150,3 +179,24 @@ groups:
             Same as JevBreakerOpen: check /_jev/health, the provider and the
             key. The verdict cache keeps serving known texts; new texts pass
             unjudged until L2 recovers.
+
+      # A request judging threw on (a bad override or rule, a bug) was failed
+      # open unjudged by the adapter (X-Jev-Source: adapter). Nothing else
+      # counts it; while every request fails this way the ratio alerts above
+      # see no L2 traffic at all. increase() misses the very first error of a
+      # new series, not a sustained failure.
+      - alert: JevAdapterErrors
+        expr: increase(jev_adapter_errors_total[5m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "jev-edge failing requests open on adapter errors on {{ $labels.instance }} ({{ $labels.entry }})"
+          description: >-
+            {{ $value | humanize }} requests through {{ $labels.entry }} on
+            {{ $labels.instance }} passed unjudged in the last 5 minutes
+            because judging threw (verdict=error, source=adapter).
+          runbook: >-
+            Read the error log for "jev-edge: {{ $labels.entry }} error,
+            failing open". After a config change: GET /_jev/config, then
+            DELETE /_jev/config to drop the override, or fix the rule in the
+            config file. Otherwise it is a bug: report the log line.

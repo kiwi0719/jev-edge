@@ -382,3 +382,44 @@ func TestWellFormedEscapesAreForwardedAsNginxReadsThem(t *testing.T) {
 		}
 	}
 }
+
+// Envoy relays a client's own x-envoy-external-address when it counts the
+// peer as internal (a private or loopback address), and the adapter takes
+// that header as the client address: the shim always replaces it with the
+// source address Envoy reports, and drops it when there is none. A client's
+// X-Jev-* (here the HAProxy agent's cut flag, which authz() honours when no
+// x-envoy-external-address comes with it) never reaches the adapter; other
+// headers still do.
+func TestClientAddressAndJevHeadersAreNotRelayed(t *testing.T) {
+	type seen struct{ xea, partial, subject, other string }
+	var got seen
+	s, _ := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		got = seen{r.Header.Get("X-Envoy-External-Address"), r.Header.Get("X-Jev-Body-Partial"),
+			r.Header.Get("X-Jev-Subject"), r.Header.Get("X-Other")}
+		if _, ok := r.Header["X-Envoy-External-Address"]; !ok {
+			got.xea = "(absent)"
+		}
+		w.Header().Set("X-Jev-Verdict", "safe")
+		w.WriteHeader(200)
+	})
+	forged := map[string]string{"x-envoy-external-address": "198.51.100.7", "X-Jev-Body-Partial": "1",
+		"x-jev-subject": "someone-else", "x-other": "kept"}
+
+	req := checkReq("/v1/chat/completions", forged)
+	req.Attributes.Source = &authv3.AttributeContext_Peer{Address: &corev3.Address{Address: &corev3.Address_SocketAddress{
+		SocketAddress: &corev3.SocketAddress{Address: "172.18.0.1", PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: 51234}},
+	}}}
+	if res, _ := s.Check(context.Background(), req); res.GetOkResponse() == nil {
+		t.Fatalf("expected OK, got %v", res)
+	}
+	if want := (seen{"172.18.0.1", "", "", "kept"}); got != want {
+		t.Fatalf("with a source address: adapter saw %+v, want %+v", got, want)
+	}
+
+	if res, _ := s.Check(context.Background(), checkReq("/v1/chat/completions", forged)); res.GetOkResponse() == nil {
+		t.Fatalf("expected OK, got %v", res)
+	}
+	if want := (seen{"(absent)", "", "", "kept"}); got != want {
+		t.Fatalf("without a source address: adapter saw %+v, want %+v", got, want)
+	}
+}

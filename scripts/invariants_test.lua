@@ -66,7 +66,8 @@ local REL = ".github/workflows/release-npm.yml"
 local PKG = "adapters/js/package.json"
 local WS = "adapters/js/pnpm-workspace.yaml"
 local TSRULES = "adapters/js/src/rules/index.ts"
-local rs, ci, tsr = read(spec), read(CI), read(TSRULES)
+local ENVOY = "adapters/envoy/envoy-http.yaml"
+local rs, ci, tsr, envoy = read(spec), read(CI), read(TSRULES), read(ENVOY)
 local sec, rel, pkg, ws = read(SEC), read(REL), read(PKG), read(WS)
 
 local function with_newjob(s)
@@ -317,6 +318,15 @@ local cases = {
   { "ci.yml: require() smoke skips /frameworks",
     { [CI] = edit(ci, "(%[''[^%]\n]*)'/frameworks', ([^%]\n]*%]%) require)", "%1%2") },
     "npm-exports", "ci.yml does not require() exports ./frameworks" },
+
+  -- gateway-headers: Envoy passes a client's x-envoy-external-address from an
+  -- internal peer (audit g1-proxy-forwarded-metadata-live#1)
+  { "envoy-http.yaml: x-envoy-external-address allow-listed again",
+    { [ENVOY] = edit(envoy, "(\n(%s*)%- exact: x%-forwarded%-for\n)", "%1%2- exact: x-envoy-external-address\n") },
+    "gateway-headers", "forwards a client's x-envoy-external-address" },
+  { "envoy-http.yaml: x-envoy-external-address as a prefix pattern",
+    { [ENVOY] = edit(envoy, "(\n(%s*)%- exact: x%-forwarded%-for\n)", "%1%2- prefix: X-Envoy-External\n") },
+    "gateway-headers", "forwards a client's x-envoy-external-address" },
 
   -- rule-parity: a path watched for any body on one runtime only
   { "rules: json_only_paths emptied in the TS copy",

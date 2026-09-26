@@ -544,7 +544,7 @@
       "type": "timeseries",
       "id": 12,
       "title": "L2 latency quantiles",
-      "description": "histogram_quantile over jev_l2_latency_ms_bucket (buckets 25..1000 ms, +Inf), plus the mean from _sum/_count.",
+      "description": "histogram_quantile over jev_l2_latency_ms_bucket (buckets 25..30000 ms, +Inf), plus the mean from _sum/_count.",
       "datasource": {
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
@@ -1099,6 +1099,118 @@
       "fieldConfig": {
         "defaults": {
           "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "id": 23,
+      "title": "Adapter errors (passed unjudged)",
+      "description": "rate(jev_adapter_errors_total): requests judging threw on (a bad override or rule, a bug), passed with verdict=error, source=adapter. Anything above zero is the JevAdapterErrors alert; the error log names the cause.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 57,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum by (instance, entry) (rate(jev_adapter_errors_total{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "{{instance}} {{entry}}",
+          "refId": "A",
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "id": 24,
+      "title": "Async re-judges by result",
+      "description": "rate(jev_async_total) by result: L3 jobs that ran. ok: every part answered. failed: a part got no answer (provider error, async.timeout_ms). no_scores: answers without a score. busy: a judge's own cap. error: the job threw. More than half not ok for 5m is the JevAsyncFailing alert; jobs never scheduled are the Async jobs dropped panel.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 65,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum by (result) (rate(jev_async_total{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "{{result}}",
+          "refId": "A",
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
           "custom": {
             "drawStyle": "line",
             "lineWidth": 1,

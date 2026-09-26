@@ -4,12 +4,22 @@
 // pass a Store).
 import { Buffer } from "node:buffer";
 import {
-  createRuntime, evaluate, withVerdictHeaders, copyRequest, healthResponse, failOpen, errorForward, type Options, type Runtime,
+  createRuntime, evaluate, withVerdictHeaders, copyRequest, healthResponse, failOpen, errorForward, jevHeaderNames, type Options, type Runtime,
 } from "./runtime.js";
 import { headers as verdictHeaders, newVerdict, ERROR, SRC_ADAPTER, type Verdict } from "./core/verdict.js";
 import { contentEncoding } from "./core/rules.js";
 
-const HEADERS = ["x-jev-verdict", "x-jev-score", "x-jev-source", "x-jev-reason", "x-jev-request-id", "x-jev-subject"];
+function adapterError(): Verdict {
+  return newVerdict({ verdict: ERROR, source: SRC_ADAPTER, reason: "adapter error" });
+}
+
+function newRequestId(): string {
+  try {
+    return crypto.randomUUID();
+  } catch {
+    return String(Date.now());
+  }
+}
 
 function runtimeOnce(opts: Options): () => Runtime {
   let rt: Runtime | undefined;
@@ -342,15 +352,15 @@ export function nodeMiddleware(opts: Options) {
         return;
       }
       const forwarded = withVerdictHeaders(request, verdict, requestId, subjectId);
-      for (const h of HEADERS) delete req.headers[h];
+      for (const h of jevHeaderNames(Object.keys(req.headers))) delete req.headers[h];
       forwarded.headers.forEach((v, k) => {
         if (k.startsWith("x-jev-")) req.headers[k] = v;
       });
       next();
     } catch (e) {
       console.error("jev-edge: middleware error, failing open: " + (e instanceof Error ? e.message : String(e)));
-      for (const h of HEADERS) delete req.headers[h];
-      const v = newVerdict({ verdict: ERROR, source: SRC_ADAPTER, reason: "adapter error" });
+      for (const h of jevHeaderNames(Object.keys(req.headers))) delete req.headers[h];
+      const v = adapterError();
       for (const [k, val] of Object.entries(verdictHeaders(v))) req.headers[k.toLowerCase()] = val;
       req.jev = v;
       next();
@@ -380,14 +390,6 @@ async function honoRequest(c: HonoContextLike): Promise<Request> {
   const raw = c.req.raw;
   if (!raw.bodyUsed || typeof c.req.arrayBuffer !== "function") return raw;
   return copyRequest(raw, raw.headers, await c.req.arrayBuffer());
-}
-
-function newRequestId(): string {
-  try {
-    return crypto.randomUUID();
-  } catch {
-    return String(Date.now());
-  }
 }
 
 /**
@@ -424,7 +426,7 @@ export function honoMiddleware(opts: Options) {
       forwarded = withVerdictHeaders(request, verdict, ev.requestId, ev.subjectId);
     } catch (e) {
       console.error("jev-edge: hono middleware error, failing open: " + (e instanceof Error ? e.message : String(e)));
-      verdict = newVerdict({ verdict: ERROR, source: SRC_ADAPTER, reason: "adapter error" });
+      verdict = adapterError();
       // the handlers must not see the client's X-Jev-* on this path either
       try {
         forwarded = withVerdictHeaders(c.req.raw, verdict, newRequestId());

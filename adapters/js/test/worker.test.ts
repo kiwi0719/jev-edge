@@ -376,6 +376,34 @@ describe("backend provider (thin Worker)", () => {
     }
   });
 
+  it("sends originToken (or env.JEV_ORIGIN_TOKEN) to the origin's /_jev/authz, never upstream", async () => {
+    const authz: (string | null)[] = [];
+    const upstream: (string | null)[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: string | Request, init?: RequestInit) => {
+      const req = input instanceof Request ? input : new Request(input, init);
+      if (new URL(req.url).pathname.startsWith("/_jev/authz")) {
+        authz.push(req.headers.get("x-jev-origin-token"));
+        return new Response(null, { status: 200, headers: { "X-Jev-Verdict": "safe", "X-Jev-Score": "0.10", "X-Jev-Reason": "injection+0.10" } });
+      }
+      upstream.push(req.headers.get("x-jev-origin-token"));
+      return Response.json({ upstream: true });
+    }));
+    const body = (n: number) => `{"messages":[{"role":"user","content":"Please write a detailed summary of quarterly report number ${n}."}]}`;
+    expect((await thinWorker({ origin: "https://origin.example", originToken: "s3cret" }).fetch(chat(body(1)), {})).status).toBe(200);
+    await thinWorker().fetch(chat(body(2)), { JEV_ORIGIN: "https://origin.example", JEV_ORIGIN_TOKEN: "from-env" });
+    await thinWorker({ origin: "https://origin.example" }).fetch(chat(body(3)), {});
+    expect(authz).toEqual(["s3cret", "from-env", null]);
+    expect(upstream).toEqual([null, null, null]);
+  });
+
+  it("an origin that refuses the token (404) fails open, marked error", async () => {
+    stubAuthz(() => new Response("not found", { status: 404 }));
+    const w = thinWorker({ origin: "https://origin.example", originToken: "wrong", config: { policy: { mode: "enforce" } } });
+    const res = await w.fetch(chat(ATTACK), {});
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as Record<string, unknown>).verdict).toBe("error");
+  });
+
   it("reads the origin from env.JEV_ORIGIN", async () => {
     stubAuthz(() => new Response(null, { status: 200, headers: { "X-Jev-Verdict": "safe", "X-Jev-Score": "0.10", "X-Jev-Reason": "injection+0.10" } }));
     const res = await thinWorker().fetch(chat(BENIGN), { JEV_ORIGIN: "https://origin.example" });

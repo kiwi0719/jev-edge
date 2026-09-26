@@ -538,6 +538,12 @@ describe("defaults.validate", () => {
       { policy: { block_threshold: 5, suspect_threshold: 2 } },
       { policy: { block_status: 42 } },
       { policy: { block_status: 403.5 } },
+      // a block is a 4xx (openresty-edge#5)
+      { policy: { block_status: 200 } },
+      { policy: { block_status: 302 } },
+      { policy: { block_status: 503 } },
+      { policy: { block_status: null } },
+      { policy: { block_status: "403" } },
       { breaker: { window_s: 0 } },
       { breaker: { open_s: -1 } },
       { breaker: { min_samples: 0 } },
@@ -557,6 +563,11 @@ describe("defaults.validate", () => {
     }
     expect(core.defaults.config.client_ip.trusted_hops).toBe(1);
     expect(core.defaults.validate(core.defaults.merge(core.defaults.config, { policy: { block_status: 429 }, client_ip: { trusted_hops: 2 } }))[0]).toBe(true);
+    for (const st of [400, 403, 429, 451, 499]) {
+      expect(core.defaults.validate(core.defaults.merge(core.defaults.config, { policy: { block_status: st } }))[0], String(st)).toBe(true);
+    }
+    expect(core.defaults.validate(core.defaults.merge(core.defaults.config, { policy: { block_status: 503 } })))
+      .toEqual([null, "policy.block_status must be a 4xx status"]);
     expect(core.defaults.config.policy.partial).toBe("judge");
     expect(core.defaults.validate(core.defaults.merge(core.defaults.config, { policy: { partial: "unjudgeable" } }))[0]).toBe(true);
   });

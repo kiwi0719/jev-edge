@@ -108,7 +108,7 @@ local schema = {
         mode              = { type = "string", enum = { "monitor", "enforce" } },
         block_threshold   = { type = "number", minimum = 0, maximum = 1 },
         suspect_threshold = { type = "number", minimum = 0, maximum = 1 },
-        block_status      = { type = "integer", minimum = 200, maximum = 599 },
+        block_status      = { type = "integer", minimum = 400, maximum = 499 },
         block_body        = { type = "string" },
       },
     },

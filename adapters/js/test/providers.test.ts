@@ -234,4 +234,23 @@ describe("providers: error kinds", () => {
     reply(() => new Response(null, { status: 502 }));
     expect(await backend.call(prompt("x"), cfg, 1000)).toEqual([null, "backend http 502", "unavailable"]);
   });
+
+  // openresty-edge#5: the origin's block is its policy.block_status, any 4xx
+  it("backend: any 4xx with X-Jev-Verdict is the origin's block; one without is not jev-edge's answer", async () => {
+    const cfg = { provider: "backend", endpoint: "http://origin" } as JevConfig;
+    for (const status of [400, 403, 429, 451]) {
+      reply(() => new Response('{"error":"request rejected"}', {
+        status, headers: { "X-Jev-Verdict": "malicious", "X-Jev-Score": "0.93", "X-Jev-Reason": "injection+0.93" },
+      }));
+      expect(await backend.call(prompt("x"), cfg, 1000), String(status)).toEqual([{ injection: 0.93 }, null]);
+    }
+    // no score on it: still a block, at 1
+    reply(() => new Response(null, { status: 429, headers: { "X-Jev-Verdict": "malicious" } }));
+    expect(await backend.call(prompt("x"), cfg, 1000)).toEqual([{ backend: 1 }, null]);
+    // the nginx in front of jev-edge refused the call
+    reply(() => new Response("forbidden", { status: 403 }));
+    expect(await backend.call(prompt("x"), cfg, 1000)).toEqual([null, "backend http 403", "rejected"]);
+    reply(() => new Response(null, { status: 429 }));
+    expect(await backend.call(prompt("x"), cfg, 1000)).toEqual([null, "backend http 429", "unavailable"]);
+  });
 });

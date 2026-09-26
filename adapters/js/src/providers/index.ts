@@ -429,7 +429,11 @@ export const backend: Provider = {
     }
     const verdict = res.headers.get("x-jev-verdict") ?? "";
     const score = Number(res.headers.get("x-jev-score"));
-    if (res.status === 403) {
+    // A block is the origin's policy.block_status (any 4xx) with its
+    // X-Jev-Verdict. A 4xx without one is not jev-edge's answer (the nginx in
+    // front refused the call, a proxy's 404): an error, as docs/recipes.md
+    // says a relay reads it, never a block.
+    if (res.status >= 400 && res.status < 500 && res.headers.has("x-jev-verdict")) {
       const name = (res.headers.get("x-jev-reason") ?? "backend").split("+")[0] || "backend";
       return [{ [name]: Number.isFinite(score) && score > 0 ? score : 1 }, null];
     }

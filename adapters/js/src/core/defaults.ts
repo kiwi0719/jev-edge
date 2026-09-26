@@ -136,8 +136,10 @@ export function validate(c: Config): [true, null] | [null, string] {
   const bb = p.block_body as unknown;
   if (bb !== undefined && typeof bb !== "string") return [null, "policy.block_body must be a string"];
   const bs = p.block_status as unknown;
-  if (bs !== undefined && bs !== null && (typeof bs !== "number" || bs < 200 || bs > 599 || !Number.isInteger(bs))) {
-    return [null, "policy.block_status must be an HTTP status code"];
+  // a block is a 4xx: a relay tells a block from an allow and from an error
+  // that fails open by it (core/defaults.lua); null is refused, as cjson.null is
+  if (bs !== undefined && (typeof bs !== "number" || bs < 400 || bs > 499 || !Number.isInteger(bs))) {
+    return [null, "policy.block_status must be a 4xx status"];
   }
   const ca: Partial<Config["cache"]> = c.cache ?? {};
   if (ca.fp_ttl !== undefined && (typeof ca.fp_ttl !== "number" || ca.fp_ttl <= 0)) return [null, "cache.fp_ttl must be > 0"];

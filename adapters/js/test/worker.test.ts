@@ -227,7 +227,9 @@ describe("backend provider (thin Worker)", () => {
   });
 
   it("turns a 403 from the origin into a block at the edge", async () => {
-    stubAuthz(() => new Response('{"error":"request rejected"}', { status: 403, headers: { "X-Jev-Reason": "injection+0.95", "X-Jev-Score": "0.95" } }));
+    stubAuthz(() => new Response('{"error":"request rejected"}', {
+      status: 403, headers: { "X-Jev-Verdict": "malicious", "X-Jev-Reason": "injection+0.95", "X-Jev-Score": "0.95" },
+    }));
     const w = thinWorker({ origin: "https://origin.example", config: { policy: { mode: "enforce" } } });
     const res = await w.fetch(chat(ATTACK), {});
     expect(res.status).toBe(403);
@@ -257,7 +259,9 @@ describe("backend provider (thin Worker)", () => {
         const b = await req.text();
         bodies.push(b);
         return b.includes(MARK)
-          ? new Response('{"error":"request rejected"}', { status: 403, headers: { "X-Jev-Reason": "injection+0.95", "X-Jev-Score": "0.95" } })
+          ? new Response('{"error":"request rejected"}', {
+            status: 403, headers: { "X-Jev-Verdict": "malicious", "X-Jev-Reason": "injection+0.95", "X-Jev-Score": "0.95" },
+          })
           : new Response(null, { status: 200, headers: { "X-Jev-Verdict": "safe", "X-Jev-Score": "0.10", "X-Jev-Reason": "injection+0.10" } });
       }));
     };

@@ -30,6 +30,12 @@ describe("defaults.validate", function()
     for _, over in ipairs({
       { policy = { block_threshold = 5, suspect_threshold = 2 } },
       { policy = { block_status = 42 } },
+      -- a block is a 4xx (openresty-edge#5)
+      { policy = { block_status = 200 } },
+      { policy = { block_status = 302 } },
+      { policy = { block_status = 503 } },
+      { policy = { block_status = 403.5 } },
+      { policy = { block_status = "403" } },
       { breaker = { window_s = 0 } },
       { breaker = { min_samples = 0 } },
       { breaker = { fail_ratio = 0 } },
@@ -64,6 +70,14 @@ describe("defaults.validate", function()
     assert.is_true(D.validate(D.merge(D.config, { policy = { block_body = '{"error":"blocked"}' },
       jev = { provider = "openai-compat", model = "m", endpoint = "http://j/v1", api_key = "k",
               api_key_env = "K", deployment_context = "A support assistant." } })))
+  end)
+
+  it("takes any 4xx as policy.block_status", function()
+    for _, st in ipairs({ 400, 403, 429, 451, 499 }) do
+      assert.is_true(D.validate(D.merge(D.config, { policy = { block_status = st } })), st)
+    end
+    local _, err = D.validate(D.merge(D.config, { policy = { block_status = 503 } }))
+    assert.equals("policy.block_status must be a 4xx status", err)
   end)
 
   it("takes policy.partial = judge | unjudgeable and nothing else", function()

@@ -126,7 +126,7 @@ return {
             { mode              = { type = "string", one_of = { "monitor", "enforce" } } },
             { block_threshold   = { type = "number", between = unit } },
             { suspect_threshold = { type = "number", between = unit } },
-            { block_status      = { type = "integer", between = { 200, 599 } } },
+            { block_status      = { type = "integer", between = { 400, 499 } } },
             { block_body        = { type = "string" } },
             { unjudgeable       = { type = "string", one_of = { "pass", "block" } } },
           },

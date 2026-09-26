@@ -266,9 +266,13 @@ function _M.validate(c)
   if p.block_body ~= nil and type(p.block_body) ~= "string" then
     return nil, "policy.block_body must be a string"
   end
+  -- a block is a 4xx: a relay in front (a thin Worker, the recipes' gateways)
+  -- tells a block from an allow (200) and from an error that fails open
+  -- (5xx, no X-Jev-Verdict) by it, and a 2xx or 3xx "block" reaches the
+  -- client as a success or a redirect
   if p.block_status ~= nil and (type(p.block_status) ~= "number"
-     or p.block_status < 200 or p.block_status > 599 or p.block_status % 1 ~= 0) then
-    return nil, "policy.block_status must be an HTTP status code"
+     or p.block_status < 400 or p.block_status > 499 or p.block_status % 1 ~= 0) then
+    return nil, "policy.block_status must be a 4xx status"
   end
   local ca = c.cache or {}
   if ca.fp_ttl ~= nil and (type(ca.fp_ttl) ~= "number" or ca.fp_ttl <= 0) then

@@ -108,7 +108,10 @@ TEXT_KEYS = ("query", "text", "prompt", "input", "messages")
 # pass-through) is sent as it is: its system instruction after the tool
 # definitions, `contents` last. jev-edge reads systemInstruction.parts,
 # system_instruction.parts and contents[*].parts (contents.parts for one
-# content) with its default text_fields.
+# content, and a `parts` that is one part object) with its default
+# text_fields. A `parts` object gets its keys added as text parts after it
+# (_gemini_contents): LiteLLM's generateContent adapter iterates it and
+# sends each key to the model as a text part.
 GEMINI_SYSTEM_KEYS = ("systemInstruction", "system_instruction")
 GEMINI_CONTENTS = "contents"
 
@@ -451,6 +454,27 @@ def _system_messages(data: dict) -> list:
     return msgs
 
 
+def _gemini_parts(content: Any) -> Any:
+    """A Gemini content whose `parts` is one part object, with `parts` as a
+    list: the object as it is (jev-edge reads it as one part, as Gemini
+    takes it), then each of its keys as a text part. LiteLLM 1.102.1's
+    generateContent adapter iterates the object, and every key is a string
+    part it sends the model as text, where jev-edge reads a part's values
+    only. A new dict: the request LiteLLM sends on is not changed."""
+    if isinstance(content, dict) and isinstance(content.get("parts"), dict):
+        parts = content["parts"]
+        return dict(content, parts=[parts] + [{"text": str(k)} for k in parts])
+    return content
+
+
+def _gemini_contents(contents: Any) -> Any:
+    """`contents` (a list, or one content) with each object `parts` in a
+    form jev-edge reads as LiteLLM reads it (_gemini_parts)."""
+    if isinstance(contents, (list, tuple)):
+        return [_gemini_parts(c) for c in contents]
+    return _gemini_parts(contents)
+
+
 def _top_key(field: str) -> str:
     """The top-level key of a path: documents[*].text -> documents."""
     return re.split(r"[.\[]", field.strip(), maxsplit=1)[0]
@@ -507,6 +531,8 @@ def _body_dict(data: dict, extra_fields: tuple = ()) -> Optional[dict]:
             value = system + convo
         if value is None or _is_definition(key, value):
             continue
+        if key == GEMINI_CONTENTS:
+            value = _gemini_contents(value)
         c = _clean(value, key=key)
         if c is not _DROP:
             body[key] = c
@@ -796,9 +822,9 @@ class JevEdgeGuardrail(_ApplyGuardrailBase):
         `format`) unchanged, Gemini's `systemInstruction`, the
         `extra_fields`, `query`, `text`, `prompt`, `input` and `messages`,
         with the system prompt (`system`, `instructions`) as the first
-        message, and Gemini's `contents`; media payloads removed outside
-        the tool calls and tool results sent whole. None when no value holds
-        any text."""
+        message, and Gemini's `contents` (a `parts` object followed by its
+        keys as text parts); media payloads removed outside the tool calls
+        and tool results sent whole. None when no value holds any text."""
         body = _body_dict(data, _parse_fields(extra_fields) if extra_fields else ())
         return None if body is None else _dumps(body)
 

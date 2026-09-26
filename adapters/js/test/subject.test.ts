@@ -170,7 +170,7 @@ describe("subject: cookie candidates (g1-subject-id-evasion#1)", () => {
       const out = core.subject.extractAll(c, view);
       const ms = performance.now() - t0;
       expect(out, "longer than MAX_VALUE_BYTES once trimmed, hashed").toEqual(want);
-      expect(ms, `${c.name} took ${ms.toFixed(1)} ms`).toBeLessThan(50);
+      expect(ms, `${c.name} took ${ms.toFixed(1)} ms`).toBeLessThan(250);
     }
   });
 

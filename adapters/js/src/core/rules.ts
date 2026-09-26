@@ -753,10 +753,13 @@ async function judged(
   if (size > max) {
     let hd = req.body_head ?? undefined;
     let tl = req.body_tail ?? undefined;
+    // the body fits in its head and tail: the tail starts where the head
+    // ends, and a value cut between them is read whole
+    let joined = size <= max + TAIL_BYTES;
     if (hd === undefined && typeof req.body === "string") {
       hd = head(req.body, max);
       const rest = req.body.slice(hd.length);
-      if (rest !== "") tl = tail(rest, TAIL_BYTES);
+      if (rest !== "") tl = joined ? rest : tail(rest, TAIL_BYTES);
     }
     if (media && !(hd !== undefined && isText(hd))) return { text: "", unj: CT_NOT_WATCHED };
     if (hd === undefined) return { text: "", unj: "unjudgeable: body too large" };
@@ -766,8 +769,15 @@ async function judged(
     const keys = fieldKeys(rule.text_fields);
     const deep = deepKeys(rule.text_fields);
     const seen: { tokenIds?: boolean } = {};
-    values = scanStrings(hd, keys, [], deep, seen);
-    if (tl !== undefined) scanStrings(tl, keys, values, deep, seen);
+    // head and tail joined are one string to scan; apart, the tail starts
+    // inside a value it has only the end of (g1-chunk-seams-window-math#6)
+    joined = joined && tl !== undefined;
+    if (joined) {
+      values = scanStrings(hd + tl, keys, [], deep, seen);
+    } else {
+      values = scanStrings(hd, keys, [], deep, seen);
+      if (tl !== undefined) scanStrings(tl, keys, values, deep, seen, { tail: true });
+    }
     ids = seen.tokenIds === true;
     if (values.length === 0) return { text: "", unj: ids ? TOKEN_REASON : "unjudgeable: body too large" };
     text = values.join("\n");
@@ -775,8 +785,8 @@ async function judged(
     retrieved = untrustedOn(rule, ctx);
     if (hasToolFields(rule)) {
       const tkeys = fieldKeys(rule.tool_fields);
-      const tvalues = scanTools(hd, tkeys, []);
-      if (tl !== undefined) scanTools(tl, tkeys, tvalues);
+      const tvalues = scanTools(joined ? hd + tl : hd, tkeys, []);
+      if (tl !== undefined && !joined) scanTools(tl, tkeys, tvalues);
       tools = toolsPart(tvalues, true, rule, ctx);
     }
   } else {

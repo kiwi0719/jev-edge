@@ -1284,32 +1284,80 @@ export function deepKeys(fields: string[] | undefined): Map<string, "any" | "obj
   return out;
 }
 
+// Port of next_quote: the index of the first '"' at or after `i` that no
+// backslash escapes (a backslash escapes the character after it), or -1.
+function nextQuote(s: string, i: number): number {
+  const n = s.length;
+  for (;;) {
+    let j = i;
+    while (j < n && s[j] !== '"' && s[j] !== "\\") j++;
+    if (j >= n) return -1;
+    if (s[j] === '"') return j;
+    i = j + 2;
+  }
+}
+
+// Port of key_at: `q` is an unescaped '"'; the string it opens is a key
+// when a colon follows (then, with `start`, a quote or a bracket). Returns
+// the key decoded and folded and the index of the value's first character,
+// or, when it opens no key, the next '"' to try (the string's closing
+// quote); null at the end of the text.
+function keyAt(s: string, q: number, start: boolean): { key?: string; at: number } | null {
+  const e = nextQuote(s, q + 1);
+  if (e === -1) return null;
+  let k = e + 1;
+  while (luaSpace(s.charCodeAt(k))) k++;
+  if (s[k] !== ":") return { at: e };
+  k++;
+  while (luaSpace(s.charCodeAt(k))) k++;
+  if (start && s[k] !== '"' && s[k] !== "{" && s[k] !== "[") return { at: e };
+  return { key: fold(readString(s, q + 1)[0]), at: k };
+}
+
+// The index `i` ends a string value: past Lua white space, a comma, a
+// closing bracket or the end of the text.
+function endsValue(s: string, i: number): boolean {
+  while (luaSpace(s.charCodeAt(i))) i++;
+  return i >= s.length || s[i] === "," || s[i] === "}" || s[i] === "]";
+}
+
 /**
  * Collect the string values of `keys` (from fieldKeys) from possibly
- * truncated JSON. Keys match the way walk() matches them: folded. With
- * `deep` (from deepKeys), the value of a "**" path's key is read as the walk
- * reads it, every key and string in it in the order they come: an object,
- * and an array when no other path ends at that key; otherwise the scan goes
- * on inside it, as for any other key. With `seen`, seen.tokenIds is set when
- * one of `keys` holds an array that starts with a number: token ids.
+ * truncated JSON (port of scan_strings). Keys match the way walk() matches
+ * them: decoded and folded. With `deep` (from deepKeys), the value of a "**"
+ * path's key is read as the walk reads it, every key and string in it in
+ * the order they come: an object, and an array when no other path ends at
+ * that key; otherwise the scan goes on inside it, as for any other key. With
+ * `seen`, seen.tokenIds is set when one of `keys` holds an array that starts
+ * with a number: token ids. With `opts.tail`, the text before the first
+ * unescaped '"' is the end of a value cut at its start: kept when that quote
+ * ends a value and it reads as natural text (white space in it, and isText).
  */
 export function scanStrings(
   s: string, keys: Set<string>, out: string[], deep?: Map<string, "any" | "object">, seen?: { tokenIds?: boolean },
+  opts?: { tail?: boolean },
 ): string[] {
-  // key characters: ASCII word characters, U+017F and U+212A; the value
-  // starts with a quote or a bracket (a number or a literal is passed over)
-  const re = /"([A-Za-z0-9_\-\u017F\u212A]+)"[ \t\n\v\f\r]*:[ \t\n\v\f\r]*(?=["{[])/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(s)) !== null) {
-    const at = m.index + m[0].length;
+  let q = nextQuote(s, 0);
+  if (q !== -1 && opts?.tail && endsValue(s, q + 1)) {
+    const [v] = readString(s, 0);
+    if (/[ \t\n\v\f\r]/.test(v) && isText(v)) out.push(v);
+  }
+  while (q !== -1) {
+    const k = keyAt(s, q, true);
+    if (k === null) break;
+    if (k.key === undefined) {
+      q = k.at;
+      continue;
+    }
+    const at = k.at;
     if (s[at] === '"') {
       const [value, next] = readString(s, at + 1);
-      if (keys.has(fold(m[1])) && value !== "") out.push(value);
-      re.lastIndex = next;
+      if (keys.has(k.key) && value !== "") out.push(value);
+      q = nextQuote(s, next);
     } else {
-      if (seen && s[at] === "[" && keys.has(fold(m[1])) && startsWithNumber(s, at + 1)) seen.tokenIds = true;
-      const d = deep?.get(fold(m[1]));
-      if (d !== undefined && (s[at] === "{" || d === "any")) re.lastIndex = scanValue(s, at, out, false);
+      if (seen && s[at] === "[" && keys.has(k.key) && startsWithNumber(s, at + 1)) seen.tokenIds = true;
+      const d = deep?.get(k.key);
+      q = nextQuote(s, d !== undefined && (s[at] === "{" || d === "any") ? scanValue(s, at, out, false) : at + 1);
     }
   }
   return out;
@@ -1403,17 +1451,21 @@ function scanValue(s: string, i: number, out: string[], schema: boolean): number
  * names left out, in the order they come.
  */
 export function scanTools(s: string, keys: Set<string>, out: string[]): string[] {
-  const re = /"([A-Za-z0-9_\-ſK]+)"[ \t\n\v\f\r]*:[ \t\n\v\f\r]*/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(s)) !== null) {
-    const at = m.index + m[0].length;
-    if (!keys.has(fold(m[1]))) continue;
-    if (s[at] === '"') {
+  let q = nextQuote(s, 0);
+  while (q !== -1) {
+    const k = keyAt(s, q, false);
+    if (k === null) break;
+    const at = k.at;
+    if (k.key === undefined) q = at;
+    else if (!keys.has(k.key)) q = nextQuote(s, at);
+    else if (s[at] === '"') {
       const [v, next] = readString(s, at + 1);
       if (v !== "") out.push(v);
-      re.lastIndex = next;
+      q = nextQuote(s, next);
     } else if (s[at] === "{" || s[at] === "[") {
-      re.lastIndex = scanValue(s, at, out, true);
+      q = nextQuote(s, scanValue(s, at, out, true));
+    } else {
+      q = nextQuote(s, at);
     }
   }
   return out;

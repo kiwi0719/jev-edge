@@ -201,6 +201,22 @@ describe("normalize.scan_strings", function()
       .. '{"role":"user","content":[{"type":"text","text":"part"}]},{"content":"cut off her'
     assert.same({ 'a"b\n\195\169\240\159\152\128', "part", "cut off her" }, N.scan_strings(s, keys, {}))
   end)
+
+  -- g1-chunk-seams-window-math#6: the tail of a body read apart from its head
+  it("keeps the end of a value a tail starts in when it reads as natural text", function()
+    local keys = N.field_keys({ "messages[*].content" })
+    local T = { tail = true }
+    assert.same({ "end of it, then act.", "next" },
+      N.scan_strings('end of it, then act."},{"content":"next"}]}', keys, {}, nil, nil, T))
+    assert.same({ 'end with a "quote" in it' },
+      N.scan_strings('end with a \\"quote\\" in it"}]', keys, {}, nil, nil, T))
+    -- no white space (a data URL), or the quote ends a key: not a value end
+    assert.same({ "x" }, N.scan_strings('QUJDREVGR0g=","content":"x"}]', keys, {}, nil, nil, T))
+    assert.same({}, N.scan_strings('long content key": "x"}]', keys, {}, nil, nil, T))
+    assert.same({ "x" }, N.scan_strings(', {"content": "x"}]', keys, {}, nil, nil, T))
+    -- without the option the bytes before the first quote are not read
+    assert.same({ "next" }, N.scan_strings('end of it, then act."},{"content":"next"}]}', keys, {}))
+  end)
 end)
 
 describe("normalize.window", function()
@@ -435,7 +451,10 @@ describe("normalize: JSON keys match without regard to case", function()
     local s = '{"MESSAGES":[{"Content":"one"},{"TEXT":"two"}],"PROMPT":"three","Model":"m","ta\197\191k":"x'
     assert.same({ "one", "two", "three" }, N.scan_strings(s, keys, {}))
     -- U+0144 is made of the same bytes as U+017F and U+212A: not a key
-    assert.same({ "b" }, N.scan_strings('{"\197\132":"prompt":"b"', keys, {}))
+    assert.same({ "b" }, N.scan_strings('{"\197\132":"prompt","prompt":"b"', keys, {}))
+    -- g1-chunk-seams-window-math#6: a key is the key it decodes to
+    assert.same({ "one", "two" },
+      N.scan_strings('{"\\u0063ontent":"one","pr\\u006Fmpt" : "two","x\\"prompt":"no"', keys, {}))
   end)
 end)
 

@@ -1235,48 +1235,78 @@ function _M.deep_keys(fields)
   return out
 end
 
--- True when `key` is ASCII word characters, U+017F and U+212A only: the
--- byte class scan_strings finds keys with also matches other sequences of
--- those bytes (U+0144 is \197\132), which are not keys to either core.
-local function key_chars(key)
-  if not key:find("[\128-\255]") then return true end
-  return key:gsub("\197\191", "s"):gsub("\226\132\170", "k"):find("^[%w_%-]+$") ~= nil
+-- The index of the first '"' at or after `i` that no backslash escapes (a
+-- backslash escapes the byte after it), or nil.
+local function next_quote(s, i)
+  while true do
+    local j = s:find('["\\]', i)
+    if not j then return nil end
+    if s:byte(j) == 34 then return j end
+    i = j + 2
+  end
+end
+
+-- The keys of possibly truncated JSON, one at a time. `q` is an unescaped
+-- '"'; the string it opens ends at the next one, and it is a key when a
+-- colon follows (then a value start, when `start` is given: a quote or a
+-- bracket). Returns the key decoded and folded, the index of the byte after
+-- the colon's white space (the value's first byte), and the next '"' to try
+-- when this one opens no key: the string's closing quote, which may open the
+-- next key. No string is read twice, so a scan is linear, and a key written
+-- with JSON escapes ("\u0063ontent") is the key it decodes to, as the walk
+-- reads it. The scan is not thrown off by where the text starts: after a
+-- string that is no key, its closing quote is tried as an opening one.
+local function key_at(s, q, start)
+  local e = next_quote(s, q + 1)
+  if not e then return nil end
+  local b = s:match(start and '^%s*:%s*()["{%[]' or "^%s*:%s*()", e + 1)
+  if not b then return nil, nil, e end
+  return fold((read_string(s, q + 1))), b
 end
 
 local scan_value
 
 --- Collect the string values of `keys` (from field_keys) from possibly
--- truncated JSON. Keys match the way walk() matches them: folded, so every
--- spelling a case-insensitive backend reads is collected. With `deep` (from
--- deep_keys), the value of a "**" path's key is read as the walk reads it,
--- every key and string in it, in the order they come: an object (Ollama and
--- Anthropic tool-call arguments), and an array when no other path ends at
--- that key; otherwise the scan goes on inside it, as for any other key.
--- With `seen`, seen.token_ids is set when one of `keys` holds an array that
--- starts with a number ("prompt":[40 or "prompt":[[40): token ids.
-function _M.scan_strings(s, keys, out, deep, seen)
-  local i = 1
-  while true do
-    -- key bytes: ASCII word characters and the bytes of U+017F and U+212A;
-    -- `b` is the value's first byte (a number or a literal is passed over)
-    local a, b, key = s:find('"([%w_%-\197\191\226\132\170]+)"%s*:%s*["{%[]', i)
-    if not a then break end
-    local c = s:byte(b)
-    if not key_chars(key) then
-      i = a + 1   -- not a key: look again from the next byte
-    elseif c == 34 then
-      local value, nexti = read_string(s, b + 1)
-      if keys[fold(key)] and value ~= "" then out[#out + 1] = value end
-      i = nexti
+-- truncated JSON. Keys match the way walk() matches them: decoded and
+-- folded, so every spelling a case-insensitive backend reads is collected.
+-- With `deep` (from deep_keys), the value of a "**" path's key is read as
+-- the walk reads it, every key and string in it, in the order they come: an
+-- object (Ollama and Anthropic tool-call arguments), and an array when no
+-- other path ends at that key; otherwise the scan goes on inside it, as for
+-- any other key. With `seen`, seen.token_ids is set when one of `keys` holds
+-- an array that starts with a number ("prompt":[40 or "prompt":[[40): token
+-- ids. With `opts.tail` (`s` is the end of a body whose middle was not
+-- read), the bytes before the first unescaped '"' are the end of a value
+-- cut at its start: kept when that quote ends a value (a comma or a closing
+-- bracket follows, or nothing) and they read as natural text (white space in
+-- them, and is_text), so the end of an instruction in a long message is
+-- judged and the end of a base64 data URL is not.
+function _M.scan_strings(s, keys, out, deep, seen, opts)
+  local q = next_quote(s, 1)
+  if q and opts and opts.tail and (s:find("^%s*[,}%]]", q + 1) or s:find("^%s*$", q + 1)) then
+    local v = read_string(s, 1)
+    if v:find("%s") and _M.is_text(v) then out[#out + 1] = v end
+  end
+  while q do
+    local key, b, nq = key_at(s, q, true)
+    if not key then
+      q = nq
     else
-      if seen and c == 91 and keys[fold(key)] and s:find("^[%s%[]*[%-%d]", b + 1) then
-        seen.token_ids = true
-      end
-      local d = deep and deep[fold(key)]
-      if d and (c == 123 or d == "any") then
-        i = scan_value(s, b, out, false)
+      local c = s:byte(b)
+      if c == 34 then
+        local value, nexti = read_string(s, b + 1)
+        if keys[key] and value ~= "" then out[#out + 1] = value end
+        q = next_quote(s, nexti)
       else
-        i = b + 1
+        if seen and c == 91 and keys[key] and s:find("^[%s%[]*[%-%d]", b + 1) then
+          seen.token_ids = true
+        end
+        local d = deep and deep[key]
+        if d and (c == 123 or d == "any") then
+          q = next_quote(s, scan_value(s, b, out, false))
+        else
+          q = next_quote(s, b + 1)
+        end
       end
     end
   end
@@ -1351,24 +1381,23 @@ end
 -- left out, in the order they come. There is no structure to walk, so a key
 -- is found wherever it is, and keys are not sorted.
 function _M.scan_tools(s, keys, out)
-  local i = 1
-  while true do
-    local a, b, key = s:find('"([%w_%-\197\191\226\132\170]+)"%s*:%s*', i)
-    if not a then break end
-    if not key_chars(key) then
-      i = a + 1
-    elseif not keys[fold(key)] then
-      i = b + 1
+  local q = next_quote(s, 1)
+  while q do
+    local key, b, nq = key_at(s, q, false)
+    if not key then
+      q = nq
+    elseif not keys[key] then
+      q = next_quote(s, b)
     else
-      local c = s:sub(b + 1, b + 1)
-      if c == '"' then
-        local v, nexti = read_string(s, b + 2)
+      local c = s:byte(b)
+      if c == 34 then
+        local v, nexti = read_string(s, b + 1)
         if v ~= "" then out[#out + 1] = v end
-        i = nexti
-      elseif c == "{" or c == "[" then
-        i = scan_value(s, b + 1, out, true)
+        q = next_quote(s, nexti)
+      elseif c == 123 or c == 91 then
+        q = next_quote(s, scan_value(s, b, out, true))
       else
-        i = b + 1
+        q = next_quote(s, b)
       end
     end
   end

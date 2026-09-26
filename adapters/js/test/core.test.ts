@@ -889,7 +889,9 @@ describe("normalize: JSON keys match without regard to case", () => {
     const s = '{"MESSAGES":[{"Content":"one"},{"TEXT":"two"}],"PROMPT":"three","Model":"m","ta\u017Fk":"x';
     expect(core.normalize.scanStrings(s, keys, [])).toEqual(["one", "two", "three"]);
     // U+0144 is made of the same bytes as U+017F and U+212A: not a key
-    expect(core.normalize.scanStrings('{"\u0144":"prompt":"b"', keys, [])).toEqual(["b"]);
+    expect(core.normalize.scanStrings('{"\u0144":"prompt","prompt":"b"', keys, [])).toEqual(["b"]);
+    // g1-chunk-seams-window-math#6: a key is the key it decodes to
+    expect(core.normalize.scanStrings(String.raw`{"\u0063ontent":"one","pr\u006Fmpt" : "two","x\"prompt":"no"`, keys, [])).toEqual(["one", "two"]);
   });
 });
 

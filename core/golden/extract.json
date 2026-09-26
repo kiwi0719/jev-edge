@@ -1356,7 +1356,7 @@
         "text": "after a key that is not one"
       },
       "input": {
-        "body": "{\"ń\":\"prompt\":\"after a key that is not one\"} ]",
+        "body": "{\"ń\":\"prompt\",\"prompt\":\"after a key that is not one\"} ]",
         "content_type": "application/json",
         "fields": [
           "messages[*].content",
@@ -1367,6 +1367,24 @@
         ]
       },
       "name": "a scanned key with another character in it is not a key"
+    },
+    {
+      "expect": {
+        "kind": "scan",
+        "text": "escaped key\nfolded"
+      },
+      "input": {
+        "body": "{\"messages\":[{\"role\":\"user\",\"\\u0063ont\\u0065nt\":\"escaped key\"},{\"role\":\"\\\"x\\\": \\\"y\",\"c\\/ontent\":\"no key\",\"CONTENT\":\"folded\"}]} ]",
+        "content_type": "application/json",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "a scanned key written with JSON escapes is read"
     },
     {
       "expect": {

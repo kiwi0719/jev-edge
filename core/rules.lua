@@ -342,12 +342,16 @@ local function judged(req, rule, ctx, ct, size, ex)
   if gateway_cut and size <= max then size = max + 1 end
   if size > max then
     local head, tail = req.body_head, req.body_tail
+    -- the body fits in its head and tail: the tail starts where the head
+    -- ends, and a value cut between them is read whole
+    local joined = size <= max + _M.TAIL_BYTES
     if not head and req.body then
       -- a whole body handed over (tests, small adapters): its head, and its
-      -- tail when there is anything past the head
+      -- tail when there is anything past the head (all of it when joined)
       head = normalize.head(req.body, max)
       if #req.body > #head then
-        tail = normalize.tail(req.body:sub(#head + 1), _M.TAIL_BYTES)
+        local rest = req.body:sub(#head + 1)
+        tail = joined and rest or normalize.tail(rest, _M.TAIL_BYTES)
       end
     end
     if media and not (head and normalize.is_text(head)) then return nil, CT_NOT_WATCHED end
@@ -358,16 +362,23 @@ local function judged(req, rule, ctx, ct, size, ex)
     if gateway_cut and pol and pol.partial == "unjudgeable" then return nil, "unjudgeable: partial body" end
     local keys, deep = normalize.field_keys(rule.text_fields), normalize.deep_keys(rule.text_fields)
     local seen = {}
-    values = normalize.scan_strings(head, keys, {}, deep, seen)
-    if tail then normalize.scan_strings(tail, keys, values, deep, seen) end
+    -- head and tail joined are one string to scan; apart, the tail starts
+    -- inside a value it has only the end of (g1-chunk-seams-window-math#6)
+    joined = joined and tail ~= nil
+    if joined then
+      values = normalize.scan_strings(head .. tail, keys, {}, deep, seen)
+    else
+      values = normalize.scan_strings(head, keys, {}, deep, seen)
+      if tail then normalize.scan_strings(tail, keys, values, deep, seen, { tail = true }) end
+    end
     ids = seen.token_ids == true
     if #values == 0 then return nil, ids and TOKEN_REASON or "unjudgeable: body too large" end
     text, partial = table.concat(values, "\n"), true
     retrieved = untrusted_on(rule, ctx)
     if has_tool_fields(rule) then
       local tkeys = normalize.field_keys(rule.tool_fields)
-      local tvalues = normalize.scan_tools(head, tkeys, {})
-      if tail then normalize.scan_tools(tail, tkeys, tvalues) end
+      local tvalues = normalize.scan_tools(joined and head .. tail or head, tkeys, {})
+      if tail and not joined then normalize.scan_tools(tail, tkeys, tvalues) end
       tools = tools_part(tvalues, true, rule, ctx)
     end
   else

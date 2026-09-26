@@ -247,10 +247,34 @@ describe("providers: error kinds", () => {
     expect(await backend.call(prompt("x"), cfg, 1000)).toEqual([null, "backend http 503", "unavailable"]);
   });
 
+  it("backend: a 200 is an answer only when the origin judged: safe, suspicious or malicious with a score", async () => {
+    const cfg = { provider: "backend", endpoint: "http://origin" } as JevConfig;
+    const answer = (headers: Record<string, string>) => {
+      reply(() => new Response(null, { status: 200, headers }));
+      return backend.call(prompt("x"), cfg, 1000);
+    };
+    expect(await answer({ "X-Jev-Verdict": "safe", "X-Jev-Score": "0.30", "X-Jev-Reason": "injection+0.30" })).toEqual([{ injection: 0.3 }, null]);
+    expect(await answer({ "X-Jev-Verdict": "suspicious", "X-Jev-Score": "0.55", "X-Jev-Reason": "injection+0.55" })).toEqual([{ injection: 0.55 }, null]);
+    expect(await answer({ "X-Jev-Verdict": "safe", "X-Jev-Score": "0.00", "X-Jev-Source": "trust", "X-Jev-Reason": "fingerprint+trusted" })).toEqual([{ fingerprint: 0 }, null]);
+    // the origin's breaker open, a path it does not watch, a body it could not read
+    expect(await answer({ "X-Jev-Verdict": "skipped", "X-Jev-Score": "0.00", "X-Jev-Source": "breaker", "X-Jev-Reason": "breaker+open" }))
+      .toEqual([null, "backend: not judged (skipped: breaker open)", "unusable"]);
+    expect(await answer({ "X-Jev-Verdict": "skipped", "X-Jev-Score": "0.00", "X-Jev-Source": "l1", "X-Jev-Reason": "path+not+watched" }))
+      .toEqual([null, "backend: not judged (skipped: path not watched)", "unusable"]);
+    // a catch-all answering 200 on /_jev/authz: no X-Jev-* at all
+    expect(await answer({})).toEqual([null, "backend: not judged (no X-Jev-Verdict: no reason)", "unusable"]);
+    // a label without its score, or an empty one (Number("") is 0)
+    expect(await answer({ "X-Jev-Verdict": "safe" })).toEqual([null, "backend: not judged (safe: no reason)", "unusable"]);
+    expect(await answer({ "X-Jev-Verdict": "safe", "X-Jev-Score": " " })).toEqual([null, "backend: not judged (safe: no reason)", "unusable"]);
+    expect(await answer({ "X-Jev-Verdict": "safe", "X-Jev-Score": "n/a" })).toEqual([null, "backend: not judged (safe: no reason)", "unusable"]);
+    // a reason that is not form-encoded is shown as sent
+    expect(await answer({ "X-Jev-Verdict": "skipped", "X-Jev-Reason": "100%" })).toEqual([null, "backend: not judged (skipped: 100%)", "unusable"]);
+  });
+
   it("backend: an origin that answered without a score is unusable, its 4xx rejected", async () => {
     const cfg = { provider: "backend", endpoint: "http://origin" } as JevConfig;
     reply(() => new Response(null, { status: 200, headers: { "X-Jev-Verdict": "error", "X-Jev-Reason": "laya+http+400" } }));
-    expect(await backend.call(prompt("x"), cfg, 1000)).toEqual([null, "backend: laya http 400", "unusable"]);
+    expect(await backend.call(prompt("x"), cfg, 1000)).toEqual([null, "backend: not judged (error: laya http 400)", "unusable"]);
     reply(() => new Response(null, { status: 414 }));
     expect(await backend.call(prompt("x"), cfg, 1000)).toEqual([null, "backend http 414", "rejected"]);
     reply(() => new Response(null, { status: 502 }));

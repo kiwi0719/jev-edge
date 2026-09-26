@@ -276,6 +276,46 @@ describe("backend provider (thin Worker)", () => {
     expect(((await res.json()) as Record<string, unknown>).verdict).toBe("error");
   });
 
+  it("fails open, uncached, when the origin did not judge: its breaker open, or no X-Jev-* at all", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      let authz = 0;
+      let answer: () => Response = () => new Response(null, { status: 200, headers: { "X-Jev-Verdict": "skipped", "X-Jev-Score": "0.00", "X-Jev-Source": "breaker", "X-Jev-Reason": "breaker+open" } });
+      stubAuthz(() => { authz++; return answer(); });
+      const w = thinWorker({ origin: "https://origin.example", config: { policy: { mode: "enforce" } } });
+      const env = {};
+      for (let i = 0; i < 2; i++) {
+        const j = (await (await w.fetch(chat(ATTACK), env)).json()) as Record<string, unknown>;
+        expect(j.upstream).toBe(true);
+        expect(j.verdict).toBe("error"); // never "safe"
+      }
+      expect(authz).toBe(2); // nothing cached: the second one asked the origin again
+      // the origin recovered: the next request is judged there and blocked
+      answer = () => new Response('{"error":"request rejected"}', { status: 403, headers: { "X-Jev-Verdict": "malicious", "X-Jev-Score": "0.95", "X-Jev-Reason": "injection+0.95" } });
+      expect((await w.fetch(chat(ATTACK), env)).status).toBe(403);
+      // a catch-all that answers 200 with no X-Jev-*
+      answer = () => new Response("<html>app</html>", { status: 200 });
+      const j = (await (await w.fetch(chat(BENIGN), env)).json()) as Record<string, unknown>;
+      expect(j.verdict).toBe("error");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("an origin that did not judge does not count against the Worker's breaker", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      let authz = 0;
+      stubAuthz(() => { authz++; return new Response(null, { status: 200, headers: { "X-Jev-Verdict": "skipped", "X-Jev-Score": "0.00", "X-Jev-Reason": "breaker+open" } }); });
+      const rt = createRuntime({ config: { jev: { provider: "backend", endpoint: "https://origin.example" }, policy: { mode: "enforce" }, breaker: { min_samples: 1 } } });
+      for (let i = 0; i < 3; i++) await handle(chat(ATTACK.replace("print", "print " + i)), rt, echo);
+      expect(authz).toBe(3);
+      expect(await rt.breaker.state()).toBe(0);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it("reads the origin from env.JEV_ORIGIN", async () => {
     stubAuthz(() => new Response(null, { status: 200, headers: { "X-Jev-Verdict": "safe", "X-Jev-Score": "0.10", "X-Jev-Reason": "injection+0.10" } }));
     const res = await thinWorker().fetch(chat(BENIGN), { JEV_ORIGIN: "https://origin.example" });

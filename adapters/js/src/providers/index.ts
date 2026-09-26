@@ -398,6 +398,20 @@ export const openaiCompat: Provider = {
  * the Worker's policy blocks it too at any block_threshold and the cached 1
  * blocks a repeat; an X-Jev-Verdict: error answer is an error here as well.
  */
+/** The labels an origin gives a text it judged; any other answer was not judged there. */
+const JUDGED = new Set(["safe", "suspicious", "malicious"]);
+
+/** X-Jev-Reason as text (form-encoded on the wire), or a placeholder. */
+function reasonText(res: Response): string {
+  const r = res.headers.get("x-jev-reason");
+  if (r === null || r === "") return "no reason";
+  try {
+    return decodeURIComponent(r.replace(/\+/g, " "));
+  } catch {
+    return r;
+  }
+}
+
 export const backend: Provider = {
   name: "backend",
   async call(prompt, cfg, timeoutMs, info) {
@@ -440,10 +454,16 @@ export const backend: Provider = {
       return [{ [name]: 1 }, null];
     }
     if (res.status !== 200) return [null, "backend http " + res.status, statusKind(res.status)];
-    // The origin answered but had no score: its own L2 failed, and its own
-    // breaker counts that when it should. The origin itself is healthy.
-    if (verdict === "error") return [null, "backend: " + decodeURIComponent((res.headers.get("x-jev-reason") ?? "error").replace(/\+/g, " ")), UNUSABLE];
-    if (!Number.isFinite(score)) return [null, "backend: no X-Jev-Score", UNUSABLE];
+    // A 200 is an answer only when the origin judged the text: a verdict it
+    // labelled from a score, with the score. `skipped` (its breaker open,
+    // the path not watched there, unjudgeable), `error` (its own L2 failed)
+    // and a 200 without X-Jev-* (a catch-all route) are not, and must not be
+    // cached here as safe. The origin itself answered, so none of them counts
+    // against the Worker's breaker: the origin's own breaker does that.
+    const raw = res.headers.get("x-jev-score");
+    if (!JUDGED.has(verdict) || raw === null || raw.trim() === "" || !Number.isFinite(score)) {
+      return [null, "backend: not judged (" + (verdict || "no X-Jev-Verdict") + ": " + reasonText(res) + ")", UNUSABLE];
+    }
     const name = (res.headers.get("x-jev-reason") ?? "backend").split("+")[0] || "backend";
     return [{ [name]: score }, null];
   },

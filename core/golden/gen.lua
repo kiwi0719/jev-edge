@@ -1685,6 +1685,16 @@ eval_case("untrusted: a 4xx on both parts is not a breaker failure", {
   judge = { error = "laya http 400", kind = "rejected" } })
 eval_case("untrusted: a short tool result is not judged on its own", {
   req = raw_req(U_SHORT), config = U_ON, judge = U_SCORES })
+-- a template judge does not know (config validation refuses one; core.evaluate
+-- does not validate): that part is left out and the rest judged, and the
+-- whole request's entry is not written; with no part left, an error
+eval_case("untrusted: an unknown untrusted template leaves that part out, the text is judged", {
+  req = raw_req(U_TOOL), judge = { answers = { injection = 0.95 } },
+  config = { untrusted = { enabled = true, templates = { "nope" } }, policy = { mode = "enforce" } } })
+eval_case("untrusted: an unknown untrusted template and nothing else to judge is an error", {
+  req = raw_req(U_FIELD), judge = { answers = { injection = 0.95 } },
+  config = { untrusted = { enabled = true, fields = { "context[*].text" }, templates = { "nope" } },
+             policy = { mode = "enforce" } } })
 eval_case("untrusted: a rule's own untrusted table turns it on for that rule", {
   req = raw_req(U_TOOL, { path = "/rag/chat" }),
   rules = { { id = "rag", extends = "llm-endpoints", watch_paths = { "^/rag/" }, untrusted = { enabled = true } },

@@ -284,3 +284,51 @@ describe("untrusted: subject reputation", () => {
     expect(points()).toBe(0);
   });
 });
+
+// twin of the untrusted_spec, defaults_spec and rules_resolve_spec cases for
+// a template name judge does not know
+describe("untrusted: an unknown template", () => {
+  const check = (u: unknown) => defaults.validate(defaults.merge(defaults.config, { untrusted: u }))[1];
+
+  it("is refused by config validation and resolve()", () => {
+    expect(check({ templates: ["untrusted", "injection"] })).toBeNull();
+    expect(check({ templates: ["untrusted", "untrustd"] })).toBe("untrusted.templates[2] untrustd is not a template");
+    expect(check({ templates: "untrusted" })).toBe("untrusted.templates must be a list of strings");
+    expect(check({ fields: { a: "x" } })).toBe("untrusted.fields must be a list of strings");
+    expect(check(null)).toBe("untrusted must be a table");
+    expect(() => resolve({ id: "t", extends: "llm-endpoints", untrusted: { enabled: true, templates: ["nope"] } }))
+      .toThrow("rule t: untrusted.templates[1] nope is not a template");
+  });
+
+  const ctxWith = (j: core.Judge, untrusted: Record<string, unknown>) => {
+    const cache = memoryStore();
+    const logs: string[] = [];
+    const ctx: core.Ctx = {
+      config: core.defaults.merge(core.defaults.config, { untrusted, policy: { mode: "enforce" } }),
+      rules: [load("llm-endpoints")],
+      cache: { get: (k) => cache.get(k), set: (k, v, ttl) => cache.set(k, v, ttl) },
+      clock: () => 1000, hash: normalize.djb2, json_decode: decode, re_find: rules.reFind, judge: j,
+      log: (level, msg) => logs.push(`${level}: ${msg}`),
+    };
+    return { ctx, logs, entries: () => [...cache.dump()].length };
+  };
+
+  it("leaves that part out and judges the rest, whose score is not the whole request's", async () => {
+    const j = recording({ injection: 0.95 });
+    const { ctx, logs, entries } = ctxWith(j, { enabled: true, templates: ["nope"] });
+    const v = await core.evaluate(toolReq(USER, ATTACK), ctx);
+    expect([v.action, v.reason]).toEqual(["block", "injection 0.95"]);
+    expect(j.prompts.length).toBe(1);
+    expect(j.prompts[0].questions.untrusted).toBeUndefined();
+    expect(logs.some((l) => l.includes("nope"))).toBe(true);
+    expect(entries()).toBe(1);
+  });
+
+  it("is an error with no part left", async () => {
+    const j = recording({ injection: 0.95 });
+    const { ctx } = ctxWith(j, { enabled: true, fields: ["context[*].text"], templates: ["nope"] });
+    const v = await core.evaluate(reqFor({ messages: [{ role: "user", content: "ok?" }], context: [{ text: ATTACK }] }), ctx);
+    expect([v.verdict, v.action]).toEqual(["error", "pass"]);
+    expect(j.prompts.length).toBe(0);
+  });
+});

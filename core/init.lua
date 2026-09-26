@@ -199,7 +199,11 @@ end
 -- not paid for again on every turn; the misses go to the judge together
 -- (ctx.judge.call_many, in parallel, when the adapter has it). The request's
 -- score is the highest part score. A part the judge failed on turns the
--- request into an error unless another part already blocks.
+-- request into an error unless another part already blocks. A part whose
+-- prompt cannot be built (a template judge does not know, which config
+-- validation refuses) is logged and left out, and the others are judged:
+-- the request is an error only when no part is left. Its score is then for
+-- less than the whole request, and the whole request's entry is not written.
 -- @param parts  list of { text, templates, context, over, label, rep } (over:
 --               cache_key's; label: put before the template name in the
 --               reason when this part's score decides; rep = false: not the
@@ -210,6 +214,7 @@ end
 local function judge_parts(ctx, rule, parts, suffix, fp, ckey, reason)
   local cfg = ctx.config
   local scores, tops, pending = {}, {}, {}
+  local left_out
   for i, part in ipairs(parts) do
     local cfp = normalize.fingerprint(part.text, { prefix_bytes = cfg.cache.fp_prefix_bytes }, ctx.hash)
     local ck = cfp ~= "" and _M.cache_key(cfp, rule, cfg, ctx.hash, part.over) or nil
@@ -220,15 +225,20 @@ local function judge_parts(ctx, rule, parts, suffix, fp, ckey, reason)
       scores[i], tops[i] = hit.score, tostring(hit.reason or ""):match("^(%S+)") or ""
     else
       local prompt, perr = judge.build(part.templates, part.text, part.context)
-      if not prompt then
-        log(ctx, "error", "jev-edge: " .. perr)
-        settle(ctx)
-        local action, label, async = policy.on_error()
-        return finish(ctx, verdict.new({ action = action, verdict = label, async = async,
-          source = verdict.SRC_L2, reason = perr, fingerprint = fp }))
+      if prompt then
+        pending[#pending + 1] = { i = i, prompt = prompt, ck = ck }
+      else
+        log(ctx, "error", "jev-edge: " .. perr .. " (that part is not judged)")
+        left_out = left_out or perr
       end
-      pending[#pending + 1] = { i = i, prompt = prompt, ck = ck }
     end
+  end
+  if #pending == 0 and next(scores) == nil then
+    -- no part left to judge
+    settle(ctx)
+    local action, label, async = policy.on_error()
+    return finish(ctx, verdict.new({ action = action, verdict = label, async = async,
+      source = verdict.SRC_L2, reason = left_out, fingerprint = fp }))
   end
 
   local t0 = now_ms(ctx)
@@ -285,7 +295,7 @@ local function judge_parts(ctx, rule, parts, suffix, fp, ckey, reason)
   local action, label, async = policy.decide(best, cfg.policy)
   local why = top ~= "" and (top .. " " .. string.format("%.2f", best)) or reason
   if top ~= "" then why = why .. suffix end
-  if ckey and ctx.cache then
+  if ckey and ctx.cache and not left_out then
     ctx.cache:set(ckey, { score = best, reason = why, rep = rep }, cfg.cache.fp_ttl)
   end
   return finish(ctx, verdict.new({
@@ -452,9 +462,12 @@ end
 -- rules, without the stores (reputation is not looked up again).
 -- @param req the request, as evaluate() had it
 -- @param ctx { config, rules, hash, json_decode, re_find, log }
--- @return nil when L1 no longer finds it suspect or a prompt cannot be
+-- @return nil when L1 no longer finds it suspect or no prompt can be
 --         built; else { fingerprint, key (the whole request's cache key, or
---         nil), reason (L1's), suffix, parts = { { prompt, key, label, rep } } }
+--         nil), reason (L1's), suffix, parts = { { prompt, key, label, rep } } }.
+--         A part of several whose prompt cannot be built is left out, as
+--         judge_parts leaves it out, and key is then nil: an answer for the
+--         rest is not one for the whole request.
 function _M.l3_job(req, ctx)
   local cfg = ctx.config
   local r, text, reason, rule, windowed, chunks, capped, untrusted, tools, retrieved = rules_mod.evaluate_all(req,
@@ -464,16 +477,20 @@ function _M.l3_job(req, ctx)
   local job = { fingerprint = p.fp, key = p.key, reason = reason, suffix = p.suffix, parts = {} }
   -- one piece: its answer is the whole request's
   local parts = p.parts or { { text = text, templates = rule.templates, context = p.context, rep = p.rep } }
-  for i, part in ipairs(parts) do
+  for _, part in ipairs(parts) do
     local prompt = judge.build(part.templates, part.text, part.context)
-    if not prompt then return nil end
-    local key = p.key
-    if p.parts then
-      local cfp = normalize.fingerprint(part.text, { prefix_bytes = cfg.cache.fp_prefix_bytes }, ctx.hash)
-      key = cfp ~= "" and _M.cache_key(cfp, rule, cfg, ctx.hash, part.over) or nil
+    if prompt then
+      local key = p.key
+      if p.parts then
+        local cfp = normalize.fingerprint(part.text, { prefix_bytes = cfg.cache.fp_prefix_bytes }, ctx.hash)
+        key = cfp ~= "" and _M.cache_key(cfp, rule, cfg, ctx.hash, part.over) or nil
+      end
+      job.parts[#job.parts + 1] = { prompt = prompt, key = key, label = part.label, rep = part.rep }
+    elseif p.parts then
+      job.key = nil
     end
-    job.parts[i] = { prompt = prompt, key = key, label = part.label, rep = part.rep }
   end
+  if #job.parts == 0 then return nil end
   return job
 end
 

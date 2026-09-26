@@ -133,7 +133,9 @@ interface Part {
 // Port of judge_parts in core/init.lua: each part (a chunk, the retrieved
 // content, the tool definitions) its own cache entry, the misses judged
 // together, the highest part score wins; a failed part makes the request an
-// error unless another part already blocks.
+// error unless another part already blocks. A part whose prompt cannot be
+// built is logged and left out (an error only when no part is left), and
+// the whole request's entry is then not written.
 async function judgeParts(
   ctx: Ctx, rule: Rule, parts: Part[], suffix: string, fp: string, ckey: string | undefined, reason: string,
 ): Promise<verdict.Verdict> {
@@ -141,6 +143,7 @@ async function judgeParts(
   const scores: (number | undefined)[] = [];
   const tops: string[] = [];
   const pending: { i: number; prompt: judge.Prompt; ck?: string }[] = [];
+  let leftOut: string | undefined;
   for (let i = 0; i < parts.length; i++) {
     const part = parts[i];
     const cfp = normalize.fingerprint(part.text, { prefix_bytes: cfg.cache.fp_prefix_bytes }, ctx.hash);
@@ -151,14 +154,19 @@ async function judgeParts(
       tops[i] = /^(\S+)/.exec(String(hit.reason ?? ""))?.[1] ?? "";
     } else {
       const [prompt, perr] = judge.build(part.templates, part.text, part.context);
-      if (!prompt) {
-        log(ctx, "error", "jev-edge: " + perr);
-        await settle(ctx);
-        const [action, label, async] = policy.onError();
-        return finish(ctx, verdict.newVerdict({ action, verdict: label, async, source: verdict.SRC_L2, reason: perr, fingerprint: fp }));
+      if (prompt) {
+        pending.push({ i, prompt, ck });
+      } else {
+        log(ctx, "error", "jev-edge: " + perr + " (that part is not judged)");
+        leftOut ??= perr;
       }
-      pending.push({ i, prompt, ck });
     }
+  }
+  if (pending.length === 0 && !scores.some((s) => s !== undefined)) {
+    // no part left to judge
+    await settle(ctx);
+    const [action, label, async] = policy.onError();
+    return finish(ctx, verdict.newVerdict({ action, verdict: label, async, source: verdict.SRC_L2, reason: leftOut!, fingerprint: fp }));
   }
 
   const t0 = nowMs(ctx);
@@ -219,7 +227,7 @@ async function judgeParts(
   const [action, label, async] = policy.decide(score, cfg.policy);
   let why = top !== "" ? `${top} ${verdict.format2(score)}` : reason;
   if (top !== "") why += suffix;
-  if (ckey && ctx.cache) await ctx.cache.set(ckey, { score, reason: why, ...(rep !== undefined ? { rep } : {}) }, cfg.cache.fp_ttl);
+  if (ckey && ctx.cache && leftOut === undefined) await ctx.cache.set(ckey, { score, reason: why, ...(rep !== undefined ? { rep } : {}) }, cfg.cache.fp_ttl);
   return finish(ctx, verdict.newVerdict({
     action, verdict: label, score, async, source: verdict.SRC_L2, reason: why, fingerprint: fp, l2_ms: elapsed,
   }), rep);

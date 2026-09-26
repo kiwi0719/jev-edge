@@ -129,6 +129,9 @@ describe("rules.resolve", function()
       end
       local _, err = try({ templates = { "injection", "injeciton" } })
       assert.equals("rule t: templates[2] injeciton is not a template", err)
+      -- a rule's untrusted.templates too
+      _, err = try({ untrusted = { enabled = true, templates = { "nope" } } })
+      assert.equals("rule t: untrusted.templates[1] nope is not a template", err)
     end)
 
     it("wants limits that are numbers in range", function()

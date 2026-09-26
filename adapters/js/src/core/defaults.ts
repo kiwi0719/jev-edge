@@ -233,17 +233,21 @@ export function validateUntrusted(u: unknown, where: string): [true, null] | [nu
   for (const k of ["enabled", "tool_results"]) {
     if (t[k] !== undefined && typeof t[k] !== "boolean") return [null, `${where}.${k} must be true|false`];
   }
-  for (const k of ["fields", "templates"]) {
-    const v = t[k];
-    if (v === undefined) continue;
-    if (!Array.isArray(v)) return [null, `${where}.${k} must be a list of strings`];
-    for (let i = 0; i < v.length; i++) {
-      if (typeof v[i] !== "string" || v[i] === "") return [null, `${where}.${k}[${i + 1}] must be a non-empty string`];
-      // a field path is checked the way a rule's text_fields are
-      const perr = k === "fields" ? pathError(v[i]) : null;
-      if (perr) return [null, `${where}.${k}[${i + 1}] ${perr}`];
+  if (t.fields !== undefined) {
+    const err = stringListError(t.fields, `${where}.fields`);
+    if (err) return [null, err];
+    // a field path is checked the way a rule's text_fields are
+    const fields = t.fields as string[];
+    for (let i = 0; i < fields.length; i++) {
+      const perr = pathError(fields[i]);
+      if (perr) return [null, `${where}.fields[${i + 1}] ${perr}`];
     }
   }
-  if (Array.isArray(t.templates) && t.templates.length === 0) return [null, `${where}.templates must not be empty`];
+  // a name judge does not know makes every request with retrieved content an
+  // L2 error, the whole-text judgment included
+  if (t.templates !== undefined) {
+    const err = templatesError(t.templates, `${where}.templates`);
+    if (err) return [null, err];
+  }
   return [true, null];
 }

@@ -375,6 +375,34 @@ describe("untrusted content: pipeline", function()
     assert.equals(V.ACTION_BLOCK, v.action)
   end)
 
+  it("leaves out a part whose template judge does not know, and judges the rest", function()
+    -- config validation refuses the name; core.evaluate does not validate
+    local j = recording({ injection = 0.95 })
+    local ctx = H.ctx({ judge = j, config = { untrusted = { enabled = true, templates = { "nope" } },
+      policy = { mode = "enforce" } } })
+    local v = core.evaluate(tool_req(USER, ATTACK), ctx)
+    assert.equals(V.ACTION_BLOCK, v.action)
+    assert.equals("injection 0.95", v.reason)
+    assert.equals(1, #j.prompts)
+    assert.is_nil(j.prompts[1].questions.untrusted)
+    local logged = false
+    for _, l in ipairs(ctx.logs) do if l:find("nope", 1, true) then logged = true end end
+    assert.is_true(logged)
+    -- the score is for less than the whole request: only the part's own entry is written
+    local n = 0
+    for _ in pairs(ctx.cache.dump()) do n = n + 1 end
+    assert.equals(1, n)
+    -- with no part left, the request is an error, as before
+    j = recording({ injection = 0.95 })
+    ctx = H.ctx({ judge = j, config = { untrusted = { enabled = true, fields = { "context[*].text" },
+      templates = { "nope" } }, policy = { mode = "enforce" } } })
+    local short = req_for({ messages = { { role = "user", content = "ok?" } }, context = { { text = ATTACK } } })
+    v = core.evaluate(short, ctx)
+    assert.equals(V.ERROR, v.verdict)
+    assert.equals(V.ACTION_PASS, v.action)
+    assert.equals(0, #j.prompts)
+  end)
+
   it("turns on for one rule only", function()
     local j = recording({})
     local load = function() return require "jev.rules.llm-endpoints" end

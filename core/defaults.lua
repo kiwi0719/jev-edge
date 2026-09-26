@@ -182,8 +182,9 @@ function _M.string_list_error(v, what, nonempty)
 end
 
 --- Why `v` is not a list of template names judge knows, or nil: a rule's
--- templates (core/rules.lua resolve). A name judge.build cannot find turns
--- every request the rule judges into an L2 error, which fails open.
+-- templates (core/rules.lua resolve) and untrusted.templates. A name
+-- judge.build cannot find turns every request judged with it into an L2
+-- error, which fails open.
 function _M.templates_error(v, what)
   local err = _M.string_list_error(v, what, true)
   if err then return err end
@@ -200,20 +201,21 @@ function _M.validate_untrusted(u, where)
   for _, k in ipairs({ "enabled", "tool_results" }) do
     if u[k] ~= nil and type(u[k]) ~= "boolean" then return nil, where .. "." .. k .. " must be true|false" end
   end
-  for _, k in ipairs({ "fields", "templates" }) do
-    if u[k] ~= nil then
-      if type(u[k]) ~= "table" then return nil, where .. "." .. k .. " must be a list of strings" end
-      for i, v in ipairs(u[k]) do
-        if type(v) ~= "string" or v == "" then
-          return nil, where .. "." .. k .. "[" .. i .. "] must be a non-empty string"
-        end
-        -- a field path is checked the way a rule's text_fields are
-        local perr = k == "fields" and normalize.path_error(v)
-        if perr then return nil, where .. "." .. k .. "[" .. i .. "] " .. perr end
-      end
+  if u.fields ~= nil then
+    local err = _M.string_list_error(u.fields, where .. ".fields")
+    if err then return nil, err end
+    -- a field path is checked the way a rule's text_fields are
+    for i, v in ipairs(u.fields) do
+      local perr = normalize.path_error(v)
+      if perr then return nil, where .. ".fields[" .. i .. "] " .. perr end
     end
   end
-  if u.templates ~= nil and #u.templates == 0 then return nil, where .. ".templates must not be empty" end
+  -- a name judge does not know makes every request with retrieved content
+  -- an L2 error, the whole-text judgment included
+  if u.templates ~= nil then
+    local err = _M.templates_error(u.templates, where .. ".templates")
+    if err then return nil, err end
+  end
   return true
 end
 

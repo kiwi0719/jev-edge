@@ -34,11 +34,14 @@ export function buildSample(cfg: Config, v: Verdict, req: Req, rules: Rule[], ri
   if (rule && typeof req.body === "string") {
     const ct = contentType(req.headers);
     const n = cfg.sampling.text_bytes ?? 512;
-    const [extracted, , , decoded] = normalize.extract(req.body, ct, rule.text_fields);
+    const [extracted, kind, , decoded] = normalize.extract(req.body, ct, rule.text_fields);
     text = normalize.normalize(extracted, { prefix_bytes: n });
-    // the tool definitions are judged as a part of their own and may be what scored it
-    if (decoded !== undefined && rule.tool_fields && rule.tool_fields.length > 0) {
-      const [values] = normalize.extractTools(decoded, rule.tool_fields, (s) => JSON.parse(s) as normalize.JsonValue);
+    // the tool definitions are judged as a part of their own and may be what
+    // scored it; JSON the decoder refused is scanned for them, as L1 scans it
+    if (rule.tool_fields && rule.tool_fields.length > 0) {
+      let values: string[] = [];
+      if (decoded !== undefined) [values] = normalize.extractTools(decoded, rule.tool_fields, (s) => JSON.parse(s) as normalize.JsonValue);
+      else if (kind === "scan") values = normalize.scanTools(req.body, normalize.fieldKeys(rule.tool_fields), []);
       if (values.length > 0) tools = normalize.normalize(values.join("\n"), { prefix_bytes: n });
     }
   }

@@ -5,7 +5,8 @@
 -- The raw body is never kept; `text` is normalize.normalize() of the
 -- extracted text, truncated to sampling.text_bytes, and `tools` the same of
 -- the tool definitions (rule.tool_fields), when the request has any: they
--- are judged as a part of their own and may be what scored it.
+-- are judged as a part of their own and may be what scored it. JSON the
+-- decoder refused is scanned for them, as L1 scans it.
 
 local normalize = require "jev.core.normalize"
 local verdict   = require "jev.core.verdict"
@@ -43,11 +44,16 @@ function _M.build(cfg, v, req, rule, extra)
   local text, tools = "", nil
   if rule and req and req.body then
     local n = cfg.sampling.text_bytes or 512
-    local raw, _, _, decoded = normalize.extract(req.body, rules_mod.content_type(req.headers), rule.text_fields,
+    local raw, kind, _, decoded = normalize.extract(req.body, rules_mod.content_type(req.headers), rule.text_fields,
       extra.json_decode)
     text = normalize.normalize(raw, { prefix_bytes = n })
-    if type(decoded) == "table" and type(rule.tool_fields) == "table" and #rule.tool_fields > 0 then
-      local ttext = normalize.extract_tools(decoded, rule.tool_fields, extra.json_decode)
+    if type(rule.tool_fields) == "table" and #rule.tool_fields > 0 then
+      local ttext = ""
+      if type(decoded) == "table" then
+        ttext = normalize.extract_tools(decoded, rule.tool_fields, extra.json_decode)
+      elseif kind == "scan" then
+        ttext = table.concat(normalize.scan_tools(req.body, normalize.field_keys(rule.tool_fields), {}), "\n")
+      end
       if ttext ~= "" then tools = normalize.normalize(ttext, { prefix_bytes = n }) end
     end
   end

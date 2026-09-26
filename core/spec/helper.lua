@@ -161,18 +161,19 @@ function H.body_decode(s)
 end
 
 -- PCRE matcher with the same contract the OpenResty adapter gives core:
--- re_find(subject, pattern) -> truthy on a case-insensitive match.
+-- re_find(subject, pattern, init) -> the byte span of the first
+-- case-insensitive match at or after byte init (1 when nil), or nil.
 do
   local rex = require "rex_pcre2"
   local CASELESS = rex.flags().CASELESS
   local compiled = {}
-  function H.re_find(subject, pattern)
+  function H.re_find(subject, pattern, init)
     local re = compiled[pattern]
     if not re then
       re = rex.new(pattern, CASELESS)
       compiled[pattern] = re
     end
-    return re:find(subject)   -- from, to (1-based, inclusive) or nil
+    return re:find(subject, init)   -- from, to (1-based, inclusive) or nil
   end
 end
 

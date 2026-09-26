@@ -85,8 +85,13 @@ export interface RulesCtx {
   cache?: CacheLike;
   clock?: () => number;
   json_decode?: (s: string) => JsonValue;
-  /** Truthy on a match; a [from, to] 1-based inclusive UTF-8 byte span places the hit in the judging window. */
-  re_find?: (subject: string, pattern: string) => boolean | readonly [number, number] | null;
+  /**
+   * The first case-insensitive match at or after byte `init` (1 when
+   * undefined): truthy on a match; a [from, to] 1-based inclusive UTF-8 byte
+   * span places the hit in the judging window. A matcher that ignores init
+   * returns an earlier span again, and the walk of that pattern stops there.
+   */
+  re_find?: (subject: string, pattern: string, init?: number) => boolean | readonly [number, number] | null;
   log?: (level: string, msg: string) => void;
   subject?: SubjectCtx;
   config?: {
@@ -409,9 +414,21 @@ export function pathMatches(path: string, patterns: string[] | undefined, caseSe
   return null;
 }
 
+// Port of text_matches() in core/rules.lua. Every pattern is run and its
+// matches walked, and the latest MAX_SPANS spans in the text are kept: the
+// first pattern's first match alone let a harmless decoy before the attack
+// take the window's hit half, and the attack was cut out of the judged text.
+// After WALK matches of one pattern the walk skips halfway to the end of the
+// text (the later matches are the ones kept), so a text full of matches
+// costs a bounded number of calls. Returns the first pattern in list order
+// that matched (the reason names it) and the spans, at most MAX_SPANS, the
+// latest in the text, in text order (none when no match gave a span).
+export const MAX_SPANS = 8;
+const WALK = 64;
+type Span = [number, number];
 let warned = false;
 const badPatterns = new Set<string>();
-function textMatches(s: string, patterns: string[] | undefined, ctx: RulesCtx | undefined): [string, number?, number?] | null {
+function textMatches(s: string, patterns: string[] | undefined, ctx: RulesCtx | undefined): [string, Span[]?] | null {
   if (!patterns || patterns.length === 0) return null;
   const reFind = ctx?.re_find;
   if (!reFind) {
@@ -421,23 +438,43 @@ function textMatches(s: string, patterns: string[] | undefined, ctx: RulesCtx | 
     }
     return null;
   }
+  const n = byteLength(s);
+  let hit: string | undefined;
+  const all: Span[] = [];
   for (const p of patterns) {
-    try {
-      const hit = reFind(s, p);
-      if (Array.isArray(hit)) return [p, hit[0], hit[1]];
-      if (hit) return [p];
-    } catch (e) {
-      // a pattern the engine rejects is skipped, like pcall in Lua, but an
-      // operator should hear about it once instead of losing the prefilter silently
-      if (!badPatterns.has(p)) {
-        badPatterns.add(p);
-        const msg = `jev-edge: always_suspect pattern ${JSON.stringify(p)} does not compile and is skipped: ${e instanceof Error ? e.message : String(e)}`;
-        if (ctx?.log) ctx.log("warn", msg);
-        else console.warn(msg);
+    const mine: Span[] = [];
+    let init = 1;
+    let walked = 0;
+    while (init <= n) {
+      let r: ReturnType<NonNullable<RulesCtx["re_find"]>>;
+      try {
+        r = reFind(s, p, init);
+      } catch (e) {
+        // a pattern the engine rejects is skipped, like pcall in Lua, but an
+        // operator should hear about it once instead of losing the prefilter silently
+        if (!badPatterns.has(p)) {
+          badPatterns.add(p);
+          const msg = `jev-edge: always_suspect pattern ${JSON.stringify(p)} does not compile and is skipped: ${e instanceof Error ? e.message : String(e)}`;
+          if (ctx?.log) ctx.log("warn", msg);
+          else console.warn(msg);
+        }
+        break;
       }
+      if (!r) break;
+      hit ??= p;
+      if (!Array.isArray(r) || typeof r[0] !== "number" || typeof r[1] !== "number" || r[0] < init) break;
+      mine.push([r[0], r[1]]);
+      if (mine.length > MAX_SPANS) mine.shift();
+      init = Math.max(r[0], r[1]) + 1;
+      walked++;
+      if (walked % WALK === 0) init = Math.max(init, Math.floor((init + n) / 2));
     }
+    all.push(...mine);
   }
-  return null;
+  if (hit === undefined) return null;
+  if (all.length === 0) return [hit];
+  all.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  return [hit, all.slice(-MAX_SPANS)];
 }
 
 /** Port of rules.content_type: the Content-Type as one string; a repeated
@@ -601,17 +638,18 @@ export function pcreToRegExp(pattern: string, flags = "i"): RegExp {
 /**
  * Case-insensitive regex search with the same contract the OpenResty adapter
  * gives core (ngx.re.find with "ijo": PCRE without UTF): the 1-based
- * inclusive UTF-8 byte span of the first match. The pattern runs over the
+ * inclusive UTF-8 byte span of the first match at or after byte `init` (1
+ * when undefined). The pattern runs over the
  * subject's bytes (pcreBytes, pcreToRegExp), so `.`, `\b` and `{m,n}` count
  * bytes as PCRE does, and the match index is the byte offset.
  */
 const reCache = new Map<string, RegExp>();
 let lastSubject: string | undefined;
 let lastBytes = "";
-export function reFind(subject: string, pattern: string): readonly [number, number] | null {
+export function reFind(subject: string, pattern: string, init?: number): readonly [number, number] | null {
   let re = reCache.get(pattern);
   if (!re) {
-    re = pcreToRegExp(pattern);
+    re = pcreToRegExp(pattern, "gi");
     reCache.set(pattern, re);
   }
   // every always_suspect pattern runs over the same text: convert it once
@@ -619,6 +657,8 @@ export function reFind(subject: string, pattern: string): readonly [number, numb
     lastSubject = subject;
     lastBytes = pcreBytes(subject);
   }
+  // the search starts at byte init, as ngx.re.find's ctx.pos
+  re.lastIndex = init !== undefined && init > 1 ? init - 1 : 0;
   const m = re.exec(lastBytes);
   if (!m) return null;
   return [m.index + 1, m.index + m[0].length];
@@ -661,7 +701,7 @@ function toolsPart(values: string[], cut: boolean, rule: Rule, ctx: RulesCtx | u
   const ttext = values.join("\n");
   if (ttext === "") return undefined;
   const hit = textMatches(ttext, rule.always_suspect, ctx);
-  const [w, windowed] = window(ttext, values, rule.max_judge_bytes ?? MAX_JUDGE_BYTES, hit?.[1], hit?.[2]);
+  const [w, windowed] = window(ttext, values, rule.max_judge_bytes ?? MAX_JUDGE_BYTES, hit?.[1]);
   return { text: w, windowed: windowed || cut, hit: hit?.[0] };
 }
 
@@ -786,35 +826,35 @@ async function judged(
     if (pieces.length > maxc && textLen <= capacity) [pieces, starts] = splitChunks(text, budget, overlap, true);
     let out = pieces;
     let capped = false;
-    const spans: [number, number][] = [];
-    const from = hit?.[1], to = hit?.[2];
+    const covered: Span[] = [];
+    const spans = hit?.[1] ?? [];
     if (pieces.length <= maxc) {
-      for (let k = 0; k < pieces.length; k++) spans.push([starts[k], starts[k] + byteLength(pieces[k]) - 1]);
+      for (let k = 0; k < pieces.length; k++) covered.push([starts[k], starts[k] + byteLength(pieces[k]) - 1]);
     } else {
       const firstKept = pieces.length - (maxc - 1); // 0-based
       const tb = utf8Bytes(text);
       let older = new TextDecoder().decode(tb.subarray(0, starts[firstKept] - 1));
       if (older.endsWith("\n")) older = older.slice(0, -1);
       const olderLen = byteLength(older);
-      const inside = from !== undefined && to !== undefined && to <= olderLen;
-      const [win] = window(older, [older], budget, inside ? from : undefined, inside ? to : undefined);
+      const inside = spans.filter(([, z]) => z <= olderLen);
+      const [win] = window(older, [older], budget, inside);
       out = [win];
       capped = true;
-      // the window holds the hit when it was inside what the window covers
-      if (inside) spans.push([from!, to!]);
+      // the window holds the hits that were inside what it covers
+      covered.push(...inside);
       for (let k = firstKept; k < pieces.length; k++) {
         out.push(pieces[k]);
-        spans.push([starts[k], starts[k] + byteLength(pieces[k]) - 1]);
+        covered.push([starts[k], starts[k] + byteLength(pieces[k]) - 1]);
       }
     }
-    if (from !== undefined && to !== undefined && !spans.some(([a, z]) => a <= from && to <= z)) {
-      // backstop: a hit longer than the overlap straddles a cut; it and up
-      // to HIT_CONTEXT bytes each side are judged as a part of their own
-      out = [window(text, [], budget, from, to)[0], ...out];
-    }
+    // backstop: a hit longer than the overlap can still straddle a cut;
+    // such hits and up to HIT_CONTEXT bytes each side are judged as a part
+    // of their own, the way window() keeps them
+    const straddle = spans.filter(([f, t]) => !covered.some(([a, z]) => a <= f && t <= z));
+    if (straddle.length > 0) out = [window(text, [], budget, straddle)[0], ...out];
     return { text: out.join("\n"), hit: hit?.[0], windowed: capped || partial, chunks: out, capped, untrusted, tools, bound, retrieved, ids };
   }
-  const [w, cut] = window(text, values, budget, hit?.[1], hit?.[2]);
+  const [w, cut] = window(text, values, budget, hit?.[1]);
   return { text: w, hit: hit?.[0], windowed: cut || partial, untrusted, tools, bound, retrieved, ids };
 }
 

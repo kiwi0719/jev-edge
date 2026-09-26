@@ -227,6 +227,34 @@ describe("normalize.window", function()
     assert.matches("newest$", w)
   end)
 
+  -- g1-chunk-seams-window-math#2: every hit kept gets its match and context
+  it("gives several hits each its match and an even share of context", function()
+    local values = { "aa decoy one aa", string.rep("x", 100) .. " attack two " .. string.rep("y", 100), "newest" }
+    local text = table.concat(values, "\n")
+    local d, a = text:find("decoy one", 1, true), text:find("attack two", 1, true)
+    local w, cut = N.window(text, values, 80, { { d, d + 8 }, { a, a + 9 } })
+    assert.is_true(cut)
+    assert.is_true(#w <= 80)
+    -- half = 40: 9 + 10 + 1 bytes of matches, (40 - 20) / 4 = 5 bytes each side
+    assert.equals("aa decoy one aa\nx\nxxxx attack two yyyy", w:match("^[^\n]*\n[^\n]*\n[^\n]*"))
+    assert.matches("newest$", w)
+    -- the old two-number form is one span
+    assert.same({ N.window(text, values, 80, { { a, a + 9 } }) }, { N.window(text, values, 80, a, a + 9) })
+  end)
+
+  it("merges overlapping hits, joins meeting context and drops the oldest only when the matches do not fit", function()
+    local text = string.rep("a", 50) .. "ONE TWO" .. string.rep("b", 10) .. "THREE" .. string.rep("c", 50)
+    local one, two, three = text:find("ONE", 1, true), text:find("TWO", 1, true), text:find("THREE", 1, true)
+    -- ONE and "NE TWO" overlap: one span of 7 bytes; with THREE, (50 - 13) / 4
+    -- = 9 bytes each side, and the two pieces' context meets: one piece
+    local w = N.window(text, { text }, 100, { { one, one + 2 }, { one + 1, two + 2 }, { three, three + 4 } })
+    assert.equals(string.rep("a", 9) .. "ONE TWO" .. string.rep("b", 10) .. "THREE" .. string.rep("c", 9),
+      w:match("^[^\n]*"))
+    -- the matches alone (7 + 5 + 1) do not fit 12 bytes: the oldest is dropped
+    w = N.window(text, { text }, 24, { { one, two + 2 }, { three, three + 4 } })
+    assert.equals("bbbTHREEccc", w:match("^[^\n]*"))
+  end)
+
   it("never cuts inside a UTF-8 sequence", function()
     local v = string.rep("\228\184\173", 40)   -- 40 x U+4E2D
     local w = N.window(v, { v }, 50)

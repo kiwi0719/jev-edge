@@ -88,11 +88,33 @@ local path_matches = _M.path_matches
 
 -- always_suspect patterns are PCRE, matched through ctx.re_find so the same
 -- rule files work under ngx.re (OpenResty), lrexlib (tests) or JS RegExp.
--- re_find returns the 1-based inclusive byte span of the match (from, to), or
--- just a truthy value; the span places the hit inside the judging window.
--- Without an injected matcher the prefilter is skipped (fail-open) and the
--- length check alone decides.
+-- re_find(subject, pattern, init) returns the 1-based inclusive byte span of
+-- the first match that starts at or after byte `init` (1 when nil), or just
+-- a truthy value; the spans place the hits inside the judging window. A
+-- matcher that ignores init returns an earlier span again, and the walk of
+-- that pattern stops there. Without an injected matcher the prefilter is
+-- skipped (fail-open) and the length check alone decides.
+--
+-- Every pattern is run and its matches walked, and the latest MAX_SPANS
+-- spans in the text are kept: the first pattern's first match alone let a
+-- harmless decoy before the attack take the window's hit half, and the
+-- attack was cut out of the judged text. After WALK matches of one pattern
+-- the walk skips halfway to the end of the text (the later matches are the
+-- ones kept), so a text full of matches costs a bounded number of calls and
+-- still one pass per pattern.
+_M.MAX_SPANS = 8
+local WALK = 64
+
+local function by_start(a, b)
+  if a[1] ~= b[1] then return a[1] < b[1] end
+  return a[2] < b[2]
+end
+
 local warned = false
+-- @return the first pattern in list order that matched (the reason names
+--         it), and the spans of the matches, at most MAX_SPANS, the latest
+--         in the text, in text order (nil when no match gave a span); nil
+--         when nothing matched
 local function text_matches(s, patterns, ctx)
   if not patterns or #patterns == 0 then return nil end
   local re_find = ctx and ctx.re_find
@@ -103,14 +125,28 @@ local function text_matches(s, patterns, ctx)
     end
     return nil
   end
+  local hit, all, n = nil, {}, #s
   for _, p in ipairs(patterns) do
-    local ok, from, to = pcall(re_find, s, p)
-    if ok and from then
-      if type(from) == "number" and type(to) == "number" then return p, from, to end
-      return p
+    local mine, init, walked = {}, 1, 0
+    while init <= n do
+      local ok, from, to = pcall(re_find, s, p, init)
+      if not ok or not from then break end
+      hit = hit or p
+      if type(from) ~= "number" or type(to) ~= "number" or from < init then break end
+      mine[#mine + 1] = { from, to }
+      if #mine > _M.MAX_SPANS then table.remove(mine, 1) end
+      init = math.max(from, to) + 1
+      walked = walked + 1
+      if walked % WALK == 0 then init = math.max(init, math.floor((init + n) / 2)) end
     end
+    for _, sp in ipairs(mine) do all[#all + 1] = sp end
   end
-  return nil
+  if not hit then return nil end
+  if #all == 0 then return hit end
+  table.sort(all, by_start)
+  local spans = {}
+  for i = math.max(1, #all - _M.MAX_SPANS + 1), #all do spans[#spans + 1] = all[i] end
+  return hit, spans
 end
 
 --- The request's Content-Type as one string. A repeated header arrives as a
@@ -256,9 +292,9 @@ end
 local function tools_part(values, cut, rule, ctx)
   local ttext = table.concat(values, "\n")
   if ttext == "" then return nil end
-  local hit, from, to = text_matches(ttext, rule.always_suspect, ctx)
+  local hit, spans = text_matches(ttext, rule.always_suspect, ctx)
   local windowed
-  ttext, windowed = normalize.window(ttext, values, rule.max_judge_bytes or _M.MAX_JUDGE_BYTES, from, to)
+  ttext, windowed = normalize.window(ttext, values, rule.max_judge_bytes or _M.MAX_JUDGE_BYTES, spans)
   return { text = ttext, windowed = (windowed or cut) and true or false, hit = hit }
 end
 
@@ -369,7 +405,7 @@ local function judged(req, rule, ctx, ct, size, ex)
     end
   end
   if text == "" then return "", nil, nil, nil, nil, nil, untrusted, tools, bound, false, ids end
-  local hit, from, to = text_matches(text, rule.always_suspect, ctx)
+  local hit, spans = text_matches(text, rule.always_suspect, ctx)
   local budget = rule.max_judge_bytes or _M.MAX_JUDGE_BYTES
   local maxc = math.floor(tonumber(rule.max_judge_chunks) or 1)
   if maxc > 1 and #text > budget then
@@ -384,41 +420,46 @@ local function judged(req, rule, ctx, ct, size, ex)
     if #pieces > maxc and #text <= capacity then
       pieces, starts = normalize.chunks(text, budget, overlap, true)
     end
-    local out, spans, capped = pieces, {}, false
+    local out, covered, capped = pieces, {}, false
     if #pieces <= maxc then
-      for k = 1, #pieces do spans[k] = { starts[k], starts[k] + #pieces[k] - 1 } end
+      for k = 1, #pieces do covered[k] = { starts[k], starts[k] + #pieces[k] - 1 } end
     else
       local first_kept = #pieces - (maxc - 1) + 1
       local older = text:sub(1, starts[first_kept] - 1):gsub("\n$", "")
-      local inside = from and to and to <= #older
-      local win = normalize.window(older, { older }, budget, inside and from or nil, inside and to or nil)
+      local inside = {}
+      for _, sp in ipairs(spans or {}) do
+        if sp[2] <= #older then inside[#inside + 1] = sp end
+      end
+      local win = normalize.window(older, { older }, budget, inside)
       out, capped = { win }, true
-      -- the window holds the hit when it was inside what the window covers
-      if inside then spans[1] = { from, to } end
+      -- the window holds the hits that were inside what it covers
+      for _, sp in ipairs(inside) do covered[#covered + 1] = sp end
       for k = first_kept, #pieces do
         out[#out + 1] = pieces[k]
-        spans[#spans + 1] = { starts[k], starts[k] + #pieces[k] - 1 }
+        covered[#covered + 1] = { starts[k], starts[k] + #pieces[k] - 1 }
       end
     end
-    if from and to then
-      -- backstop: a hit longer than the overlap can still straddle a cut;
-      -- it and up to HIT_CONTEXT bytes each side are judged as a part of
-      -- their own, the way window() keeps it
+    -- backstop: a hit longer than the overlap can still straddle a cut;
+    -- such hits and up to HIT_CONTEXT bytes each side are judged as a part
+    -- of their own, the way window() keeps them
+    local straddle = {}
+    for _, sp in ipairs(spans or {}) do
       local whole = false
-      for _, sp in ipairs(spans) do
-        if sp[1] <= from and to <= sp[2] then whole = true break end
+      for _, c in ipairs(covered) do
+        if c[1] <= sp[1] and sp[2] <= c[2] then whole = true break end
       end
-      if not whole then
-        local around = normalize.window(text, {}, budget, from, to)
-        local with = { around }
-        for k = 1, #out do with[k + 1] = out[k] end
-        out = with
-      end
+      if not whole then straddle[#straddle + 1] = sp end
+    end
+    if #straddle > 0 then
+      local around = normalize.window(text, {}, budget, straddle)
+      local with = { around }
+      for k = 1, #out do with[k + 1] = out[k] end
+      out = with
     end
     return table.concat(out, "\n"), nil, hit, capped or partial, out, capped, untrusted, tools, bound, retrieved, ids
   end
   local windowed
-  text, windowed = normalize.window(text, values, budget, from, to)
+  text, windowed = normalize.window(text, values, budget, spans)
   return text, nil, hit, windowed or partial, nil, nil, untrusted, tools, bound, retrieved, ids
 end
 
@@ -441,7 +482,9 @@ end
 --             body_partial (the gateway forwarded only the body's first part)
 -- @param rule rule table (see rules/*.lua)
 -- @param ctx  { cache = {get=fn}, json_decode = fn, clock = fn,
---               re_find = fn(subject, pcre) -> truthy on match (case-insensitive) }
+--               re_find = fn(subject, pcre, init) -> from, to of the first
+--               case-insensitive match at or after byte init (1 when nil),
+--               or truthy on a match, or nil }
 -- @return result, text, reason, windowed, chunks, capped, untrusted ({ text,
 --         windowed } of retrieved content to judge on its own, or nil), tools
 --         ({ text, windowed, hit } of the tool definitions, or nil). `only`

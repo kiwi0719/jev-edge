@@ -1465,21 +1465,77 @@ function _M.chunks(text, budget, overlap, hard)
   return pieces, starts
 end
 
---- @param text   the joined values
--- @param values the values, in order (newest last)
--- @param budget max bytes
--- @param from,to byte span of an always_suspect hit in `text`, or nil
--- @return the text to judge, true when it was cut
-function _M.window(text, values, budget, from, to)
-  if #text <= budget then return text, false end
-  local out, rem = {}, budget
-  if from and to then
-    -- the hit and up to HIT_CONTEXT bytes each side, in at most half the budget
-    local half = math.floor(budget / 2)
+-- The hits' part of a window, in at most `half` bytes. One span: the hit and
+-- up to HIT_CONTEXT bytes each side. Several (text_matches keeps up to
+-- rules.MAX_SPANS, in text order): overlapping ones are merged, and each gets
+-- its match and the same context each side, which shrinks evenly toward 0 so
+-- that all of them fit; only when the matches alone do not fit are the
+-- oldest dropped. Pieces whose context meets are joined, the others are
+-- separated by a newline.
+local function hit_part(text, spans, half)
+  local merged = {}
+  for _, sp in ipairs(spans) do
+    local last = merged[#merged]
+    if last and sp[1] <= last[2] + 1 then
+      if sp[2] > last[2] then last[2] = sp[2] end
+    else
+      merged[#merged + 1] = { sp[1], sp[2] }
+    end
+  end
+  -- the matches from `first` on and the newlines between them
+  local function needed(first)
+    local need = #merged - first
+    for i = first, #merged do need = need + merged[i][2] - merged[i][1] + 1 end
+    return need
+  end
+  local first = 1
+  local need = needed(first)
+  while need > half and first < #merged do
+    first = first + 1
+    need = needed(first)
+  end
+  if first == #merged then
+    local from, to = merged[first][1], merged[first][2]
     local ctxb = math.max(0, math.min(_M.HIT_CONTEXT, math.floor((half - (to - from + 1)) / 2)))
     local a = math.max(1, from - ctxb)
     while a > 1 and cont(text, a) do a = a - 1 end
-    local piece = _M.head(text:sub(a), math.min(math.min(to + ctxb, #text) - a + 1, half))
+    return _M.head(text:sub(a), math.min(math.min(to + ctxb, #text) - a + 1, half))
+  end
+  local m = #merged - first + 1
+  local ctxb = math.max(0, math.min(_M.HIT_CONTEXT, math.floor((half - need) / (2 * m))))
+  local ranges = {}
+  for i = first, #merged do
+    local from, to = merged[i][1], merged[i][2]
+    -- forward to a character start: the context never grows past its share
+    local a = math.max(1, from - ctxb)
+    while a < from and cont(text, a) do a = a + 1 end
+    local b = math.min(#text, to + ctxb)
+    local last = ranges[#ranges]
+    if last and a <= last[2] + 1 then
+      last[2] = b
+    else
+      ranges[#ranges + 1] = { a, b }
+    end
+  end
+  local parts = {}
+  for i, r in ipairs(ranges) do parts[i] = _M.head(text:sub(r[1], r[2] + 1), r[2] - r[1] + 1) end
+  return table.concat(parts, "\n")
+end
+
+--- @param text   the joined values
+-- @param values the values, in order (newest last)
+-- @param budget max bytes
+-- @param spans  byte spans { { from, to }, ... } of always_suspect hits in
+--               `text`, in text order, or nil; or, as before, one span given
+--               as two numbers (from, to)
+-- @return the text to judge, true when it was cut
+function _M.window(text, values, budget, spans, to)
+  if #text <= budget then return text, false end
+  if type(spans) == "number" then spans = to and { { spans, to } } or nil end
+  local out, rem = {}, budget
+  if type(spans) == "table" and #spans > 0 then
+    -- the hits and their context, in at most half the budget
+    local piece = hit_part(text, spans, math.floor(budget / 2))
     out[1] = piece
     rem = rem - #piece - 1
   end

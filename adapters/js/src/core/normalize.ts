@@ -1510,21 +1510,83 @@ export function chunks(text: string, budget: number, overlap = 0, hard = false):
   return [pieces, starts];
 }
 
-/**
- * @param from,to 1-based inclusive byte span of an always_suspect hit, or undefined
- * @returns the text to judge, and true when it was cut
- */
-export function window(text: string, values: string[], budget: number, from?: number, to?: number): [string, boolean] {
-  const tb = enc.encode(text);
-  if (tb.length <= budget) return [text, false];
-  const out: string[] = [];
-  let rem = budget;
-  if (from !== undefined && to !== undefined) {
-    const half = Math.floor(budget / 2);
+// `len` bytes at most of `tb` from byte `a` (1-based), cut back to a
+// character boundary, as normalize.head(text:sub(a), len) in Lua.
+function headAt(tb: Uint8Array, a: number, len: number): string {
+  if (len <= 0) return "";
+  const s = tb.subarray(a - 1);
+  if (s.length <= len) return dec.decode(s);
+  let e = len;
+  while (e > 0 && isCont(s, e)) e--;
+  return dec.decode(s.subarray(0, e));
+}
+
+// Port of hit_part() in core/normalize.lua: the hits' part of a window, in
+// at most `half` bytes. One span: the hit and up to HIT_CONTEXT bytes each
+// side. Several (in text order): overlapping ones are merged, and each gets
+// its match and the same context each side, which shrinks evenly toward 0
+// so that all of them fit; only when the matches alone do not fit are the
+// oldest dropped. Pieces whose context meets are joined, the others are
+// separated by a newline.
+function hitPart(tb: Uint8Array, spans: readonly (readonly [number, number])[], half: number): string {
+  const merged: [number, number][] = [];
+  for (const [f, t] of spans) {
+    const last = merged[merged.length - 1];
+    if (last && f <= last[1] + 1) {
+      if (t > last[1]) last[1] = t;
+    } else {
+      merged.push([f, t]);
+    }
+  }
+  const lastIdx = merged.length - 1;
+  let first = 0;
+  let need = 0;
+  for (;;) {
+    need = lastIdx - first;
+    for (let i = first; i <= lastIdx; i++) need += merged[i][1] - merged[i][0] + 1;
+    if (need <= half || first === lastIdx) break;
+    first++;
+  }
+  const n = tb.length;
+  if (first === lastIdx) {
+    const [from, to] = merged[first];
     const ctxb = Math.max(0, Math.min(HIT_CONTEXT, Math.floor((half - (to - from + 1)) / 2)));
     let a = Math.max(1, from - ctxb);
     while (a > 1 && isCont(tb, a - 1)) a--;
-    const piece = head(dec.decode(tb.subarray(a - 1)), Math.min(Math.min(to + ctxb, tb.length) - a + 1, half));
+    return headAt(tb, a, Math.min(Math.min(to + ctxb, n) - a + 1, half));
+  }
+  const m = lastIdx - first + 1;
+  const ctxb = Math.max(0, Math.min(HIT_CONTEXT, Math.floor((half - need) / (2 * m))));
+  const ranges: [number, number][] = [];
+  for (let i = first; i <= lastIdx; i++) {
+    const [from, to] = merged[i];
+    // forward to a character start: the context never grows past its share
+    let a = Math.max(1, from - ctxb);
+    while (a < from && isCont(tb, a - 1)) a++;
+    const b = Math.min(n, to + ctxb);
+    const last = ranges[ranges.length - 1];
+    if (last && a <= last[1] + 1) last[1] = b;
+    else ranges.push([a, b]);
+  }
+  return ranges.map(([a, b]) => headAt(tb, a, b - a + 1)).join("\n");
+}
+
+/**
+ * @param spans 1-based inclusive byte spans of always_suspect hits, in text
+ *              order, or undefined; or, as before, one span given as two
+ *              numbers (from, to)
+ * @returns the text to judge, and true when it was cut
+ */
+export function window(text: string, values: string[], budget: number,
+  spans?: readonly (readonly [number, number])[] | number, to?: number): [string, boolean] {
+  const tb = enc.encode(text);
+  if (tb.length <= budget) return [text, false];
+  if (typeof spans === "number") spans = to !== undefined ? [[spans, to]] : undefined;
+  const out: string[] = [];
+  let rem = budget;
+  if (spans && spans.length > 0) {
+    // the hits and their context, in at most half the budget
+    const piece = hitPart(tb, spans, Math.floor(budget / 2));
     out.push(piece);
     rem = rem - byteLength(piece) - 1;
   }

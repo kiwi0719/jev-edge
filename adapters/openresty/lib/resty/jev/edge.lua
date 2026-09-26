@@ -90,9 +90,10 @@ local function ensure_runtime(cfg)
   end
 end
 
--- the byte span of the match (from, to), which places the hit in the
--- judging window; nil when there is none
-local function re_find(subject, pattern)
+-- the byte span of the first match at or after byte init (from, to), which
+-- places the hit in the judging window; nil when there is none
+local function re_find(subject, pattern, init)
+  if init and init > 1 then return ngx.re.find(subject, pattern, "ijo", { pos = init }) end
   return ngx.re.find(subject, pattern, "ijo")
 end
 

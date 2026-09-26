@@ -198,7 +198,10 @@ local function build_req(rt)
   return req
 end
 
-local function re_find(subject, pattern)
+-- the byte span of the first match at or after byte init, which places the
+-- hit in the judging window
+local function re_find(subject, pattern, init)
+  if init and init > 1 then return ngx.re.find(subject, pattern, "ijo", { pos = init }) end
   return ngx.re.find(subject, pattern, "ijo")
 end
 

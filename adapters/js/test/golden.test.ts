@@ -83,7 +83,7 @@ describe("golden: verdict", () => {
   for (const c of load("verdict").cases) {
     it(c.name, () => {
       const v = core.verdict.newVerdict(c.input);
-      expect({ verdict: v, headers: core.verdict.headers(v) }).toEqual(c.expect);
+      expect({ verdict: v, headers: core.verdict.headers(v), client_headers: core.verdict.clientHeaders(v) }).toEqual(c.expect);
     });
   }
 });

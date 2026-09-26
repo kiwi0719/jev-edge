@@ -15,7 +15,9 @@ const post = (body: string, key: string, extra: Record<string, string> = {}) =>
   });
 
 describe("subject reputation", () => {
+  let lastReason: string | undefined;
   const rt = () => createRuntime({
+    onVerdict: (v) => { lastReason = v.reason; },
     config: {
       jev: { provider: "mock", mock_score: 0.1, mock_header: "x-jev-mock-score", timeout_ms: 400 },
       policy: { mode: "enforce" },
@@ -29,7 +31,8 @@ describe("subject reputation", () => {
     expect((await handle(post(ATTACK.replace("print", "show"), "key-A", { "x-jev-mock-score": "0.97" }), r, seen)).status).toBe(403);
     const blocked = await handle(post(BENIGN, "key-A", { "x-forwarded-for": "198.51.100.77" }), r, seen);
     expect(blocked.status).toBe(403);
-    expect(blocked.headers.get("x-jev-reason")).toBe("subject+reputation");
+    expect(lastReason).toBe("subject reputation");
+    expect(blocked.headers.get("x-jev-reason")).toBeNull();
     const other = await handle(post(BENIGN, "key-B"), r, seen);
     expect(((await other.json()) as Record<string, string>).verdict).toBe("safe");
   });

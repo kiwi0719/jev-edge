@@ -50,7 +50,7 @@ Per route, per service or global, with the same keys as the Lua config file:
    }'
    ```
 
-Your upstream receives `X-Jev-Verdict`, `X-Jev-Score`, `X-Jev-Source`, `X-Jev-Reason` and `X-Jev-Request-Id`. In `enforce` mode a block is a 403 with `policy.block_body` and the verdict headers on the response.
+Your upstream receives `X-Jev-Verdict`, `X-Jev-Score`, `X-Jev-Source`, `X-Jev-Reason` and `X-Jev-Request-Id`. In `enforce` mode a block is a 403 with `policy.block_body`, `X-Jev-Verdict` and `X-Jev-Request-Id` on the response; the score, reason and source go to the upstream and the log only, never to the client.
 
 ## What maps to what
 

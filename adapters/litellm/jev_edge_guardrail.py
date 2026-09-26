@@ -1011,11 +1011,20 @@ class JevEdgeGuardrail(_ApplyGuardrailBase):
 
     @staticmethod
     def _raise(verdict: dict) -> None:
+        """The client learns that the request was refused and the id to quote,
+        never the score, the reason or the source: they tell an attacker how
+        close a prompt came and which pattern fired. The verdict stays in the
+        proxy's metadata (`jev_verdict`), the guardrail log and the
+        exception's `jev_verdict` attribute, which no response serializes."""
         status = int(verdict.get("status") or 403)
-        detail = {"error": "request rejected", "jev": verdict}
+        detail = {"error": "request rejected", "request_id": verdict.get("request_id")}
+        exc: Exception
         if HTTPException is not None:
-            raise HTTPException(status_code=status, detail=detail)
-        raise JevEdgeBlocked(status, detail)
+            exc = HTTPException(status_code=status, detail=detail)
+        else:
+            exc = JevEdgeBlocked(status, detail)
+        exc.jev_verdict = verdict  # type: ignore[attr-defined]
+        raise exc
 
     def _log_verdict(self, key: str, md: dict, data: dict, verdict: dict, started: float, blocks: bool) -> None:
         """The verdict in LiteLLM's standard guardrail logging too, so it

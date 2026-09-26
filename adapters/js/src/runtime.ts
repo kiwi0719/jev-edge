@@ -411,8 +411,9 @@ function describe(e: unknown): string {
  * A path that is not well formed (wellFormedPath): refused with 400 and the
  * block body, whatever policy.mode and policy.unjudgeable say, as nginx
  * answers it inline and the Envoy shim and HAProxy agent do. It is the
- * client's error, not a verdict, so it never fails open. The X-Jev-* headers
- * say skipped / adapter / "invalid path", as the HAProxy agent sets them.
+ * client's error, not a verdict, so it never fails open. The client sees
+ * X-Jev-Verdict: skipped and the request id (clientHeaders); the log says
+ * why.
  */
 function badPath(rt: Runtime, requestId: string, pathname: string): Evaluation {
   console.warn("jev-edge: refusing malformed path " + JSON.stringify(pathname.slice(0, 256)) + " with 400");
@@ -421,7 +422,7 @@ function badPath(rt: Runtime, requestId: string, pathname: string): Evaluation {
   });
   const response = new Response(rt.config.policy.block_body ?? '{"error":"request rejected"}', {
     status: 400,
-    headers: { "Content-Type": "application/json", ...core.verdict.headers(verdict), "X-Jev-Request-Id": requestId },
+    headers: { "Content-Type": "application/json", ...core.verdict.clientHeaders(verdict), "X-Jev-Request-Id": requestId },
   });
   return { verdict, response, requestId };
 }
@@ -517,9 +518,11 @@ async function evaluateInner(request: Request, rt: Runtime, requestId: string, r
   }
   const out: Evaluation = { verdict, requestId, subjectId: subject?.id };
   if (verdict.action === core.verdict.ACTION_BLOCK) {
+    // the client sees the verdict and the request id, never the score, the
+    // reason or the source (core.verdict.clientHeaders): those go to logs
     out.response = new Response(rt.config.policy.block_body ?? '{"error":"request rejected"}', {
       status: rt.config.policy.block_status ?? 403,
-      headers: { "Content-Type": "application/json", ...core.verdict.headers(verdict), "X-Jev-Request-Id": requestId },
+      headers: { "Content-Type": "application/json", ...core.verdict.clientHeaders(verdict), "X-Jev-Request-Id": requestId },
     });
   }
   return out;

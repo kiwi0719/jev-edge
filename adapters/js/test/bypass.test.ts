@@ -93,8 +93,9 @@ describe("a path nginx would refuse is answered 400, never passed", () => {
           expect(await res.text()).toBe('{"error":"request rejected"}');
           expect(res.headers.get("content-type")).toBe("application/json");
           expect(res.headers.get("x-jev-verdict")).toBe("skipped");
-          expect(res.headers.get("x-jev-source")).toBe("adapter");
-          expect(res.headers.get("x-jev-reason")).toBe("invalid+path");
+          // the client sees the verdict and the request id only; the log says why
+          expect(res.headers.get("x-jev-source")).toBeNull();
+          expect(res.headers.get("x-jev-reason")).toBeNull();
           expect(res.headers.get("x-jev-request-id")).toBeTruthy();
         }
         expect(warn).toHaveBeenCalledWith(expect.stringContaining("refusing malformed path"));

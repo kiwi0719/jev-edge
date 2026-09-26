@@ -365,8 +365,11 @@ function _M.access(conf, ctx)
   core.request.set_header(ctx, "X-Jev-Request-Id", ctx.var.request_id or "")
 
   if v.action == verdict.ACTION_BLOCK then
+    -- the client sees the verdict and the request id, never the score, the
+    -- reason or the source (verdict.client_headers): those go to the log
     core.response.set_header("Content-Type", "application/json")
-    for k, val in pairs(verdict.headers(v)) do core.response.set_header(k, val) end
+    for k, val in pairs(verdict.client_headers(v)) do core.response.set_header(k, val) end
+    core.response.set_header("X-Jev-Request-Id", ctx.var.request_id or "")
     return rt.cfg.policy.block_status or 403, rt.cfg.policy.block_body or '{"error":"request rejected"}'
   end
 end

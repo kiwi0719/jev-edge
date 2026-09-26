@@ -1158,7 +1158,7 @@ local function verdict_case(name, t)
   local v = verdict.new(t)
   verdict_cases[#verdict_cases + 1] = {
     name = name, input = t,
-    expect = { verdict = v, headers = verdict.headers(v) },
+    expect = { verdict = v, headers = verdict.headers(v), client_headers = verdict.client_headers(v) },
   }
 end
 

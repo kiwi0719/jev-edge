@@ -190,7 +190,7 @@ describe("denoHandler", () => {
       const h = denoHandler({ upstream: UPSTREAM, config: cfg, kv });
       const res = await h(chat(ATTACK), PEER);
       expect(res.status).toBe(403);
-      expect(res.headers.get("x-jev-source")).toBe("l2");
+      expect(res.headers.get("x-jev-verdict")).toBe("malicious"); // judged: the adapter fails open, never blocks
       expect(seen).toHaveLength(0);
       for (let i = 0; i < 20; i++) await tick(); // the fire-and-forget subject write
       const warned = warn.mock.calls.map((c) => String(c[0]));

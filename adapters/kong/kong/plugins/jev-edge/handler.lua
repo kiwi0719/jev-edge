@@ -262,8 +262,11 @@ function JevEdge:access(conf)
   kong.ctx.plugin.verdict = v
 
   if v.action == verdict.ACTION_BLOCK then
-    local headers = verdict.headers(v)
+    -- the client sees the verdict and the request id, never the score, the
+    -- reason or the source (verdict.client_headers): those go to the log
+    local headers = verdict.client_headers(v)
     headers["Content-Type"] = "application/json"
+    headers["X-Jev-Request-Id"] = ngx.var.request_id or ""
     return kong.response.exit(rt.cfg.policy.block_status or 403,
       rt.cfg.policy.block_body or DEFAULT_BLOCK_BODY, headers)
   end

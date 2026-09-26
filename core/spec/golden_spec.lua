@@ -98,7 +98,7 @@ describe("golden: verdict", function()
   for _, c in ipairs(load("verdict").cases) do
     it(c.name, function()
       local v = verdict.new(c.input)
-      same(c.expect, { verdict = v, headers = verdict.headers(v) })
+      same(c.expect, { verdict = v, headers = verdict.headers(v), client_headers = verdict.client_headers(v) })
     end)
   end
 end)

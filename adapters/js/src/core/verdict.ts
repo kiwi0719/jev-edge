@@ -105,6 +105,13 @@ export function encodeReason(s: unknown): string {
   return out;
 }
 
+/** Port of verdict.client_headers: the only verdict header a client may see
+ *  on a block response (with X-Jev-Request-Id, which the adapter adds).
+ *  Score, reason and source go to the logs and the upstream request only. */
+export function clientHeaders(v: Verdict): Record<string, string> {
+  return { "X-Jev-Verdict": v.verdict };
+}
+
 export function headers(v: Verdict): Record<string, string> {
   return {
     "X-Jev-Verdict": v.verdict,

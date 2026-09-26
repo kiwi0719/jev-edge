@@ -57,7 +57,8 @@ describe("nextMiddleware", () => {
       for (const path of ["/v1/%u0063ompletions", "/v1/chat/completions%", "/v1/%zzchat/completions"]) {
         const res = await mw(chat(ATTACK, {}, path));
         expect({ path, status: res.status }).toEqual({ path, status: 400 });
-        expect(res.headers.get("x-jev-reason")).toBe("invalid+path");
+        expect(res.headers.get("x-jev-verdict")).toBe("skipped");
+        expect(res.headers.get("x-jev-reason")).toBeNull();
       }
     } finally {
       warn.mockRestore();
@@ -295,7 +296,8 @@ describe("nodeMiddleware", () => {
     const res = nodeRes();
     await mw(req as never, res, () => {});
     expect(res.statusCode).toBe(403);
-    expect(res.headers["x-jev-source"]).toBe("l2");
+    expect(res.headers["x-jev-verdict"]).toBe("malicious");
+    expect(res.headers["x-jev-source"]).toBeUndefined();
   });
 
   it("judges the whole path under a Router mounted deeper: /v1/chat", async () => {
@@ -642,5 +644,65 @@ describe("subject trajectories", () => {
   it("rejects subject.enabled without a salt", async () => {
     const { createRuntime } = await import("../src/runtime");
     expect(() => createRuntime({ config: { subject: { enabled: true, from: "ip" } } })).toThrow(/salt/);
+  });
+});
+
+// g2-block-response-verdict-oracle#1: score, reason and source tell an
+// attacker how close a prompt came and which pattern fired. A block response
+// carries X-Jev-Verdict and X-Jev-Request-Id only, on every host.
+describe("block responses tell the client the verdict and the request id only", () => {
+  const LEAKS = ["x-jev-score", "x-jev-reason", "x-jev-source"];
+  const block = { "x-jev-mock-score": "0.95" };
+
+  it("Next.js, Node, Workers and Lambda@Edge", async () => {
+    const seen: Record<string, Record<string, string>> = {};
+    const lower = (h: Headers) => { const o: Record<string, string> = {}; h.forEach((v, k) => (o[k] = v)); return o; };
+
+    const next = await nextMiddleware(opts(), { next: () => new Response("next") })(chat(ATTACK, block));
+    expect(next.status).toBe(403);
+    seen.next = lower(next.headers);
+
+    const req = new EventEmitter() as EventEmitter & Record<string, unknown>;
+    Object.assign(req, { method: "POST", url: "/v1/chat/completions", socket: { remoteAddress: "203.0.113.7" },
+      headers: { host: "app.example", "content-type": "application/json", ...block } });
+    setTimeout(() => { req.emit("data", Buffer.from(ATTACK)); req.emit("end"); }, 0);
+    const res = { statusCode: 200, headers: {} as Record<string, string>, setHeader(k: string, v: string) { this.headers[k.toLowerCase()] = v; }, end() {} };
+    await nodeMiddleware(opts())(req as never, res as never, () => {});
+    expect(res.statusCode).toBe(403);
+    seen.node = res.headers;
+
+    const { fullWorker } = await import("../src");
+    const w = fullWorker({ ...opts(), upstream: "https://upstream.example" });
+    const wres = await w.fetch(chat(ATTACK, block), {});
+    expect(wres.status).toBe(403);
+    seen.worker = lower(wres.headers);
+
+    const out = (await lambdaEdgeHandler(opts())({ Records: [{ cf: { config: { eventType: "viewer-request" }, request: {
+      method: "POST", uri: "/v1/chat/completions", clientIp: "203.0.113.7",
+      headers: { host: [{ key: "Host", value: "app.example" }], "content-type": [{ key: "Content-Type", value: "application/json" }],
+        "x-jev-mock-score": [{ key: "X-Jev-Mock-Score", value: "0.95" }] },
+      body: { encoding: "base64", data: Buffer.from(ATTACK).toString("base64"), bodyTruncated: false },
+    } } }] })) as CfResponse;
+    expect(out.status).toBe("403");
+    seen.lambda = Object.fromEntries(Object.entries(out.headers ?? {}).map(([k, v]) => [k, v[0].value]));
+
+    for (const [host, h] of Object.entries(seen)) {
+      expect({ host, verdict: h["x-jev-verdict"] }).toEqual({ host, verdict: "malicious" });
+      expect({ host, rid: !!h["x-jev-request-id"] }).toEqual({ host, rid: true });
+      for (const k of LEAKS) expect({ host, [k]: h[k] }).toEqual({ host, [k]: undefined });
+    }
+  });
+
+  it("the 400 for a path nginx would refuse too", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const res = await nextMiddleware(opts(), { next: () => new Response("next") })(chat(ATTACK, {}, "/v1/%u0063ompletions"));
+      expect(res.status).toBe(400);
+      expect(res.headers.get("x-jev-verdict")).toBe("skipped");
+      expect(res.headers.get("x-jev-request-id")).toBeTruthy();
+      for (const k of LEAKS) expect(res.headers.get(k)).toBeNull();
+    } finally {
+      warn.mockRestore();
+    }
   });
 });

@@ -52,6 +52,15 @@ function _M.headers(v)
   }
 end
 
+--- The only verdict header a client may see, on a block response (with
+--- X-Jev-Request-Id, which the adapter adds). Score, reason and source say
+--- how close a text came and which pattern or template fired: an attacker
+--- tunes a prompt against them, so they go to the logs and the upstream
+--- request (headers above), never back to the client.
+function _M.client_headers(v)
+  return { ["X-Jev-Verdict"] = v.verdict }
+end
+
 --- URL-encode and truncate a reason for header transport (<= 200 bytes of
 --- encoded output, never cut inside a %XX escape).
 _M.REASON_MAX = 200

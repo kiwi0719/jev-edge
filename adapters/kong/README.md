@@ -48,7 +48,7 @@ plugins:
 
 3. Start Kong with `TYPESAFE_API_KEY` in its environment and add the plugin to a route or service (above).
 
-Your upstream receives `X-Jev-Verdict`, `X-Jev-Score`, `X-Jev-Source`, `X-Jev-Reason` and `X-Jev-Request-Id`; the same headers sent by the client are removed first. In `enforce` mode a block is `policy.block_status` (403) with `policy.block_body` and the verdict headers on the response, via `kong.response.exit`. Any error in the plugin fails open: the request goes upstream with `X-Jev-Verdict: error` and `X-Jev-Source: adapter`, and the error is in Kong's error log.
+Your upstream receives `X-Jev-Verdict`, `X-Jev-Score`, `X-Jev-Source`, `X-Jev-Reason` and `X-Jev-Request-Id`; the same headers sent by the client are removed first. In `enforce` mode a block is `policy.block_status` (403) with `policy.block_body`, `X-Jev-Verdict` and `X-Jev-Request-Id` on the response, via `kong.response.exit`; the score, reason and source go to the upstream and the log only, never to the client. Any error in the plugin fails open: the request goes upstream with `X-Jev-Verdict: error` and `X-Jev-Source: adapter`, and the error is in Kong's error log.
 
 ## What maps to what
 

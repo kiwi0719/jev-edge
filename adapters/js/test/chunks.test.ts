@@ -28,8 +28,10 @@ const judge: Provider = {
   },
 };
 
+let lastReason: string | undefined;
 const rt = (chunks: number) => createRuntime({
   provider: judge,
+  onVerdict: (v) => { lastReason = v.reason; },
   config: { policy: { mode: "enforce" } },
   rules: [{ id: "long", extends: "llm-endpoints", max_judge_bytes: 512, max_judge_chunks: chunks }],
 });
@@ -50,7 +52,8 @@ describe("max_judge_chunks", () => {
     calls = 0; maxInFlight = 0;
     const res = await handle(post(), rt(6), seen);
     expect(res.status).toBe(403);
-    expect(res.headers.get("x-jev-reason")).toMatch(/^injection\+0\.95\+%28\d\+chunks%29$/);
+    expect(lastReason).toMatch(/^injection 0\.95 \(\d chunks\)$/);
+    expect(res.headers.get("x-jev-reason")).toBeNull(); // the block response carries the verdict only
     expect(calls).toBeGreaterThan(1);
     expect(maxInFlight).toBeGreaterThan(1);
   });

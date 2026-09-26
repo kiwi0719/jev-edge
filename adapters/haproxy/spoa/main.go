@@ -1,8 +1,9 @@
 // jev-spoa: HAProxy SPOE agent that asks a running jev-edge (/_jev/authz)
 // and hands the verdict back as transaction variables.
 //
-// HAProxy sends one message per request with method, path, client IP, the
-// raw header block and (with `option http-buffer-request`) the body. The
+// HAProxy sends one message per request with method, request target (and
+// path, for an older agent), client IP, the raw header block and (with
+// `option http-buffer-request`) the body. The
 // agent sets txn.jev.verdict / score / source / reason / action / rid /
 // status; haproxy.cfg turns action=block into a deny (status from
 // txn.jev.status) and copies the rest to X-Jev-* headers.
@@ -320,6 +321,32 @@ func handler(req *request.Request) {
 	}))
 }
 
+// targetPath returns the path nginx reads from a request target: an
+// origin-form target ("/v1/x?y") is its own path; an absolute-form one
+// ("http://host/v1/x", what HAProxy's url gives for HTTP/2 and for a
+// request sent to a proxy) the part from the first '/' after the host, or
+// "/" when there is none. Anything else ("?x", "#x", "*", the
+// authority-form "host:443") nginx answers with 400: ok is false.
+func targetPath(uri string) (string, bool) {
+	if strings.HasPrefix(uri, "/") {
+		return uri, true
+	}
+	i := strings.Index(uri, "://")
+	if i <= 0 {
+		return "", false
+	}
+	for _, c := range uri[:i] { // nginx takes a scheme of letters
+		if !('a' <= c && c <= 'z' || 'A' <= c && c <= 'Z') {
+			return "", false
+		}
+	}
+	rest := uri[i+3:]
+	if j := strings.IndexAny(rest, "/?#"); j >= 0 && rest[j] == '/' {
+		return rest[j:], true
+	}
+	return "/", true
+}
+
 // check asks jev-edge about one SPOE message (get returns its arguments)
 // and returns the txn.jev.* variables to set.
 func check(get func(string) string) map[string]string {
@@ -327,7 +354,19 @@ func check(get func(string) string) map[string]string {
 	// value only). It is ignored; Content-Type comes from hdrs.
 	method, path, ip, hdrs := get("method"), get("path"), get("ip"), get("hdrs")
 	body := []byte(get("body"))
-	if path == "" {
+	// spoe.conf sends the request target as `uri` (HAProxy's url). HAProxy's
+	// path fetch skips to the first '/' anywhere in it, so "?x", "*" and
+	// "host:443" came as an empty path, judged as "/", and
+	// "?a/v1/chat/completions" as /v1/chat/completions, all of which nginx
+	// answers with 400. An older spoe.conf sends `path` only.
+	if uri := get("uri"); uri != "" {
+		p, ok := targetPath(uri)
+		if !ok {
+			log.Printf("jev-spoa: refusing request target %.256q with 400", uri)
+			return refuse("invalid path")
+		}
+		path = p
+	} else if path == "" {
 		path = "/"
 	}
 	// the query, and a fragment: nginx ends $uri at a '#' (net/url would

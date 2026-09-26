@@ -228,6 +228,70 @@ func TestMalformedPathIsBlockedWith400(t *testing.T) {
 	}
 }
 
+// The path is taken from the request target (spoe.conf's uri) as nginx
+// takes it. HAProxy's path fetch skips to the first '/' anywhere in the
+// target: "?x", "*" and "host:443" came as "" and were judged as "/", and
+// "?a/v1/chat/completions" as /v1/chat/completions, where nginx answers 400.
+// An absolute-form target (HTTP/2, a proxy request) gives the path after
+// its host, and "/" without one. Without uri (an older spoe.conf) the path
+// argument is read as before.
+func TestPathIsTakenFromTheRequestTargetAsNginxDoes(t *testing.T) {
+	var got string
+	authz(t, func(w http.ResponseWriter, r *http.Request) {
+		got = r.RequestURI
+		w.Header().Set("X-Jev-Verdict", "malicious")
+		w.WriteHeader(403)
+	})
+	for uri, want := range map[string]string{
+		"/v1/chat/completions?stream=true":                  "/v1/chat/completions",
+		"http://h/v1/chat/completions":                      "/v1/chat/completions",
+		"https://api.example:8443/v1/chat/completions?x=/y": "/v1/chat/completions",
+		"HTTP://h/v1/x/../chat/completions":                 "/v1/chat/completions",
+		"http://user@h//v1/chat/completions#f":              "/v1/chat/completions",
+		"http://h":                                          "/",
+		"http://h?a/v1/chat/completions":                    "/",
+		"http://h#/v1/chat/completions":                     "/",
+		"//v1/chat/completions":                             "/v1/chat/completions",
+	} {
+		for _, unj := range []string{"pass", "block"} {
+			*unjudged = unj
+			got = ""
+			// path: what HAProxy's path fetch gives, which uri overrides
+			if v := check(msg(map[string]string{"method": "POST", "uri": uri, "path": "/v1/chat/completions", "body": "{}"})); v["verdict"] != "malicious" || v["status"] != "403" {
+				t.Fatalf("-unjudged=%s uri %q: vars = %v", unj, uri, v)
+			}
+			if got != "/_jev/authz"+want {
+				t.Fatalf("uri %q: jev-edge saw %q, want %q", uri, got, "/_jev/authz"+want)
+			}
+		}
+	}
+	want := map[string]string{"verdict": "skipped", "score": "0.00", "source": "adapter",
+		"reason": "invalid+path", "action": "block", "rid": "", "status": "400"}
+	for uri, path := range map[string]string{
+		"?x": "", "?": "", "#frag": "", "*": "", "api.example:443": "", "?a/v1/chat/completions": "/v1/chat/completions",
+		"#/v1/chat/completions": "/v1/chat/completions", "h2c+x://h/v1/chat/completions": "/v1/chat/completions",
+		"://h/v1/chat/completions": "/v1/chat/completions", "v1/chat/completions": "",
+	} {
+		for _, unj := range []string{"pass", "block"} {
+			*unjudged = unj
+			got = ""
+			if v := check(msg(map[string]string{"method": "POST", "uri": uri, "path": path, "body": "{}"})); !reflect.DeepEqual(v, want) || got != "" {
+				t.Fatalf("-unjudged=%s uri %q: vars = %v, jev-edge saw %q", unj, uri, v, got)
+			}
+		}
+	}
+	// an older spoe.conf sends path only: read as before, "" as "/"
+	for path, want := range map[string]string{"/v1/chat/completions?x": "/v1/chat/completions", "": "/"} {
+		got = ""
+		if v := check(msg(map[string]string{"method": "POST", "path": path, "body": "{}"})); v["verdict"] != "malicious" {
+			t.Fatalf("path %q without uri: vars = %v", path, v)
+		}
+		if got != "/_jev/authz"+want {
+			t.Fatalf("path %q without uri: jev-edge saw %q, want %q", path, got, "/_jev/authz"+want)
+		}
+	}
+}
+
 // Well-formed escapes reach jev-edge as nginx reads them inline: UTF-8, an
 // escaped control character, and escapes of bytes that are not UTF-8 (the
 // overlong %C0%AE, %FF), which nginx and HAProxy take and jev-edge judges;

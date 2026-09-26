@@ -319,6 +319,9 @@ var malformedPaths = []string{
 	"/v1/chat/completions%00", "/v1/comp\x01letions", "/v1/comp\x7fletions",
 	// refused with 400 even with a dot segment or a doubled slash
 	"/v1//%u0063ompletions", "/v1/../%zz", "/v1/%2e%2e/%u002f", "v1/%u0063ompletions",
+	// a target that does not start with '/': nginx answers 400 (before, the
+	// cut left "", read as "/")
+	"?x", "?", "#frag", "?a/v1/chat/completions", "*",
 }
 
 // They are denied with 400, as nginx answers them inline and Envoy's HTTP

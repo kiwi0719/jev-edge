@@ -73,13 +73,16 @@ func (s *server) Check(ctx context.Context, req *authv3.CheckRequest) (*authv3.C
 		method = http.MethodGet
 	}
 	path := httpReq.GetPath()
-	// the query, and a fragment: nginx ends $uri at a '#' (net/url would
-	// have taken the rest for the URL's fragment and not sent it)
-	if i := strings.IndexAny(path, "?#"); i >= 0 {
-		path = path[:i]
-	}
 	if path == "" {
 		path = "/"
+	}
+	// the query, and a fragment: nginx ends $uri at a '#' (net/url would
+	// have taken the rest for the URL's fragment and not sent it). A :path
+	// of "?x" leaves nothing, which normalizePath refuses with 400, as nginx
+	// refuses a target that does not start with '/' (Envoy itself answers
+	// such a :path with 404 before ext_authz runs)
+	if i := strings.IndexAny(path, "?#"); i >= 0 {
+		path = path[:i]
 	}
 	// a dot segment, an encoded dot or a doubled slash (Istio, for one, does
 	// not merge slashes by default) is judged the way nginx reads it inline,

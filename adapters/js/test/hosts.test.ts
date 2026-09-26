@@ -80,7 +80,8 @@ describe("nextMiddleware", () => {
     const res = await mw(chat(BENIGN), event);
     const { subject } = (await res.json()) as { subject: string };
     expect(subject).toMatch(/^ip:[0-9a-f]{64}$/);
-    expect(kept).toHaveLength(1);
+    // the subject write, and the writes core makes once the verdict is decided
+    expect(kept.length).toBeGreaterThanOrEqual(1);
     await Promise.all(kept);
     expect(await ringLoad(store, subject, 20)).toHaveLength(1);
   });

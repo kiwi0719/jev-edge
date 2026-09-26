@@ -79,9 +79,24 @@ export interface Runtime {
   opts: Options;
 }
 
-/** Per-request host facilities. `waitUntil` (Workers, Pages) keeps the subject write alive after the response is sent. */
+/** Per-request host facilities. `waitUntil` (Workers, Pages) keeps the
+ *  writes made once the verdict is decided (subject trajectory and
+ *  reputation, verdict cache, breaker and adaptive bookkeeping) alive after
+ *  the response is sent, so the response does not wait for them. */
 export interface RequestCtx {
   waitUntil?: (p: Promise<unknown>) => void;
+}
+
+/** Hand `p` to the host's waitUntil. false when there is none or it refused
+ *  the promise: the caller then awaits it, or lets it run on its own. */
+function keepAlive(rctx: RequestCtx | undefined, p: Promise<unknown>): boolean {
+  if (!rctx?.waitUntil) return false;
+  try {
+    rctx.waitUntil(p);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function isKV(x: unknown): x is KVLike {
@@ -338,14 +353,9 @@ async function subjectCtx(rt: Runtime, request: Request, clientIp: string, rctx?
     record: (e) => {
       const p = subjectMod.appendHistory(store, id, e, scfg.max_entries, scfg.history_ttl ?? 3600).catch(() => {});
       // On Workers the isolate may be torn down right after the response;
-      // waitUntil keeps the write alive. Elsewhere it is plain fire-and-forget.
-      if (rctx?.waitUntil) {
-        try {
-          rctx.waitUntil(p);
-        } catch {
-          /* a host that refuses the promise still gets the fire-and-forget write */
-        }
-      }
+      // waitUntil keeps the write alive. Elsewhere (or refused) it is plain
+      // fire-and-forget.
+      keepAlive(rctx, p);
     },
   };
 }
@@ -443,7 +453,11 @@ async function evaluateInner(request: Request, rt: Runtime, requestId: string, r
     const t0 = Date.now();
     const r = await rt.provider.call(prompt, rt.config.jev, timeoutMs, info);
     const elapsed = Date.now() - t0;
-    if (r[0]) await rt.adaptive.success(elapsed);
+    if (r[0]) {
+      // the sample only serves later requests: past the response where the host can keep it alive
+      const p = rt.adaptive.success(elapsed).catch(() => {});
+      if (!keepAlive(rctx, p)) await p;
+    }
     else if (String(r[1]).includes("timeout")) await rt.adaptive.timeout(timeoutMs);
     return r;
   };
@@ -473,6 +487,9 @@ async function evaluateInner(request: Request, rt: Runtime, requestId: string, r
     },
     log: (level, msg) => console[level === "error" ? "error" : "warn"](msg),
   };
+  // the writes core makes once the verdict is decided go past the response
+  // where the host keeps promises alive; awaited everywhere else
+  if (rctx?.waitUntil) ctx.defer = (p) => rctx.waitUntil!(p);
   let verdict: core.Verdict;
   try {
     verdict = await core.evaluate(req, ctx);

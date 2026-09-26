@@ -43,10 +43,38 @@ export interface Ctx {
   json_decode?: (s: string) => JsonValue;
   re_find?: RulesCtx["re_find"];
   log?: (level: string, msg: string) => void;
+  /** Optional: keeps a promise alive past the response (the host's
+   *  waitUntil). With it, the writes made once the verdict is decided (the
+   *  verdict cache, reputation points, breaker success, the trust renewal)
+   *  run past the response instead of on the request path, and a rejection
+   *  is logged, never raised. Without it they are awaited, in the order the
+   *  golden vectors pin. The price: a later request in the same isolate may
+   *  miss an entry still being written. */
+  defer?: (p: Promise<unknown>) => void;
 }
 
 function log(ctx: Ctx, level: string, msg: string): void {
   if (ctx.log) ctx.log(level, msg);
+}
+
+// A write made once the verdict is decided: handed to ctx.defer when the
+// host has one, awaited otherwise (and when the host refuses the promise).
+async function after(ctx: Ctx, write: () => unknown): Promise<void> {
+  if (!ctx.defer) {
+    await write();
+    return;
+  }
+  const p = Promise.resolve()
+    .then(write)
+    .then(
+      () => undefined,
+      (e) => log(ctx, "warn", "jev-edge: deferred write failed: " + (e instanceof Error ? e.message : String(e))),
+    );
+  try {
+    ctx.defer(p);
+  } catch {
+    await p;
+  }
 }
 
 function nowMs(ctx: Ctx): number {
@@ -74,7 +102,7 @@ function repOf(best: number | undefined, own: number | undefined): Rep {
 async function finish(ctx: Ctx, v: verdict.Verdict, rep?: Rep): Promise<verdict.Verdict> {
   subject.record(ctx, v);
   const charge = rep === false ? false : typeof rep === "number" ? policy.decide(rep, ctx.config.policy)[1] : undefined;
-  await subject.repRecord(ctx, v, charge);
+  if (ctx.subject) await after(ctx, () => subject.repRecord(ctx, v, charge));
   return v;
 }
 
@@ -86,7 +114,7 @@ async function settle(ctx: Ctx, failed = false, answered = false): Promise<void>
   const b = ctx.breaker;
   if (!b) return;
   if (failed) await b.failure();
-  else if (answered) await b.success();
+  else if (answered) await after(ctx, () => b.success());
   else if (b.release) await b.release();
 }
 
@@ -197,7 +225,8 @@ async function judgeParts(
       answered = true;
       scores[p.i] = s;
       tops[p.i] = t;
-      if (p.ck && ctx.cache) await ctx.cache.set(p.ck, { score: s, reason: `${t} ${verdict.format2(s)}` }, cfg.cache.fp_ttl);
+      const { ck } = p, cache = ctx.cache;
+      if (ck && cache) await after(ctx, () => cache.set(ck, { score: s, reason: `${t} ${verdict.format2(s)}` }, cfg.cache.fp_ttl));
     }
   }
   // only calls that reached the provider say anything about its health
@@ -227,7 +256,10 @@ async function judgeParts(
   const [action, label, async] = policy.decide(score, cfg.policy);
   let why = top !== "" ? `${top} ${verdict.format2(score)}` : reason;
   if (top !== "") why += suffix;
-  if (ckey && ctx.cache && leftOut === undefined) await ctx.cache.set(ckey, { score, reason: why, ...(rep !== undefined ? { rep } : {}) }, cfg.cache.fp_ttl);
+  const cache = ctx.cache;
+  if (ckey && cache && leftOut === undefined) {
+    await after(ctx, () => cache.set(ckey, { score, reason: why, ...(rep !== undefined ? { rep } : {}) }, cfg.cache.fp_ttl));
+  }
   return finish(ctx, verdict.newVerdict({
     action, verdict: label, score, async, source: verdict.SRC_L2, reason: why, fingerprint: fp, l2_ms: elapsed,
   }), rep);
@@ -276,7 +308,7 @@ export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
     const now = ctx.clock ? ctx.clock() : 0;
     const rec = await trust.get(store, fp, now);
     if (rec && store) {
-      await trust.touch(store, fp, rec, now, cfg.feedback);
+      await after(ctx, () => trust.touch(store, fp, rec, now, cfg.feedback));
       return finish(ctx, verdict.newVerdict({
         action: verdict.ACTION_PASS, verdict: verdict.SAFE, score: 0,
         source: verdict.SRC_TRUST, fingerprint: fp,
@@ -402,13 +434,14 @@ export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
       reason: why, fingerprint: fp, l2_ms: elapsed,
     }));
   }
-  if (ctx.breaker) await ctx.breaker.success();
+  await settle(ctx, false, true);
   const [action, label, async] = policy.decide(score, cfg.policy);
   // the score is for the window, not the whole text; say so
   const why = top !== "" ? `${top} ${verdict.format2(score)}${windowed ? " (window)" : ""}` : reason;
 
-  if (ckey && ctx.cache) {
-    await ctx.cache.set(ckey, { score, reason: why, ...(textRep === false ? { rep: false } : {}) }, cfg.cache.fp_ttl);
+  const cache = ctx.cache;
+  if (ckey && cache) {
+    await after(ctx, () => cache.set(ckey, { score, reason: why, ...(textRep === false ? { rep: false } : {}) }, cfg.cache.fp_ttl));
   }
 
   return finish(ctx, verdict.newVerdict({

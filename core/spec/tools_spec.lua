@@ -307,6 +307,17 @@ describe("tool definitions", function()
       "type", "function" }, "\n"), text)
   end)
 
+  it("reads Gemini's functionDeclarations under tools, on its generateContent route", function()
+    local b = '{"contents":[{"role":"user","parts":[{"text":"hi there"}]}],"tools":[{"functionDeclarations":'
+      .. '[{"name":"lookup","description":"Look an order up by its id."}]}]}'
+    local r, _, reason, _, _, _, _, tools = rules_mod.evaluate({ method = "POST",
+      path = "/v1beta/models/gemini-2.0-flash:generateContent", headers = { ["content-type"] = "application/json" },
+      body = b, body_size = #b }, load("llm-endpoints"), H.ctx())
+    assert.equals(rules_mod.SUSPECT, r)
+    assert.equals("tool definitions", reason)
+    assert.equals("functionDeclarations\ndescription\nLook an order up by its id.\nname\nlookup", tools.text)
+  end)
+
   it("keeps one oversized array in a definition from hiding the next tool", function()
     normalize.DEEP_NODES = 40
     local enum = {}

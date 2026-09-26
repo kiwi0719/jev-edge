@@ -291,6 +291,17 @@ describe("tool definitions", () => {
       "type", "function"]);
   });
 
+  it("reads Gemini's functionDeclarations under tools, on its generateContent route", async () => {
+    const body = JSON.stringify({ contents: [{ role: "user", parts: [{ text: "hi there" }] }],
+      tools: [{ functionDeclarations: [{ name: "lookup", description: "Look an order up by its id." }] }] });
+    const [r, , reason, , , , , tools] = await rules.evaluate({ method: "POST",
+      path: "/v1beta/models/gemini-2.0-flash:generateContent", headers: { "content-type": "application/json" },
+      body, body_size: body.length }, load("llm-endpoints"), { json_decode: decode, re_find: rules.reFind });
+    expect(r).toBe(rules.SUSPECT);
+    expect(reason).toBe("tool definitions");
+    expect(tools?.text).toBe("functionDeclarations\ndescription\nLook an order up by its id.\nname\nlookup");
+  });
+
   it("keeps one oversized array in a definition from hiding the next tool", async () => {
     normalize.DEEP.nodes = 40;
     const en = Array.from({ length: 30 }, (_, i) => "v" + (i + 1));

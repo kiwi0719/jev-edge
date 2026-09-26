@@ -560,6 +560,30 @@ describe("defaults.validate", () => {
     expect(core.defaults.config.policy.partial).toBe("judge");
     expect(core.defaults.validate(core.defaults.merge(core.defaults.config, { policy: { partial: "unjudgeable" } }))[0]).toBe(true);
   });
+
+  // keys the host reads as strings (openresty-edge#4); null is given and wrong, as cjson.null is in Lua
+  it("wants block_body and the judge's settings to be strings", () => {
+    for (const [over, want] of [
+      [{ policy: { block_body: { error: "blocked" } } }, "policy.block_body must be a string"],
+      [{ policy: { block_body: null } }, "policy.block_body must be a string"],
+      [{ jev: { provider: 123 } }, "jev.provider must be a string"],
+      [{ jev: { provider: null } }, "jev.provider must be a string"],
+      [{ jev: { provider: "" } }, "jev.provider must be a non-empty string"],
+      [{ jev: { model: {} } }, "jev.model must be a string"],
+      [{ jev: { endpoint: null } }, "jev.endpoint must be a string"],
+      [{ jev: { api_key: 42 } }, "jev.api_key must be a string"],
+      [{ jev: { api_key_env: true } }, "jev.api_key_env must be a string"],
+      [{ jev: { deployment_context: ["a"] } }, "jev.deployment_context must be a string"],
+    ] as [object, string][]) {
+      expect(core.defaults.validate(core.defaults.merge(core.defaults.config, over)), JSON.stringify(over)).toEqual([null, want]);
+    }
+    expect(core.defaults.validate(core.defaults.merge(core.defaults.config, {
+      policy: { block_body: '{"error":"blocked"}' },
+      jev: { provider: "openai-compat", model: "m", endpoint: "http://j/v1", api_key: "k", api_key_env: "K", deployment_context: "A support assistant." },
+    }))[0]).toBe(true);
+    // undefined is a key left out, as nil is in Lua
+    expect(core.defaults.validate(core.defaults.merge(core.defaults.config, { jev: { model: undefined } }))[0]).toBe(true);
+  });
 });
 
 describe("subject id hygiene", () => {

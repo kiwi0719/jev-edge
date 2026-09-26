@@ -260,6 +260,12 @@ function _M.validate(c)
   if p.partial ~= nil and p.partial ~= "judge" and p.partial ~= "unjudgeable" then
     return nil, "policy.partial must be judge|unjudgeable"
   end
+  -- the adapters write it as the block response's body: a table (a JSON
+  -- object where a JSON document encoded as a string belongs) or JSON null
+  -- turned every block into a 500, which a relay's failure mode allows
+  if p.block_body ~= nil and type(p.block_body) ~= "string" then
+    return nil, "policy.block_body must be a string"
+  end
   if p.block_status ~= nil and (type(p.block_status) ~= "number"
      or p.block_status < 200 or p.block_status > 599 or p.block_status % 1 ~= 0) then
     return nil, "policy.block_status must be an HTTP status code"
@@ -295,6 +301,14 @@ function _M.validate(c)
   if type(c.jev.timeout_ms) ~= "number" or c.jev.timeout_ms <= 0 then
     return nil, "jev.timeout_ms must be > 0"
   end
+  -- the judge is built from these on the request path (ensure_runtime), where
+  -- a table or JSON null (cjson.null) threw and failed every request open
+  for _, k in ipairs({ "provider", "model", "endpoint", "api_key", "api_key_env", "deployment_context" }) do
+    if c.jev[k] ~= nil and type(c.jev[k]) ~= "string" then
+      return nil, "jev." .. k .. " must be a string"
+    end
+  end
+  if c.jev.provider == "" then return nil, "jev.provider must be a non-empty string" end
   local sm = c.sampling or {}
   if sm.rate ~= nil and (type(sm.rate) ~= "number" or sm.rate < 0 or sm.rate > 1) then
     return nil, "sampling.rate must be in [0,1]"

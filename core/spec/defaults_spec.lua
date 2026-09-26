@@ -41,6 +41,31 @@ describe("defaults.validate", function()
     end
   end)
 
+  -- keys the request path reads as strings (openresty-edge#4): a table, a
+  -- number or JSON null (cjson.null is userdata; io.stdout stands in for it)
+  it("wants block_body and the judge's settings to be strings", function()
+    local NULL = io.stdout
+    for _, c in ipairs({
+      { { policy = { block_body = { error = "blocked" } } }, "policy.block_body must be a string" },
+      { { policy = { block_body = NULL } }, "policy.block_body must be a string" },
+      { { jev = { provider = 123 } }, "jev.provider must be a string" },
+      { { jev = { provider = NULL } }, "jev.provider must be a string" },
+      { { jev = { provider = "" } }, "jev.provider must be a non-empty string" },
+      { { jev = { model = {} } }, "jev.model must be a string" },
+      { { jev = { endpoint = NULL } }, "jev.endpoint must be a string" },
+      { { jev = { api_key = 42 } }, "jev.api_key must be a string" },
+      { { jev = { api_key_env = true } }, "jev.api_key_env must be a string" },
+      { { jev = { deployment_context = { "a" } } }, "jev.deployment_context must be a string" },
+    }) do
+      local ok, err = D.validate(D.merge(D.config, c[1]))
+      assert.is_nil(ok, c[2])
+      assert.equals(c[2], err)
+    end
+    assert.is_true(D.validate(D.merge(D.config, { policy = { block_body = '{"error":"blocked"}' },
+      jev = { provider = "openai-compat", model = "m", endpoint = "http://j/v1", api_key = "k",
+              api_key_env = "K", deployment_context = "A support assistant." } })))
+  end)
+
   it("takes policy.partial = judge | unjudgeable and nothing else", function()
     assert.equals("judge", D.config.policy.partial)
     for _, v in ipairs({ "judge", "unjudgeable" }) do

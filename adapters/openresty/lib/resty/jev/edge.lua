@@ -173,6 +173,19 @@ local function strip_inbound()
   for _, h in ipairs(HEADER_NAMES) do ngx.req.clear_header(h) end
 end
 
+-- The block response. defaults.validate refuses a block_body that is not a
+-- string and a block_status that is not a number; the fallbacks are defence
+-- in depth, so a block is never a 500 that a relay's failure mode lets
+-- through.
+local DEFAULT_BLOCK_BODY = '{"error":"request rejected"}'
+local function block_response(cfg)
+  local p = cfg.policy or {}
+  local status, body = p.block_status, p.block_body
+  if type(status) ~= "number" then status = 403 end
+  if type(body) ~= "string" then body = DEFAULT_BLOCK_BODY end
+  return status, body
+end
+
 local function set_headers(v)
   for k, val in pairs(verdict.headers(v)) do ngx.req.set_header(k, val) end
   ngx.req.set_header("X-Jev-Request-Id", ngx.var.request_id or "")
@@ -273,8 +286,9 @@ end
 
 -- leg: "access" (the request itself) or "authz" (a relay asking about it)
 local function evaluate_current(cfg, rules, over, leg)
-  ensure_runtime(cfg)
+  -- first: a client's X-Jev-* never reach the upstream, whatever throws next
   strip_inbound()
+  ensure_runtime(cfg)
   local req = build_req(rules, over)
   local subj = subject_ctx(cfg, req, leg)
   ngx.ctx.jev_subject = subj and subj.id or nil
@@ -309,15 +323,20 @@ function _M.access()
 
   if not ok then
     ngx.log(ngx.ERR, "jev-edge: access error, failing open: ", err)
+    -- the client's X-Jev-* (or a verdict's, half set) must not reach the
+    -- upstream beside the error: a forged score or request id would be
+    -- read as jev-edge's
+    pcall(strip_inbound)
     ngx.req.set_header("X-Jev-Verdict", verdict.ERROR)
     ngx.req.set_header("X-Jev-Source", "adapter")
     return
   end
 
   if v and v.action == verdict.ACTION_BLOCK then
-    ngx.status = cfg.policy.block_status or 403
+    local status, body = block_response(cfg)
+    ngx.status = status
     ngx.header["Content-Type"] = "application/json"
-    ngx.say(cfg.policy.block_body or '{"error":"request rejected"}')
+    ngx.say(body)
     return ngx.exit(ngx.HTTP_OK)
   end
 end
@@ -623,9 +642,10 @@ local function respond_authz(cfg, rules, over, who)
   for k, val in pairs(verdict.headers(v)) do ngx.header[k] = val end
   ngx.header["X-Jev-Request-Id"] = ngx.var.request_id or ""
   if v.action == verdict.ACTION_BLOCK then
-    ngx.status = cfg.policy.block_status or 403
+    local status, body = block_response(cfg)
+    ngx.status = status
     ngx.header["Content-Type"] = "application/json"
-    ngx.say(cfg.policy.block_body or '{"error":"request rejected"}')
+    ngx.say(body)
     return ngx.exit(ngx.HTTP_OK)
   end
   ngx.status = 200

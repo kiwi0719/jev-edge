@@ -130,6 +130,11 @@ export function validate(c: Config): [true, null] | [null, string] {
   if (typeof p.block_threshold !== "number" || typeof p.suspect_threshold !== "number") return [null, "policy thresholds must be numbers"];
   if (p.suspect_threshold > p.block_threshold) return [null, "policy.suspect_threshold must be <= block_threshold"];
   if (p.block_threshold > 1 || p.suspect_threshold < 0) return [null, "policy thresholds must be in [0,1]"];
+  // the host writes it as the block response's body: an object (a JSON
+  // object where a JSON document encoded as a string belongs) or null is
+  // refused, as core/defaults.lua refuses a table or cjson.null
+  const bb = p.block_body as unknown;
+  if (bb !== undefined && typeof bb !== "string") return [null, "policy.block_body must be a string"];
   const bs = p.block_status as unknown;
   if (bs !== undefined && bs !== null && (typeof bs !== "number" || bs < 200 || bs > 599 || !Number.isInteger(bs))) {
     return [null, "policy.block_status must be an HTTP status code"];
@@ -150,6 +155,12 @@ export function validate(c: Config): [true, null] | [null, string] {
   const as: Partial<Config["async"]> = c.async ?? {};
   if (as.max_async !== undefined && (typeof as.max_async !== "number" || as.max_async < 0)) return [null, "async.max_async must be >= 0"];
   if (typeof c.jev.timeout_ms !== "number" || c.jev.timeout_ms <= 0) return [null, "jev.timeout_ms must be > 0"];
+  // the judge is built from these; null counts as given (Lua's cjson.null), undefined as left out
+  for (const k of ["provider", "model", "endpoint", "api_key", "api_key_env", "deployment_context"]) {
+    const v = c.jev[k];
+    if (v !== undefined && typeof v !== "string") return [null, `jev.${k} must be a string`];
+  }
+  if (c.jev.provider === "") return [null, "jev.provider must be a non-empty string"];
   const fb = c.feedback ?? {};
   if (fb.trust_ttl !== undefined && (typeof fb.trust_ttl !== "number" || fb.trust_ttl <= 0)) return [null, "feedback.trust_ttl must be > 0"];
   if (fb.max_renewals !== undefined && (typeof fb.max_renewals !== "number" || fb.max_renewals < 0)) return [null, "feedback.max_renewals must be >= 0"];

@@ -121,20 +121,17 @@ export function fold(s: string): string {
   return asciiLower(s).replace(/\u017F/g, "s").replace(/\u212A/g, "k");
 }
 
-// The keys of object `node` other than `key` itself that fold to `key`, in
-// byte order (UTF-16 order is the same for the characters that can fold to
-// a field name); undefined when there are none (nearly always).
-function variants(node: { [k: string]: JsonValue }, key: string): string[] | undefined {
-  const want = fold(key);
+// Port of first_bytes: marks in `first` the UTF-16 units a key that folds to
+// `name` can start with: the folded name's first, that letter's other case,
+// U+017F for s and U+212A for k.
+function firstUnits(name: string, first: Set<number>): void {
+  const want = fold(name);
+  if (want === "") return;
   const b = want.charCodeAt(0);
-  let others: string[] | undefined;
-  for (const k of Object.keys(node)) {
-    if (k === key) continue;
-    const c = k.charCodeAt(0);
-    if ((c === b || (c >= 0x41 && c <= 0x5a && c + 32 === b) || (b === 0x73 && c === 0x17f) || (b === 0x6b && c === 0x212a))
-      && fold(k) === want) (others ??= []).push(k);
-  }
-  return others?.sort();
+  first.add(b);
+  if (b >= 0x61 && b <= 0x7a) first.add(b - 32);
+  if (b === 0x73) first.add(0x17f);
+  if (b === 0x6b) first.add(0x212a);
 }
 
 // ---------------------------------------------------------------------------
@@ -295,81 +292,162 @@ function deepValue(node: JsonValue, st: WalkState): void {
 // through item by item is read item by item for all of them, so the values
 // come out in document order (a message's content and its tool calls
 // together). Each "**" value is read after the walk, newest first, so the
-// node budget goes to the most recent tool calls.
+// node budget goes to the most recent tool calls. A list of paths is
+// compiled once into a plan (planOf), so the walk allocates nothing but the
+// "**" slots.
 // ---------------------------------------------------------------------------
+
+const OP_END = 1, OP_DEEP = 2, OP_KEY = 3;
+/** A path that ends here; `depth`: collect()'s, 2 for a path that ends at an array read item by item. */
+interface EndOp { kind: typeof OP_END; depth: number }
+/** A "**" here. */
+interface DeepOp { kind: typeof OP_DEEP }
+/** A key the paths go on through: the plan for its value when that is not an array (`whole`), and when it is, the plans for the array and for each item. */
+interface KeyOp { kind: typeof OP_KEY; key: string; whole?: Plan; wholeArr?: Plan; itemsArr?: Plan }
+type Op = EndOp | DeepOp | KeyOp;
+/** What to do at a node, in the order the first path for each op comes; `folded`, `first`, `lens`, `exact`: for variantsOf. */
+interface Plan { ops: Op[]; folded?: Map<string, number[]>; first?: Set<number>; lens?: Set<number>; exact?: Set<string> }
 
 /** One path from a node: its segments and the next one's index; `depth`: collect()'s, for a path read item by item. */
 interface Cursor { segs: Seg[]; i: number; depth?: number }
-interface Group { key: string; cursors: Cursor[] }
 
-function cursorsOf(fields: string[] | undefined): Cursor[] {
-  return (fields ?? []).map((f) => ({ segs: splitPath(f), i: 0 }));
-}
-
-// Port of through: `child`, the value under one key (or the node itself for
-// "[*]"), for the cursors going through that key. Lua ipairs over a cjson
-// array: null is a value, skipped, not the end.
-function through(child: JsonValue | undefined, cursors: Cursor[], st: WalkState): void {
-  if (child === undefined || child === null) return;
-  const whole: Cursor[] = [];
-  const items: Cursor[] = [];
-  const array = Array.isArray(child) && child.length > 0;
-  for (const c of cursors) {
-    if (c.segs[c.i].each) {
-      if (isObj(child)) items.push({ segs: c.segs, i: c.i + 1 });
-    } else if (array && c.i === c.segs.length - 1 && !st.leaf) {
-      // a path that ends at the array: collect() reads it item by item, one level down
-      items.push({ segs: c.segs, i: c.i + 1, depth: 2 });
-    } else {
-      whole.push({ segs: c.segs, i: c.i + 1 });
-    }
-  }
-  if (whole.length > 0) walk(child, whole, st);
-  if (items.length > 0 && Array.isArray(child)) {
-    for (const item of child) {
-      if (item === null || item === undefined) continue;
-      walk(item, items, st);
-    }
-  }
-}
-
-// Port of walk: a path that ends here, a "**" here, or the cursors that go on
-// through one key, in the order the first cursor for each comes. A key is
-// matched the way fold() says, and every key that folds to it is read: the
-// exact key first, the others in byte order.
-function walk(node: JsonValue | undefined, cursors: Cursor[], st: WalkState): void {
-  if (node === undefined || node === null) return;
-  const ops: (Cursor | Group)[] = [];
-  const groups = new Map<string, Group>();
+// Port of compile: `leaf` (tool_fields) reads an array that ends a path whole.
+function compile(cursors: Cursor[], leaf: boolean): Plan {
+  const ops: Op[] = [];
+  const groups = new Map<string, Cursor[]>();
   for (const c of cursors) {
     const seg = c.segs[c.i];
-    if (seg === undefined || seg.deep) {
-      ops.push(c);
+    if (seg === undefined) {
+      ops.push({ kind: OP_END, depth: c.depth ?? 1 });
+    } else if (seg.deep) {
+      ops.push({ kind: OP_DEEP });
     } else {
       let g = groups.get(seg.key);
       if (!g) {
-        g = { key: seg.key, cursors: [] };
+        g = [];
         groups.set(seg.key, g);
-        ops.push(g);
+        ops.push({ kind: OP_KEY, key: seg.key });
       }
-      g.cursors.push(c);
+      g.push(c);
     }
   }
-  for (const op of ops) {
-    if ("segs" in op) {
-      if (op.segs[op.i] === undefined) {
-        if (st.leaf) st.leaf(node, st);
-        else collect(node, st.out as string[], op.depth ?? 1);
+  const plan: Plan = { ops };
+  ops.forEach((op, i) => {
+    if (op.kind !== OP_KEY) return;
+    const whole: Cursor[] = [];
+    const wholeArr: Cursor[] = [];
+    const itemsArr: Cursor[] = [];
+    for (const c of groups.get(op.key)!) {
+      const nxt = { segs: c.segs, i: c.i + 1 };
+      if (c.segs[c.i].each) {
+        itemsArr.push(nxt);
       } else {
-        const slot: Slot = { node, values: [] };
-        st.out.push(slot);
-        st.defer.push(slot);
+        whole.push(nxt);
+        // a path that ends at an array: collect() reads it item by item, one level down
+        if (c.i === c.segs.length - 1 && !leaf) itemsArr.push({ segs: c.segs, i: c.i + 1, depth: 2 });
+        else wholeArr.push(nxt);
       }
+    }
+    if (whole.length > 0) op.whole = compile(whole, leaf);
+    if (wholeArr.length > 0) op.wholeArr = compile(wholeArr, leaf);
+    if (itemsArr.length > 0) op.itemsArr = compile(itemsArr, leaf);
+    if (op.key !== "") {
+      const folded = (plan.folded ??= new Map());
+      const f = fold(op.key);
+      folded.set(f, [...(folded.get(f) ?? []), i]);
+      firstUnits(op.key, (plan.first ??= new Set()));
+      // fold() maps one UTF-16 unit to one: a key that folds to f is as long
+      (plan.lens ??= new Set()).add(f.length);
+    }
+  });
+  if (plan.folded) {
+    // a key that is an op's own, and that no other op's key folds to, needs no look
+    plan.exact = new Set();
+    for (const op of ops) {
+      if (op.kind !== OP_KEY || op.key === "") continue;
+      if (plan.folded.get(fold(op.key))!.every((j) => (ops[j] as KeyOp).key === op.key)) plan.exact.add(op.key);
+    }
+  }
+  return plan;
+}
+
+// Port of plan_of: plans by list of paths, the cache started over past PLANS_MAX.
+const PLANS = new Map<string, Plan>();
+const PLANS_MAX = 64;
+function planOf(fields: string[] | undefined, leaf: boolean): Plan {
+  const list = fields ?? [];
+  const key = (leaf ? "t" : "c") + "\0" + list.join("\0");
+  let plan = PLANS.get(key);
+  if (!plan) {
+    plan = compile(list.map((f) => ({ segs: splitPath(f), i: 0 })), leaf);
+    if (PLANS.size >= PLANS_MAX) PLANS.clear();
+    PLANS.set(key, plan);
+  }
+  return plan;
+}
+
+// Port of variants_of: the keys of object `node` that fold to an op's key
+// without being it, by op index, each list in byte order (UTF-16 order is
+// the same for the characters that can fold to a field name); undefined when
+// there are none (nearly always). One pass over the keys.
+function variantsOf(node: { [k: string]: JsonValue }, plan: Plan): (string[] | undefined)[] | undefined {
+  const { folded, first, lens, exact } = plan as Required<Plan>;
+  let found: (string[] | undefined)[] | undefined;
+  for (const k in node) {
+    if (exact.has(k) || !first.has(k.charCodeAt(0)) || !lens.has(k.length)) continue;
+    const ops = folded.get(fold(k));
+    // for-in walks inherited keys too; JSON.parse makes none, but a polluted prototype could
+    if (!ops || !Object.hasOwn(node, k)) continue;
+    for (const i of ops) {
+      if ((plan.ops[i] as KeyOp).key !== k) ((found ??= [])[i] ??= []).push(k);
+    }
+  }
+  if (found) for (const list of found) list?.sort();
+  return found;
+}
+
+// Port of through: `child`, the value under one key (or the node itself for
+// "[*]"), for the paths going on through that key. Lua ipairs over a cjson
+// array: null is a value, skipped, not the end.
+function through(child: JsonValue | undefined, op: KeyOp, st: WalkState): void {
+  if (child === undefined || child === null) return;
+  if (Array.isArray(child) && child.length > 0) {
+    if (op.wholeArr) walk(child, op.wholeArr, st);
+    const items = op.itemsArr;
+    if (items) {
+      for (const item of child) {
+        if (item === null || item === undefined) continue;
+        walk(item, items, st);
+      }
+    }
+  } else if (op.whole) {
+    walk(child, op.whole, st);
+  }
+}
+
+// Port of walk: a path that ends here, a "**" here, or the paths that go on
+// through one key. A key is matched the way fold() says, and every key that
+// folds to it is read: the exact key first, the others in byte order.
+function walk(node: JsonValue | undefined, plan: Plan, st: WalkState): void {
+  if (node === undefined || node === null) return;
+  const obj = isObj(node) && !Array.isArray(node) ? node : undefined;
+  const found = plan.folded && obj ? variantsOf(obj, plan) : undefined;
+  const ops = plan.ops;
+  for (let i = 0; i < ops.length; i++) {
+    const op = ops[i];
+    if (op.kind === OP_END) {
+      if (st.leaf) st.leaf(node, st);
+      else collect(node, st.out as string[], op.depth);
+    } else if (op.kind === OP_DEEP) {
+      const slot: Slot = { node, values: [] };
+      st.out.push(slot);
+      st.defer.push(slot);
     } else if (op.key === "") {
-      through(node, op.cursors, st);
-    } else if (isObj(node) && !Array.isArray(node)) {
-      through(node[op.key], op.cursors, st);
-      for (const k of variants(node, op.key) ?? []) through(node[k], op.cursors, st);
+      through(node, op, st);
+    } else if (obj) {
+      through(obj[op.key], op, st);
+      const others = found?.[i];
+      if (others) for (const k of others) through(obj[k], op, st);
     }
   }
 }
@@ -404,7 +482,7 @@ export function extractJsonValues(decoded: JsonValue, fields: string[], jsonDeco
 
 function extractJsonState(decoded: JsonValue, fields: string[], jsonDecode?: Decode): { out: string[]; capped: boolean } {
   const st = newState(jsonDecode);
-  walk(decoded, cursorsOf(fields), st);
+  walk(decoded, planOf(fields, false), st);
   return { out: settle(st), capped: st.capped };
 }
 
@@ -418,7 +496,7 @@ function extractJsonState(decoded: JsonValue, fields: string[], jsonDecode?: Dec
 export function extractTools(decoded: JsonValue | undefined, fields: string[] | undefined, jsonDecode?: Decode): [string[], boolean] {
   const st = newState(jsonDecode);
   st.leaf = toolLeaf;
-  if (isObj(decoded)) walk(decoded, cursorsOf(fields), st);
+  if (isObj(decoded)) walk(decoded, planOf(fields, true), st);
   return [settle(st), st.capped];
 }
 
@@ -468,7 +546,7 @@ export function extractUntrustedValues(
   const st = newState(jsonDecode);
   if (!isObj(decoded)) return [];
   if (spec.tool_results !== false) toolResults(decoded, st.out as string[]);
-  walk(decoded, cursorsOf(spec.fields), st);
+  walk(decoded, planOf(spec.fields, false), st);
   return settle(st);
 }
 

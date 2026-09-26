@@ -85,29 +85,17 @@ _M.fold = fold
 
 -- A folded key starts with the folded name's first byte, or with that
 -- letter's other case, or with the first byte of U+017F / U+212A.
-local FIRST = { s = { [0x53] = true, [0x73] = true, [0xC5] = true },
-                k = { [0x4B] = true, [0x6B] = true, [0xE2] = true } }
+local FIRST = { s = 0xC5, k = 0xE2 }
 
--- The keys of object `node` other than `key` itself that fold to `key`, in
--- byte order; nil when there are none (nearly always).
-local function variants(node, key)
-  if node[1] ~= nil then return nil end   -- an array
-  local want = fold(key)
+-- Marks in `first` the bytes a key that folds to `name` can start with.
+local function first_bytes(name, first)
+  local want = fold(name)
   local b = want:byte(1)
-  local first = FIRST[want:sub(1, 1)]
-  local others
-  for k in pairs(node) do
-    if type(k) == "string" and k ~= key and #k >= #want then
-      local c = k:byte(1)
-      if (c == b or (first and first[c]) or (c and c >= 0x41 and c <= 0x5A and c + 32 == b))
-         and fold(k) == want then
-        others = others or {}
-        others[#others + 1] = k
-      end
-    end
-  end
-  if others then table.sort(others) end
-  return others
+  if not b then return end
+  first[b] = true
+  if b >= 0x61 and b <= 0x7A then first[b - 32] = true end
+  local extra = FIRST[want:sub(1, 1)]
+  if extra then first[extra] = true end
 end
 
 -- ---------------------------------------------------------------------------
@@ -248,77 +236,177 @@ end
 -- calls included. Each "**" value is read after the walk, newest first, so
 -- the node budget goes to the most recent tool calls and a bound cuts the
 -- oldest.
+--
+-- A list of paths is compiled once into a plan (plan_of), so the walk itself
+-- allocates nothing but the "**" slots: at a node, what to do there, in the
+-- order the first path for it comes. An op is a path that ends here
+-- ({ kind = END, depth }: collect()'s depth, 2 for a path that ends at an
+-- array read item by item), a "**" here ({ kind = DEEP }), or a key the
+-- paths go on through ({ kind = KEY, key, whole, whole_arr, items_arr }):
+-- the plan for the value under the key when it is not an array (`whole`),
+-- and when it is, the plans for the array itself and for each of its items.
 -- ---------------------------------------------------------------------------
 
-local NONE = {}
+local END, DEEP, KEY = 1, 2, 3
 
--- One path from a node: its segments and the index of the next one. `depth`
--- is collect()'s depth for a path that ends at an array read item by item.
-local function cursors_of(fields)
-  local out = {}
-  for _, f in ipairs(fields or {}) do out[#out + 1] = { segs = split_path(f), i = 1 } end
-  return out
-end
-
-local walk
-
--- `child`, the value under one key (or the node itself for "[*]"), for the
--- cursors going through that key.
-local function through(child, cursors, st)
-  if child == nil then return end
-  local whole, items = {}, {}
-  local array = type(child) == "table" and child[1] ~= nil
-  for _, c in ipairs(cursors) do
-    local seg = c.segs[c.i]
-    if seg.each then
-      if type(child) == "table" then items[#items + 1] = { segs = c.segs, i = c.i + 1 } end
-    elseif array and c.i == #c.segs and not st.leaf then
-      -- a path that ends at the array: collect() reads it item by item, one level down
-      items[#items + 1] = { segs = c.segs, i = c.i + 1, depth = 2 }
-    else
-      whole[#whole + 1] = { segs = c.segs, i = c.i + 1 }
-    end
-  end
-  if #whole > 0 then walk(child, whole, st) end
-  if #items > 0 then
-    for _, item in ipairs(child) do walk(item, items, st) end
-  end
-end
-
--- st.out collects the values; st.leaf, when set, reads the value a path
--- ends at (tool_fields), collect() otherwise. A "**" value leaves a slot
--- for settle() to fill.
-walk = function(node, cursors, st)
-  if node == nil then return end
-  -- what to do here, in the order the first cursor for it comes: a path that
-  -- ends here, a "**" here, or the cursors that go on through one key
+-- `cursors`: the paths at one node, { segs, i (the next segment), depth }.
+-- `leaf`: tool_fields, whose paths read an array that ends them whole.
+local function compile(cursors, leaf)
   local ops, groups = {}, {}
   for _, c in ipairs(cursors) do
     local seg = c.segs[c.i]
-    if not seg or seg.deep then
-      ops[#ops + 1] = c
+    if not seg then
+      ops[#ops + 1] = { kind = END, depth = c.depth or 1 }
+    elseif seg.deep then
+      ops[#ops + 1] = { kind = DEEP }
     else
       local g = groups[seg.key]
       if not g then
-        g = { key = seg.key, cursors = {} }
+        g = { kind = KEY, key = seg.key, cursors = {} }
         groups[seg.key] = g
         ops[#ops + 1] = g
       end
       g.cursors[#g.cursors + 1] = c
     end
   end
-  for _, op in ipairs(ops) do
-    if op.segs and not op.segs[op.i] then
-      if st.leaf then st.leaf(node, st) else collect(node, st.out, op.depth or 1) end
-    elseif op.segs then
+  for i, op in ipairs(ops) do
+    if op.kind == KEY then
+      local whole, whole_arr, items_arr = {}, {}, {}
+      for _, c in ipairs(op.cursors) do
+        local nxt = { segs = c.segs, i = c.i + 1 }
+        if c.segs[c.i].each then
+          items_arr[#items_arr + 1] = nxt
+        else
+          whole[#whole + 1] = nxt
+          if c.i == #c.segs and not leaf then
+            -- a path that ends at an array: collect() reads it item by item, one level down
+            items_arr[#items_arr + 1] = { segs = c.segs, i = c.i + 1, depth = 2 }
+          else
+            whole_arr[#whole_arr + 1] = nxt
+          end
+        end
+      end
+      op.cursors = nil
+      if #whole > 0 then op.whole = compile(whole, leaf) end
+      if #whole_arr > 0 then op.whole_arr = compile(whole_arr, leaf) end
+      if #items_arr > 0 then op.items_arr = compile(items_arr, leaf) end
+      if op.key ~= "" then
+        -- for variants_of: the ops by folded key, the bytes a key can start
+        -- with, and the lengths an ASCII key can have (U+017F and U+212A
+        -- take 2 and 3 bytes for one)
+        ops.folded, ops.first, ops.lens = ops.folded or {}, ops.first or {}, ops.lens or {}
+        local f = fold(op.key)
+        local list = ops.folded[f] or {}
+        list[#list + 1] = i
+        ops.folded[f] = list
+        first_bytes(op.key, ops.first)
+        ops.lens[#f] = true
+        ops.maxlen = math.max(ops.maxlen or 0, 3 * #f)
+      end
+    end
+  end
+  if ops.folded then
+    -- a key that is an op's own, and that no other op's key folds to, needs no look
+    ops.exact = {}
+    for _, op in ipairs(ops) do
+      if op.kind == KEY and op.key ~= "" then
+        local same = true
+        for _, j in ipairs(ops.folded[fold(op.key)]) do
+          if ops[j].key ~= op.key then same = false end
+        end
+        if same then ops.exact[op.key] = true end
+      end
+    end
+  end
+  return ops
+end
+
+-- The keys of object `node` that fold to an op's key without being it, by
+-- op index, each list in byte order; nil when there are none (nearly
+-- always). One pass over the keys, for all the plan's keys at once.
+local function variants_of(node, plan)
+  local first, folded, exact, lens, maxlen, found = plan.first, plan.folded, plan.exact, plan.lens, plan.maxlen, nil
+  for k in pairs(node) do
+    if type(k) == "string" and not exact[k] and first[k:byte(1) or 0]
+       and (lens[#k] or (#k <= maxlen and k:find("[\128-\255]"))) then
+      local ops = folded[fold(k)]
+      if ops then
+        for _, i in ipairs(ops) do
+          if plan[i].key ~= k then
+            found = found or {}
+            local list = found[i] or {}
+            list[#list + 1] = k
+            found[i] = list
+          end
+        end
+      end
+    end
+  end
+  if found then
+    for _, list in pairs(found) do table.sort(list) end
+  end
+  return found
+end
+
+-- Plans by list of paths; a rule's lists are few, and the cache starts over
+-- past PLANS_MAX rather than grow with lists a caller makes per request.
+local PLANS, NPLANS, PLANS_MAX = {}, 0, 64
+local NONE = {}
+
+local function plan_of(fields, leaf)
+  fields = fields or NONE
+  local key = (leaf and "t" or "c") .. "\0" .. table.concat(fields, "\0")
+  local plan = PLANS[key]
+  if not plan then
+    local cursors = {}
+    for i, f in ipairs(fields) do cursors[i] = { segs = split_path(f), i = 1 } end
+    plan = compile(cursors, leaf)
+    if NPLANS >= PLANS_MAX then PLANS, NPLANS = {}, 0 end
+    PLANS[key], NPLANS = plan, NPLANS + 1
+  end
+  return plan
+end
+
+local walk
+
+-- `child`, the value under one key (or the node itself for "[*]"), for the
+-- paths that go on through that key.
+local function through(child, op, st)
+  if child == nil then return end
+  if type(child) == "table" and child[1] ~= nil then
+    if op.whole_arr then walk(child, op.whole_arr, st) end
+    local items = op.items_arr
+    if items then
+      for _, item in ipairs(child) do walk(item, items, st) end
+    end
+  elseif op.whole then
+    walk(child, op.whole, st)
+  end
+end
+
+-- st.out collects the values; st.leaf, when set, reads the value a path
+-- ends at (tool_fields), collect() otherwise. A "**" value leaves a slot
+-- for settle() to fill.
+walk = function(node, plan, st)
+  if node == nil then return end
+  local found = plan.folded and type(node) == "table" and node[1] == nil and variants_of(node, plan)
+  for i = 1, #plan do
+    local op = plan[i]
+    local kind = op.kind
+    if kind == END then
+      if st.leaf then st.leaf(node, st) else collect(node, st.out, op.depth) end
+    elseif kind == DEEP then
       local slot = { node = node }
       st.out[#st.out + 1] = slot
       st.defer[#st.defer + 1] = slot
     elseif op.key == "" then
-      through(node, op.cursors, st)
+      through(node, op, st)
     elseif type(node) == "table" then
-      through(node[op.key], op.cursors, st)
-      for _, k in ipairs(variants(node, op.key) or NONE) do through(node[k], op.cursors, st) end
+      through(node[op.key], op, st)
+      local others = found and found[i]
+      if others then
+        for _, k in ipairs(others) do through(node[k], op, st) end
+      end
     end
   end
 end
@@ -352,7 +440,7 @@ end
 --         something out
 function _M.extract_json(decoded, fields, json_decode)
   local st = new_state(json_decode)
-  walk(decoded, cursors_of(fields), st)
+  walk(decoded, plan_of(fields, false), st)
   local out = settle(st)
   return table.concat(out, "\n"), out, st.capped
 end
@@ -370,7 +458,7 @@ end
 function _M.extract_tools(decoded, fields, json_decode)
   local st = new_state(json_decode)
   st.leaf = tool_leaf
-  if type(decoded) == "table" then walk(decoded, cursors_of(fields), st) end
+  if type(decoded) == "table" then walk(decoded, plan_of(fields, true), st) end
   local out = settle(st)
   return table.concat(out, "\n"), out, st.capped
 end
@@ -426,7 +514,7 @@ function _M.extract_untrusted(decoded, spec, json_decode)
   local st = new_state(json_decode)
   if type(decoded) ~= "table" or type(spec) ~= "table" then return "", st.out end
   if spec.tool_results ~= false then tool_results(decoded, st.out) end
-  walk(decoded, cursors_of(spec.fields), st)
+  walk(decoded, plan_of(spec.fields, false), st)
   local out = settle(st)
   return table.concat(out, "\n"), out
 end

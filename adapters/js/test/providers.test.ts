@@ -166,6 +166,27 @@ describe("System One providers: jev and laya", () => {
     expect(await jev.call(prompt("x"), {} as JevConfig, 1000)).toEqual([null, "jev http 500", "unavailable"]);
   });
 
+  // lead-hosted-api-providers#1: the wording-override vectors in
+  // conformance/vectors.json are the bodies providers/jev.lua builds; the JS
+  // provider must send the same questions (a criteria side left out is not
+  // sent, an empty override is {}).
+  it("builds the wording-override bodies of conformance/vectors.json, as providers/jev.lua does", async () => {
+    const { readFileSync } = await import("node:fs");
+    const vectors = JSON.parse(readFileSync(new URL("../../../conformance/vectors.json", import.meta.url), "utf8")) as {
+      cases: { name: string; input: { body?: { state: unknown; questions: unknown }; wording?: unknown; deployment?: string } }[];
+    };
+    const cases = vectors.cases.filter((c) => c.input.wording !== undefined);
+    expect(cases.length).toBe(5);
+    for (const c of cases) {
+      const seen = capture(() => Response.json({ answers: { injection: { noul: 0.1 } } }));
+      const text = typeof c.input.body!.state === "string" ? c.input.body!.state : (c.input.body!.state as { user_message: string }).user_message;
+      const [p] = build(["injection"], text, { path: "/v1/chat/completions", method: "POST", deployment: c.input.deployment ?? "" });
+      await jev.call(p!, { questions: { injection: c.input.wording } } as unknown as JevConfig, 1000);
+      expect(seen.body!.questions, c.name).toEqual(c.input.body!.questions);
+      expect(seen.body!.state, c.name).toEqual(c.input.body!.state);
+    }
+  });
+
   it("cfg.questions replaces the wording of that question only", async () => {
     const seen = capture(() => Response.json({ answers: {} }));
     const cfg = { questions: { injection: { instructions: "Custom?", criteria: { true: "yes-case", false: "no-case" } } } } as unknown as JevConfig;

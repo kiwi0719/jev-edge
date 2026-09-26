@@ -4,8 +4,9 @@
 export interface Template {
   instructions: string;
   instructions_ctx?: string;
-  criteria?: { true: string; false: string };
-  criteria_ctx?: { true: string; false: string };
+  /** a side may be absent: a config override replaces the whole pair (jev.questions) */
+  criteria?: { true?: string; false?: string };
+  criteria_ctx?: { true?: string; false?: string };
 }
 
 export const injection: Template = {

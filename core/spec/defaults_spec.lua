@@ -132,6 +132,19 @@ describe("defaults.validate jev.questions", function()
     assert.matches("jev.questions.injection.instructions", err, 1, true)
     assert.is_nil((v({ injection = { criteria_ctx = "x" } })))
   end)
+  -- lead-hosted-api-providers#1: a criteria override replaces the pair and
+  -- sends only the sides it names; each one named is a non-empty string
+  it("takes a partial or empty criteria, and refuses a side that is not a non-empty string", function()
+    for _, c in ipairs({ { ["true"] = "a" }, { ["false"] = "b" }, {}, { [true] = "a", [false] = "b" } }) do
+      assert.is_true((v({ injection = { criteria = c, criteria_ctx = c } })))
+    end
+    -- io.stdout is a userdata, as cjson.null is
+    for _, c in ipairs({ { ["true"] = "" }, { ["false"] = 5 }, { [true] = "" }, { ["true"] = io.stdout } }) do
+      local ok, err = v({ injection = { criteria_ctx = c } })
+      assert.is_nil(ok)
+      assert.matches("^jev%.questions%.injection%.criteria_ctx%.%a+ must be a non%-empty string$", err)
+    end
+  end)
 end)
 
 describe("defaults.validate untrusted.templates", function()

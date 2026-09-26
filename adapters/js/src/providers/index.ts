@@ -137,13 +137,24 @@ function systemOne(name: string, defaults: { model: string; url: string }): Prov
   };
 }
 
-/** Only the four wording fields of an override; anything else is ignored. */
+/**
+ * Only the four wording fields of an override; anything else is ignored. A
+ * criteria override replaces the whole pair, and carries only the sides it
+ * names: a side left out is not sent (providers/jev.lua sends the keys
+ * present), so a partial or empty override is the same body in both cores.
+ */
 function pickWording(o: QuestionWording): Partial<Template> {
   const out: Partial<Template> = {};
   if (o.instructions !== undefined) out.instructions = o.instructions;
   if (o.instructions_ctx !== undefined) out.instructions_ctx = o.instructions_ctx;
-  if (o.criteria !== undefined) out.criteria = { true: o.criteria.true ?? "", false: o.criteria.false ?? "" };
-  if (o.criteria_ctx !== undefined) out.criteria_ctx = { true: o.criteria_ctx.true ?? "", false: o.criteria_ctx.false ?? "" };
+  const sides = (c: { true?: string; false?: string }) => {
+    const s: { true?: string; false?: string } = {};
+    if (c.true !== undefined) s.true = c.true;
+    if (c.false !== undefined) s.false = c.false;
+    return s;
+  };
+  if (o.criteria !== undefined) out.criteria = sides(o.criteria);
+  if (o.criteria_ctx !== undefined) out.criteria_ctx = sides(o.criteria_ctx);
   return out;
 }
 

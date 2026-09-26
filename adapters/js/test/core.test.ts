@@ -559,6 +559,10 @@ describe("defaults.validate", () => {
       { async: { max_async: -1 } },
       { client_ip: { trusted_hops: 0 } },
       { client_ip: { trusted_hops: 1.5 } },
+      // lead-hosted-api-providers#1: a criteria side named is a non-empty string
+      { jev: { questions: { injection: { criteria: { true: "" } } } } },
+      { jev: { questions: { injection: { criteria_ctx: { false: null } } } } },
+      { jev: { questions: { injection: { criteria: { false: 5 } } } } },
       // lead-gateways-live#21
       { client_ip: { ipv6_prefix: 0 } },
       { client_ip: { ipv6_prefix: 129 } },

@@ -392,6 +392,17 @@ function _M.validate(c)
         if q[k] ~= nil and type(q[k]) ~= "table" then
           return nil, "jev.questions." .. name .. "." .. k .. " must be a table"
         end
+        -- a side it names is sent as the judge's criterion: a string, not
+        -- empty (a JSON null or a number would reach the judge as is)
+        -- (keyed by string in JSON, or by boolean as the templates are)
+        for _, side in ipairs({ "true", "false" }) do
+          for _, key in ipairs({ side, side == "true" }) do
+            local v = q[k] and q[k][key]
+            if v ~= nil and (type(v) ~= "string" or v == "") then
+              return nil, "jev.questions." .. name .. "." .. k .. "." .. side .. " must be a non-empty string"
+            end
+          end
+        end
       end
     end
   end

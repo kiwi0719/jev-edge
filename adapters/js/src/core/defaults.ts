@@ -202,6 +202,11 @@ export function validate(c: Config): [true, null] | [null, string] {
       }
       for (const k of ["criteria", "criteria_ctx"]) {
         if (o[k] !== undefined && (typeof o[k] !== "object" || o[k] === null)) return [null, `jev.questions.${name}.${k} must be a table`];
+        // a side it names is sent as the judge's criterion: a string, not empty
+        for (const side of ["true", "false"]) {
+          const v = (o[k] as Record<string, unknown> | undefined)?.[side];
+          if (v !== undefined && (typeof v !== "string" || v === "")) return [null, `jev.questions.${name}.${k}.${side} must be a non-empty string`];
+        }
       }
     }
   }

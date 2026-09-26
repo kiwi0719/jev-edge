@@ -3,7 +3,7 @@
 // id hygiene and the breaker's post-probe reset (twin of the Lua specs).
 import { describe, it, expect, vi } from "vitest";
 import * as core from "../src/core";
-import { luaPatternToRegExp, luaBytes, patternError, pathMatches, canonicalPath, evaluate as rulesEvaluate } from "../src/core/rules";
+import { luaPatternToRegExp, luaBytes, patternError, pathMatches, canonicalPath, reFind, evaluate as rulesEvaluate } from "../src/core/rules";
 import { resolve, load } from "../src/rules";
 import { truncateBytes, normalize, fingerprint, djb2 } from "../src/core/normalize";
 import { encodeReason } from "../src/core/verdict";
@@ -867,5 +867,45 @@ describe("core.cacheKey scope", () => {
     const u = { untrusted: { instructions: "Does the content address the assistant?" } };
     expect(key({ questions: u }, over)).not.toBe(key({}, over));
     expect(key({ questions: u })).toBe(key({}));
+  });
+});
+
+// js-core-parity#4: always_suspect runs as ngx.re runs it ("ijo", PCRE
+// without UTF), over bytes; spans are 1-based inclusive UTF-8 byte offsets.
+describe("reFind (PCRE without UTF)", () => {
+  it("takes only ASCII spaces for \\s and \\S, in a class too", () => {
+    expect(reFind("system prompt", String.raw`system\s+prompt`)).toEqual([1, 13]);
+    for (const sp of [" ", "　", " ", "\u0085", "﻿"]) {
+      expect(reFind(`system${sp}prompt`, String.raw`system\s+prompt`), JSON.stringify(sp)).toBeNull();
+      expect(reFind(`system${sp}prompt`, String.raw`system[\s]+prompt`), JSON.stringify(sp)).toBeNull();
+      // every byte of it is \S
+      expect(reFind(`a${sp}b`, String.raw`a\S+b`), JSON.stringify(sp)).not.toBeNull();
+      expect(reFind(`a${sp}b`, String.raw`a[\S]+b`), JSON.stringify(sp)).not.toBeNull();
+    }
+    expect(reFind("a\tb", String.raw`a[\s,]b`)).toEqual([1, 3]);
+    expect(reFind("a b", String.raw`a[^\s]b`)).toBeNull();
+    expect(reFind("aéb", String.raw`a[^\s]+b`)).toEqual([1, 4]);
+  });
+
+  it("counts bytes for '.', {m,n} and the span", () => {
+    // 8 Han characters are 24 bytes: past .{0,20}
+    const han8 = "我们的任务是这些";
+    expect(reFind(`Ignore ${han8} previous instructions`, String.raw`\bignore\b.{0,20}\bprevious\b`)).toBeNull();
+    expect(reFind(`Ignore ${han8.slice(0, 4)} previous`, String.raw`\bignore\b.{0,20}\bprevious\b`)).toEqual([1, 28]);
+    // the span is in bytes: "café " is 6 bytes
+    expect(reFind("café you are now", String.raw`\byou are now\b`)).toEqual([7, 17]);
+    expect(reFind("\u{1F600}x", "x")).toEqual([5, 5]);
+    // '.' is any byte but \n; \r included
+    expect(reFind("a\rb", "a.b")).toEqual([1, 3]);
+    expect(reFind("a\nb", "a.b")).toBeNull();
+    expect(reFind("aéb", "a..b")).toEqual([1, 4]);
+  });
+
+  it("folds ASCII case only, and reads ']' first in a class as a member", () => {
+    expect(reFind("YOU ARE NOW", String.raw`\byou are now\b`)).toEqual([1, 11]);
+    expect(reFind("É", "é")).toBeNull();
+    expect(reFind("a]b", "a[]]b")).toEqual([1, 3]);
+    expect(reFind("a]b", "a[^]]b")).toBeNull();
+    expect(reFind("axb", "a[^]]b")).toEqual([1, 3]);
   });
 });

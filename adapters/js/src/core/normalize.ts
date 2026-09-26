@@ -14,6 +14,18 @@ export function byteLength(s: string): number {
 }
 
 /**
+ * `s` as Lua and PCRE without UTF see it: one character (U+0000..U+00FF) per
+ * UTF-8 byte. ASCII comes back as it is.
+ */
+export function byteString(s: string): string {
+  if (!/[^\x00-\x7f]/.test(s)) return s;
+  const b = enc.encode(s);
+  let out = "";
+  for (let i = 0; i < b.length; i += 8192) out += String.fromCharCode(...b.subarray(i, i + 8192));
+  return out;
+}
+
+/**
  * Truncate to at most n UTF-8 bytes on a code point boundary: the output
  * never exceeds n bytes and never contains a U+FFFD from a split code point
  * (the partial code point is dropped). Lua's `s:sub(1, n)` keeps the partial

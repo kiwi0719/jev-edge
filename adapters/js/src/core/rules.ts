@@ -1,5 +1,5 @@
 // Port of core/rules.lua: L1, cheap and short-circuiting.
-import { extract, extractTools, extractUntrusted, jsonLike, isText, byteLength, head, tail, fieldKeys, deepKeys, scanStrings, scanTools, window, chunks as splitChunks, chunkOverlap, utf8Bytes, type JsonValue } from "./normalize.js";
+import { extract, extractTools, extractUntrusted, jsonLike, isText, byteLength, head, tail, fieldKeys, deepKeys, scanStrings, scanTools, window, chunks as splitChunks, chunkOverlap, utf8Bytes, byteString, type JsonValue } from "./normalize.js";
 import { untrustedSpec, type UntrustedConfig } from "./defaults.js";
 import { repBlocked, type SubjectCtx, type ReputationConfig } from "./subject.js";
 
@@ -251,10 +251,7 @@ function literal(c: number): string {
  * Lua, and U+2028 is three of them. ASCII comes back as it is.
  */
 export function luaBytes(s: string): string {
-  if (!/[^\x00-\x7f]/.test(s)) return s;
-  let out = "";
-  for (const b of utf8Bytes(s)) out += String.fromCharCode(b);
-  return out;
+  return byteString(s);
 }
 
 /**
@@ -518,21 +515,78 @@ function jsonOnlyMiss(req: Req, rule: Rule, ct: string, ctx: RulesCtx | undefine
   return [ex[1] !== "json" && ex[1] !== "scan", ex];
 }
 
+// PCRE's \s without UTF or UCP (ngx.re, lrexlib): the six ASCII spaces
+// only; and its complement spelled out over the 256 byte values, for use
+// inside a class.
+const PCRE_SPACE = "\\t\\n\\v\\f\\r ";
+const PCRE_NOT_SPACE = "\\x00-\\x08\\x0e-\\x1f\\x21-\\xff";
+
+/**
+ * A PCRE pattern as a RegExp that matches a byte string (byteString) the way
+ * PCRE without the UTF flag matches bytes: `\s` and `\S` are the ASCII
+ * spaces and the rest, in a class too (JS's `\s` also takes U+00A0, U+3000
+ * and more), `.` is any byte but \n (JS's stops at \r too), and a ']' first
+ * in a class is a member, as in PCRE. The 'i' flag without 'u' folds ASCII
+ * letters as PCRE's C-locale tables do. `\w`, `\d` and `\b` are ASCII in
+ * both already, and other syntax is left as it is.
+ */
+export function pcreToRegExp(pattern: string): RegExp {
+  let out = "";
+  let inClass = false;
+  for (let i = 0; i < pattern.length; i++) {
+    const c = pattern[i];
+    if (c === "\\") {
+      const d = pattern[i + 1];
+      i++;
+      if (d === "s") out += inClass ? PCRE_SPACE : "[" + PCRE_SPACE + "]";
+      else if (d === "S") out += inClass ? PCRE_NOT_SPACE : "[^" + PCRE_SPACE + "]";
+      else if (d === undefined) out += "\\";
+      else out += "\\" + d;
+    } else if (inClass) {
+      if (c === "]") inClass = false;
+      out += c;
+    } else if (c === "[") {
+      inClass = true;
+      out += c;
+      if (pattern[i + 1] === "^") out += pattern[++i];
+      // a ']' first in the class is a member in PCRE; JS would close it
+      if (pattern[i + 1] === "]") {
+        out += "\\]";
+        i++;
+      }
+    } else if (c === ".") {
+      out += "[^\\n]";
+    } else {
+      out += c;
+    }
+  }
+  return new RegExp(out, "i");
+}
+
 /**
  * Case-insensitive regex search with the same contract the OpenResty adapter
- * gives core: the 1-based inclusive UTF-8 byte span of the first match.
+ * gives core (ngx.re.find with "ijo": PCRE without UTF): the 1-based
+ * inclusive UTF-8 byte span of the first match. The pattern runs over the
+ * subject's bytes (pcreToRegExp), so `.`, `\b` and `{m,n}` count bytes as
+ * PCRE does, and the match index is the byte offset.
  */
 const reCache = new Map<string, RegExp>();
+let lastSubject: string | undefined;
+let lastBytes = "";
 export function reFind(subject: string, pattern: string): readonly [number, number] | null {
   let re = reCache.get(pattern);
   if (!re) {
-    re = new RegExp(pattern, "i");
+    re = pcreToRegExp(pattern);
     reCache.set(pattern, re);
   }
-  const m = re.exec(subject);
+  // every always_suspect pattern runs over the same text: convert it once
+  if (subject !== lastSubject) {
+    lastSubject = subject;
+    lastBytes = byteString(subject);
+  }
+  const m = re.exec(lastBytes);
   if (!m) return null;
-  const from = byteLength(subject.slice(0, m.index)) + 1;
-  return [from, from + byteLength(m[0]) - 1];
+  return [m.index + 1, m.index + m[0].length];
 }
 
 const untrustedOn = (rule: Rule, ctx: RulesCtx | undefined) => untrustedSpec(ctx?.config, rule).enabled === true;

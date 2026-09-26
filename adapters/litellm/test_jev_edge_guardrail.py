@@ -1,6 +1,7 @@
 """Runs without LiteLLM: the hook is exercised against a fake /_jev/authz."""
 
 import asyncio
+import base64
 import enum
 import inspect
 import json
@@ -831,6 +832,75 @@ def test_bedrock_pass_through_body_is_judged(bag):
                                                                 "system": ATTACK, "messages": [{"role": "user", "content": "hi"}]},
                                                                route="/bedrock/model/br-claude/invoke"), "allm_passthrough_route"))
     assert seen["body"] == {"messages": [{"role": "system", "content": ATTACK}, {"role": "user", "content": "hi"}]}
+
+
+def b64(text) -> str:
+    return base64.b64encode(text if isinstance(text, bytes) else text.encode()).decode()
+
+
+def test_bedrock_text_document_is_sent_as_text():
+    # A Converse document of a text format is text the model reads, but its
+    # source.bytes were dropped as media and jev-edge reads no document
+    # source: an attack in a .txt attachment, or in a .md a tool returned,
+    # was sent as no text at all. Now it follows its block as a text part
+    doc = {"document": {"format": "txt", "name": "notes", "source": {"bytes": b64(ATTACK)}}}
+    got = body({"messages": [{"role": "user", "content": [{"text": "Summarise the notes"}, doc]}]})
+    assert got["messages"][0]["content"] == [
+        {"text": "Summarise the notes"}, {"document": {"format": "txt", "name": "notes", "source": {}}}, {"text": ATTACK}]
+    result = {"toolResult": {"toolUseId": "t1", "content": [
+        {"text": "fetched"}, {"document": {"format": "md", "name": "page", "source": {"bytes": b64("# Page\n" + ATTACK)}}}]}}
+    got = body({"messages": [{"role": "user", "content": [result, {"text": "go on"}]}]})
+    assert got["messages"][0]["content"] == [
+        {"toolResult": {"toolUseId": "t1", "content": [
+            {"text": "fetched"}, {"document": {"format": "md", "name": "page", "source": {}}}]}},
+        {"text": "# Page\n" + ATTACK}, {"text": "go on"}]
+    # every text format; bytes that are not UTF-8 read with U+FFFD; source.text as it is
+    for fmt in ("txt", "md", "csv", "html", "TXT"):
+        d = {"document": {"format": fmt, "name": "d", "source": {"bytes": b64(b"\xff" + ATTACK.encode())}}}
+        assert body({"messages": [{"role": "user", "content": [d]}]})["messages"][0]["content"][1] == {"text": "\ufffd" + ATTACK}
+    d = {"document": {"format": "txt", "name": "d", "source": {"text": ATTACK}}}
+    assert body({"messages": [{"role": "user", "content": [d]}]})["messages"][0]["content"][1] == {"text": ATTACK}
+    # a binary format stays media: its bytes are left out, no text part
+    pdf = {"document": {"format": "pdf", "name": "q2", "source": {"bytes": b64(b"%PDF-1.7 " + ATTACK.encode())}}}
+    assert body({"messages": [{"role": "user", "content": [pdf]}]})["messages"][0]["content"] == [
+        {"document": {"format": "pdf", "name": "q2", "source": {}}}]
+    # the request LiteLLM sends on is not changed
+    msgs = [{"role": "user", "content": [doc]}]
+    body({"messages": msgs})
+    assert msgs == [{"role": "user", "content": [doc]}] and doc["document"]["source"]["bytes"] == b64(ATTACK)
+
+
+def test_bedrock_text_document_through_the_pass_through_is_judged():
+    transport, seen = fake_authz(status=403, verdict="malicious", score="0.95")
+    converse = {"messages": [{"role": "user", "content": [
+        {"text": "What does it say?"}, {"document": {"format": "txt", "name": "n", "source": {"bytes": b64(ATTACK)}}}]}]}
+    with pytest.raises(Exception) as ei:
+        run(guard(transport).async_pre_call_hook({}, None, bedrock(converse), "allm_passthrough_route"))
+    assert ei.value.status_code == 403
+    assert seen["body"]["messages"][0]["content"][-1] == {"text": ATTACK}
+
+
+@pytest.mark.parametrize("source,limit", [
+    ({"bytes": "not base64 @@"}, None),
+    ({"bytes": b64("x" * 2048)}, 1024),                 # past max_body_bytes
+    ({"s3Location": {"uri": "s3://bucket/notes.txt"}}, None),  # not in the request
+    ({}, None),
+])
+def test_bedrock_text_document_the_guardrail_cannot_read_is_unjudged(source, limit):
+    kw = {"max_body_bytes": limit} if limit else {}
+    doc = {"document": {"format": "csv", "name": "n", "source": source}}
+    for data, call_type in (({"messages": [{"role": "user", "content": [{"text": "hi"}, doc]}]}, "acompletion"),
+                            (bedrock({"messages": [{"role": "user", "content": [
+                                {"toolResult": {"toolUseId": "t", "content": [doc]}}]}]}), "allm_passthrough_route")):
+        transport, seen = fake_authz()
+        out = run(guard(transport, **kw).async_pre_call_hook({}, None, dict(data), call_type))
+        assert seen["calls"] == 0
+        v = out[jg._metadata_key(out)]["jev_verdict"]
+        assert (v["verdict"], v["action"], v["reason"]) == (
+            "skipped", "pass", f"unjudgeable: call type {call_type}: bedrock document csv not readable")
+        with pytest.raises(Exception) as ei:
+            run(guard(transport, unjudged="block", **kw).async_pre_call_hook({}, None, dict(data), call_type))
+        assert ei.value.status_code == 403 and seen["calls"] == 0
 
 
 @pytest.mark.parametrize("call_type,data", [

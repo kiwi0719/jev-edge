@@ -54,6 +54,8 @@ depends on.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import contextvars
 import importlib.util
 import json
@@ -120,8 +122,13 @@ GEMINI_CONTENTS = "contents"
 MEDIA_PARTS = frozenset({"image_url", "input_image", "image", "input_audio", "audio", "file", "input_file"})
 # Keys whose values are media payloads wherever they appear (`bytes`: a
 # Bedrock Converse image, document or video source), except in tool calls
-# and tool results sent whole (SENT_WHOLE).
+# and tool results sent whole (SENT_WHOLE). A Converse document of a text
+# format is read first: its text goes on as a text part (_bedrock_documents).
 MEDIA_KEYS = frozenset({"image_url", "input_audio", "file_data", "inline_data", "inlineData", "bytes"})
+# Bedrock Converse document formats that are text: the model reads the
+# document's bytes as text, so they are decoded and judged. The others (pdf,
+# doc, docx, xls, xlsx) are media.
+TEXT_DOCUMENT_FORMATS = frozenset({"txt", "md", "csv", "html"})
 # Strings under these keys name structure, not text: a body with nothing else
 # is not worth a round trip. Below a path sent whole every key and string is
 # text.
@@ -154,7 +161,8 @@ TOOL_ARGUMENTS = frozenset({
 # Gemini's functionResponse.response (function_response in the REST API's
 # snake_case), which jev-edge reads whole, every key and string, as a tool
 # result, and a Bedrock Converse toolResult's `json` blocks. A toolResult's
-# image, document and video blocks are media: their `bytes` are left out.
+# image and video blocks, and its documents of a binary format, are media:
+# their `bytes` are left out (a text document is read, _bedrock_documents).
 TOOL_RESULTS = frozenset({
     ("contents", "*", "parts", "*", "functionresponse", "response"),
     ("contents", "*", "parts", "*", "function_response", "response"),
@@ -454,6 +462,85 @@ def _system_messages(data: dict) -> list:
     return msgs
 
 
+class _Unreadable(ValueError):
+    """A Bedrock Converse document of a text format whose text the guardrail
+    cannot read: not base64, over the bound, or not in the request."""
+
+    def __init__(self, fmt: str) -> None:
+        super().__init__(fmt)
+        self.format = fmt
+
+
+def _document_text(doc: dict, limit: int) -> Optional[str]:
+    """The text of a Converse document block (`document`) of a text format,
+    None for any other format. source.bytes (base64 in JSON) is decoded as
+    UTF-8, bad bytes replaced, at most `limit` bytes of it; source.text and
+    source.content's text blocks are text already. _Unreadable when none of
+    them is there (an s3Location) or the bytes are not base64 or too many."""
+    fmt = doc.get("format")
+    if not isinstance(fmt, str) or fmt.lower() not in TEXT_DOCUMENT_FORMATS:
+        return None
+    src = doc.get("source")
+    src = src if isinstance(src, dict) else {}
+    raw = src.get("bytes")
+    if isinstance(raw, str):
+        b64 = "".join(raw.split())
+        if len(b64) > (limit // 3 + 1) * 4:
+            raise _Unreadable(fmt)
+        try:
+            raw = base64.b64decode(b64, validate=True)
+        except (binascii.Error, ValueError):
+            raise _Unreadable(fmt) from None
+    if isinstance(raw, (bytes, bytearray)):
+        if len(raw) > limit:
+            raise _Unreadable(fmt)
+        return bytes(raw).decode("utf-8", "replace")
+    if isinstance(src.get("text"), str):
+        text = src["text"]
+    elif isinstance(src.get("content"), list):
+        text = "\n".join(b["text"] for b in src["content"] if isinstance(b, dict) and isinstance(b.get("text"), str))
+    else:
+        raise _Unreadable(fmt)
+    if len(text.encode("utf-8", "surrogatepass")) > limit:
+        raise _Unreadable(fmt)
+    return text
+
+
+def _bedrock_documents(msgs: list, limit: int) -> list:
+    """`msgs` with the text of every Bedrock Converse document of a text
+    format (txt, md, csv, html) as a {"text": ...} part of its message's
+    content, right after the block that holds it: the document block, or
+    the toolResult it is in. The media filter drops a document's
+    source.bytes, and jev-edge reads a message's text parts, not a
+    document's source: a text document was sent as no text at all.
+    _Unreadable for one that cannot be read, which leaves the request
+    unjudgeable rather than "no text". New lists; the request is not
+    changed."""
+    out = []
+    for m in msgs:
+        content = m.get("content") if isinstance(m, dict) else None
+        if not isinstance(content, list):
+            out.append(m)
+            continue
+        new, added = [], False
+        for block in content:
+            new.append(block)
+            if not isinstance(block, dict):
+                continue
+            docs = [block["document"]] if isinstance(block.get("document"), dict) else []
+            result = block.get("toolResult")
+            if isinstance(result, dict) and isinstance(result.get("content"), list):
+                docs += [b["document"] for b in result["content"]
+                         if isinstance(b, dict) and isinstance(b.get("document"), dict)]
+            for doc in docs:
+                text = _document_text(doc, limit)
+                if text:
+                    new.append({"text": text})
+                    added = True
+        out.append(dict(m, content=new) if added else m)
+    return out
+
+
 def _gemini_parts(content: Any) -> Any:
     """A Gemini content whose `parts` is one part object, with `parts` as a
     list: the object as it is (jev-edge reads it as one part, as Gemini
@@ -500,7 +587,10 @@ def _is_definition(key: str, value: Any) -> bool:
 READ_KEYS = DEFINITION_KEYS + SYSTEM_KEYS + TEXT_KEYS + GEMINI_SYSTEM_KEYS + (GEMINI_CONTENTS,)
 
 
-def _body_dict(data: dict, extra_fields: tuple = ()) -> Optional[dict]:
+def _body_dict(data: dict, extra_fields: tuple = (), limit: int = MAX_BODY_BYTES) -> Optional[dict]:
+    """The body jev-edge judges (body_for), as a dict, or None without text.
+    limit: the most bytes of one Bedrock text document read (_Unreadable
+    past it)."""
     body: dict[str, Any] = {}
     for key in DEFINITION_KEYS + ("text",):
         value = data.get(key)
@@ -518,6 +608,8 @@ def _body_dict(data: dict, extra_fields: tuple = ()) -> Optional[dict]:
     convo = data.get("messages")
     if convo is not None and not isinstance(convo, list):
         convo = [convo]
+    if convo is not None:
+        convo = _bedrock_documents(convo, limit)
     if system and convo is None:
         # no conversation under `messages` (the Responses API): the system
         # prompt goes first, before the input
@@ -829,7 +921,9 @@ class JevEdgeGuardrail(_ApplyGuardrailBase):
         with the system prompt (`system`, `instructions`) as the first
         message, and Gemini's `contents` (a `parts` object followed by its
         keys as text parts); media payloads removed outside the tool calls
-        and tool results sent whole. None when no value holds any text."""
+        and tool results sent whole, a Bedrock text document's bytes sent as
+        a text part. None when no value holds any text; ValueError for a
+        Bedrock text document it cannot read."""
         body = _body_dict(data, _parse_fields(extra_fields) if extra_fields else ())
         return None if body is None else _dumps(body)
 
@@ -891,7 +985,10 @@ class JevEdgeGuardrail(_ApplyGuardrailBase):
             data = _run(data)
         elif name in ("create_assistants", "acreate_assistants"):
             data = _assistant(data)
-        return "judge", _body_dict(data, self.extra_fields)
+        try:
+            return "judge", _body_dict(data, self.extra_fields, self.max_body_bytes)
+        except _Unreadable as e:
+            return "unjudged", f"unjudgeable: call type {name}: bedrock document {e.format} not readable"
 
     def _plan_passthrough(self, name: str, body: dict, what: str) -> tuple:
         """A pass-through client's body, in the provider's own format: judged
@@ -899,7 +996,10 @@ class JevEdgeGuardrail(_ApplyGuardrailBase):
         (Titan's `inputText`, Cohere's `message`, a batch's `requests`, ...)
         is unjudgeable, not "no text": the format is not one it knows. An
         empty one (a Bedrock GET) has no text."""
-        judged = _body_dict(body, self.extra_fields)
+        try:
+            judged = _body_dict(body, self.extra_fields, self.max_body_bytes)
+        except _Unreadable as e:
+            return "unjudged", f"unjudgeable: call type {name}: bedrock document {e.format} not readable"
         if judged is not None:
             return "judge", judged
         read = READ_KEYS + self.extra_fields

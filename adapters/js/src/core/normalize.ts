@@ -966,6 +966,14 @@ function delimiterEnd(body: string, at: number, nl?: string): [number | false | 
 // has a filename or filename* parameter; it is read when it is not a file or
 // its Content-Type (text/plain when it has none) is text or JSON, and the
 // value reads as text.
+// Port of text_part_type(): a file part's media type the backend may read
+// as text: text/*, any JSON type, none (RFC 7578's default text/plain), and
+// application/octet-stream (curl -F, openai-python, Node's FormData for a
+// .jsonl or .md file). isText still keeps binary out.
+function textPartType(ct: string): boolean {
+  return ct === "" || ct.startsWith("text/") || ct.includes("json") || ct === "application/octet-stream";
+}
+
 function multipartPart(part: string, out: string[]): void {
   const hm = /^\r?\n/.exec(part) ?? /\r?\n\r?\n/.exec(part);
   if (!hm) return;
@@ -980,9 +988,9 @@ function multipartPart(part: string, out: string[]): void {
     } else if (name === "content-type") {
       const v = line.slice(colon + 1);
       const semi = v.indexOf(";");
-      const ct = asciiLower(semi === -1 ? v : v.slice(0, semi));
+      const ct = trim(asciiLower(semi === -1 ? v : v.slice(0, semi)));
       typed = true;
-      if (/^[ \t\n\v\f\r]*text\//.test(ct) || ct.includes("json")) textType = true;
+      if (textPartType(ct)) textType = true;
     }
   }
   if ((!hasFile || !typed || textType) && isText(value)) out.push(value);

@@ -188,7 +188,18 @@ describe("normalize.extract: multipart", function()
       .. ATTACK .. "\r\n--B--"))
     -- a file that declares a type that is neither text nor JSON is skipped
     assert.equals("", mp('--B\r\ncontent-disposition: form-data; name="f"; filename*=UTF-8\'\'p.bin\r\n'
-      .. "Content-Type: application/octet-stream\r\n\r\n" .. ATTACK .. "\r\n--B--"))
+      .. "Content-Type: image/png\r\n\r\n" .. ATTACK .. "\r\n--B--"))
+    -- application/octet-stream (curl -F, openai-python, FormData for a .jsonl
+    -- file) and an empty type are read when the value is text, not when it is
+    -- binary (g2-deferred-and-stateful-llm-apis#3)
+    for _, t in ipairs({ "application/octet-stream", "Application/Octet-Stream; x=1", "", " " }) do
+      assert.equals(ATTACK, mp('--B\r\ncontent-disposition: form-data; name="f"; filename="b.jsonl"\r\n'
+        .. "Content-Type:" .. t .. "\r\n\r\n" .. ATTACK .. "\r\n--B--"), t)
+      assert.equals("", mp('--B\r\ncontent-disposition: form-data; name="f"; filename="w.bin"\r\n'
+        .. "Content-Type:" .. t .. "\r\n\r\n\0\1\2 weights\r\n--B--"), t)
+    end
+    assert.equals("", mp('--B\r\ncontent-disposition: form-data; name="f"; filename="a.pdf"\r\n'
+      .. "Content-Type: application/pdf\r\n\r\n" .. ATTACK .. "\r\n--B--"))
     assert.equals(ATTACK, mp('--B\r\nContent-Disposition: form-data; name="f"; filename="p.json"\r\n'
       .. "Content-Type: application/json; charset=utf-8\r\n\r\n" .. ATTACK .. "\r\n--B--"))
   end)

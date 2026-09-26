@@ -290,6 +290,13 @@ describe("multipart as the backend reads it", () => {
     expect(await send(field("B", "a", PROMPT, "\r\n", "Content-Type: application/octet-stream\r\nX-Note: filename=none\r\n") + "--B--")).toBe(403);
     expect(await send(field("B", "filename=x", PROMPT, "\r\n", "Content-Type: image/png\r\n") + "--B--")).toBe(403);
     expect(await send(`--B\r\nContent-Disposition: form-data; name="f"; filename="p.txt"\r\n\r\n${PROMPT}\r\n--B--`)).toBe(403);
-    expect(text(`--B\r\ncontent-disposition: form-data; name="f"; filename*=UTF-8''p.bin\r\nContent-Type: application/octet-stream\r\n\r\n${PROMPT}\r\n--B--`)).toBe("");
+    expect(text(`--B\r\ncontent-disposition: form-data; name="f"; filename*=UTF-8''p.bin\r\nContent-Type: image/png\r\n\r\n${PROMPT}\r\n--B--`)).toBe("");
+    // g2-deferred-and-stateful-llm-apis#3: octet-stream and an empty type are
+    // read when the value is text, not when it is binary
+    for (const t of ["application/octet-stream", "Application/Octet-Stream; x=1", "", " "]) {
+      expect(text(`--B\r\ncontent-disposition: form-data; name="f"; filename="b.jsonl"\r\nContent-Type:${t}\r\n\r\n${PROMPT}\r\n--B--`), t).toBe(PROMPT);
+      expect(text(`--B\r\ncontent-disposition: form-data; name="f"; filename="w.bin"\r\nContent-Type:${t}\r\n\r\n\0\x01\x02 weights\r\n--B--`), t).toBe("");
+    }
+    expect(text(`--B\r\ncontent-disposition: form-data; name="f"; filename="a.pdf"\r\nContent-Type: application/pdf\r\n\r\n${PROMPT}\r\n--B--`)).toBe("");
   });
 });

@@ -933,6 +933,15 @@ end
 -- Content-Disposition has a filename or filename* parameter, and it is read
 -- when it is not a file or its Content-Type (text/plain when it has none,
 -- RFC 7578 4.4) is text or JSON, and the value reads as text.
+-- A file part's media type the backend may read as text: text/*, any JSON
+-- type, none (the RFC 7578 default is text/plain), and
+-- application/octet-stream, what curl -F, openai-python and Node's FormData
+-- send for a .jsonl or .md file. is_text still keeps binary out.
+local function text_part_type(ct)
+  return ct == "" or ct:find("^text/") ~= nil or ct:find("json", 1, true) ~= nil
+    or ct == "application/octet-stream"
+end
+
 local function multipart_part(part, out)
   local hs, he = part:find("^\r?\n")
   if not hs then hs, he = part:find("\r?\n\r?\n") end
@@ -950,9 +959,9 @@ local function multipart_part(part, out)
       elseif name == "content-type" then
         local v = line:sub(colon + 1)
         local semi = v:find(";", 1, true)
-        local ct = (semi and v:sub(1, semi - 1) or v):lower()
+        local ct = _M.trim((semi and v:sub(1, semi - 1) or v):lower())
         typed = true
-        if ct:find("^%s*text/") or ct:find("json", 1, true) then text_type = true end
+        if text_part_type(ct) then text_type = true end
       end
     end
   end

@@ -911,8 +911,9 @@ describe("stores", () => {
     await Promise.all(kept);
     const id = first.subjectId!;
     expect(id).toMatch(/^ip:/);
-    // the ring's counter went through the object's atomic /incr
-    expect(objects.get("jev-edge")!.mem.get("subj:" + id + ":n")).toMatchObject({ v: 2 });
+    // the ring's counter went through the atomic incr of the subject's own object, not jev-edge's
+    expect(objects.get("jev-subject:" + id)!.mem.get("subj:" + id + ":n")).toMatchObject({ v: 2 });
+    expect([...objects.get("jev-edge")!.mem.keys()].some((k) => k.startsWith("subj:"))).toBe(false);
     expect(await ringLoad(rt.subjectStore, id, 20)).toHaveLength(2);
     expect([...objects.get("cache")!.mem.keys()].some((k) => k.startsWith("fp:"))).toBe(true);
   });
@@ -935,7 +936,11 @@ describe("stores", () => {
       const blocked = await one.fetch(chat(BENIGN, { "x-jev-mock-score": "0.1" }), env);
       expect(blocked.status).toBe(403);
       expect(blocked.headers.get("x-jev-reason")).toBe("subject+reputation");
-      expect([...objects.get("jev-edge")!.mem.keys()].some((k) => k.startsWith("srep:ip:"))).toBe(true);
+      // in the subject's own object, not the global one
+      const subjects = [...objects.keys()].filter((n) => n.startsWith("jev-subject:ip:"));
+      expect(subjects).toHaveLength(1);
+      expect([...objects.get(subjects[0])!.mem.keys()].some((k) => k.startsWith("srep:ip:"))).toBe(true);
+      expect([...objects.get("jev-edge")!.mem.keys()].some((k) => k.startsWith("srep:"))).toBe(false);
       // options that name a subjectStore keep it
       const fresh = namespaces();
       const mem = memoryStore();
@@ -945,11 +950,13 @@ describe("stores", () => {
       expect((await three.fetch(chat(attack(2)), { JEV_STATE: fresh.ns })).status).toBe(403);
       expect(counted.some((k) => k.startsWith("srep:ip:"))).toBe(true);
       expect([...(fresh.objects.get("jev-edge")?.mem.keys() ?? [])].some((k) => k.startsWith("srep:"))).toBe(false);
+      expect([...fresh.objects.keys()].some((n) => n.startsWith("jev-subject"))).toBe(false);
       // without reputation the subject store stays the runtime's default
       const plain = namespaces();
       const four = fullWorker({ upstream: "https://app.internal", provider: providers.mock, config: { ...ENFORCE95, subject: SUBJECTS.subject } });
       expect((await four.fetch(chat(attack(3)), { JEV_STATE: plain.ns })).status).toBe(403);
       expect([...(plain.objects.get("jev-edge")?.mem.keys() ?? [])].some((k) => k.startsWith("subj:"))).toBe(false);
+      expect([...plain.objects.keys()].some((n) => n.startsWith("jev-subject"))).toBe(false);
     } finally {
       vi.unstubAllGlobals();
     }

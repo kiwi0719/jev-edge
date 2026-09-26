@@ -17,6 +17,7 @@
 import { Breaker, type Store, type BreakerLike, type BreakerConfig, type State } from "../core/breaker.js";
 import { Adaptive, tuning, type AdaptiveLike } from "./adaptive.js";
 import type { JevConfig } from "../core/defaults.js";
+import { KEY_PREFIX, REP_PREFIX, ringLoad, ringAppend, loadHistory, appendHistory, type Entry as SubjectEntry } from "../core/subject.js";
 
 export interface KVLike {
   get(key: string, type: "json"): Promise<unknown>;
@@ -141,6 +142,10 @@ export function memoryStore(clock: () => number = () => Date.now() / 1000, opts:
  *                               (durableRequest): before the judge, allow()
  *                               and the timeout; after it, the adaptive
  *                               samples and the breaker's record together.
+ *   /subject                    one subject's object (durableSubjectStore):
+ *                               "load" reads its trajectory and the
+ *                               reputation keys a request reads, "append"
+ *                               adds to the trajectory, each in one hop.
  */
 export interface DOStateLike {
   storage: {
@@ -200,6 +205,7 @@ export class JevState {
     const body = (await request.json()) as {
       key?: string; value?: unknown; ttl?: number; by?: number; op?: string; cfg?: unknown; now?: number; ms?: number;
       breaker?: unknown; jev?: unknown; samples?: unknown; result?: unknown;
+      id?: unknown; max?: unknown; keys?: unknown; entry?: unknown;
     };
     if (url.pathname === "/get") {
       const v = await this.store.get(String(body.key));
@@ -261,9 +267,30 @@ export class JevState {
       }
       return Response.json({ ok: true });
     }
+    if (url.pathname === "/subject") {
+      if (typeof body.id !== "string" || body.id === "") return new Response("bad subject id", { status: 400 });
+      const max = typeof body.max === "number" ? body.max : undefined;
+      switch (body.op) {
+        case "load": {
+          const values: Record<string, unknown> = {};
+          const keys = Array.isArray(body.keys) ? body.keys.slice(0, MAX_LOAD_KEYS) : [];
+          for (const k of keys) if (typeof k === "string") values[k] = (await this.store.get(k)) ?? null;
+          return Response.json({ value: { history: await ringLoad(this.store, body.id, max), values } });
+        }
+        case "append":
+          if (typeof body.entry !== "object" || body.entry === null) return new Response("bad subject entry", { status: 400 });
+          await ringAppend(this.store, body.id, body.entry as SubjectEntry, max, typeof body.ttl === "number" ? body.ttl : undefined);
+          return Response.json({ ok: true });
+        default:
+          return new Response("bad subject op", { status: 400 });
+      }
+    }
     return new Response("not found", { status: 404 });
   }
 }
+
+/** Keys one /subject load reads besides the trajectory. */
+const MAX_LOAD_KEYS = 8;
 
 export interface DOStubLike {
   fetch(input: string | Request, init?: RequestInit): Promise<Response>;
@@ -459,6 +486,125 @@ export function durableStore(target: StateTarget): Store {
     incr: async (k, by, ttl) => Number((await call("/incr", { key: k, by, ttl })).value),
     expire: async (k, ttl) => {
       await call("/expire", { key: k, ttl });
+    },
+  };
+}
+
+/** Where durableSubjectStore keeps a subject: the object `jev-subject:<id>` (`jev-subject:<name>:<id>` with a name). */
+export const SUBJECT_OBJECT = "jev-subject";
+
+/** The subject a subject-store key is about: `subj:<id>...` (trajectory) and `srep:<id>...` (reputation), an id being `<from>:<hex>` (core/subject.ts). */
+const SUBJECT_KEY = new RegExp("^(?:" + KEY_PREFIX + "|" + REP_PREFIX + ")([a-z]+:[0-9a-f]+)(?::|$)");
+
+/** What a judged request needs of its subject's object, loaded in one hop. */
+export interface SubjectSession {
+  /** The subject's trajectory, oldest first (ringLoad), or null. */
+  history: unknown;
+  /** The subject's keys for this request: a key loaded with the history is
+   *  answered from that load until this request writes it, any other is read
+   *  from the object. */
+  store: Store;
+  /** Adds one entry to the trajectory inside the object: one hop, atomic. */
+  append(e: SubjectEntry): Promise<void>;
+}
+
+/** durableSubjectStore: a Store over one object per subject, and the session one request uses. */
+export interface SubjectObjects extends Store {
+  /** One hop to the subject's object: its trajectory (the newest `max`) and
+   *  `keys`, read together. `ttl` is the trajectory's (subject.history_ttl). */
+  session(id: string, o?: { max?: number; ttl?: number; keys?: string[] }): Promise<SubjectSession>;
+}
+
+/**
+ * Subject trajectories and reputation in the JevState namespace, one object
+ * per subject (`idFromName("jev-subject:" + id)`, or
+ * `"jev-subject:<name>:" + id` for `{ namespace, name }`): each subject's
+ * counters are atomic, as in the one object, and strongly consistent across
+ * isolates and locations, and no subject's traffic queues behind another's
+ * or the breaker's in the global jev-edge object. As a Store it routes each
+ * key to its subject's object (a key naming no subject goes to
+ * `jev-subject`), one hop per operation. `session` is what the runtime uses
+ * for a judged request: the trajectory and the reputation keys L1 and the
+ * record read, in one hop before the judge; the points and the trajectory
+ * entry one each after it. A JevState of an older build (404 on /subject) is
+ * read and written per key instead. A stub is made per call, as the other
+ * durable helpers make theirs from a namespace: a stub is bound to the
+ * request that made it.
+ */
+export function durableSubjectStore(target: DONamespaceLike | DONamed): SubjectObjects {
+  let ns: DONamespaceLike;
+  let prefix = SUBJECT_OBJECT;
+  if (isNamespace(target)) {
+    ns = target;
+  } else if (isNamed(target) && isNamespace(target.namespace)) {
+    if (target.name !== undefined && (typeof target.name !== "string" || target.name === "")) {
+      throw new TypeError("jev-edge: { namespace, name }: name must be a non-empty string");
+    }
+    ns = target.namespace;
+    if (target.name !== undefined) prefix = SUBJECT_OBJECT + ":" + target.name;
+  } else {
+    throw new TypeError("jev-edge: durableSubjectStore takes a Durable Object namespace or { namespace, name }; is the binding configured?");
+  }
+  const objectOf = (id: string) => ({ namespace: ns, name: prefix + ":" + id });
+  const forKey = (k: string): Store => {
+    const m = SUBJECT_KEY.exec(k);
+    return durableStore(m ? objectOf(m[1]) : { namespace: ns, name: prefix });
+  };
+  const routed: Store = {
+    get: (k) => forKey(k).get(k),
+    set: (k, v, ttl) => forKey(k).set(k, v, ttl),
+    incr: (k, by, ttl) => forKey(k).incr!(k, by, ttl),
+    expire: (k, ttl) => forKey(k).expire!(k, ttl),
+  };
+  let legacy = false;
+  return {
+    ...routed,
+    session: async (id, o = {}) => {
+      const one = durableStore(objectOf(id));
+      const max = o.max;
+      const keys = (o.keys ?? []).slice(0, MAX_LOAD_KEYS);
+      if (!legacy) {
+        const call = caller(objectOf(id));
+        try {
+          const v = (await call("/subject", { op: "load", id, max, keys })).value as { history?: unknown; values?: Record<string, unknown> } | undefined;
+          return {
+            history: v?.history ?? null,
+            store: loaded(routed, keys, v?.values ?? {}),
+            append: async (e) => {
+              await call("/subject", { op: "append", id, entry: e, max, ttl: o.ttl });
+            },
+          };
+        } catch (e) {
+          if (!missingEndpoint(e)) throw e;
+          legacy = true;
+        }
+      }
+      return {
+        history: await loadHistory(one, id, max),
+        store: routed,
+        append: (e) => appendHistory(one, id, e, max, o.ttl),
+      };
+    },
+  };
+}
+
+/** `base`, with the keys read in a load answered from it until written here. */
+function loaded(base: Store, keys: string[], values: Record<string, unknown>): Store {
+  const got = new Map<string, unknown>();
+  for (const k of keys) if (Object.prototype.hasOwnProperty.call(values, k)) got.set(k, values[k] ?? undefined);
+  return {
+    get: async (k) => (got.has(k) ? got.get(k) : base.get(k)),
+    set: async (k, v, ttl) => {
+      got.delete(k);
+      await base.set(k, v, ttl);
+    },
+    incr: async (k, by, ttl) => {
+      got.delete(k);
+      return base.incr!(k, by, ttl);
+    },
+    expire: async (k, ttl) => {
+      got.delete(k);
+      await base.expire!(k, ttl);
     },
   };
 }

@@ -42,8 +42,9 @@ function presetRuntime<E extends WorkerEnv>(opts: Options, env: E): Runtime {
   if (!o.state && env.JEV_STATE) o.state = env.JEV_STATE;
   // Subject reputation counts with the store's incr: atomic in the Durable
   // Object, lost under concurrency in KV, per isolate in memory. So with the
-  // object bound (or named in `state`), the subject store is that object
-  // unless the options name one.
+  // object bound (or named in `state`), the subject store is that namespace,
+  // one object per subject (durableSubjectStore), unless the options name
+  // one; a stub in `state` is that one object.
   if (!o.subjectStore && isStateTarget(o.state) && reputationOn(o)) o.subjectStore = o.state;
   if (env.TYPESAFE_API_KEY) o.config = { ...o.config, jev: { api_key: env.TYPESAFE_API_KEY, ...o.config?.jev } };
   return createRuntime(o);

@@ -15,9 +15,11 @@ import type { AdaptiveLike } from "./cf/adaptive.js";
 // its per-key write rate or daily quota, a Durable Object that is overloaded
 // or restarting, a Deno KV error) is logged and the verdict stands, as on
 // OpenResty, where a full shared dict's `set` returns an error and never
-// raises. The store reads a verdict is made from (cache, subject history) are
-// not wrapped: without them there is no verdict, and the fail-open contract
-// covers that.
+// raises. The store reads a verdict is made from (cache, subject history read
+// key by key) are not wrapped: without them there is no verdict, and the
+// fail-open contract covers that. A subject's own Durable Object
+// (durableSubjectStore) is read like the state below: a failed read judges
+// without the subject's history, its reputation read per key.
 //
 // ---------------------------------------------------------------------------
 // Reads before the judge are best effort too
@@ -91,7 +93,8 @@ export interface BestEffortOptions {
   defer?: (p: Promise<void>) => boolean;
 }
 
-async function read<T>(failing: Set<string>, what: string, op: () => Promise<T>, fallback: T, instead: string): Promise<T> {
+/** `op`'s value, or `fallback` when it throws: logged when `what` starts failing and again only once it has recovered. */
+export async function bestEffortRead<T>(failing: Set<string>, what: string, op: () => Promise<T>, fallback: T, instead: string): Promise<T> {
   try {
     const v = await op();
     failing.delete(what);
@@ -118,8 +121,8 @@ export function bestEffortBreaker(b: BreakerLike, o: BestEffortOptions = {}): Br
     return o.defer?.(p) ? Promise.resolve() : p;
   };
   const wrapped: BreakerLike = {
-    state: () => read(failing, "breaker read", () => b.state(), CLOSED, "the breaker closed"),
-    allow: () => read(failing, "breaker read", () => b.allow(), true, "the breaker closed"),
+    state: () => bestEffortRead(failing, "breaker read", () => b.state(), CLOSED, "the breaker closed"),
+    allow: () => bestEffortRead(failing, "breaker read", () => b.allow(), true, "the breaker closed"),
     trip: (now) => write("breaker trip", () => b.trip(now)),
     success: () => write("breaker success", () => b.success()),
     failure: () => write("breaker failure", () => b.failure()),
@@ -136,7 +139,7 @@ export function bestEffortAdaptive(a: AdaptiveLike, o: BestEffortOptions = {}): 
   const failing = o.failing ?? new Set<string>();
   const floor = o.floor ?? 400;
   return {
-    current: () => read(failing, "adaptive timeout read", () => a.current(), floor, "the timeout at its floor, " + floor + " ms"),
+    current: () => bestEffortRead(failing, "adaptive timeout read", () => a.current(), floor, "the timeout at its floor, " + floor + " ms"),
     success: (ms) => quietly("adaptive timeout sample", () => a.success(ms)),
     timeout: (firedMs) => quietly("adaptive timeout sample", () => a.timeout(firedMs)),
   };

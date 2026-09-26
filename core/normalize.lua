@@ -107,21 +107,31 @@ end
 -- cjson's own nesting limit: JSON either core decodes is never cut by depth,
 -- the bound only guards the recursion. Object keys are read in byte order: a
 -- Lua table has none, and both cores must produce the same text. One
--- oversized node must not starve what comes after it: an object with more
--- keys than the budget has left is skipped whole (reading any of its keys
--- means sorting all of them), and an array with more items than that keeps
--- its newest ones, the last, half as many as the budget has left, so what
--- follows it keeps the other half. Whatever a bound leaves out, `capped` says
--- so. An empty object or array (and a decoder's null, which may be an empty
--- table) adds nothing and is not counted.
+-- oversized node must not starve what comes after it, whether its own keys
+-- and items are too many or only what is below them (an enum of small
+-- arrays, a list of small objects): before a node is read, the nodes below
+-- it are counted, up to what the budget has left. A node that fits is read
+-- whole. One that does not spends at most half of what is left, so what
+-- follows it keeps the other half: an array its newest items that fit whole
+-- (the last ones) and, with what remains, the one before them; an object
+-- its keys, unless they alone are more than its half (reading any of them
+-- means sorting all of them, so it is skipped whole), then each value in
+-- key order by the same rule. Counting is bounded too, or a chain of
+-- nodes over the budget would be counted again at every level: past
+-- DEEP_COUNT times DEEP_NODES nodes counted, a node is taken not to fit.
+-- Whatever a bound leaves out, `capped` says so. An empty object or array
+-- (and a decoder's null, which may be an empty table) adds nothing and is
+-- not counted.
 -- ---------------------------------------------------------------------------
 
 _M.DEEP_DEPTH = 1000
 _M.DEEP_NODES = 20000
+_M.DEEP_COUNT = 4
 
 -- @param decode json_decode, for "**" values that are a string of JSON
 local function new_state(decode)
-  return { out = {}, nodes = _M.DEEP_NODES, capped = false, decode = decode, defer = {} }
+  return { out = {}, nodes = _M.DEEP_NODES, counts = _M.DEEP_COUNT * _M.DEEP_NODES, capped = false,
+           decode = decode, defer = {} }
 end
 
 -- The string keys of object `node` in byte order, counted against the node
@@ -141,21 +151,6 @@ local function keys_of(node, st)
   st.nodes = st.nodes - n
   table.sort(keys)
   return keys
-end
-
--- The index of the first item of array `node` the walk reads, counted
--- against the node budget: 1 when all of them fit; else the newest items
--- (the last ones), half as many as the budget has left.
-local function first_item(node, st)
-  local n = #node
-  if n <= st.nodes then
-    st.nodes = st.nodes - n
-    return 1
-  end
-  st.capped = true
-  local k = math.floor(st.nodes / 2)
-  st.nodes = st.nodes - k
-  return n - k + 1
 end
 
 local function take(st, s)
@@ -178,28 +173,128 @@ local function schema_type(v)
   return true
 end
 
+-- The nodes the walk spends below `node` (at `depth`): its keys or items,
+-- and theirs, as keys_of and every_string count them. The count stops as
+-- soon as it is over `limit`, and returns a number over it: that only says
+-- the node does not fit.
+local function nodes_below(node, limit, depth, schema)
+  if type(node) ~= "table" or next(node) == nil or depth > _M.DEEP_DEPTH then return 0 end
+  local n = 0
+  if node[1] ~= nil then
+    n = #node
+    if n > limit then return n end
+    for i = 1, #node do
+      local v = node[i]
+      if type(v) == "table" then
+        n = n + nodes_below(v, limit - n, depth + 1, schema)
+        if n > limit then return n end
+      end
+    end
+    return n
+  end
+  for k, v in pairs(node) do
+    if type(k) == "string" then
+      n = n + 1
+      if n > limit then return n end
+      if type(v) == "table" and not (schema and k == "type" and schema_type(v)) then
+        n = n + nodes_below(v, limit - n, depth + 1, schema)
+        if n > limit then return n end
+      end
+    end
+  end
+  return n
+end
+
+-- nodes_below(), charged to the walk's counting allowance (st.counts) at what it
+-- counted, or limit + 1 when it stopped: the same charge whatever order the
+-- keys come in. Once the allowance is spent a table does not fit.
+local function counted(st, node, limit, depth, schema)
+  if type(node) ~= "table" or next(node) == nil or depth > _M.DEEP_DEPTH then return 0 end
+  if st.counts <= 0 then return limit + 1 end
+  local n = nodes_below(node, limit, depth, schema)
+  st.counts = st.counts - math.min(n, limit + 1)
+  return n
+end
+
+local partial
+
 --- Every key and string value below `node`, keys in byte order: what a
 -- template that renders the value as JSON shows the model. With `schema`
 -- (tool definitions) a `type` whose value is a JSON Schema type name is
--- left out, key and value.
-local function every_string(node, st, depth, schema)
+-- left out, key and value. `fits`: the caller counted this node and it fits
+-- the budget, so nothing below it is counted again. `last`: nothing after
+-- it in its object needs the budget, so a node over it may spend all of it.
+local function every_string(node, st, depth, schema, fits, last)
   if type(node) == "string" then return take(st, node) end
   if type(node) ~= "table" or next(node) == nil then return end
   if depth > _M.DEEP_DEPTH then
     st.capped = true
     return
   end
+  if not fits and counted(st, node, st.nodes, depth, schema) > st.nodes then
+    -- over the budget: at most half of what is left, the rest kept for what follows
+    st.capped = true
+    local keep = last and 0 or st.nodes - math.floor(st.nodes / 2)
+    st.nodes = st.nodes - keep
+    partial(node, st, depth, schema)
+    st.nodes = st.nodes + keep
+    return
+  end
   if node[1] ~= nil then
-    for i = first_item(node, st), #node do every_string(node[i], st, depth + 1, schema) end
+    st.nodes = st.nodes - #node
+    for i = 1, #node do every_string(node[i], st, depth + 1, schema, true) end
+    return
+  end
+  for _, k in ipairs(keys_of(node, st)) do
+    local v = node[k]
+    if not (schema and k == "type" and schema_type(v)) then
+      take(st, k)
+      every_string(v, st, depth + 1, schema, true)
+    end
+  end
+end
+
+-- A node over the budget (st.nodes, its share), read as far as it goes. An
+-- array: its newest items that fit whole, walking back from the last, and
+-- the one before them with what is left (a table, over it by then). An
+-- object: its keys, unless there are more than the budget has left, then
+-- each value as every_string reads one; the values after the last table
+-- among them are strings and scalars, which cost nothing, so that table
+-- keeps nothing back for them.
+partial = function(node, st, depth, schema)
+  if node[1] ~= nil then
+    local n, left = #node, st.nodes
+    local first = n + 1
+    while first > 1 and left > 0 do
+      local c = 1 + counted(st, node[first - 1], left - 1, depth + 1, schema)
+      if c > left then break end
+      left, first = left - c, first - 1
+    end
+    local whole = st.nodes - left
+    st.nodes = left
+    if first > 1 and left > 0 then
+      st.nodes = left - 1
+      partial(node[first - 1], st, depth + 1, schema)
+    end
+    st.nodes = st.nodes + whole
+    for i = first, n do
+      st.nodes = st.nodes - 1
+      every_string(node[i], st, depth + 1, schema, true)
+    end
     return
   end
   local keys = keys_of(node, st)
   if not keys then return end
-  for _, k in ipairs(keys) do
+  local last = 0
+  for i, k in ipairs(keys) do
+    local v = node[k]
+    if type(v) == "table" and next(v) ~= nil and not (schema and k == "type" and schema_type(v)) then last = i end
+  end
+  for i, k in ipairs(keys) do
     local v = node[k]
     if not (schema and k == "type" and schema_type(v)) then
       take(st, k)
-      every_string(v, st, depth + 1, schema)
+      every_string(v, st, depth + 1, schema, false, i == last)
     end
   end
 end

@@ -142,14 +142,18 @@ function firstUnits(name: string, first: Set<number>): void {
 // nesting limit, which tooDeep() applies here: JSON either core decodes is
 // never cut by depth). Object keys are read in UTF-8 byte order, as Lua's
 // table.sort orders them. One oversized node must not starve what comes
-// after it: an object with more keys than the budget has left is skipped
-// whole, and an array with more items than that keeps its newest ones (the
-// last), half as many as the budget has left; `capped` says so. An empty
-// object or array (and null) adds nothing and is not counted. Tests lower
-// the bounds.
+// after it, whether its own keys and items are too many or only what is
+// below them: the nodes below a node are counted (nodesBelow) up to what the
+// budget has left. A node that fits is read whole; one that does not spends
+// at most half of what is left: an array its newest items that fit whole
+// and, with what remains, the one before them; an object its keys (skipped
+// whole when they alone are more than that), then each value by the same
+// rule. Counting is bounded too: past DEEP.count times DEEP.nodes nodes
+// counted, a node is taken not to fit. `capped` says so. An empty object or
+// array (and null) adds nothing and is not counted. Tests lower the bounds.
 // ---------------------------------------------------------------------------
 
-export const DEEP = { depth: 1000, nodes: 20000 };
+export const DEEP = { depth: 1000, nodes: 20000, count: 4 };
 
 type Decode = (s: string) => JsonValue;
 
@@ -161,6 +165,8 @@ interface WalkState {
   /** reads the value a path ends at (tool_fields); collect() otherwise */
   leaf?: (node: JsonValue, st: WalkState) => void;
   nodes: number;
+  /** what nodesBelow() may still count (see counted) */
+  counts: number;
   capped: boolean;
   /** json_decode, for "**" values that are a string of JSON */
   decode?: Decode;
@@ -169,7 +175,7 @@ interface WalkState {
 }
 
 function newState(decode?: Decode): WalkState {
-  return { out: [], nodes: DEEP.nodes, capped: false, decode, defer: [] };
+  return { out: [], nodes: DEEP.nodes, counts: DEEP.count * DEEP.nodes, capped: false, decode, defer: [] };
 }
 
 /** Lua string order (bytes): UTF-16 order except that a character above U+FFFF sorts after all others. */
@@ -205,21 +211,6 @@ function keysOf(node: { [k: string]: JsonValue }, st: WalkState): string[] | und
   return keys.some((k) => SURROGATE.test(k)) ? keys.sort(byteOrder) : keys.sort();
 }
 
-// Port of first_item: the index of the first item of array `node` the walk
-// reads, counted against the node budget: 0 when all of them fit; else the
-// newest items (the last ones), half as many as the budget has left.
-function firstItem(node: JsonValue[], st: WalkState): number {
-  const n = node.length;
-  if (n <= st.nodes) {
-    st.nodes -= n;
-    return 0;
-  }
-  st.capped = true;
-  const k = Math.floor(st.nodes / 2);
-  st.nodes -= k;
-  return n - k;
-}
-
 function take(st: WalkState, s: string): void {
   if (s !== "") st.out.push(s);
 }
@@ -238,10 +229,53 @@ function schemaType(v: JsonValue | undefined): boolean {
   return v.every((t) => typeof t === "string" && SCHEMA_TYPES.has(t));
 }
 
+// Port of nodes_below: the nodes the walk spends below `node` (at `depth`), its keys
+// or items and theirs; the count stops as soon as it is over `limit` and
+// returns a number over it, which only says the node does not fit.
+function nodesBelow(node: JsonValue | undefined, limit: number, depth: number, schema: boolean): number {
+  if (!isObj(node) || depth > DEEP.depth) return 0;
+  let n = 0;
+  if (Array.isArray(node)) {
+    n = node.length;
+    if (n > limit) return n;
+    for (const v of node) {
+      if (isObj(v)) {
+        n += nodesBelow(v, limit - n, depth + 1, schema);
+        if (n > limit) return n;
+      }
+    }
+    return n;
+  }
+  for (const k of Object.keys(node)) {
+    n++;
+    if (n > limit) return n;
+    const v = node[k];
+    if (isObj(v) && !(schema && k === "type" && schemaType(v))) {
+      n += nodesBelow(v, limit - n, depth + 1, schema);
+      if (n > limit) return n;
+    }
+  }
+  return n;
+}
+
+// Port of counted: nodesBelow(), charged to the walk's counting allowance at what
+// it counted, or limit + 1 when it stopped (the same whatever the key order);
+// once the allowance is spent a table does not fit.
+function counted(st: WalkState, node: JsonValue | undefined, limit: number, depth: number, schema: boolean): number {
+  if (!isObj(node) || (Array.isArray(node) ? node.length === 0 : !hasKey(node)) || depth > DEEP.depth) return 0;
+  if (st.counts <= 0) return limit + 1;
+  const n = nodesBelow(node, limit, depth, schema);
+  st.counts -= Math.min(n, limit + 1);
+  return n;
+}
+
 // Port of every_string: every key and string value below `node`, keys in
 // byte order; with `schema` (tool definitions) a `type` whose value is a JSON
-// Schema type name is left out, key and value.
-function everyString(node: JsonValue | undefined, st: WalkState, depth: number, schema = false): void {
+// Schema type name is left out, key and value. `fits`: the caller counted
+// this node and it fits the budget, so nothing below it is counted again.
+// `last`: nothing after it in its object needs the budget, so a node over it
+// may spend all of it.
+function everyString(node: JsonValue | undefined, st: WalkState, depth: number, schema = false, fits = false, last = false): void {
   if (typeof node === "string") return take(st, node);
   if (!isObj(node)) return;
   if (Array.isArray(node) ? node.length === 0 : !hasKey(node)) return;
@@ -249,18 +283,71 @@ function everyString(node: JsonValue | undefined, st: WalkState, depth: number, 
     st.capped = true;
     return;
   }
+  if (!fits && counted(st, node, st.nodes, depth, schema) > st.nodes) {
+    // over the budget: at most half of what is left, the rest kept for what follows
+    st.capped = true;
+    const keep = last ? 0 : st.nodes - Math.floor(st.nodes / 2);
+    st.nodes -= keep;
+    partial(node, st, depth, schema);
+    st.nodes += keep;
+    return;
+  }
   if (Array.isArray(node)) {
-    for (let i = firstItem(node, st); i < node.length; i++) everyString(node[i], st, depth + 1, schema);
+    st.nodes -= node.length;
+    for (const v of node) everyString(v, st, depth + 1, schema, true);
+    return;
+  }
+  for (const k of keysOf(node, st)!) {
+    const v = node[k];
+    if (schema && k === "type" && schemaType(v)) continue;
+    take(st, k);
+    everyString(v, st, depth + 1, schema, true);
+  }
+}
+
+// Port of partial: a node over the budget (st.nodes, its share), read as far
+// as it goes. An array: its newest items that fit whole, walking back from
+// the last, and the one before them with what is left. An object: its keys,
+// unless there are more than the budget has left, then each value as
+// everyString reads one; the last table among them keeps nothing back for
+// the strings and scalars after it, which cost nothing.
+function partial(node: JsonValue[] | { [k: string]: JsonValue }, st: WalkState, depth: number, schema: boolean): void {
+  if (Array.isArray(node)) {
+    const n = node.length;
+    let left = st.nodes;
+    let first = n;
+    while (first > 0 && left > 0) {
+      const c = 1 + counted(st, node[first - 1], left - 1, depth + 1, schema);
+      if (c > left) break;
+      left -= c;
+      first--;
+    }
+    const whole = st.nodes - left;
+    st.nodes = left;
+    if (first > 0 && left > 0) {
+      st.nodes = left - 1;
+      partial(node[first - 1] as JsonValue[] | { [k: string]: JsonValue }, st, depth + 1, schema);
+    }
+    st.nodes += whole;
+    for (let i = first; i < n; i++) {
+      st.nodes--;
+      everyString(node[i], st, depth + 1, schema, true);
+    }
     return;
   }
   const keys = keysOf(node, st);
   if (!keys) return;
-  for (const k of keys) {
+  let last = -1;
+  keys.forEach((k, i) => {
     const v = node[k];
-    if (schema && k === "type" && schemaType(v)) continue;
+    if (isObj(v) && (Array.isArray(v) ? v.length > 0 : hasKey(v)) && !(schema && k === "type" && schemaType(v))) last = i;
+  });
+  keys.forEach((k, i) => {
+    const v = node[k];
+    if (schema && k === "type" && schemaType(v)) return;
     take(st, k);
-    everyString(v, st, depth + 1, schema);
-  }
+    everyString(v, st, depth + 1, schema, false, i === last);
+  });
 }
 
 // Port of tool_leaf: a string whole, anything else every key and string in

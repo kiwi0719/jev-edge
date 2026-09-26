@@ -266,6 +266,25 @@ rule("makefile", function(r)
   if (read("Makefile") or ""):find("%$%$%(PWD%)") then fail(r, "Makefile uses $$(PWD); use $(CURDIR)") end
 end)
 
+-- 9b. A Grafana state timeline with value mappings colours by them: with
+--     color mode "thresholds" it turns values into threshold ranges before
+--     the mappings, and the Breaker state panel drew closed, open and
+--     half-open as one green "-inf..+inf" bar (audit lead-github-ops#33)
+rule("grafana-state-timeline", function(r)
+  local f = "ops/grafana/jev-edge.json"
+  local n = 0
+  for panel in (read(f) or ""):gmatch("\n    {\n(.-)\n    }") do
+    if panel:find('"type"%s*:%s*"state%-timeline"') then
+      n = n + 1
+      if panel:find('"mappings"%s*:%s*%[%s*{') and panel:find('"color"%s*:%s*{%s*"mode"%s*:%s*"thresholds"') then
+        fail(r, f .. ": state timeline " .. (panel:match('"title"%s*:%s*"([^"]*)"') or "?")
+          .. " has value mappings and color mode thresholds; use fixed")
+      end
+    end
+  end
+  if n == 0 then fail(r, f .. ": no state-timeline panel found") end
+end)
+
 -- 10. The shipped rule set is the same in Lua and TypeScript
 rule("rule-parity", function(r)
   local lua = read("rules/llm-endpoints.lua") or ""

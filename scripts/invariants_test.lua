@@ -95,6 +95,16 @@ local cases = {
   { "rockspec: does not load", { [spec] = edit(rs, "\nbuild = {", "\nbuild = {{") },
     "rockspec-modules", "does not load" },
 
+  -- grafana-state-timeline (audit lead-github-ops#33)
+  { "grafana: the breaker panel colours by thresholds again",
+    { ["ops/grafana/jev-edge.json"] = edit(read("ops/grafana/jev-edge.json"),
+        '("title": "Breaker state".-"color": {%s*"mode": )"fixed"', '%1"thresholds"') },
+    "grafana-state-timeline", "state timeline Breaker state has value mappings and color mode thresholds" },
+  { "grafana: no state timeline left to check",
+    { ["ops/grafana/jev-edge.json"] = edit(read("ops/grafana/jev-edge.json"),
+        '"type": "state%-timeline"', '"type": "timeseries"') },
+    "grafana-state-timeline", "no state-timeline panel found" },
+
   -- ci-ok: every job, whatever the jobs: line looks like (audit ci-release#5)
   { "ci.yml: new job not in needs", { [CI] = with_newjob(ci) }, "ci-ok", "ci-ok does not need job newjob" },
   { "ci.yml: jobs: with a comment, new job not in needs",

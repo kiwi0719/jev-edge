@@ -745,16 +745,7 @@
             }
           ],
           "color": {
-            "mode": "thresholds"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              }
-            ]
+            "mode": "fixed"
           }
         },
         "overrides": []

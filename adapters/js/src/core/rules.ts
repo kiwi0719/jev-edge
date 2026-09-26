@@ -84,7 +84,8 @@ export interface RulesCtx {
  * some subject. Returns null when the pattern is well formed. Used at rule
  * resolve time so a malformed watch path fails at startup, not per request.
  */
-export function patternError(p: string): string | null {
+export function patternError(pattern: string): string | null {
+  const p = luaBytes(pattern); // lstrlib walks bytes
   const n = p.length;
   let i = 0;
   // captures in opening order; true once closed (see the Lua original)
@@ -149,29 +150,45 @@ const LUA_CLASSES: Record<string, string> = {
 };
 
 /**
+ * `s` as Lua sees it: one character (U+0000..U+00FF) per UTF-8 byte. Lua
+ * patterns work on bytes, so a subject goes through this before a RegExp from
+ * luaPatternToRegExp is tested on it: `.` and a set then take one byte, as in
+ * Lua, and U+2028 is three of them. ASCII comes back as it is.
+ */
+export function luaBytes(s: string): string {
+  if (!/[^\x00-\x7f]/.test(s)) return s;
+  let out = "";
+  for (const b of utf8Bytes(s)) out += String.fromCharCode(b);
+  return out;
+}
+
+/**
  * Lua pattern -> RegExp for the subset rule files use: ^ $ anchors, literals,
  * %-escaped punctuation, the %a %d %s %w %x %p classes and [...] sets (with
  * those classes and ranges inside). Anything else in a watch path is
  * unsupported on this adapter and throws at load time rather than silently
  * matching differently. `-` is Lua's lazy `*?` outside a set and a plain
- * range/literal inside one. `.` is any character, as any byte in Lua: JS's
- * `.` stops at a line terminator (\n, \r, U+2028, U+2029), which a
+ * range/literal inside one. The RegExp matches bytes, as Lua does: the
+ * pattern is translated from its UTF-8 bytes and the subject must be passed
+ * through luaBytes (pathMatches does). `.` is any one byte, line terminators
+ * included: JS's `.` stops at \n, \r, U+2028 and U+2029, which a
  * percent-decoded path can hold.
  */
 const luaPatternCache = new Map<string, RegExp>();
-export function luaPatternToRegExp(p: string): RegExp {
-  const hit = luaPatternCache.get(p);
+export function luaPatternToRegExp(pattern: string): RegExp {
+  const hit = luaPatternCache.get(pattern);
   if (hit) return hit;
-  const perr = patternError(p);
-  if (perr) throw new Error(`malformed Lua pattern ${p}: ${perr}`);
+  const perr = patternError(pattern);
+  if (perr) throw new Error(`malformed Lua pattern ${pattern}: ${perr}`);
+  const p = luaBytes(pattern);
   let out = "";
   let i = 0;
   const n = p.length;
   const classFor = (k: string, inSet: boolean): string => {
     const body = LUA_CLASSES[k];
     if (body !== undefined) return inSet ? body : "[" + body + "]";
-    if (/[A-Za-z0-9]/.test(k)) throw new Error(`unsupported Lua class %${k} in ${p}`);
-    return "\\" + k; // escaped punctuation is a literal in both
+    if (/[A-Za-z0-9]/.test(k)) throw new Error(`unsupported Lua class %${k} in ${pattern}`);
+    return "\\" + k; // escaped punctuation (or a byte past ASCII) is a literal in both
   };
   while (i < n) {
     const c = p[i];
@@ -212,7 +229,7 @@ export function luaPatternToRegExp(p: string): RegExp {
     }
   }
   const re = new RegExp(out);
-  luaPatternCache.set(p, re);
+  luaPatternCache.set(pattern, re);
   return re;
 }
 
@@ -262,7 +279,7 @@ function foldPattern(p: string): string {
 export function pathMatches(path: string, patterns: string[] | undefined, caseSensitive?: boolean): string | null {
   if (!patterns || patterns.length === 0) return null;
   const cs = caseSensitive === true;
-  const s = canonicalPath(path ?? "", cs);
+  const s = luaBytes(canonicalPath(path ?? "", cs));
   for (const p of patterns) {
     if (luaPatternToRegExp(cs ? p : foldPattern(p)).test(s)) return p;
   }

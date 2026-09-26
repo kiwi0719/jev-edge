@@ -388,6 +388,13 @@ describe("rules.path_matches", function()
                          "/models/a\226\128\168b:generateContent", "/models/a\226\128\169b:generateContent" }) do
       assert.is_not_nil(R.path_matches(p, W), p)
     end
+    -- one byte: U+2028 is three (twin of adapters/js/test/core.test.ts)
+    assert.is_nil(R.path_matches("/a\226\128\168b", { "^/a.b$" }))
+    assert.equals("^/a...b$", R.path_matches("/a\226\128\168b", { "^/a...b$" }))
+    assert.is_nil(R.path_matches("/caf\195\169", { "^/caf.$" }))
+    assert.equals("^/caf..$", R.path_matches("/caf\195\169", { "^/caf..$" }))
+    assert.equals("^/caf\195\169$", R.path_matches("/caf\195\169", { "^/caf\195\169$" }))
+    assert.is_nil(R.path_matches("/\195\169", { "^/%a+$" }))
   end)
 
   it("is what rule_for uses", function()

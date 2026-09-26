@@ -3,7 +3,7 @@
 // id hygiene and the breaker's post-probe reset (twin of the Lua specs).
 import { describe, it, expect, vi } from "vitest";
 import * as core from "../src/core";
-import { luaPatternToRegExp, patternError, pathMatches, canonicalPath, evaluate as rulesEvaluate } from "../src/core/rules";
+import { luaPatternToRegExp, luaBytes, patternError, pathMatches, canonicalPath, evaluate as rulesEvaluate } from "../src/core/rules";
 import { resolve, load } from "../src/rules";
 import { truncateBytes, normalize, fingerprint, djb2 } from "../src/core/normalize";
 import { encodeReason } from "../src/core/verdict";
@@ -34,11 +34,21 @@ describe("luaPatternToRegExp", () => {
     expect(() => luaPatternToRegExp("^/%g")).toThrow(/unsupported/);
   });
 
-  it("reads '.' as any character, line terminators included, as Lua reads it as any byte", () => {
-    // Lua: ("/a\nb"):find("^/a.b$") and the same for \r, U+2028 and U+2029
-    for (const t of ["\n", "\r", "\u2028", "\u2029", "x"]) {
+  it("reads '.' as one byte, line terminators included, as Lua does", () => {
+    // Lua: ("/a\nb"):find("^/a.b$") and the same for \r
+    for (const t of ["\n", "\r", "x"]) {
       expect(luaPatternToRegExp("^/a.b$").test(`/a${t}b`), JSON.stringify(t)).toBe(true);
       expect(luaPatternToRegExp("^/a.-b$").test(`/a${t}${t}b`), JSON.stringify(t)).toBe(true);
+    }
+    // U+2028 and U+2029 are three bytes: ("/a\226\128\168b"):find("^/a.b$") is nil
+    for (const t of ["\u2028", "\u2029"]) {
+      const b = luaBytes(`/a${t}b`);
+      expect(b.length, JSON.stringify(t)).toBe(6);
+      expect(luaPatternToRegExp("^/a.b$").test(b), JSON.stringify(t)).toBe(false);
+      expect(luaPatternToRegExp("^/a...b$").test(b), JSON.stringify(t)).toBe(true);
+      expect(luaPatternToRegExp("^/a.-b$").test(b), JSON.stringify(t)).toBe(true);
+      expect(luaPatternToRegExp("^/a[^/]b$").test(b), JSON.stringify(t)).toBe(false);
+      expect(luaPatternToRegExp("^/a[^/]+b$").test(b), JSON.stringify(t)).toBe(true);
     }
     expect(luaPatternToRegExp("^/a[.]b$").test("/a\nb")).toBe(false);
     expect(luaPatternToRegExp("^/a%.b$").test("/a\nb")).toBe(false);
@@ -46,6 +56,13 @@ describe("luaPatternToRegExp", () => {
     for (const t of ["\n", "\r", "\u2028", "\u2029"]) {
       expect(pathMatches(`/models/a${t}b:generateContent`, W), JSON.stringify(t)).not.toBeNull();
     }
+    // pathMatches compares bytes, as core/rules.lua path_matches does
+    expect(pathMatches("/a\u2028b", ["^/a.b$"])).toBeNull();
+    expect(pathMatches("/a\u2028b", ["^/a...b$"])).toBe("^/a...b$");
+    expect(pathMatches("/caf\u00e9", ["^/caf.$"])).toBeNull();
+    expect(pathMatches("/caf\u00e9", ["^/caf..$"])).toBe("^/caf..$");
+    expect(pathMatches("/caf\u00e9", ["^/caf\u00e9$"])).toBe("^/caf\u00e9$");
+    expect(pathMatches("/\u00e9", ["^/%a+$"])).toBeNull();
   });
 
   it("patternError mirrors core/rules.lua", () => {

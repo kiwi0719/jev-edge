@@ -1,4 +1,4 @@
-.PHONY: test lint check invariants luajit-check golden golden-check calibrate labels context-lint test-js test-openresty bench bench-offline bench-judge bench-judge-live bench-chart dist opm-build rock-lint rock-pack rock-upload install live-check live-full live-openai soak shim e2e-envoy e2e-forward-auth e2e-apisix e2e-kong e2e-haproxy test-litellm suite-fetch suite-build suite-live suite-report suite-tooldocs-build suite-untrusted suite-untrusted-report suite-heldout-build suite-heldout suite-heldout-report conformance conformance-vectors conformance-check test-laya
+.PHONY: test lint check invariants luajit-check golden golden-check calibrate labels context-lint test-js test-openresty bench bench-offline bench-judge bench-judge-live bench-chart dist opm-build rock-lint rock-pack rock-upload install live-check live-full live-openai soak shim e2e-envoy e2e-forward-auth e2e-apisix e2e-kong e2e-haproxy test-litellm suite-fetch suite-build suite-live suite-report suite-tooldocs-build suite-untrusted suite-untrusted-report suite-heldout-build suite-heldout suite-heldout-report tools-fp-fetch tools-fp-build tools-fp tools-fp-report conformance conformance-vectors conformance-check test-laya
 
 test:
 	busted
@@ -181,6 +181,24 @@ suite-heldout:
 
 suite-heldout-report:
 	lua bench/suite/heldout_report.lua > bench/suite/heldout-report.md
+
+# False positives of tool-definition judging (bench/tools/README.md): 30 real
+# tool sets, the tools part alone, `injection` and `untrusted`. At most 66 calls.
+tools-fp-fetch:
+	sh bench/tools/fetch.sh
+
+tools-fp-build:
+	python3 bench/tools/build.py --raw bench/tools/raw
+
+tools-fp:
+	docker run --rm --env-file .env -v "$(CURDIR)":/work jev-edge-test sh -c \
+	  'resty --http-conf "lua_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt; lua_ssl_verify_depth 5;" \
+	   -I /work/adapters/openresty/lib -I /work /work/bench/tools/run.lua'
+
+# the generated tables, then everything from the "<!-- notes" line of the old report on
+tools-fp-report:
+	{ lua bench/tools/report.lua; sed -n '/^<!-- notes/,$$p' bench/tools/report.md 2>/dev/null; } > bench/tools/report.md.tmp
+	mv bench/tools/report.md.tmp bench/tools/report.md
 
 # openai-compat provider against an Ollama container on the jev-net network:
 #   docker network create jev-net; docker run -d --rm --name ollama --network jev-net ollama/ollama

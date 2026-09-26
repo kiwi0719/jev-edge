@@ -3,7 +3,7 @@
 // only the request shape and the stores differ (memory per process unless you
 // pass a Store).
 import { Buffer } from "node:buffer";
-import { createRuntime, evaluate, withVerdictHeaders, healthResponse, type Options, type Runtime } from "./runtime.js";
+import { createRuntime, evaluate, withVerdictHeaders, copyRequest, healthResponse, type Options, type Runtime } from "./runtime.js";
 import { headers as verdictHeaders, newVerdict, ERROR, SRC_ADAPTER, type Verdict } from "./core/verdict.js";
 
 const HEADERS = ["x-jev-verdict", "x-jev-score", "x-jev-source", "x-jev-reason", "x-jev-request-id", "x-jev-subject"];
@@ -269,9 +269,31 @@ export function nodeMiddleware(opts: Options) {
 // ---------------------------------------------------------------------------
 
 export interface HonoContextLike {
-  req: { raw: Request };
+  /** `arrayBuffer` is HonoRequest's: the body from Hono's cache when another
+   *  middleware already read it (c.req.json(), c.req.text()). */
+  req: { raw: Request; arrayBuffer?: () => Promise<ArrayBuffer> };
   set(key: string, value: unknown): void;
   header(name: string, value: string): void;
+}
+
+/**
+ * The request to judge: `c.req.raw`, or, when a middleware before this one
+ * read its body through HonoRequest (which consumes raw and caches the
+ * body for the handler), a copy of it with Hono's cached body. Judging raw
+ * then would fail open on every request.
+ */
+async function honoRequest(c: HonoContextLike): Promise<Request> {
+  const raw = c.req.raw;
+  if (!raw.bodyUsed || typeof c.req.arrayBuffer !== "function") return raw;
+  return copyRequest(raw, raw.headers, await c.req.arrayBuffer());
+}
+
+function newRequestId(): string {
+  try {
+    return crypto.randomUUID();
+  } catch {
+    return String(Date.now());
+  }
 }
 
 /**
@@ -283,9 +305,11 @@ export interface HonoContextLike {
  * place). The response gets X-Jev-Request-Id only: the verdict, score,
  * reason, source and subject are for the handlers and the log, never the
  * client, which could otherwise map the judge one request at a time (in
- * monitor mode too) and see when the breaker is open. Blocked requests
- * return the block response from the middleware; an adapter error fails
- * open.
+ * monitor mode too) and see when the breaker is open. A body a middleware
+ * before this one already read through HonoRequest is judged from Hono's
+ * cached copy. Blocked requests return the block response from the
+ * middleware; an adapter error fails open, with the client's X-Jev-*
+ * replaced by x-jev-verdict: error, x-jev-source: adapter as on a pass.
  */
 export function honoMiddleware(opts: Options) {
   const rt = runtimeOnce(opts);
@@ -296,16 +320,23 @@ export function honoMiddleware(opts: Options) {
       const r = rt();
       const url = new URL(c.req.raw.url);
       if (r.opts.health !== false && url.pathname === "/_jev/health" && c.req.raw.method === "GET") return healthResponse(r);
-      const ev = await evaluate(c.req.raw, r);
+      const request = await honoRequest(c);
+      const ev = await evaluate(request, r);
       verdict = ev.verdict;
       if (ev.response) {
         c.set("jev", verdict);
         return ev.response;
       }
-      forwarded = withVerdictHeaders(c.req.raw, verdict, ev.requestId, ev.subjectId);
+      forwarded = withVerdictHeaders(request, verdict, ev.requestId, ev.subjectId);
     } catch (e) {
       console.error("jev-edge: hono middleware error, failing open: " + (e instanceof Error ? e.message : String(e)));
       verdict = newVerdict({ verdict: ERROR, source: SRC_ADAPTER, reason: "adapter error" });
+      // the handlers must not see the client's X-Jev-* on this path either
+      try {
+        forwarded = withVerdictHeaders(c.req.raw, verdict, newRequestId());
+      } catch {
+        /* the original request, as the last resort */
+      }
     }
     c.set("jev", verdict);
     if (forwarded) {

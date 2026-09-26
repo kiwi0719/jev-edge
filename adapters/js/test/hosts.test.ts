@@ -466,9 +466,9 @@ describe("honoMiddleware", () => {
     }
   });
 
-  it("fails open when the runtime cannot be built", async () => {
+  it("fails open when the runtime cannot be built, with the client's X-Jev-* replaced", async () => {
     const mw = honoMiddleware({ config: { policy: { mode: "bogus" as never } } });
-    const { c, vars, resHeaders } = ctx(chat(BENIGN));
+    const { c, vars, resHeaders } = ctx(chat(BENIGN, { "x-jev-verdict": "safe", "x-jev-source": "l2", "x-jev-subject": "header:00" }));
     const err = vi.spyOn(console, "error").mockImplementation(() => {});
     let nexted = false;
     const out = await mw(c, async () => { nexted = true; });
@@ -476,8 +476,61 @@ describe("honoMiddleware", () => {
     expect(out).toBeUndefined();
     expect(nexted).toBe(true);
     expect((vars.jev as { verdict: string; source: string })).toMatchObject({ verdict: "error", source: "adapter" });
+    expect(c.req.raw.headers.get("x-jev-verdict")).toBe("error");
+    expect(c.req.raw.headers.get("x-jev-source")).toBe("adapter");
+    expect(c.req.raw.headers.get("x-jev-subject")).toBeNull();
+    expect(await c.req.raw.text()).toBe(BENIGN); // the body still goes to the handler
     expect(resHeaders["X-Jev-Source"]).toBeUndefined();
     expect(resHeaders["X-Jev-Verdict"]).toBeUndefined();
+    expect(resHeaders["X-Jev-Request-Id"]).toBe(c.req.raw.headers.get("x-jev-request-id"));
+  });
+
+  /** A context whose body a middleware before this one read through HonoRequest: raw consumed, the text cached. */
+  async function readBefore(req: Request) {
+    const text = await req.text();
+    const h = ctx(req);
+    const c = { ...h.c, req: { ...h.c.req, arrayBuffer: async () => new TextEncoder().encode(text).buffer as ArrayBuffer } };
+    return { ...h, c };
+  }
+
+  it("judges a body an earlier middleware already read, from Hono's cached copy", async () => {
+    const mw = honoMiddleware(opts());
+    const blocked = await readBefore(chat(ATTACK, { "x-jev-mock-score": "0.95", "x-jev-verdict": "safe" }));
+    let nexted = false;
+    const out = await mw(blocked.c, async () => { nexted = true; });
+    expect(out?.status).toBe(403);
+    expect(nexted).toBe(false);
+    const passed = await readBefore(chat(BENIGN, { "x-jev-verdict": "malicious" }));
+    await mw(passed.c, async () => {});
+    expect((passed.vars.jev as { verdict: string; source: string })).toMatchObject({ verdict: "safe", source: "l2" });
+    expect(passed.c.req.raw.headers.get("x-jev-verdict")).toBe("safe");
+    expect(await passed.c.req.raw.text()).toBe(BENIGN); // raw readable again, for handlers that read it
+  });
+
+  it("a consumed body with no cached copy fails open with the client's X-Jev-* replaced", async () => {
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const mw = honoMiddleware(opts());
+      // read straight off raw: HonoRequest has nothing cached and rejects
+      const req = chat(ATTACK, { "x-jev-mock-score": "0.95", "x-jev-verdict": "safe", "x-jev-source": "l2" });
+      await req.text();
+      const h = ctx(req);
+      const c = { ...h.c, req: { ...h.c.req, arrayBuffer: () => req.arrayBuffer() } };
+      let nexted = false;
+      expect(await mw(c, async () => { nexted = true; })).toBeUndefined();
+      expect(nexted).toBe(true);
+      expect(c.req.raw.headers.get("x-jev-verdict")).toBe("error");
+      expect(c.req.raw.headers.get("x-jev-source")).toBe("adapter");
+      // no HonoRequest at all (another framework): the runtime's own error verdict, headers replaced as well
+      const bare = chat(ATTACK, { "x-jev-mock-score": "0.95", "x-jev-verdict": "safe" });
+      await bare.text();
+      const b = ctx(bare);
+      await mw(b.c, async () => {});
+      expect(b.c.req.raw.headers.get("x-jev-verdict")).toBe("error");
+      expect(b.c.req.raw.headers.get("x-jev-source")).toBe("adapter");
+    } finally {
+      err.mockRestore();
+    }
   });
 
   it("sets c.get('jev') and continues", async () => {

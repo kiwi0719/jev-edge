@@ -114,7 +114,7 @@ app.use("/v1/*", honoMiddleware({ config: { … } }));
 app.post("/v1/chat/completions", (c) => c.json({ verdict: c.get("jev") }));
 ```
 
-`c.req.raw` is replaced with the request carrying the verdict's `X-Jev-*` (client-supplied ones removed). The response gets `X-Jev-Request-Id` only: the verdict, score, reason, source and subject stay with the handlers and the log.
+`c.req.raw` is replaced with the request carrying the verdict's `X-Jev-*` (client-supplied ones removed), on a middleware error too, where they say `error` / `adapter`. A body an earlier middleware already read with `c.req.json()` or `c.req.text()` is judged from Hono's cached copy. The response gets `X-Jev-Request-Id` only: the verdict, score, reason, source and subject stay with the handlers and the log.
 
 ## AWS Lambda@Edge
 

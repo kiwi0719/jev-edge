@@ -544,7 +544,24 @@ export function withVerdictHeaders(request: Request, verdict: core.Verdict, requ
   for (const [k, v] of Object.entries(core.verdict.headers(verdict))) headers.set(k, v);
   headers.set("X-Jev-Request-Id", requestId);
   if (subjectId) headers.set("X-Jev-Subject", subjectId);
+  // new Request(request) throws on a body something already read; the
+  // headers must still be stripped and set, so that copy goes without it
+  if (request.bodyUsed) return copyRequest(request, headers);
   return new Request(request, { headers });
+}
+
+/**
+ * `request`'s URL and method with these headers and, when given (and the
+ * method takes one), this body: for a request whose own body something
+ * already read, which `new Request(request)` refuses. The platform's `cf`
+ * object goes along where there is one (workerd takes it in the init), so
+ * the copy is still a Cloudflare request to clientIpOf and requestIdFor.
+ */
+export function copyRequest(request: Request, headers: HeadersInit, body?: BodyInit): Request {
+  const init: RequestInit = { method: request.method, headers };
+  if (body !== undefined && request.method !== "GET" && request.method !== "HEAD") init.body = body;
+  if ("cf" in request) (init as { cf?: unknown }).cf = (request as { cf?: unknown }).cf;
+  return new Request(request.url, init);
 }
 
 export function healthResponse(rt: Runtime): Response {

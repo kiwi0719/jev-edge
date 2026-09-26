@@ -60,7 +60,8 @@ end
 p:close()
 assert(spec, "no rockspec at the repo root")
 local CI = ".github/workflows/ci.yml"
-local rs, ci = read(spec), read(CI)
+local TSRULES = "adapters/js/src/rules/index.ts"
+local rs, ci, tsr = read(spec), read(CI), read(TSRULES)
 
 local function with_newjob(s)
   return edit(s, "\n  ci%-ok:\n",
@@ -141,6 +142,11 @@ local cases = {
     "ci-ok", "ci-ok does not run jq -e" },
   { "ci.yml: jq line commented out", { [CI] = edit(ci, "\n(%s*)(echo[^\n]*jq %-e 'all)", "\n%1# %2") },
     "ci-ok", "ci-ok does not run jq -e" },
+
+  -- rule-parity: a path watched for any body on one runtime only
+  { "rules: json_only_paths emptied in the TS copy",
+    { [TSRULES] = edit(tsr, 'json_only_paths: %["%^/%$"%]', "json_only_paths: []") },
+    "rule-parity", "json_only_paths differ" },
 }
 
 local bad = 0

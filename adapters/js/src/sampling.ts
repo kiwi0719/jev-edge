@@ -3,7 +3,7 @@
 import * as normalize from "./core/normalize.js";
 import { MALICIOUS, SRC_L1, type Verdict } from "./core/verdict.js";
 import type { Config } from "./core/defaults.js";
-import { contentType, pathMatches, type Req, type Rule } from "./core/rules.js";
+import { contentType, ruleFor, type Req, type Rule } from "./core/rules.js";
 
 const RANK: Record<string, number> = { skipped: -1, error: 0, safe: 1, suspicious: 2, malicious: 3 };
 
@@ -26,7 +26,9 @@ export function shouldSample(cfg: Config, v: Verdict, rand: () => number = Math.
 }
 
 export function buildSample(cfg: Config, v: Verdict, req: Req, rules: Rule[], rid: string, ts = Date.now() / 1000): Sample {
-  const rule = rules.find((r) => pathMatches(req.path ?? "", r.watch_paths, r.paths_case_sensitive) !== null); // watch_paths are Lua patterns
+  // the rule core judged with, as OpenResty and APISIX pick it (rules.rule_for):
+  // path, json_only_paths, method and content type
+  const rule = ruleFor(req, rules);
   let text = "";
   if (rule && typeof req.body === "string") {
     const ct = contentType(req.headers);

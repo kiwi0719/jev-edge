@@ -274,6 +274,32 @@ describe("normalize: documents and retrieved results", function()
       { file_id = "f", text = "found one" }, { file_id = "g", text = "found two" } } } } }
     assert.equals("found one\nfound two", N.extract_json(d, { "input" }))
   end)
+
+  it("reads documents, prompt.variables and Gemini function responses whole, keys in byte order", function()
+    assert.equals("rank\nsnippet\nS\ntags\na\ntitle\nT\nplain", N.extract_json({ documents = {
+      { title = "T", snippet = "S", rank = 1, tags = { "a", "" } }, "plain" } }, { "documents" }))
+    assert.equals("city\nParis\nq\ntext\nwhy\ntype\ninput_text", N.extract_json({ prompt = { id = "p",
+      variables = { city = "Paris", q = { type = "input_text", text = "why" } } } }, { "prompt.variables" }))
+    -- a path that only ends in the same name is read as content parts
+    assert.equals("", N.extract_json({ meta = { documents = { title = "not read" } } }, { "meta.documents" }))
+    assert.equals("hi\na\n1\nb\n2", N.extract_json({ contents = { { parts = { { text = "hi" },
+      { functionResponse = { name = "f", response = { b = "2", a = "1" } } } } } } }, { "contents[*].parts" }))
+  end)
+
+  it("reads an object past the sort budget in full, only not in byte order", function()
+    local big = {}
+    for i = 0, 20000 do big["k" .. i] = "v" .. i end
+    local _, v = N.extract_json({ documents = { big, { b = "2", a = "1" } } }, { "documents" })
+    assert.equals(40002 + 4, #v)
+    local seen, n = {}, 0
+    for k = 1, 40002 do
+      if not seen[v[k]] then n = n + 1 end
+      seen[v[k]] = true
+    end
+    assert.equals(40002, n)
+    -- the keys the budget has left are still sorted
+    assert.same({ "a", "1", "b", "2" }, { v[40003], v[40004], v[40005], v[40006] })
+  end)
 end)
 
 describe("normalize.chunks", function()

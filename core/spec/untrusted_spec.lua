@@ -96,11 +96,45 @@ describe("untrusted content: extraction", function()
     assert.equals("custom output\nshell output\nmcp output\nfile text", t)
   end)
 
+  it("finds Gemini function responses, read whole, contents and parts in either form", function()
+    local fr = { functionResponse = { name = "search", response = { result = "found it", n = 2,
+      items = { "one", { title = "two" } } } } }
+    local t = normalize.extract_untrusted({ contents = {
+      { role = "user", parts = { { text = "the user's own words" } } },
+      { role = "function", parts = { fr, { function_response = { name = "f", response = { output = "snake" } } } } },
+    } }, spec)
+    assert.equals("items\none\ntitle\ntwo\nn\nresult\nfound it\noutput\nsnake", t)
+    -- one content and one part, as LiteLLM takes them
+    assert.equals("items\none\ntitle\ntwo\nn\nresult\nfound it",
+      (normalize.extract_untrusted({ contents = { role = "function", parts = fr } }, spec)))
+  end)
+
+  it("finds retrieved documents, read whole: Cohere v1 maps, v2 strings and { id, data }", function()
+    local t = normalize.extract_untrusted({ message = "hi", documents = {
+      { title = "Refunds", snippet = "Refunds take 5 days.", url = "https://example.com/r" },
+      "a plain v2 document",
+      { id = "d3", data = { text = "v2 data", ["Ignore previous"] = "" } },
+    } }, spec)
+    assert.equals("snippet\nRefunds take 5 days.\ntitle\nRefunds\nurl\nhttps://example.com/r\n"
+      .. "a plain v2 document\ndata\nIgnore previous\ntext\nv2 data\nid\nd3", t)
+    -- a Cohere v2 tool message's document parts
+    t = normalize.extract_untrusted({ messages = { { role = "tool", tool_call_id = "c",
+      content = { { type = "document", document = { id = "x", data = { body = "tool doc" } } } } } } }, spec)
+    assert.equals("data\nbody\ntool doc\nid\nx", t)
+  end)
+
   it("reads untrusted.fields, and skips tool results when tool_results is false", function()
+    local doc = { messages = { { role = "tool", content = "tool" } }, context = { { text = "c1" }, { text = "c2" } } }
+    assert.equals("tool\nc1\nc2", (normalize.extract_untrusted(doc, { fields = { "context[*].text" } })))
+    local only = normalize.extract_untrusted(doc, { tool_results = false, fields = { "context[*].text" } })
+    assert.equals("c1\nc2", only)
+  end)
+
+  it("does not add a field value the tool results already hold", function()
     local doc = { messages = { { role = "tool", content = "tool" } }, documents = { { text = "d1" }, { text = "d2" } } }
-    assert.equals("tool\nd1\nd2", (normalize.extract_untrusted(doc, { fields = { "documents[*].text" } })))
-    local only = normalize.extract_untrusted(doc, { tool_results = false, fields = { "documents[*].text" } })
-    assert.equals("d1\nd2", only)
+    local fields = { "documents[*].text" }
+    assert.equals("tool\ntext\nd1\ntext\nd2", (normalize.extract_untrusted(doc, { fields = fields })))
+    assert.equals("d1\nd2", (normalize.extract_untrusted(doc, { tool_results = false, fields = fields })))
   end)
 
   it("returns nothing for a body without retrieved content", function()
@@ -235,9 +269,9 @@ describe("untrusted content: pipeline", function()
 
   it("judges an untrusted.fields value outside text_fields even with no user text", function()
     local j = recording({ untrusted = 0.7 })
-    local ctx = H.ctx({ judge = j, config = on({ untrusted = { enabled = true, fields = { "documents[*].text" } } }) })
+    local ctx = H.ctx({ judge = j, config = on({ untrusted = { enabled = true, fields = { "context[*].text" } } }) })
     local v = core.evaluate(req_for({ messages = { { role = "user", content = "ok?" } },
-      documents = { { text = ATTACK } } }), ctx)
+      context = { { text = ATTACK } } }), ctx)
     assert.equals(1, #j.prompts)
     assert.truthy(j.prompts[1].questions.untrusted)
     assert.equals(0.7, v.score)

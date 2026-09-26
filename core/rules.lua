@@ -179,6 +179,33 @@ end
 
 local CT_NOT_WATCHED = "content-type not watched"
 
+-- A path in the rule's json_only_paths is watched only for a JSON body: one
+-- normalize.extract() reads as JSON ("json"), or declared JSON the decoder
+-- refused whose text fields the scanner found ("scan"). TGI serves
+-- generation at the site root, where a site's own POST (a login form, an
+-- upload, text that starts with {) must not reach the judge, or the IP and
+-- subject reputation checks. A body extract() cannot read is decided on what
+-- there is: past max_body_bytes, still encoded, empty, or with no
+-- ctx.json_decode, its first byte or JSON media type (normalize.json_like on
+-- the head the adapter kept); with no body at all, the Content-Type alone.
+-- @return true when the rule does not watch the request; and extract()'s
+--         results in a list when it ran, for judged() to reuse
+local NOT_JSON = "path not watched: body not JSON"
+local function json_only_miss(req, rule, ct, ctx)
+  local jo = rule.json_only_paths
+  if type(jo) ~= "table" or #jo == 0 or not path_matches(req.path, jo, rule.paths_case_sensitive) then
+    return false
+  end
+  local body, decode = req.body, ctx and ctx.json_decode
+  if type(body) ~= "string" or body == "" or not decode
+     or math.max(tonumber(req.body_size) or 0, #body) > (rule.max_body_bytes or _M.MAX_BODY_BYTES)
+     or (_M.content_encoding(req.headers) ~= "" and not req.decoded) then
+    return not normalize.json_like(req.body_head or body, ct)
+  end
+  local ex = { normalize.extract(body, ct, rule.text_fields, decode) }
+  return ex[2] ~= "json" and ex[2] ~= "scan", ex
+end
+
 -- Retrieved content (tool results, untrusted.fields) when untrusted judging is
 -- on for `rule`, cut to its own judging window. Only from a body parsed whole:
 -- past max_body_bytes there is no JSON structure to find it in.
@@ -194,12 +221,13 @@ local function untrusted_part(decoded, rule, ctx)
 end
 
 -- Text to judge from the body (or, past max_body_bytes, from the head and
--- tail the adapter handed over), cut to the judging window.
+-- tail the adapter handed over), cut to the judging window. `ex`: the body's
+-- extract() results json_only_miss already has, or nil.
 -- @return text, reason-or-nil, hit pattern, windowed, chunks (list, when
 --         judged in more than one piece), capped (chunks did not cover it all),
 --         untrusted ({ text, windowed } when untrusted judging is on and the
 --         body carries retrieved content)
-local function judged(req, rule, ctx, ct, size)
+local function judged(req, rule, ctx, ct, size, ex)
   local max = rule.max_body_bytes or _M.MAX_BODY_BYTES
   -- a media type is taken at its word only when the bytes agree (or there
   -- are none to look at): anything that reads as JSON or text is judged
@@ -234,7 +262,11 @@ local function judged(req, rule, ctx, ct, size)
     text, partial = table.concat(values, "\n"), true
   else
     local kind, decoded
-    text, kind, values, decoded = normalize.extract(req.body, ct, rule.text_fields, ctx and ctx.json_decode)
+    if ex then
+      text, kind, values, decoded = ex[1], ex[2], ex[3], ex[4]
+    else
+      text, kind, values, decoded = normalize.extract(req.body, ct, rule.text_fields, ctx and ctx.json_decode)
+    end
     if media and (kind == "binary" or kind == "none") then return nil, CT_NOT_WATCHED end
     if kind == "binary" then return nil, "unjudgeable: binary body" end
     -- declared JSON the decoder refused, with no text-field value to scan
@@ -276,9 +308,15 @@ end
 -- @return result, text, reason, windowed, chunks, capped, untrusted ({ text,
 --         windowed } of retrieved content to judge on its own, or nil)
 function _M.evaluate(req, rule, ctx)
-  -- 1. path watch list
+  -- 1. path watch list; a json_only_paths path only for a JSON body (what
+  --    extract() reads it as, or the Content-Type when there is no body)
   if not path_matches(req.path, rule.watch_paths, rule.paths_case_sensitive) then
     return _M.PASS, "", "path not watched"
+  end
+  local ct = _M.content_type(req.headers)
+  local miss, ex = json_only_miss(req, rule, ct, ctx)
+  if miss then
+    return _M.PASS, "", NOT_JSON
   end
 
   -- 2. reputation: one dict lookup, before anything that needs a body, so a
@@ -305,7 +343,6 @@ function _M.evaluate(req, rule, ctx)
   if rule.methods and not rule.methods[(req.method or ""):upper()] then
     return _M.PASS, "", "method not watched"
   end
-  local ct = _M.content_type(req.headers)
   if not ct_watched(ct, rule) then
     return _M.PASS, "", CT_NOT_WATCHED
   end
@@ -328,7 +365,7 @@ function _M.evaluate(req, rule, ctx)
 
   -- 6+7. extract text (whole body, or head + tail past max_body_bytes), regex
   --      prefilter over all of it, judging window, natural-language length
-  local text, unj, hit, windowed, chunks, capped, untrusted = judged(req, rule, ctx, ct, size)
+  local text, unj, hit, windowed, chunks, capped, untrusted = judged(req, rule, ctx, ct, size, ex)
   if unj == CT_NOT_WATCHED then return _M.PASS, "", unj end
   if unj then return _M.UNJUDGEABLE, "", unj end
   local min_chars = rule.min_text_chars or 20
@@ -361,9 +398,12 @@ end
 function _M.judged_text(req, rule, ctx)
   if not rule or not req then return "" end
   local size = math.max(tonumber(req.body_size) or 0, req.body and #req.body or 0)
+  local ct = _M.content_type(req.headers)
+  local miss, ex = json_only_miss(req, rule, ct, ctx)
+  if miss then return "" end
   -- one window, never chunks: L3 re-judges off the request path with one call
   local one = setmetatable({ max_judge_chunks = 1 }, { __index = rule })
-  local text = judged(req, one, ctx, _M.content_type(req.headers), size)
+  local text = judged(req, one, ctx, ct, size, ex)
   return text or ""
 end
 
@@ -464,18 +504,28 @@ function _M.resolve(spec, load)
   for k, v in pairs(spec) do if k ~= "extends" then out[k] = v end end
   if not out.id then return nil, "rule needs an id" end
   if type(out.watch_paths) ~= "table" then return nil, "rule " .. out.id .. " needs watch_paths" end
-  -- watch_paths are Lua patterns; a malformed one raises on every request.
-  for i, p in ipairs(out.watch_paths) do
-    if type(p) ~= "string" then return nil, "rule " .. out.id .. ": watch_paths[" .. i .. "] must be a string" end
-    local perr = _M.pattern_error(p)
-    if perr then return nil, "rule " .. out.id .. ": watch_paths[" .. i .. "] " .. perr end
+  if out.json_only_paths ~= nil and type(out.json_only_paths) ~= "table" then
+    return nil, "rule " .. out.id .. ": json_only_paths must be a list of patterns"
+  end
+  -- watch_paths and json_only_paths are Lua patterns; a malformed one raises
+  -- on every request.
+  for _, k in ipairs({ "watch_paths", "json_only_paths" }) do
+    for i, p in ipairs(out[k] or {}) do
+      if type(p) ~= "string" then return nil, "rule " .. out.id .. ": " .. k .. "[" .. i .. "] must be a string" end
+      local perr = _M.pattern_error(p)
+      if perr then return nil, "rule " .. out.id .. ": " .. k .. "[" .. i .. "] " .. perr end
+    end
   end
   local uok, uerr = defaults.validate_untrusted(out.untrusted, "rule " .. out.id .. ": untrusted")
   if not uok then return nil, uerr end
   if not out.text_fields then
-    out.text_fields = { "system", "template", "messages[*].content", "messages[*].parts", "prompt", "input",
-                        "input[*].output", "query", "text", "suffix", "input_prefix", "input_suffix",
-                        "input_extra[*].text" }
+    out.text_fields = { "system", "instructions", "preamble", "system_prompt", "systemInstruction.parts",
+                        "system_instruction.parts", "documents", "template", "messages[*].content",
+                        "messages[*].parts", "contents[*].parts", "contents.parts", "chat_history[*].message",
+                        "message", "prompt", "prompt.prompt_string", "prompt[*].prompt_string", "prompt.variables",
+                        "input", "input[*].output", "inputs", "instances[*].inputs",
+                        "instances[*].messages[*].content", "query", "text", "suffix", "input_prefix",
+                        "input_suffix", "input_extra[*].text" }
   end
   if not out.templates then out.templates = { "injection" } end
   return out
@@ -492,15 +542,18 @@ function _M.resolve_all(specs, load)
   return out
 end
 
---- The rule evaluate_all judged a request with: the first one whose path,
--- method and content type all match. Adapters that rebuild the prompt off the
--- request path (L3, sampling) use it; path alone is not enough, since a
--- tenant rule can match the path and still hand the request to the general
--- rule on method or content type.
-function _M.rule_for(req, rules)
+--- The rule evaluate_all judged a request with: the first one whose path
+-- (json_only_paths included), method and content type all match. Adapters
+-- that rebuild the prompt off the request path (L3, sampling) use it; path
+-- alone is not enough, since a tenant rule can match the path and still hand
+-- the request to the general rule on method or content type.
+-- @param ctx { json_decode = fn }, as evaluate_all had it: a json_only_paths
+--        path is decided on what the decoder makes of the body
+function _M.rule_for(req, rules, ctx)
   local ct = _M.content_type(req.headers)
   for _, r in ipairs(rules or {}) do
     if path_matches(req.path, r.watch_paths, r.paths_case_sensitive)
+      and not json_only_miss(req, r, ct, ctx)
       and not (r.methods and not r.methods[(req.method or ""):upper()])
       and ct_watched(ct, r) then
       return r

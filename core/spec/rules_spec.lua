@@ -229,6 +229,105 @@ describe("rules.evaluate_all", function()
   end)
 end)
 
+describe("rules: json_only_paths", function()
+  local ctx
+  before_each(function() ctx = H.ctx() end)
+  local ASK = "Please write a detailed summary of the attached quarterly report."
+  local FORM = "username=alice%40example.com&password=hunter2hunter2&remember=on"
+  local function root(ct, body, over)
+    local r = { method = "POST", path = "/", headers = { ["content-type"] = ct }, body = body,
+                body_size = body and #body or 0, client_ip = "203.0.113.7" }
+    for k, v in pairs(over or {}) do r[k] = v end
+    return r
+  end
+
+  it("watches TGI's root for a JSON body only", function()
+    local json = H.json.encode({ inputs = ASK })
+    assert.equals(R.SUSPECT, (R.evaluate(root("application/json", json), rule, ctx)))
+    assert.equals(R.SUSPECT, (R.evaluate(root(nil, json), rule, ctx)))
+    assert.equals(R.SUSPECT, (R.evaluate(root("text/plain", " \n" .. json), rule, ctx)))
+    for _, c in ipairs({
+      { "application/x-www-form-urlencoded", FORM }, { nil, FORM }, { "text/plain", ASK },
+      { "multipart/form-data; boundary=B", "--B\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\n"
+        .. ASK .. "\r\n--B--\r\n" },
+      { "application/octet-stream", "\0\1\2 binary upload body" },
+      -- what extract() reads the body as decides, not its first byte
+      { "text/plain", "{" .. ASK .. "}" }, { nil, "[" .. ASK },
+      { "application/x-www-form-urlencoded", "[note]=" .. ASK:gsub(" ", "+") },
+      { "application/json", '{"username":"alice","password":"hunter2' },
+    }) do
+      local r, text, reason = R.evaluate(root(c[1], c[2]), rule, ctx)
+      assert.equals(R.PASS, r, c[1])
+      assert.equals("", text)
+      assert.equals("path not watched: body not JSON", reason)
+    end
+  end)
+
+  it("decides before the reputation checks, on the Content-Type when there is no body", function()
+    ctx.cache:set("rep:203.0.113.7", { blocked_until = 2000 })
+    ctx.clock = function() return 1000 end
+    assert.equals(R.PASS, (R.evaluate(root("application/x-www-form-urlencoded", FORM), rule, ctx)))
+    assert.equals(R.PASS, (R.evaluate(root("text/plain", "{" .. ASK), rule, ctx)))
+    assert.equals(R.PASS, (R.evaluate(root(nil, nil, { method = "GET" }), rule, ctx)))
+    assert.equals(R.BLOCK, (R.evaluate(root("application/json", H.json.encode({ inputs = ASK })), rule, ctx)))
+    assert.equals(R.BLOCK, (R.evaluate(root("application/json", nil, { body_size = 100 }), rule, ctx)))
+  end)
+
+  it("looks at the head past max_body_bytes", function()
+    local big = { body_size = 4 * 1048576 }
+    assert.equals(R.PASS, (R.evaluate(root("application/x-www-form-urlencoded", FORM, big), rule, ctx)))
+    local r = R.evaluate(root(nil, nil, { body_head = '{"inputs":"' .. ASK .. '"', body_size = 4 * 1048576 }),
+      rule, ctx)
+    assert.equals(R.SUSPECT, r)
+    r = R.evaluate(root(nil, nil, { body_head = FORM, body_size = 4 * 1048576 }), rule, ctx)
+    assert.equals(R.PASS, r)
+  end)
+
+  it("hands the request to the next rule, and L3 the same rule and text", function()
+    local site = assert(R.resolve({ id = "site", watch_paths = { "^/$" } }, function() end))
+    local req = root("application/x-www-form-urlencoded", "note=" .. ASK:gsub(" ", "+"))
+    local r, text, _, by = R.evaluate_all(req, { rule, site }, ctx)
+    assert.equals(R.SUSPECT, r)
+    assert.equals(ASK, text)
+    assert.equals("site", by.id)
+    assert.equals("site", R.rule_for(req, { rule, site }).id)
+    assert.is_nil(R.rule_for(req, { rule }))
+    assert.equals("", R.judged_text(req, rule, ctx))
+    assert.equals(ASK, R.judged_text(req, site, ctx))
+    -- text that starts with {: rule_for decides on what the decoder makes of it
+    req = root("text/plain", "{" .. ASK .. "}")
+    r, text, _, by = R.evaluate_all(req, { rule, site }, ctx)
+    assert.equals(R.SUSPECT, r)
+    assert.equals("{" .. ASK .. "}", text)
+    assert.equals("site", by.id)
+    assert.equals("site", R.rule_for(req, { rule, site }, ctx).id)
+    assert.equals("", R.judged_text(req, rule, ctx))
+    assert.equals("{" .. ASK .. "}", R.judged_text(req, site, ctx))
+  end)
+
+  it("decides a body it cannot parse on its first byte or media type", function()
+    local gz = { ["content-type"] = "application/json", ["content-encoding"] = "gzip" }
+    assert.equals(R.UNJUDGEABLE, (R.evaluate(root(nil, "\31\8\0\0 bytes", { headers = gz }), rule, ctx)))
+    local plain = { ["content-type"] = "text/plain", ["content-encoding"] = "gzip" }
+    assert.equals(R.PASS, (R.evaluate(root(nil, "\31\8\0\0 bytes", { headers = plain }), rule, ctx)))
+    -- without a decoder, as before: the first byte (extract() then reads nothing)
+    local nodec = H.ctx()
+    nodec.json_decode = nil
+    local req = root("text/plain", "{" .. ASK .. "}")
+    assert.equals("llm-endpoints", R.rule_for(req, { rule }).id)
+    assert.is_nil(R.rule_for(req, { rule }, ctx))
+    assert.equals("no text", select(3, R.evaluate(req, rule, nodec)))
+  end)
+
+  it("applies only to the paths it lists", function()
+    local r = R.evaluate(H.chat_req("", { path = "/v1/completions", body = "prompt=" .. ASK:gsub(" ", "+"),
+      headers = { ["content-type"] = "application/x-www-form-urlencoded" } }), rule, ctx)
+    assert.equals(R.SUSPECT, r)
+    local any = setmetatable({ json_only_paths = {} }, { __index = rule })
+    assert.equals(R.SUSPECT, (R.evaluate(root("application/x-www-form-urlencoded", "note=" .. ASK), any, ctx)))
+  end)
+end)
+
 describe("rules.path_matches", function()
   local W = rule.watch_paths
 
@@ -266,6 +365,36 @@ describe("rules.path_matches", function()
 
   it("folds ASCII only, like the TypeScript core", function()
     assert.is_nil(R.path_matches("/v1/\195\137", { "^/v1/\195\169" }))   -- É is not é
+  end)
+
+  it("matches Gemini's camelCase routes with and without folding", function()
+    for _, p in ipairs({ "/v1beta/models/gemini-2.0-flash:generateContent", "/models/gpt-4o:streamGenerateContent",
+                         "/v1/projects/p/locations/l/publishers/google/models/g:generateContent" }) do
+      assert.is_not_nil(R.path_matches(p, W), p)
+      assert.is_not_nil(R.path_matches(p, W, true), p)
+    end
+    assert.is_nil(R.path_matches("/v1beta/models/g:countTokens", W, true))
+  end)
+
+  it("anchors Cohere's /v2/chat", function()
+    assert.is_not_nil(R.path_matches("/v2/chat", W))
+    assert.is_not_nil(R.path_matches("/v2/chat/", W))
+    assert.is_nil(R.path_matches("/v2/chatbots", W))
+    assert.is_nil(R.path_matches("/v2/chat/history", W))
+  end)
+
+  it("matches any byte with '.', line terminators included", function()
+    for _, p in ipairs({ "/models/a\nb:generateContent", "/models/a\rb:generateContent",
+                         "/models/a\226\128\168b:generateContent", "/models/a\226\128\169b:generateContent" }) do
+      assert.is_not_nil(R.path_matches(p, W), p)
+    end
+    -- one byte: U+2028 is three (twin of adapters/js/test/core.test.ts)
+    assert.is_nil(R.path_matches("/a\226\128\168b", { "^/a.b$" }))
+    assert.equals("^/a...b$", R.path_matches("/a\226\128\168b", { "^/a...b$" }))
+    assert.is_nil(R.path_matches("/caf\195\169", { "^/caf.$" }))
+    assert.equals("^/caf..$", R.path_matches("/caf\195\169", { "^/caf..$" }))
+    assert.equals("^/caf\195\169$", R.path_matches("/caf\195\169", { "^/caf\195\169$" }))
+    assert.is_nil(R.path_matches("/\195\169", { "^/%a+$" }))
   end)
 
   it("is what rule_for uses", function()

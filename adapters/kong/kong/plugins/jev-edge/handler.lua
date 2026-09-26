@@ -200,7 +200,7 @@ end
 local function maybe_async(rt, v, req)
   if not v.async then return end
   if rt.breaker:state() ~= breaker_m.CLOSED then return end
-  local rule = rules_mod.rule_for(req, rt.rules)
+  local rule = rules_mod.rule_for(req, rt.rules, { json_decode = cjson.decode })
   if not rule then return end
   local text = rules_mod.judged_text(req, rule, { json_decode = cjson.decode, re_find = re_find })
   if text == "" then return end
@@ -217,7 +217,7 @@ end
 local function maybe_sample(rt, v, req)
   if not sampling.should_sample(rt.cfg, v, math.random) then return end
   local ok, err = pcall(function()
-    local s = sampling.build(rt.cfg, v, req, rules_mod.rule_for(req, rt.rules),
+    local s = sampling.build(rt.cfg, v, req, rules_mod.rule_for(req, rt.rules, { json_decode = cjson.decode }),
       { rid = ngx.var.request_id, ts = ngx.now(), json_decode = cjson.decode })
     sampling.store(rt.cfg, cache, s)
     if rt.cfg.sampling.log then kong.log.info("jev-edge sample: ", cjson.encode(s)) end

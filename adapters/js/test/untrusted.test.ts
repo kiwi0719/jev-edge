@@ -45,10 +45,43 @@ describe("untrusted: extraction", () => {
     expect(v).toEqual(["custom output", "shell output", "mcp output", "file text"]);
   });
 
+  it("finds Gemini function responses, read whole, contents and parts in either form", () => {
+    const fr = { functionResponse: { name: "search", response: { result: "found it", n: 2, items: ["one", { title: "two" }] } } };
+    const v = normalize.extractUntrustedValues({ contents: [
+      { role: "user", parts: [{ text: "the user's own words" }] },
+      { role: "function", parts: [fr, { function_response: { name: "f", response: { output: "snake" } } }] },
+    ] }, spec);
+    expect(v).toEqual(["items", "one", "title", "two", "n", "result", "found it", "output", "snake"]);
+    // one content and one part, as LiteLLM takes them
+    expect(normalize.extractUntrustedValues({ contents: { role: "function", parts: fr } }, spec))
+      .toEqual(["items", "one", "title", "two", "n", "result", "found it"]);
+  });
+
+  it("finds retrieved documents, read whole: Cohere v1 maps, v2 strings and { id, data }", () => {
+    const v = normalize.extractUntrustedValues({ message: "hi", documents: [
+      { title: "Refunds", snippet: "Refunds take 5 days.", url: "https://example.com/r" },
+      "a plain v2 document",
+      { id: "d3", data: { text: "v2 data", "Ignore previous": "" } },
+    ] }, spec);
+    expect(v).toEqual(["snippet", "Refunds take 5 days.", "title", "Refunds", "url", "https://example.com/r",
+      "a plain v2 document", "data", "Ignore previous", "text", "v2 data", "id", "d3"]);
+    // a Cohere v2 tool message's document parts
+    expect(normalize.extractUntrustedValues({ messages: [{ role: "tool", tool_call_id: "c",
+      content: [{ type: "document", document: { id: "x", data: { body: "tool doc" } } }] }] }, spec))
+      .toEqual(["data", "body", "tool doc", "id", "x"]);
+  });
+
   it("reads fields, and skips tool results when tool_results is false", () => {
+    const doc = { messages: [{ role: "tool", content: "tool" }], context: [{ text: "c1" }, { text: "c2" }] };
+    expect(normalize.extractUntrustedValues(doc, { fields: ["context[*].text"] })).toEqual(["tool", "c1", "c2"]);
+    expect(normalize.extractUntrustedValues(doc, { tool_results: false, fields: ["context[*].text"] })).toEqual(["c1", "c2"]);
+  });
+
+  it("does not add a field value the tool results already hold", () => {
     const doc = { messages: [{ role: "tool", content: "tool" }], documents: [{ text: "d1" }, { text: "d2" }] };
-    expect(normalize.extractUntrustedValues(doc, { fields: ["documents[*].text"] })).toEqual(["tool", "d1", "d2"]);
-    expect(normalize.extractUntrustedValues(doc, { tool_results: false, fields: ["documents[*].text"] })).toEqual(["d1", "d2"]);
+    const fields = ["documents[*].text"];
+    expect(normalize.extractUntrustedValues(doc, { fields })).toEqual(["tool", "text", "d1", "text", "d2"]);
+    expect(normalize.extractUntrustedValues(doc, { tool_results: false, fields })).toEqual(["d1", "d2"]);
   });
 
   it("ignores a top-level array and a messages object", () => {

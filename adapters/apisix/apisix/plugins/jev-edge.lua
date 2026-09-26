@@ -228,9 +228,10 @@ local function load_rules(specs)
   return out
 end
 
--- The rule core judged with (path, method and content type all match).
+-- The rule core judged with (path, method and content type all match; a
+-- json_only_paths path on what the decoder makes of the body).
 local function rule_for(rt, req)
-  return rules_mod.rule_for(req, rt.rules)
+  return rules_mod.rule_for(req, rt.rules, { json_decode = cjson.decode })
 end
 
 -- Decision sampling into the shared dict ring; read it with

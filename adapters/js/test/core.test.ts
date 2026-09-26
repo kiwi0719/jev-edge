@@ -3,10 +3,11 @@
 // id hygiene and the breaker's post-probe reset (twin of the Lua specs).
 import { describe, it, expect, vi } from "vitest";
 import * as core from "../src/core";
-import { luaPatternToRegExp, patternError, pathMatches, canonicalPath, evaluate as rulesEvaluate } from "../src/core/rules";
+import { luaPatternToRegExp, luaBytes, patternError, pathMatches, canonicalPath, evaluate as rulesEvaluate } from "../src/core/rules";
 import { resolve, load } from "../src/rules";
 import { truncateBytes, normalize, fingerprint, djb2 } from "../src/core/normalize";
 import { encodeReason } from "../src/core/verdict";
+import { buildSample } from "../src/sampling";
 import { Breaker, memoryStore, OPEN, CLOSED } from "../src/core/breaker";
 
 describe("luaPatternToRegExp", () => {
@@ -31,6 +32,37 @@ describe("luaPatternToRegExp", () => {
     expect(luaPatternToRegExp("^/a%.b/%d+$").test("/aXb/42")).toBe(false);
     expect(luaPatternToRegExp("^/x{y}|z$").test("/x{y}|z")).toBe(true);
     expect(() => luaPatternToRegExp("^/%g")).toThrow(/unsupported/);
+  });
+
+  it("reads '.' as one byte, line terminators included, as Lua does", () => {
+    // Lua: ("/a\nb"):find("^/a.b$") and the same for \r
+    for (const t of ["\n", "\r", "x"]) {
+      expect(luaPatternToRegExp("^/a.b$").test(`/a${t}b`), JSON.stringify(t)).toBe(true);
+      expect(luaPatternToRegExp("^/a.-b$").test(`/a${t}${t}b`), JSON.stringify(t)).toBe(true);
+    }
+    // U+2028 and U+2029 are three bytes: ("/a\226\128\168b"):find("^/a.b$") is nil
+    for (const t of ["\u2028", "\u2029"]) {
+      const b = luaBytes(`/a${t}b`);
+      expect(b.length, JSON.stringify(t)).toBe(6);
+      expect(luaPatternToRegExp("^/a.b$").test(b), JSON.stringify(t)).toBe(false);
+      expect(luaPatternToRegExp("^/a...b$").test(b), JSON.stringify(t)).toBe(true);
+      expect(luaPatternToRegExp("^/a.-b$").test(b), JSON.stringify(t)).toBe(true);
+      expect(luaPatternToRegExp("^/a[^/]b$").test(b), JSON.stringify(t)).toBe(false);
+      expect(luaPatternToRegExp("^/a[^/]+b$").test(b), JSON.stringify(t)).toBe(true);
+    }
+    expect(luaPatternToRegExp("^/a[.]b$").test("/a\nb")).toBe(false);
+    expect(luaPatternToRegExp("^/a%.b$").test("/a\nb")).toBe(false);
+    const W = load("llm-endpoints").watch_paths;
+    for (const t of ["\n", "\r", "\u2028", "\u2029"]) {
+      expect(pathMatches(`/models/a${t}b:generateContent`, W), JSON.stringify(t)).not.toBeNull();
+    }
+    // pathMatches compares bytes, as core/rules.lua path_matches does
+    expect(pathMatches("/a\u2028b", ["^/a.b$"])).toBeNull();
+    expect(pathMatches("/a\u2028b", ["^/a...b$"])).toBe("^/a...b$");
+    expect(pathMatches("/caf\u00e9", ["^/caf.$"])).toBeNull();
+    expect(pathMatches("/caf\u00e9", ["^/caf..$"])).toBe("^/caf..$");
+    expect(pathMatches("/caf\u00e9", ["^/caf\u00e9$"])).toBe("^/caf\u00e9$");
+    expect(pathMatches("/\u00e9", ["^/%a+$"])).toBeNull();
   });
 
   it("patternError mirrors core/rules.lua", () => {
@@ -86,6 +118,119 @@ describe("pathMatches (twin of core/spec/rules_spec.lua)", () => {
     expect(pathMatches("/v1/É", ["^/v1/é"])).toBeNull();
     expect(canonicalPath("/V1/É;x")).toBe("/v1/É");
   });
+
+  it("matches Gemini's camelCase routes with and without folding", () => {
+    for (const p of ["/v1beta/models/gemini-2.0-flash:generateContent", "/models/gpt-4o:streamGenerateContent",
+      "/v1/projects/p/locations/l/publishers/google/models/g:generateContent"]) {
+      expect(pathMatches(p, W), p).not.toBeNull();
+      expect(pathMatches(p, W, true), p).not.toBeNull();
+    }
+    expect(pathMatches("/v1beta/models/g:countTokens", W, true)).toBeNull();
+  });
+
+  it("anchors Cohere's /v2/chat", () => {
+    expect(pathMatches("/v2/chat", W)).not.toBeNull();
+    expect(pathMatches("/v2/chat/", W)).not.toBeNull();
+    expect(pathMatches("/v2/chatbots", W)).toBeNull();
+    expect(pathMatches("/v2/chat/history", W)).toBeNull();
+  });
+});
+
+describe("rules: json_only_paths (twin of core/spec/rules_spec.lua)", () => {
+  const rule = load("llm-endpoints");
+  const ASK = "Please write a detailed summary of the attached quarterly report.";
+  const FORM = "username=alice%40example.com&password=hunter2hunter2&remember=on";
+  const root = (ct: string | undefined, body: string | undefined, over: Record<string, unknown> = {}) => ({
+    method: "POST", path: "/", headers: ct === undefined ? {} : { "content-type": ct }, body,
+    body_size: body === undefined ? 0 : Buffer.byteLength(body), client_ip: "203.0.113.7", ...over,
+  });
+  const ctx = (cache: Record<string, unknown> = {}) => ({
+    re_find: core.rules.reFind, json_decode: (s: string) => JSON.parse(s), clock: () => 1000,
+    cache: { get: (k: string) => cache[k] },
+  });
+
+  it("watches TGI's root for a JSON body only", async () => {
+    const json = JSON.stringify({ inputs: ASK });
+    for (const [ct, body] of [["application/json", json], [undefined, json], ["text/plain", " \n" + json]] as const) {
+      expect((await rulesEvaluate(root(ct, body), rule, ctx()))[0]).toBe("suspect");
+    }
+    for (const [ct, body] of [
+      ["application/x-www-form-urlencoded", FORM], [undefined, FORM], ["text/plain", ASK],
+      ["multipart/form-data; boundary=B", `--B\r\nContent-Disposition: form-data; name="a"\r\n\r\n${ASK}\r\n--B--\r\n`],
+      ["application/octet-stream", "\0\x01\x02 binary upload body"],
+      // what extract() reads the body as decides, not its first byte
+      ["text/plain", "{" + ASK + "}"], [undefined, "[" + ASK],
+      ["application/x-www-form-urlencoded", "[note]=" + ASK.replace(/ /g, "+")],
+      ["application/json", '{"username":"alice","password":"hunter2'],
+    ] as const) {
+      expect(await rulesEvaluate(root(ct, body), rule, ctx())).toEqual(["pass", "", "path not watched: body not JSON"]);
+    }
+  });
+
+  it("decides before the reputation checks, on the Content-Type when there is no body", async () => {
+    const blocked = { "rep:203.0.113.7": { blocked_until: 2000 } };
+    expect((await rulesEvaluate(root("application/x-www-form-urlencoded", FORM), rule, ctx(blocked)))[0]).toBe("pass");
+    expect((await rulesEvaluate(root("text/plain", "{" + ASK), rule, ctx(blocked)))[0]).toBe("pass");
+    expect((await rulesEvaluate(root(undefined, undefined, { method: "GET" }), rule, ctx(blocked)))[0]).toBe("pass");
+    expect((await rulesEvaluate(root("application/json", JSON.stringify({ inputs: ASK })), rule, ctx(blocked)))[0]).toBe("block");
+    expect((await rulesEvaluate(root("application/json", undefined, { body_size: 100 }), rule, ctx(blocked)))[0]).toBe("block");
+  });
+
+  it("looks at the head past max_body_bytes", async () => {
+    const big = { body_size: 4 * 1048576 };
+    expect((await rulesEvaluate(root("application/x-www-form-urlencoded", FORM, big), rule, ctx()))[0]).toBe("pass");
+    expect((await rulesEvaluate(root(undefined, undefined, { body_head: `{"inputs":"${ASK}"`, ...big }), rule, ctx()))[0]).toBe("suspect");
+    expect((await rulesEvaluate(root(undefined, undefined, { body_head: FORM, ...big }), rule, ctx()))[0]).toBe("pass");
+  });
+
+  it("hands the request to the next rule, and L3 the same rule and text", async () => {
+    const site = resolve({ id: "site", watch_paths: ["^/$"] });
+    const req = root("application/x-www-form-urlencoded", "note=" + ASK.replace(/ /g, "+"));
+    const [r, text, , by] = await core.rules.evaluateAll(req, [rule, site], ctx());
+    expect([r, text, by?.id]).toEqual(["suspect", ASK, "site"]);
+    expect(core.rules.ruleFor(req, [rule, site])?.id).toBe("site");
+    expect(core.rules.ruleFor(req, [rule])).toBeUndefined();
+    expect(await core.rules.judgedText(req, rule, ctx())).toBe("");
+    expect(await core.rules.judgedText(req, site, ctx())).toBe(ASK);
+    // text that starts with {: ruleFor decides on what the decoder makes of it
+    const brace = root("text/plain", "{" + ASK + "}");
+    const [r2, , , by2] = await core.rules.evaluateAll(brace, [rule, site], ctx());
+    expect([r2, by2?.id]).toEqual(["suspect", "site"]);
+    expect(core.rules.ruleFor(brace, [rule, site], ctx())?.id).toBe("site");
+    expect(await core.rules.judgedText(brace, rule, ctx())).toBe("");
+    expect(await core.rules.judgedText(brace, site, ctx())).toBe("{" + ASK + "}");
+  });
+
+  it("decides a body it cannot parse on its first byte or media type", async () => {
+    const gz = { "content-type": "application/json", "content-encoding": "gzip" };
+    expect((await rulesEvaluate(root(undefined, "\x1f\b\0\0 bytes", { headers: gz }), rule, ctx()))[0]).toBe("unjudgeable");
+    const plain = { "content-type": "text/plain", "content-encoding": "gzip" };
+    expect((await rulesEvaluate(root(undefined, "\x1f\b\0\0 bytes", { headers: plain }), rule, ctx()))[0]).toBe("pass");
+  });
+
+  it("is how the sampler picks its rule, as rules.rule_for", () => {
+    const cfg = core.defaults.merge(core.defaults.config, { sampling: { enabled: true, rate: 1 } });
+    const v = core.verdict.newVerdict({ verdict: "malicious", source: "l2" });
+    // JSON to / is llm-endpoints'; a form POST to / is no rule's (it watches / for JSON only)
+    const json = root("application/json", JSON.stringify({ note: ASK, inputs: "Tell me a story." }));
+    expect(buildSample(cfg, v, json, [rule], "r1").text).toBe(normalize("Tell me a story."));
+    expect(buildSample(cfg, v, root("application/x-www-form-urlencoded", FORM), [rule], "r2").text).toBe("");
+    expect(buildSample(cfg, v, root("text/plain", "{" + ASK + "}"), [rule], "r2").text).toBe("");
+    // a tenant rule that matches the path but not the method hands it on
+    const tenant = resolve({ id: "t", watch_paths: ["^/v1/chat"], methods: { PUT: true }, text_fields: ["other"] });
+    const chat = { method: "POST", path: "/v1/chat/completions", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ messages: [{ role: "user", content: ASK }] }) };
+    expect(buildSample(cfg, v, chat, [tenant, rule], "r3").text).toBe(normalize(ASK));
+  });
+
+  it("applies only to the paths it lists", async () => {
+    const form = { "content-type": "application/x-www-form-urlencoded" };
+    const body = "prompt=" + ASK.replace(/ /g, "+");
+    const req = { method: "POST", path: "/v1/completions", headers: form, body, body_size: body.length };
+    expect((await rulesEvaluate(req, rule, ctx()))[0]).toBe("suspect");
+    const any = { ...rule, json_only_paths: [] };
+    expect((await rulesEvaluate(root("application/x-www-form-urlencoded", "note=" + ASK), any, ctx()))[0]).toBe("suspect");
+  });
 });
 
 describe("rules.resolve", () => {
@@ -103,6 +248,14 @@ describe("rules.resolve", () => {
     expect(() => resolve({ id: "t", watch_paths: ["^/v1/["] })).toThrow(/watch_paths\[1\]/);
     expect(() => resolve({ id: "t", watch_paths: [42 as never] })).toThrow(/must be a string/);
     expect(() => resolve({ watch_paths: [] })).toThrow(/needs an id/);
+  });
+
+  it("checks json_only_paths like watch_paths, and inherits them", () => {
+    expect(() => resolve({ id: "t", watch_paths: ["^/"], json_only_paths: ["^/("] })).toThrow(/json_only_paths\[1\] unfinished capture/);
+    expect(() => resolve({ id: "t", watch_paths: ["^/"], json_only_paths: [42 as never] })).toThrow(/must be a string/);
+    expect(() => resolve({ id: "t", watch_paths: ["^/"], json_only_paths: "^/$" as never })).toThrow(/json_only_paths must be a list/);
+    expect(resolve("llm-endpoints").json_only_paths).toEqual(["^/$"]);
+    expect(resolve({ id: "any", extends: "llm-endpoints", json_only_paths: [] }).json_only_paths).toEqual([]);
   });
 
   it("llm-endpoints reads every content type but media types", () => {
@@ -479,6 +632,32 @@ describe("normalize: documents and retrieved results", () => {
       "messages[*].content")).toBe("block one\nblock two");
     expect(ex({ input: [{ type: "file_search_call", queries: ["q"], results: [
       { file_id: "f", text: "found one" }, { file_id: "g", text: "found two" }] }] }, "input")).toBe("found one\nfound two");
+  });
+
+  it("reads documents, prompt.variables and Gemini function responses whole, keys in UTF-8 byte order", () => {
+    const ex = (d: object, f: string) => core.normalize.extractJson(d as never, [f]);
+    expect(ex({ documents: [{ title: "T", snippet: "S", rank: 1, tags: ["a", ""] }, "plain"] }, "documents"))
+      .toBe("rank\nsnippet\nS\ntags\na\ntitle\nT\nplain");
+    expect(ex({ prompt: { id: "p", variables: { city: "Paris", q: { type: "input_text", text: "why" } } } }, "prompt.variables"))
+      .toBe("city\nParis\nq\ntext\nwhy\ntype\ninput_text");
+    // a path that only ends in the same name is read as content parts
+    expect(ex({ meta: { documents: { title: "not read" } } }, "meta.documents")).toBe("");
+    expect(ex({ contents: [{ parts: [{ text: "hi" }, { functionResponse: { name: "f", response: { b: "2", a: "1" } } }] }] },
+      "contents[*].parts")).toBe("hi\na\n1\nb\n2");
+    // U+E000 sorts before U+1F600 in UTF-8 (and in Lua), after it in UTF-16
+    expect(ex({ documents: { "\u{1F600}": "x", "\uE000": "y", "\u00e9": "z" } }, "documents"))
+      .toBe("\u00e9\nz\n\uE000\ny\n\u{1F600}\nx");
+  });
+
+  it("reads an object past the sort budget in full, only not in byte order", () => {
+    const big: Record<string, string> = {};
+    for (let i = 0; i < 20001; i++) big["k" + i] = "v" + i;
+    const small = { b: "2", a: "1" };
+    const v = core.normalize.extractJsonValues({ documents: [big, small] } as never, ["documents"]);
+    expect(v.length).toBe(40002 + 4);
+    expect(new Set(v.slice(0, 40002)).size).toBe(40002);
+    // the keys the budget has left are still sorted
+    expect(v.slice(40002)).toEqual(["a", "1", "b", "2"]);
   });
 });
 

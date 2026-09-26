@@ -1,5 +1,5 @@
 // Port of core/rules.lua: L1, cheap and short-circuiting.
-import { extract, extractUntrustedValues, isText, byteLength, head, tail, fieldKeys, scanStrings, window, chunks as splitChunks, utf8Bytes, type JsonValue } from "./normalize.js";
+import { extract, extractUntrustedValues, jsonLike, isText, byteLength, head, tail, fieldKeys, scanStrings, window, chunks as splitChunks, utf8Bytes, type JsonValue } from "./normalize.js";
 import { untrustedSpec, type UntrustedConfig } from "./defaults.js";
 import { repBlocked, type SubjectCtx, type ReputationConfig } from "./subject.js";
 
@@ -23,6 +23,8 @@ export interface Rule {
   watch_paths: string[];
   /** Match watch_paths without folding ASCII case (default: folded, see pathMatches). */
   paths_case_sensitive?: boolean;
+  /** Watched paths (Lua patterns) watched only for a JSON body (see core/rules.lua). */
+  json_only_paths?: string[];
   methods?: Record<string, boolean>;
   /** Allow list (the pre-0.4 behaviour); without it, skip_content_types applies. */
   content_types?: string[];
@@ -84,7 +86,8 @@ export interface RulesCtx {
  * some subject. Returns null when the pattern is well formed. Used at rule
  * resolve time so a malformed watch path fails at startup, not per request.
  */
-export function patternError(p: string): string | null {
+export function patternError(pattern: string): string | null {
+  const p = luaBytes(pattern); // lstrlib walks bytes
   const n = p.length;
   let i = 0;
   // captures in opening order; true once closed (see the Lua original)
@@ -149,27 +152,45 @@ const LUA_CLASSES: Record<string, string> = {
 };
 
 /**
+ * `s` as Lua sees it: one character (U+0000..U+00FF) per UTF-8 byte. Lua
+ * patterns work on bytes, so a subject goes through this before a RegExp from
+ * luaPatternToRegExp is tested on it: `.` and a set then take one byte, as in
+ * Lua, and U+2028 is three of them. ASCII comes back as it is.
+ */
+export function luaBytes(s: string): string {
+  if (!/[^\x00-\x7f]/.test(s)) return s;
+  let out = "";
+  for (const b of utf8Bytes(s)) out += String.fromCharCode(b);
+  return out;
+}
+
+/**
  * Lua pattern -> RegExp for the subset rule files use: ^ $ anchors, literals,
  * %-escaped punctuation, the %a %d %s %w %x %p classes and [...] sets (with
  * those classes and ranges inside). Anything else in a watch path is
  * unsupported on this adapter and throws at load time rather than silently
  * matching differently. `-` is Lua's lazy `*?` outside a set and a plain
- * range/literal inside one.
+ * range/literal inside one. The RegExp matches bytes, as Lua does: the
+ * pattern is translated from its UTF-8 bytes and the subject must be passed
+ * through luaBytes (pathMatches does). `.` is any one byte, line terminators
+ * included: JS's `.` stops at \n, \r, U+2028 and U+2029, which a
+ * percent-decoded path can hold.
  */
 const luaPatternCache = new Map<string, RegExp>();
-export function luaPatternToRegExp(p: string): RegExp {
-  const hit = luaPatternCache.get(p);
+export function luaPatternToRegExp(pattern: string): RegExp {
+  const hit = luaPatternCache.get(pattern);
   if (hit) return hit;
-  const perr = patternError(p);
-  if (perr) throw new Error(`malformed Lua pattern ${p}: ${perr}`);
+  const perr = patternError(pattern);
+  if (perr) throw new Error(`malformed Lua pattern ${pattern}: ${perr}`);
+  const p = luaBytes(pattern);
   let out = "";
   let i = 0;
   const n = p.length;
   const classFor = (k: string, inSet: boolean): string => {
     const body = LUA_CLASSES[k];
     if (body !== undefined) return inSet ? body : "[" + body + "]";
-    if (/[A-Za-z0-9]/.test(k)) throw new Error(`unsupported Lua class %${k} in ${p}`);
-    return "\\" + k; // escaped punctuation is a literal in both
+    if (/[A-Za-z0-9]/.test(k)) throw new Error(`unsupported Lua class %${k} in ${pattern}`);
+    return "\\" + k; // escaped punctuation (or a byte past ASCII) is a literal in both
   };
   while (i < n) {
     const c = p[i];
@@ -201,13 +222,16 @@ export function luaPatternToRegExp(p: string): RegExp {
     } else if ("\\{}|".includes(c)) {
       out += "\\" + c; // literal in Lua, special in JS
       i++;
+    } else if (c === ".") {
+      out += "[\\s\\S]";
+      i++;
     } else {
-      out += c; // ^ $ . * + ? ( ) mean the same in both for this subset
+      out += c; // ^ $ * + ? ( ) mean the same in both for this subset
       i++;
     }
   }
   const re = new RegExp(out);
-  luaPatternCache.set(p, re);
+  luaPatternCache.set(pattern, re);
   return re;
 }
 
@@ -257,7 +281,7 @@ function foldPattern(p: string): string {
 export function pathMatches(path: string, patterns: string[] | undefined, caseSensitive?: boolean): string | null {
   if (!patterns || patterns.length === 0) return null;
   const cs = caseSensitive === true;
-  const s = canonicalPath(path ?? "", cs);
+  const s = luaBytes(canonicalPath(path ?? "", cs));
   for (const p of patterns) {
     if (luaPatternToRegExp(cs ? p : foldPattern(p)).test(s)) return p;
   }
@@ -341,6 +365,36 @@ function ctWatched(ct: string, rule: Rule): boolean | "media" {
 
 const CT_NOT_WATCHED = "content-type not watched";
 
+// The body's size as core counts it: the larger of what the adapter declared
+// and what it handed over (bytes, like Lua's #body).
+function bodySize(req: Req): number {
+  const declared = Number(req.body_size);
+  return Math.max(Number.isFinite(declared) ? declared : 0, typeof req.body === "string" ? byteLength(req.body) : 0);
+}
+
+// Port of json_only_miss() in core/rules.lua: a json_only_paths path is
+// watched only for a JSON body, one extract() reads as JSON ("json") or
+// declared JSON the decoder refused whose text fields the scanner found
+// ("scan"). A body extract() cannot read (past max_body_bytes, still
+// encoded, empty) is decided on its first byte or JSON media type (jsonLike
+// on the head the adapter kept); with no body at all, on the Content-Type
+// alone. A site's own POST to TGI's root passes. Returns the extraction when
+// it ran, for judged() to reuse. (Lua also falls back to the first byte when
+// ctx has no json_decode; extract() here always has one.)
+type Extraction = ReturnType<typeof extract>;
+const NOT_JSON = "path not watched: body not JSON";
+function jsonOnlyMiss(req: Req, rule: Rule, ct: string, ctx: RulesCtx | undefined): [boolean, Extraction?] {
+  const jo = rule.json_only_paths;
+  if (!Array.isArray(jo) || jo.length === 0 || !pathMatches(req.path ?? "", jo, rule.paths_case_sensitive)) return [false];
+  const body = req.body;
+  if (typeof body !== "string" || body === "" || bodySize(req) > (rule.max_body_bytes ?? MAX_BODY_BYTES)
+    || (contentEncoding(req.headers) !== "" && !req.decoded)) {
+    return [!jsonLike(req.body_head ?? body, ct)];
+  }
+  const ex = extract(body, ct, rule.text_fields, ctx?.json_decode);
+  return [ex[1] !== "json" && ex[1] !== "scan", ex];
+}
+
 /**
  * Case-insensitive regex search with the same contract the OpenResty adapter
  * gives core: the 1-based inclusive UTF-8 byte span of the first match.
@@ -370,9 +424,10 @@ function untrustedPart(decoded: JsonValue | undefined, rule: Rule, ctx: RulesCtx
   return { text: w, windowed: cut };
 }
 
-// Port of judged() in core/rules.lua.
+// Port of judged() in core/rules.lua. `ex`: the body's extraction
+// jsonOnlyMiss already has, or undefined.
 async function judged(
-  req: Req, rule: Rule, ctx: RulesCtx | undefined, ct: string, size: number,
+  req: Req, rule: Rule, ctx: RulesCtx | undefined, ct: string, size: number, ex?: Extraction,
 ): Promise<{ text: string; unj?: string; hit?: string; windowed?: boolean; chunks?: string[]; capped?: boolean; untrusted?: UntrustedPart }> {
   const max = rule.max_body_bytes ?? MAX_BODY_BYTES;
   // a media type is taken at its word only when the bytes agree (or there
@@ -408,7 +463,7 @@ async function judged(
   } else {
     let kind: string;
     let decoded: JsonValue | undefined;
-    [text, kind, values, decoded] = extract(req.body, ct, rule.text_fields, ctx?.json_decode);
+    [text, kind, values, decoded] = ex ?? extract(req.body, ct, rule.text_fields, ctx?.json_decode);
     if (media && (kind === "binary" || kind === "none")) return { text: "", unj: CT_NOT_WATCHED };
     if (kind === "binary") return { text: "", unj: "unjudgeable: binary body" };
     // declared JSON the decoder refused, with no text-field value to scan
@@ -440,18 +495,24 @@ async function judged(
 /** Port of rules.judged_text: the text evaluate() judges under `rule` ("" when none). */
 export async function judgedText(req: Req, rule: Rule | undefined, ctx?: RulesCtx): Promise<string> {
   if (!rule || !req) return "";
-  const declared = Number(req.body_size);
-  const size = Math.max(Number.isFinite(declared) ? declared : 0, typeof req.body === "string" ? byteLength(req.body) : 0);
+  const size = bodySize(req);
   // one window, never chunks: L3-style re-judging uses one call
-  const r = await judged(req, { ...rule, max_judge_chunks: 1 }, ctx, contentType(req.headers), size);
+  const ct = contentType(req.headers);
+  const [miss, ex] = jsonOnlyMiss(req, rule, ct, ctx);
+  if (miss) return "";
+  const r = await judged(req, { ...rule, max_judge_chunks: 1 }, ctx, ct, size, ex);
   return r.text;
 }
 
 export async function evaluate(
   req: Req, rule: Rule, ctx?: RulesCtx,
 ): Promise<[RuleResult, string, string, boolean?, string[]?, boolean?, UntrustedPart?]> {
-  // 1. path watch list
+  // 1. path watch list; a json_only_paths path only for a JSON body (what
+  //    extract() reads it as, or the Content-Type when there is no body)
   if (!pathMatches(req.path ?? "", rule.watch_paths, rule.paths_case_sensitive)) return [PASS, "", "path not watched"];
+  const ct = contentType(req.headers);
+  const [miss, ex] = jsonOnlyMiss(req, rule, ct, ctx);
+  if (miss) return [PASS, "", NOT_JSON];
 
   // 2. reputation, before anything that needs a body. It only ever blocks:
   //    safe verdicts earn an IP nothing (see core/rules.lua)
@@ -469,14 +530,12 @@ export async function evaluate(
   //    content_types; the deny list of media types is only settled once the
   //    body shows it is binary, in step 6)
   if (rule.methods && !rule.methods[(req.method ?? "").toUpperCase()]) return [PASS, "", "method not watched"];
-  const ct = contentType(req.headers);
   if (!ctWatched(ct, rule)) return [PASS, "", CT_NOT_WATCHED];
 
   // 4. body size: the larger of what the adapter declared and what it handed
   //    over, so a wrong or missing Content-Length cannot shrink the body
   //    (bytes, like Lua's #body).
-  const declared = Number(req.body_size);
-  const size = Math.max(Number.isFinite(declared) ? declared : 0, typeof req.body === "string" ? byteLength(req.body) : 0);
+  const size = bodySize(req);
   if (size === 0 && (req.body === undefined || req.body === null) && (req.body_head === undefined || req.body_head === null)) {
     return [PASS, "", "no body"];
   }
@@ -487,7 +546,7 @@ export async function evaluate(
   if (ce !== "" && !req.decoded) return [UNJUDGEABLE, "", "unjudgeable: content-encoding " + ce];
 
   // 6+7. extract, prefilter over all of it, judging window, length
-  const j = await judged(req, rule, ctx, ct, size);
+  const j = await judged(req, rule, ctx, ct, size, ex);
   if (j.unj === CT_NOT_WATCHED) return [PASS, "", j.unj];
   if (j.unj) return [UNJUDGEABLE, "", j.unj];
   const minChars = rule.min_text_chars ?? 20;
@@ -508,11 +567,16 @@ export async function evaluate(
   return [PASS, "", "text too short"];
 }
 
-/** Port of rules.rule_for: the first rule whose path, method and content type all match. */
-export function ruleFor(req: Req, rules: Rule[] | undefined): Rule | undefined {
+/**
+ * Port of rules.rule_for: the first rule whose path (json_only_paths
+ * included), method and content type all match. `ctx.json_decode`, as
+ * evaluateAll had it, decides a json_only_paths path (JSON.parse without one).
+ */
+export function ruleFor(req: Req, rules: Rule[] | undefined, ctx?: Pick<RulesCtx, "json_decode">): Rule | undefined {
   const ct = contentType(req.headers);
   for (const r of rules ?? []) {
     if (pathMatches(req.path ?? "", r.watch_paths, r.paths_case_sensitive)
+      && !jsonOnlyMiss(req, r, ct, ctx)[0]
       && !(r.methods && !r.methods[(req.method ?? "").toUpperCase()])
       && ctWatched(ct, r)) return r;
   }

@@ -131,10 +131,12 @@ _M.config = {
   untrusted = {
     enabled      = false,
     -- OpenAI `role: "tool"` / `"function"` messages, Anthropic `tool_result`
-    -- content blocks, Responses API `function_call_output` items
+    -- content blocks, Responses API `*_call_output` and `mcp_call` items and
+    -- `file_search_call` results, Gemini `functionResponse` parts, and
+    -- retrieved `documents` (Cohere, vLLM): core/normalize.lua tool_results
     tool_results = true,
     -- JSON paths (text_fields syntax) whose values are retrieved content the
-    -- app sends outside a tool message, e.g. { "documents[*].text", "context" }.
+    -- app sends outside a tool message, e.g. { "context", "sources[*].text" }.
     -- Retrieved text pasted into the user's message cannot be told apart.
     fields       = {},
     templates    = { "untrusted" },

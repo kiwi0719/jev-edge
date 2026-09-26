@@ -12,18 +12,51 @@ return {
   -- switch to. OpenAI and compatible servers (/v1/..., Responses and
   -- Anthropic Messages included), Ollama (/api/chat, /api/generate), the
   -- Vercel AI SDK's useChat and useCompletion (/api/chat, /api/completion),
-  -- LiteLLM and llama.cpp without the /v1 prefix, LiteLLM /engines/<model>/,
-  -- Azure OpenAI and LiteLLM /openai/deployments/<name>/ and /openai/v1/,
-  -- llama.cpp /completion and /infill. Short generic names are anchored at
-  -- both ends so an application's own routes do not match.
+  -- LiteLLM and llama.cpp without the /v1 prefix (/responses included),
+  -- LiteLLM /engines/<model>/, Azure OpenAI and LiteLLM
+  -- /openai/deployments/<name>/ and /openai/v1/, llama.cpp /completion and
+  -- /infill. Short generic names are anchored at both ends so an
+  -- application's own routes do not match.
   watch_paths = {
     "^/v1/chat", "^/v1/completions", "^/v1/responses", "^/v1/messages",
     "^/api/chat", "^/api/completions?", "^/api/generate/?$",
-    "^/chat/completions", "^/completions?/?$", "^/infill/?$",
+    "^/chat/completions", "^/completions?/?$", "^/responses/?$", "^/infill/?$",
     "^/engines/[^/]+/chat/completions", "^/engines/[^/]+/completions",
     "^/openai/deployments/[^/]+/chat/completions", "^/openai/deployments/[^/]+/completions",
     "^/openai/v1/chat", "^/openai/v1/completions", "^/openai/v1/responses",
+    -- Gemini generateContent and streamGenerateContent: the Gemini API
+    -- (/v1beta/models/<m>:..., /v1/..., tunedModels, Vertex AI's
+    -- /v1/projects/.../models/<m>:...), and LiteLLM, which serves them for
+    -- every model, also as /models/<m>:... (<m> may hold a slash). Written
+    -- in the real camelCase so that a rule with paths_case_sensitive = true
+    -- watches them too. Gemini's OpenAI-compatible route.
+    "^/v1%w*/.+:%a*[Gg]enerate[Cc]ontent/?$", "^/models/.+:%a*[Gg]enerate[Cc]ontent/?$",
+    "^/v1beta/openai/chat/completions",
+    -- Inference servers' native routes, beside their /v1 ones: SGLang
+    -- /generate; TGI / (POST), /generate, /generate_stream, /vertex and
+    -- /invocations; vLLM and SageMaker-style /invocations. The site root is
+    -- watched only for a JSON body (json_only_paths below).
+    "^/$", "^/generate/?$", "^/generate_stream/?$", "^/vertex/?$", "^/invocations/?$",
+    -- Open WebUI: /api/v1/chat/completions (the /api/chat/completions
+    -- handler), its Anthropic Messages routes, and its Ollama and OpenAI
+    -- proxies (a /<url_idx> suffix included).
+    "^/api/v1/chat/completions", "^/api/v1/messages/?$", "^/api/message/?$",
+    "^/ollama/api/chat", "^/ollama/api/generate", "^/ollama/v1/chat", "^/ollama/v1/completions",
+    "^/ollama/v1/messages", "^/ollama/v1/responses",
+    "^/openai/chat/completions", "^/openai/completions", "^/openai/responses", "^/openai/messages",
+    -- LM Studio's REST API; Cohere /v2/chat and /v1/generate (/v1/chat is above).
+    "^/api/v0/chat/completions", "^/api/v0/completions", "^/api/v1/chat/?$",
+    "^/v2/chat/?$", "^/v1/generate/?$",
   },
+  -- Of the watch_paths, those watched only for a JSON body (one that parses
+  -- as JSON, or declared JSON with text fields the scanner finds; past
+  -- max_body_bytes, a JSON media type or a head that starts with { or [):
+  -- TGI's root. A site's own POST to / (a login form, an upload, text that
+  -- starts with {) passes as "path not watched: body not JSON", before the
+  -- judge and the reputation checks. Lua patterns, like
+  -- watch_paths; a rule that extends this one and watches / for any body
+  -- sets json_only_paths = {}.
+  json_only_paths = { "^/$" },
   methods = { POST = true, PUT = true, PATCH = true },
   -- Media types that are never a prompt. Any other Content-Type (or none) is
   -- read and the body decides the format: backends parse JSON whatever the
@@ -45,14 +78,31 @@ return {
   -- policy.unjudgeable then decides what still does not fit. See README.
   max_judge_chunks = 1,
   -- Oldest first: the judging window keeps the last ones first.
-  -- system: Anthropic Messages and Ollama /api/generate; template: Ollama.
-  -- messages[*].parts: AI SDK 5 UIMessages, which carry no content.
+  -- The system text each API puts before the conversation: system (a string
+  -- or text blocks): Anthropic Messages and Ollama /api/generate;
+  -- instructions: the Responses API; preamble: Cohere v1; system_prompt: LM
+  -- Studio /api/v1/chat; systemInstruction or system_instruction: Gemini.
+  -- documents: retrieved documents (Cohere v1 and v2, vLLM chat), read
+  -- whole: every key and string in them (WHOLE_FIELDS in core/normalize.lua).
+  -- template: Ollama. messages[*].parts: AI SDK 5 UIMessages, which carry no
+  -- content. contents: Gemini (a list, or one content as LiteLLM takes it),
+  -- function responses included; parts given as one object are read by their
+  -- keys too, which LiteLLM sends as text parts (KEY_FIELDS in
+  -- core/normalize.lua). chat_history[*].message, message: Cohere v1
+  -- /v1/chat. prompt.prompt_string: llama.cpp's prompt object, alone or in a
+  -- list. prompt.variables: the values a Responses API stored prompt is
+  -- filled with, read whole.
   -- input[*].output: a Responses API function_call_output (a tool result).
+  -- inputs, instances: TGI /generate, / and /vertex.
   -- suffix: OpenAI completions and Ollama; input_prefix, input_suffix,
   -- input_extra: llama.cpp /infill.
-  text_fields = { "system", "template", "messages[*].content", "messages[*].parts", "prompt", "input",
-                  "input[*].output", "query", "text", "suffix", "input_prefix", "input_suffix",
-                  "input_extra[*].text" },
+  text_fields = { "system", "instructions", "preamble", "system_prompt", "systemInstruction.parts",
+                  "system_instruction.parts", "documents", "template", "messages[*].content",
+                  "messages[*].parts", "contents[*].parts", "contents.parts", "chat_history[*].message",
+                  "message", "prompt", "prompt.prompt_string", "prompt[*].prompt_string", "prompt.variables",
+                  "input", "input[*].output", "inputs", "instances[*].inputs",
+                  "instances[*].messages[*].content", "query", "text", "suffix", "input_prefix",
+                  "input_suffix", "input_extra[*].text" },
   min_text_chars = 20,
   always_suspect = {
     [[\b(ignore|disregard|forget)\b.{0,20}\b(previous|prior|above|earlier|all)\b]]

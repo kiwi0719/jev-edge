@@ -33,6 +33,7 @@ local function run(files)
       open = function(path, mode)
         local s = files[path]
         if s == nil then return io.open(path, mode) end
+        if s == false then return nil, path .. ": No such file or directory" end
         return { read = function() return s end, close = function() return true end }
       end,
       stderr = { write = function(_, s) out[#out + 1] = s end },
@@ -60,8 +61,13 @@ end
 p:close()
 assert(spec, "no rockspec at the repo root")
 local CI = ".github/workflows/ci.yml"
+local SEC = ".github/workflows/security.yml"
+local REL = ".github/workflows/release-npm.yml"
+local PKG = "adapters/js/package.json"
+local WS = "adapters/js/pnpm-workspace.yaml"
 local TSRULES = "adapters/js/src/rules/index.ts"
 local rs, ci, tsr = read(spec), read(CI), read(TSRULES)
+local sec, rel, pkg, ws = read(SEC), read(REL), read(PKG), read(WS)
 
 local function with_newjob(s)
   return edit(s, "\n  ci%-ok:\n",
@@ -142,6 +148,43 @@ local cases = {
     "ci-ok", "ci-ok does not run jq -e" },
   { "ci.yml: jq line commented out", { [CI] = edit(ci, "\n(%s*)(echo[^\n]*jq %-e 'all)", "\n%1# %2") },
     "ci-ok", "ci-ok does not run jq -e" },
+
+  -- pnpm-pin: one exact pnpm, read by every workflow (audit ci-release#10)
+  { "package.json: no packageManager", { [PKG] = edit(pkg, ',\n%s*"packageManager": "[^"]*"', "") },
+    "pnpm-pin", 'has no "packageManager"' },
+  { "package.json: packageManager is a range",
+    { [PKG] = edit(pkg, '"packageManager": "pnpm@[^"]*"', '"packageManager": "pnpm@^11.9.0"') },
+    "pnpm-pin", "not an exact pnpm@X.Y.Z" },
+  { "package.json: packageManager is a major",
+    { [PKG] = edit(pkg, '"packageManager": "pnpm@[^"]*"', '"packageManager": "pnpm@11"') },
+    "pnpm-pin", "not an exact pnpm@X.Y.Z" },
+  { "package.json: packageManager with its hash",
+    { [PKG] = edit(pkg, '("packageManager": "pnpm@[%d%.]+)"', '%1+sha512.0123abcdef"') } },
+  { "ci.yml: pnpm/action-setup back on version: 9",
+    { [CI] = edit(ci, "package_json_file: adapters/js/package%.json", "version: 9") },
+    "pnpm-pin", "ci.yml: pnpm/action-setup does not read the version from adapters/js/package.json" },
+  { "security.yml: pnpm/action-setup with a version as well",
+    { [SEC] = edit(sec, "(\n(%s*)package_json_file: adapters/js/package%.json)", "%1\n%2version: 11") },
+    "pnpm-pin", "security.yml: pnpm/action-setup sets a pnpm version of its own" },
+  { "release-npm.yml: pnpm/action-setup reads the root package.json",
+    { [REL] = edit(rel, "package_json_file: adapters/js/package%.json", "package_json_file: package.json") },
+    "pnpm-pin", "release-npm.yml: pnpm/action-setup does not read the version" },
+  { "ci.yml: pnpm/action-setup as `uses:` under `- name:`, with a version",
+    { [CI] = edit(ci, "\n(%s*)%- (uses: pnpm/action%-setup@[^\n]*)\n(%s*)with:\n",
+        "\n%1- name: pnpm\n%1  %2\n%3with:\n%3  version: 9\n") },
+    "pnpm-pin", "ci.yml: pnpm/action-setup sets a pnpm version of its own" },
+  { "pnpm-workspace.yaml: missing", { [WS] = false }, "pnpm-pin", "pnpm-workspace.yaml is missing" },
+  { "pnpm-workspace.yaml: what a newer pnpm writes, undecided",
+    { [WS] = edit(ws, "esbuild: false", "esbuild: set this to true or false") },
+    "pnpm-pin", "allowBuilds esbuild is set this to true or false" },
+  { "pnpm-workspace.yaml: esbuild's build script runs", { [WS] = edit(ws, "esbuild: false", "esbuild: true") },
+    "pnpm-pin", "allowBuilds esbuild is true" },
+  { "pnpm-workspace.yaml: esbuild with a comment",
+    { [WS] = edit(ws, "esbuild: false", "esbuild: false # see above") } },
+  { "pnpm-workspace.yaml: no decisions", { [WS] = edit(ws, "\nallowBuilds:\n[^\n]*\n", "\n") },
+    "pnpm-pin", "has no allowBuilds decisions" },
+  { "pnpm-workspace.yaml: every build script allowed", { [WS] = ws .. "dangerouslyAllowAllBuilds: true\n" },
+    "pnpm-pin", "dangerouslyAllowAllBuilds" },
 
   -- rule-parity: a path watched for any body on one runtime only
   { "rules: json_only_paths emptied in the TS copy",

@@ -74,6 +74,61 @@ local function rule(name, fn)
   if not ok then fail(name, "check raised: " .. tostring(err)) end
 end
 
+-- a GitHub workflow's lines, CRLF read as LF
+local function yaml_lines(src)
+  local out = {}
+  for l in ((src or ""):gsub("\r\n?", "\n") .. "\n"):gmatch("([^\n]*)\n") do out[#out + 1] = l end
+  return out
+end
+
+-- a workflow's top-level jobs: their ids in order, and each one's lines
+local function workflow_jobs(src)
+  local jobs, body, cur, injobs = {}, {}, nil, false
+  for _, l in ipairs(yaml_lines(src)) do
+    if not injobs then
+      injobs = l:match("^jobs:%s*$") or l:match("^jobs:%s*#")
+    elseif l:match("^[^%s#]") then
+      break
+    else
+      local name = l:match("^  ([%w_%-]+):")
+      if name then
+        jobs[#jobs + 1], cur, body[name] = name, name, {}
+      elseif cur then
+        table.insert(body[cur], l)
+      end
+    end
+  end
+  return jobs, body
+end
+
+-- the steps of a workflow (or of one job's lines) whose `uses:` matches the
+-- Lua pattern pat, each as "\n<its lines>\n" without comment lines
+local function steps_using(ls, pat)
+  local code_ls = {}
+  for _, l in ipairs(ls) do
+    if not l:match("^%s*#") then code_ls[#code_ls + 1] = l end
+  end
+  local out = {}
+  for i, l in ipairs(code_ls) do
+    if l:match("^%s*%-?%s*uses:%s*[\"']?" .. pat) then
+      local s, ui = i, #l:match("^(%s*)")
+      if not l:match("^%s*%- ") then -- `uses:` under `- name:`: back to that line
+        s = i - 1
+        while s > 0 and not (code_ls[s]:match("^%s*%- ") and #code_ls[s]:match("^(%s*)") + 2 == ui) do
+          s = s - 1
+        end
+        if s == 0 then s = i end
+      end
+      local ind, e = #code_ls[s]:match("^(%s*)"), i
+      while code_ls[e + 1] and (code_ls[e + 1]:match("^%s*$") or #code_ls[e + 1]:match("^(%s*)") > ind) do
+        e = e + 1
+      end
+      out[#out + 1] = "\n" .. table.concat(code_ls, "\n", s, e) .. "\n"
+    end
+  end
+  return out
+end
+
 -- 1. One version everywhere --------------------------------------------------
 rule("version", function(r)
   local want = (read("dist.ini") or ""):match("\nversion = ([%d%.]+)")
@@ -391,23 +446,8 @@ end)
 --     counts as passing, so its `if:` is exactly always(): !cancelled() skips
 --     it in a cancelled run, `!cancelled() && !failure()` when a job failed)
 rule("ci-ok", function(r)
-  local ci = (read(".github/workflows/ci.yml") or ""):gsub("\r\n?", "\n")
   -- the top-level jobs mapping: job ids at two spaces, each with its lines
-  local jobs, body, cur, injobs = {}, {}, nil, false
-  for l in (ci .. "\n"):gmatch("([^\n]*)\n") do
-    if not injobs then
-      injobs = l:match("^jobs:%s*$") or l:match("^jobs:%s*#")
-    elseif l:match("^[^%s#]") then
-      break
-    else
-      local name = l:match("^  ([%w_%-]+):")
-      if name then
-        jobs[#jobs + 1], cur, body[name] = name, name, {}
-      elseif cur then
-        table.insert(body[cur], l)
-      end
-    end
-  end
+  local jobs, body = workflow_jobs(read(".github/workflows/ci.yml"))
   if #jobs < 2 then return fail(r, "found " .. #jobs .. " jobs in ci.yml") end
   if not body["ci-ok"] then return fail(r, "ci.yml has no ci-ok job") end
   local ok_job = "\n" .. table.concat(body["ci-ok"], "\n")
@@ -466,6 +506,54 @@ rule("breaker-failures", function(r)
   if not code("adapters/openresty/lib/resty/jev/http.lua"):find("judge%.status_kind%(res%.status%)") then
     fail(r, "resty/jev/http.lua: a failed parse is not classified by the provider's status")
   end
+end)
+
+-- 14. One pnpm, pinned exactly by "packageManager" in adapters/js/package.json,
+--     and every workflow's pnpm/action-setup reads it (audit ci-release#10: CI
+--     pinned pnpm 9 while a local pnpm 11 wrote a pnpm-workspace.yaml that
+--     pnpm 9 rejects, and CI ran the dependency build scripts local installs
+--     block). pnpm-workspace.yaml records a decision for each dependency
+--     build script, and none of them runs.
+rule("pnpm-pin", function(r)
+  local pm = (read("adapters/js/package.json") or ""):match('\n%s*"packageManager":%s*"([^"]*)"')
+  if not pm then
+    fail(r, 'adapters/js/package.json has no "packageManager"')
+  elseif not (pm:match("^pnpm@%d+%.%d+%.%d+$") or pm:match("^pnpm@%d+%.%d+%.%d+%+sha%d+%.%x+$")) then
+    fail(r, 'adapters/js/package.json "packageManager" is ' .. pm .. ", not an exact pnpm@X.Y.Z")
+  end
+  for _, wf in ipairs(tracked(".github/workflows", "%.ya?ml$")) do
+    for _, step in ipairs(steps_using(yaml_lines(read(wf)), "pnpm/action%-setup@")) do
+      if not step:find("\n%s*package_json_file:%s*adapters/js/package%.json%s*\n")
+         and not step:find("\n%s*package_json_file:%s*adapters/js/package%.json%s+#[^\n]*\n") then
+        fail(r, wf .. ": pnpm/action-setup does not read the version from adapters/js/package.json")
+      end
+      if step:find("\n%s*version:") then fail(r, wf .. ": pnpm/action-setup sets a pnpm version of its own") end
+    end
+  end
+  local ws = read("adapters/js/pnpm-workspace.yaml")
+  if not ws then
+    return fail(r, "adapters/js/pnpm-workspace.yaml is missing (the dependency build-script decisions)")
+  end
+  local inblock, n = false, 0
+  for _, l in ipairs(yaml_lines(ws)) do
+    local t = l:gsub("%s+#.*$", ""):gsub("^#.*$", "")
+    if t:match("^allowBuilds:%s*$") then
+      inblock = true
+    elseif t:match("^%S") then
+      inblock = false
+      if t:match("^dangerouslyAllowAllBuilds:%s*true") then
+        fail(r, "pnpm-workspace.yaml: dangerouslyAllowAllBuilds runs every dependency build script")
+      end
+    elseif inblock and t:match("%S") then
+      n = n + 1
+      local name, v = t:match("^%s+[\"']?([^\"':]+)[\"']?:%s*(.-)%s*$")
+      if v ~= "false" then
+        fail(r, "pnpm-workspace.yaml: allowBuilds " .. tostring(name) .. " is " .. tostring(v)
+          .. ", not false (no dependency build script runs)")
+      end
+    end
+  end
+  if n == 0 then fail(r, "pnpm-workspace.yaml has no allowBuilds decisions") end
 end)
 
 -- ---------------------------------------------------------------------------

@@ -1,0 +1,11 @@
+# pnpm settings for adapters/js, a single package (no `packages` list).
+# pnpm is pinned by "packageManager" in package.json; CI reads it from there.
+#
+# Dependency build scripts: none run. pnpm refuses to install while a
+# dependency's build script has no decision here (strictDepBuilds), so a new
+# one fails the install until it is named below, and only `true` runs it.
+# esbuild (an optional peer of vite) gets its binary from its @esbuild/*
+# platform package; its postinstall only verifies that binary, or downloads
+# one when the platform package is missing.
+allowBuilds:
+  esbuild: false

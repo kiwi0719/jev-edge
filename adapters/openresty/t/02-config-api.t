@@ -277,7 +277,7 @@ GET /t
 --- response_body
 subject.enabled=false
 --- error_log
-config invalid, keeping previous: subject.enabled needs subject.salt
+config invalid, using the defaults (monitor mode): subject.enabled needs subject.salt
 the config file sets subject.salt from JEV_T_UNSET_SALT, unset when it ran
 add `env JEV_T_UNSET_SALT;` to nginx.conf
 --- no_error_log
@@ -298,7 +298,7 @@ GET /t
 --- response_body
 rate=0.05
 --- error_log
-config invalid, keeping previous: sampling.rate must be in [0,1]
+config invalid, using the defaults (monitor mode): sampling.rate must be in [0,1]
 --- no_error_log
 JEV_T_UNSET
 unset when it ran

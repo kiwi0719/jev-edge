@@ -460,8 +460,11 @@ function _M.config_api()
   local method = ngx.req.get_method()
   ngx.header["Content-Type"] = "application/json"
   if method == "GET" then
+    -- config_error: why `effective` is not the configured file plus override
+    -- (it failed validation, or the file could not be loaded); null otherwise
     ngx.say(cjson.encode({ effective = redacted(config.current()),
-                           override = redacted(config.get_override()) or cjson.null }))
+                           override = redacted(config.get_override()) or cjson.null,
+                           config_error = config.error() or cjson.null }))
     return
   elseif method == "PUT" then
     local body, berr = read_admin_body()
@@ -661,13 +664,17 @@ end
 --- content_by_lua for /_jev/health: one real provider round trip.
 -- 200 {"ok":true,...} or 503 {"ok":false,"error":...}. Use it after install to
 -- prove the key, the endpoint and the CA bundle work before turning enforce on.
+-- While the configured file or override is refused (config_error), the
+-- answer is 503 too: what runs is the previous config, or the defaults in
+-- monitor mode when nothing valid was ever loaded.
 function _M.health()
   local cfg = config.current()
+  local cerr = config.error()
   ngx.header["Content-Type"] = "application/json"
   local ok, err = pcall(ensure_runtime, cfg)
   if not ok then
     ngx.status = 503
-    ngx.say(cjson.encode({ ok = false, error = tostring(err) }))
+    ngx.say(cjson.encode({ ok = false, error = tostring(err), config_error = cerr or cjson.null }))
     return
   end
   local prompt = judge_mod.build({ "injection" },
@@ -682,7 +689,8 @@ function _M.health()
     effective = judge.adaptive:current()
   end
   local body = {
-    ok = answers ~= nil,
+    ok = answers ~= nil and cerr == nil,
+    config_error = cerr or cjson.null,
     provider = cfg.jev.provider, endpoint = cfg.jev.endpoint or cjson.null, model = cfg.jev.model or cjson.null,
     latency_ms = ms, error = jerr or cjson.null, score = answers and answers.injection or cjson.null,
     timeout = { effective_ms = effective, floor_ms = cfg.jev.timeout_ms,
@@ -690,7 +698,7 @@ function _M.health()
     breaker_state = breaker and breaker:state() or cjson.null,
     mode = cfg.policy.mode,
   }
-  if not answers then ngx.status = 503 end
+  if not answers or cerr then ngx.status = 503 end
   ngx.say(cjson.encode(body))
 end
 

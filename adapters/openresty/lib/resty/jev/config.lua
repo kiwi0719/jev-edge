@@ -17,6 +17,13 @@ local state = {
   current = defaults.merge(defaults.config),
   rules = {},
   dict_name = "jev_config",
+  -- false until a config passed validation; then a refused one keeps it
+  applied = false,
+  -- why the config in force is not the one asked for: the last validation
+  -- failure (cleared by the next config that passes) and the last time the
+  -- file could not be loaded (cleared when it loads)
+  error = nil,
+  file_error = nil,
 }
 
 local rules_mod = require "jev.core.rules"
@@ -140,12 +147,27 @@ local function rebuild()
   local merged = defaults.merge(defaults.merge(defaults.config, state.file_cfg), override)
   local ok, err = defaults.validate(merged)
   if not ok then
-    ngx.log(ngx.ERR, "jev-edge: config invalid, keeping previous: ", err, env_hint(err))
+    state.error = tostring(err)
+    if state.applied then
+      ngx.log(ngx.ERR, "jev-edge: config invalid, keeping previous: ", err, env_hint(err))
+      return false
+    end
+    -- Nothing valid was ever applied (the init call): run the defaults, rules
+    -- included, so what runs is what GET /_jev/config shows (monitor mode, the
+    -- stock rules) and not the defaults' table with no rules loaded, where
+    -- every request passes as "no rules". /_jev/config and /_jev/health
+    -- report the error until a config passes.
+    ngx.log(ngx.ERR, "jev-edge: config invalid, using the defaults (monitor mode): ", err, env_hint(err))
+    local fallback = defaults.merge(defaults.config)
+    read_api_key(fallback)
+    state.current = fallback
+    state.rules = load_rules(fallback.rules)
     return false
   end
   read_api_key(merged)
   state.current = merged
   state.rules = load_rules(merged.rules)
+  state.applied, state.error = true, nil
   return true
 end
 
@@ -197,6 +219,7 @@ function _M.init(path, opts)
       state.file_cfg = cfg
       state.file_mtime = file_mtime(path)
     else
+      state.file_error = "cannot load " .. tostring(path) .. ": " .. tostring(err)
       ngx.log(ngx.ERR, "jev-edge: cannot load ", path, ": ", tostring(err), "; using defaults")
     end
   end
@@ -213,9 +236,11 @@ function _M.reload()
       if cfg then
         state.file_cfg = cfg
         state.file_mtime = m
+        state.file_error = nil
         changed = true
         ngx.log(ngx.NOTICE, "jev-edge: config file reloaded")
       else
+        state.file_error = "cannot load " .. tostring(state.path) .. ": " .. tostring(err)
         ngx.log(ngx.ERR, "jev-edge: config reload failed, keeping previous: ", tostring(err))
         state.file_mtime = m
       end
@@ -235,6 +260,10 @@ end
 
 function _M.current() return state.current end
 function _M.rules() return state.rules end
+
+--- Why the config in force is not the one configured, or nil: the config
+-- (file plus override) failed validation, or the file could not be loaded.
+function _M.error() return state.error or state.file_error end
 
 --- Runtime override API (used by /_jev/config).
 function _M.set_override(tbl)

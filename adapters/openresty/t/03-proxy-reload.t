@@ -246,3 +246,51 @@ X-Jev-Mock-Score: 0.97
  "^\\{\"ok\":true\\}",
  '(?=.*"config_error":"rules\\[1\\]: )(?=.*"rules":\\["llm-endpoints"\\])(?=.*"mode":"monitor")']
 --- timeout: 15
+
+
+
+=== TEST 8: a file saved twice within one second, or read half-written, loads what it holds last
+--- http_config eval: $::HttpConfig
+--- user_files eval: ::conf('policy = { mode = "monitor", block_threshold = 0.85, suspect_threshold = 0.5 },')
+--- config eval
+qq{
+location /v1/chat/completions { $::Access $::Echo }
+location = /save {
+    content_by_lua_block {
+        -- lfs with an mtime that does not move between the saves: what two
+        -- saves within one whole second look like
+        package.loaded.lfs = { attributes = function() return { modification = 1700000000 } end }
+        local config = require "resty.jev.config"
+        local path = ngx.var.document_root .. "/jev-edge.conf.lua"
+        local function save(s) local f = assert(io.open(path, "w")); f:write(s); f:close() end
+        local function conf(policy)
+            return 'return { jev = { provider = "mock", mock_header = "x-jev-mock-score" }, '
+                .. 'rules = { "llm-endpoints" }, cache = { fp_ttl = 0.001 }, policy = ' .. policy .. ' }'
+        end
+        save(conf('{ mode = "monitor", block_threshold = 0.85, suspect_threshold = 0.4 }'))
+        config.reload()
+        save(conf('{ mode = "enforce", block_threshold = 0.85, suspect_threshold = 0.5 }'))
+        config.reload()
+        ngx.say("two saves: ", config.current().policy.mode)
+        -- the timer reads the file while it is being written (a syntax
+        -- error), then the write completes
+        local full = conf('{ mode = "monitor", block_threshold = 0.85, suspect_threshold = 0.3 }')
+        save(full:sub(1, 60))
+        config.reload()
+        ngx.say("half-written: ", tostring(config.error()):match("unfinished string") or tostring(config.error()))
+        save(full)
+        config.reload()
+        ngx.say("half-written, then whole: ", config.current().policy.suspect_threshold, " ", tostring(config.error()))
+    }
+}
+}
+--- request eval
+["GET /save",
+ "POST /v1/chat/completions\n{\"messages\":[{\"role\":\"user\",\"content\":\"Please summarise the attached quarterly report for me.\"}]}"]
+--- more_headers
+Content-Type: application/json
+X-Jev-Mock-Score: 0.35
+--- response_body eval
+["two saves: enforce\nhalf-written: unfinished string\nhalf-written, then whole: 0.3 nil\n",
+ "verdict=suspicious score=0.35 source=l2 reason=injection+0.35\n"]
+--- timeout: 10

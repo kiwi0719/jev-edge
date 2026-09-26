@@ -1,7 +1,7 @@
 -- resty/jev/config.lua
 -- Layers: core defaults < config file < runtime override (shared dict).
 -- Each worker keeps a plain table for the current config; reload is driven by
--- a timer that watches the file mtime and the override dict's version key.
+-- a timer that watches the file's content and the override dict's version key.
 
 local defaults = require "jev.core.defaults"
 local cjson = require "cjson.safe"
@@ -17,7 +17,8 @@ local state = {
   -- the override, whenever the override changes, and replaced by the next
   -- edit of the file
   file_pending = nil,
-  file_mtime = 0,
+  -- signature of the file content last read (file_sig), loaded or not
+  file_sig = nil,
   file_env = nil,
   override_version = 0,
   current = defaults.merge(defaults.config),
@@ -242,22 +243,22 @@ local function rebuild(reloaded)
   return false
 end
 
-local function file_mtime(path)
-  local lfs_ok, lfs = pcall(require, "lfs")
-  if lfs_ok then
-    local attr = lfs.attributes(path)
-    return attr and attr.modification or 0
-  end
-  -- no lfs: fall back to content hash as a change signal
-  local f = io.open(path, "rb")
-  if not f then return 0 end
+-- The file's content and its signature (CRC-32 and length), or nil, err.
+-- Not the mtime: it has whole seconds, so a second save within the same
+-- second, or a half-written file the timer read followed by the rest of the
+-- write, kept the mtime already seen and the new content was never loaded.
+-- The content loaded is the content signed, read once.
+local function read_file(path)
+  local f, err = io.open(path, "rb")
+  if not f then return nil, err end
   local data = f:read("*a")
   f:close()
-  return ngx.crc32_long(data)
+  if not data then return nil, "cannot read " .. tostring(path) end
+  return data, ngx.crc32_long(data) .. ":" .. #data
 end
 
-local function load_file(path)
-  local chunk, err = loadfile(path)
+local function load_file(path, data)
+  local chunk, err = loadstring(data, "@" .. path)
   if not chunk then return nil, err end
   -- os.getenv is wrapped while the file runs to note what came back empty
   -- (env_hint), and put back even when the file fails. A config file has no
@@ -285,10 +286,17 @@ function _M.init(path, opts)
   state.dict_name = opts.dict or state.dict_name
   state.path = path
   if path then
-    local cfg, err = load_file(path)
+    local data, sig = read_file(path)
+    local cfg, err
+    if data then
+      -- recorded loaded or not: a refused file is read again once it changes
+      state.file_sig = sig
+      cfg, err = load_file(path, data)
+    else
+      err = sig
+    end
     if cfg then
       state.file_pending = cfg
-      state.file_mtime = file_mtime(path)
     else
       state.file_error = "cannot load " .. tostring(path) .. ": " .. tostring(err)
       ngx.log(ngx.ERR, "jev-edge: cannot load ", path, ": ", tostring(err), "; using defaults")
@@ -301,12 +309,16 @@ end
 function _M.reload()
   local changed, reloaded = false, false
   if state.path then
-    local m = file_mtime(state.path)
-    if m ~= state.file_mtime then
+    local data, sig = read_file(state.path)
+    -- an unreadable file has no signature: read again every 2 s, reported
+    -- once, when it stops being readable
+    local m = data and sig or nil
+    if m ~= state.file_sig then
       -- advanced whatever the file holds, so a bad one is not read and
       -- refused again every 2 s
-      state.file_mtime = m
-      local cfg, err = load_file(state.path)
+      state.file_sig = m
+      local cfg, err
+      if data then cfg, err = load_file(state.path, data) else err = sig end
       if cfg then
         -- in force only once rebuild() has validated it: until then
         -- state.file_cfg, which set_override checks against, is the last

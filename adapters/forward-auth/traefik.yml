@@ -22,6 +22,13 @@ http:
         # jev-edge, so a large request would be denied rather than passed as
         # "body too large" (fail-open). Cap request size with a `buffering`
         # middleware (maxRequestBodyBytes) ahead of this one if you need to.
+        # Keep false. With true, a request from an IP the entrypoint trusts
+        # (forwardedHeaders.trustedIPs, e.g. your load balancer) passes the
+        # client's own X-Forwarded-Uri and X-Forwarded-Method on, and
+        # jev-edge judges the path the client wrote (/healthz, not watched)
+        # instead of the one Traefik routes. Behind a load balancer, get the
+        # client IP with the entrypoint's proxyProtocol.trustedIPs instead.
+        trustForwardHeader: false
         # copy the verdict onto the request that reaches your service
         authResponseHeaders:
           - X-Jev-Verdict

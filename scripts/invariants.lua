@@ -252,6 +252,13 @@ rule("gateway-headers", function(r)
   if traefik:find("\n%s*maxBodySize:") then
     fail(r, "traefik.yml sets maxBodySize (Traefik denies past it instead of letting jev-edge judge)")
   end
+  -- trustForwardHeader true relays the client's X-Forwarded-Uri/Method from
+  -- a trusted peer, and jev-edge judges that path (audit openresty-edge#8)
+  for v in traefik:gmatch("\n%s*trustForwardHeader:%s*([^\n#]-)%s*[\n#]") do
+    if v ~= "false" then
+      fail(r, "traefik.yml sets trustForwardHeader: " .. v .. " (the client's X-Forwarded-Uri is judged)")
+    end
+  end
   local envoy = read("adapters/envoy/envoy-http.yaml") or ""
   if not envoy:find("exact:%s*content%-encoding") then fail(r, "envoy-http.yaml does not forward content-encoding") end
   for _, f in ipairs({ "adapters/envoy/envoy-http.yaml", "adapters/envoy/envoy-grpc.yaml" }) do

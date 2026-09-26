@@ -118,6 +118,19 @@ local cases = {
     { ["ops/grafana/jev-edge.json"] = edit(read("ops/grafana/jev-edge.json"),
         '"max by %(instance%) %((jev_breaker_state{[^}]*})%)', '"max(%1) by (instance)') } },
 
+  -- gateway-headers: Traefik must not relay the client's X-Forwarded-Uri (audit openresty-edge#8)
+  { "traefik: trustForwardHeader true",
+    { ["adapters/forward-auth/traefik.yml"] = edit(read("adapters/forward-auth/traefik.yml"),
+        "trustForwardHeader: false", "trustForwardHeader: true") },
+    "gateway-headers", "traefik.yml sets trustForwardHeader: true" },
+  { "traefik: trustForwardHeader true with a comment",
+    { ["adapters/forward-auth/traefik.yml"] = edit(read("adapters/forward-auth/traefik.yml"),
+        "trustForwardHeader: false", "trustForwardHeader: true  # behind the LB") },
+    "gateway-headers", "traefik.yml sets trustForwardHeader: true" },
+  { "traefik: trustForwardHeader left to Traefik's default (false)",
+    { ["adapters/forward-auth/traefik.yml"] = edit(read("adapters/forward-auth/traefik.yml"),
+        "\n%s*trustForwardHeader: false", "") } },
+
   -- ci-ok: every job, whatever the jobs: line looks like (audit ci-release#5)
   { "ci.yml: new job not in needs", { [CI] = with_newjob(ci) }, "ci-ok", "ci-ok does not need job newjob" },
   { "ci.yml: jobs: with a comment, new job not in needs",

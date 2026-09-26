@@ -837,35 +837,173 @@ local function form_values(body, out)
   end
 end
 
--- multipart/form-data: every field without a filename, and file parts whose
--- own Content-Type is text or JSON (a prompt uploaded as prompt.txt). Binary
--- files contribute nothing. At most MAX_PARTS parts are read.
-local MAX_PARTS = 100
-local function multipart_values(body, content_type, out)
-  local boundary = content_type:match('[Bb][Oo][Uu][Nn][Dd][Aa][Rr][Yy]="([^"]+)"')
-    or content_type:match("[Bb][Oo][Uu][Nn][Dd][Aa][Rr][Yy]=([^;%s,]+)")
-  if not boundary then return end
-  local delim = "--" .. boundary
-  local pos = body:find(delim, 1, true)
-  local parts = 0
-  while pos and parts < MAX_PARTS do
-    local after = pos + #delim
-    if body:sub(after, after + 1) == "--" then break end   -- closing delimiter
-    local next_pos = body:find(delim, after, true)
-    local part = body:sub(after, (next_pos or #body + 1) - 1)
-    part = part:gsub("^\r?\n", ""):gsub("\r?\n$", "")
-    local hs, he = part:find("\r?\n\r?\n")
-    if hs then
-      local head, value = part:sub(1, hs - 1):lower(), part:sub(he + 1)
-      local has_file = head:find("filename%*?=") ~= nil
-      local pct = head:match("content%-type:%s*([^\r\n;]+)") or ""
-      if (not has_file or pct:find("^text/") or pct:find("json", 1, true)) and _M.is_text(value) then
-        out[#out + 1] = value
+-- The parameters of a header value such as Content-Type or
+-- Content-Disposition, in order: { { name, value }, ... }. The value before
+-- the first ';' (the media or disposition type) is not one. Parameters are
+-- split on ';' outside quoted strings; a name is trimmed and lowercased; a
+-- value is a quoted string (backslash escapes removed) or a token that ends
+-- at ';', ',' or whitespace, so the values of repeated headers that
+-- rules.content_type joined with ", " come apart. Linear: plain finds, each
+-- byte looked at a bounded number of times.
+local function header_params(s)
+  local out, n = {}, #s
+  local i = s:find(";", 1, true)
+  if not i then return out end
+  i = i + 1
+  while i <= n do
+    local eq = s:find("[=;]", i)
+    if not eq then break end
+    if s:byte(eq) == 59 then
+      i = eq + 1   -- a parameter without '=': nothing to read
+    else
+      local a, e = s:find("%S", i), eq - 1
+      while e >= i and s:find("^%s", e) do e = e - 1 end
+      local name = (a and a <= e) and s:sub(a, e):lower() or ""
+      local v = s:find("%S", eq + 1) or n + 1
+      local value, after
+      if s:byte(v) == 34 then
+        -- a quoted string, to its closing quote (or the end)
+        local buf, j = {}, v + 1
+        while j <= n do
+          local k = s:find('["\\]', j)
+          if not k then
+            buf[#buf + 1] = s:sub(j)
+            j = n + 1
+            break
+          end
+          buf[#buf + 1] = s:sub(j, k - 1)
+          if s:byte(k) == 34 then
+            j = k + 1
+            break
+          end
+          buf[#buf + 1] = s:sub(k + 1, k + 1)
+          j = k + 2
+        end
+        value, after = table.concat(buf), j
+      else
+        local e2 = s:find("[;,%s]", v) or n + 1
+        value, after = s:sub(v, e2 - 1), e2
+      end
+      out[#out + 1] = { name = name, value = value }
+      local nxt = s:find(";", after, true)
+      if not nxt then break end
+      i = nxt + 1
+    end
+  end
+  return out
+end
+_M.header_params = header_params
+
+-- The index just past a delimiter's line when the "--" .. boundary that ends
+-- before `at` is a delimiter: "--" (the close: returns false), or optional
+-- space or tab and then `nl` (or, with no `nl` yet, "\r\n" or "\n", which is
+-- returned as well). nil when it is not a delimiter, only text that starts
+-- like one.
+local function delimiter_end(body, at, nl)
+  if body:sub(at, at + 1) == "--" then return false end
+  local e = body:find("[^ \t]", at) or #body + 1
+  if nl then
+    if body:sub(e, e + #nl - 1) == nl then return e + #nl end
+    return nil
+  end
+  if body:sub(e, e + 1) == "\r\n" then return e + 2, "\r\n" end
+  if body:byte(e) == 10 then return e + 1, "\n" end
+  return nil
+end
+
+-- One part: its headers, one per line. A part is a file when its
+-- Content-Disposition has a filename or filename* parameter, and it is read
+-- when it is not a file or its Content-Type (text/plain when it has none,
+-- RFC 7578 4.4) is text or JSON, and the value reads as text.
+local function multipart_part(part, out)
+  local hs, he = part:find("^\r?\n")
+  if not hs then hs, he = part:find("\r?\n\r?\n") end
+  if not hs then return end
+  local value = part:sub(he + 1)
+  local has_file, typed, text_type = false, false, false
+  for line in part:sub(1, hs - 1):gmatch("[^\r\n]+") do
+    local colon = line:find(":", 1, true)
+    if colon then
+      local name = line:sub(1, colon - 1):match("^%s*(%S*)"):lower()
+      if name == "content-disposition" then
+        for _, p in ipairs(header_params(line:sub(colon + 1))) do
+          if p.name == "filename" or p.name == "filename*" then has_file = true end
+        end
+      elseif name == "content-type" then
+        local v = line:sub(colon + 1)
+        local semi = v:find(";", 1, true)
+        local ct = (semi and v:sub(1, semi - 1) or v):lower()
+        typed = true
+        if ct:find("^%s*text/") or ct:find("json", 1, true) then text_type = true end
       end
     end
-    parts = parts + 1
-    pos = next_pos
   end
+  if (not has_file or not typed or text_type) and _M.is_text(value) then out[#out + 1] = value end
+end
+
+-- The parts of a multipart body under `boundary`, as RFC 2046, Go's
+-- mime/multipart and Starlette read them: the first delimiter at the start
+-- of the body or of a line (a preamble before it is skipped), its line
+-- ending CRLF, or LF as Go also takes it; then every delimiter is that line
+-- ending, "--" and the boundary, followed by "--" (the close, after which
+-- nothing is read) or by optional space or tab and the line ending. The
+-- boundary anywhere else, mid-line or with more after it, is part of a
+-- value. A part's value runs to the line ending before the next delimiter.
+local function multipart_parts(body, boundary, out)
+  local delim = "--" .. boundary
+  local after, nl
+  if body:sub(1, #delim) == delim then after, nl = delimiter_end(body, 1 + #delim) end
+  local pos = 1
+  while after == nil do
+    local p = body:find("\n" .. delim, pos, true)
+    if not p then return end
+    after, nl = delimiter_end(body, p + 1 + #delim)
+    pos = p + 1
+  end
+  if not after then return end   -- the close before any part
+  local sep = nl .. delim
+  while true do
+    local stop, next_after
+    local q = after
+    while true do
+      local m = body:find(sep, q, true)
+      if not m then break end
+      next_after = delimiter_end(body, m + #sep, nl)
+      if next_after ~= nil then
+        stop = m - 1
+        break
+      end
+      q = m + 1
+    end
+    multipart_part(body:sub(after, stop or #body), out)
+    -- nil: no delimiter left (a body cut short); false: the close
+    if not next_after then return end
+    after = next_after
+  end
+end
+
+-- multipart/form-data: every field without a filename, and file parts whose
+-- own Content-Type is text or JSON, or that have none (a prompt uploaded as
+-- prompt.txt). Binary files contribute nothing. Every part is read:
+-- max_body_bytes bounds the body, and the scan is linear. Several distinct
+-- boundary parameters (a repeated one, or repeated headers joined with ", ")
+-- are each read, the values of all of them judged, since the backend may
+-- take any one; each costs a scan of the body, so past MAX_BOUNDARIES of
+-- them (a client does not send more than one, Go refuses a second) none is
+-- read and the body is unreadable: returns true.
+_M.MAX_BOUNDARIES = 8
+local function multipart_values(body, content_type, out)
+  local list, seen = {}, {}
+  for _, p in ipairs(header_params(content_type)) do
+    local b = p.value
+    if p.name == "boundary" and b ~= "" and not b:find("[\r\n]") and not seen[b] then
+      seen[b] = true
+      list[#list + 1] = b
+      if #list > _M.MAX_BOUNDARIES then return true end
+    end
+  end
+  for _, b in ipairs(list) do multipart_parts(body, b, out) end
+  return false
 end
 
 --- `s` with every \uD800-\uDFFF escape that is not half of a valid pair
@@ -921,7 +1059,9 @@ end
 -- @param fields       list of JSON paths
 -- @param json_decode  function(string) -> table|nil
 -- @return text string (the values joined with "\n"),
---         kind ("json"|"scan"|"invalid"|"form"|"multipart"|"text"|"binary"|"none"),
+--         kind ("json"|"scan"|"invalid"|"form"|"multipart"|"boundaries"|"text"|
+--         "binary"|"none"; "boundaries": a multipart type with more boundary
+--         parameters than MAX_BOUNDARIES, nothing read),
 --         list of the values found (newest last), for window(),
 --         the decoded JSON value when kind is "json", true when a "**"
 --         walk hit a bound and left something out, and true when a text
@@ -962,8 +1102,8 @@ function _M.extract(body, content_type, fields, json_decode)
     if #out > 0 then
       if form and not declared_json then
         form_values(body, out)
-      elseif multipart and not declared_json then
-        multipart_values(body, raw_ct, out)
+      elseif multipart and not declared_json and multipart_values(body, raw_ct, out) then
+        return "", "boundaries", {}
       end
       return table.concat(out, "\n"), "scan", out, nil, nil, seen.token_ids == true
     end
@@ -975,7 +1115,7 @@ function _M.extract(body, content_type, fields, json_decode)
     return table.concat(out, "\n"), "form", out
   end
   if multipart then
-    multipart_values(body, raw_ct, out)
+    if multipart_values(body, raw_ct, out) then return "", "boundaries", {} end
     return table.concat(out, "\n"), "multipart", out
   end
   if _M.is_text(body) then return body, "text", { body } end

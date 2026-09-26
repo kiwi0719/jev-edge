@@ -599,6 +599,294 @@
     },
     {
       "expect": {
+        "kind": "multipart",
+        "text": "hello --B-- world\nsecond field"
+      },
+      "input": {
+        "body": "--B\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nhello --B-- world\r\n--B\r\nContent-Disposition: form-data; name=\"b\"\r\n\r\nsecond field\r\n--B--\r\n",
+        "content_type": "multipart/form-data; boundary=B",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "multipart: the boundary mid-line is part of the value"
+    },
+    {
+      "expect": {
+        "kind": "multipart",
+        "text": "line one\r\n--Bxyz\nsecond field"
+      },
+      "input": {
+        "body": "--B\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nline one\r\n--Bxyz\r\n--B\r\nContent-Disposition: form-data; name=\"b\"\r\n\r\nsecond field\r\n--B--\r\n",
+        "content_type": "multipart/form-data; boundary=B",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "multipart: the boundary with more after it at a line start is part of the value"
+    },
+    {
+      "expect": {
+        "kind": "multipart",
+        "text": "first field\nsecond field"
+      },
+      "input": {
+        "body": "--B\nContent-Disposition: form-data; name=\"a\"\n\nfirst field\n--B\nContent-Disposition: form-data; name=\"b\"\n\nsecond field\n--B--\n",
+        "content_type": "multipart/form-data; boundary=B",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "multipart: LF line endings"
+    },
+    {
+      "expect": {
+        "kind": "multipart",
+        "text": "first field\nsecond field"
+      },
+      "input": {
+        "body": "preamble text\r\n--Bnot a delimiter\r\n--B \t\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nfirst field\r\n--B\r\nContent-Disposition: form-data; name=\"b\"\r\n\r\nsecond field\r\n--B--\r\nepilogue text",
+        "content_type": "multipart/form-data; boundary=B",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "multipart: a preamble, and transport padding after a delimiter"
+    },
+    {
+      "expect": {
+        "kind": "multipart",
+        "text": "first field\ncut short"
+      },
+      "input": {
+        "body": "--B\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nfirst field\r\n--B\r\nContent-Disposition: form-data; name=\"b\"\r\n\r\ncut short",
+        "content_type": "multipart/form-data; boundary=B",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "multipart: a body cut short keeps its last part"
+    },
+    {
+      "expect": {
+        "kind": "multipart",
+        "text": "v1\nv2\nv3\nv4\nv5\nv6\nv7\nv8\nv9\nv10\nv11\nv12\nv13\nv14\nv15\nv16\nv17\nv18\nv19\nv20\nv21\nv22\nv23\nv24\nv25\nv26\nv27\nv28\nv29\nv30\nv31\nv32\nv33\nv34\nv35\nv36\nv37\nv38\nv39\nv40\nv41\nv42\nv43\nv44\nv45\nv46\nv47\nv48\nv49\nv50\nv51\nv52\nv53\nv54\nv55\nv56\nv57\nv58\nv59\nv60\nv61\nv62\nv63\nv64\nv65\nv66\nv67\nv68\nv69\nv70\nv71\nv72\nv73\nv74\nv75\nv76\nv77\nv78\nv79\nv80\nv81\nv82\nv83\nv84\nv85\nv86\nv87\nv88\nv89\nv90\nv91\nv92\nv93\nv94\nv95\nv96\nv97\nv98\nv99\nv100\nfield 101"
+      },
+      "input": {
+        "body": "--B\r\nContent-Disposition: form-data; name=\"f1\"\r\n\r\nv1\r\n--B\r\nContent-Disposition: form-data; name=\"f2\"\r\n\r\nv2\r\n--B\r\nContent-Disposition: form-data; name=\"f3\"\r\n\r\nv3\r\n--B\r\nContent-Disposition: form-data; name=\"f4\"\r\n\r\nv4\r\n--B\r\nContent-Disposition: form-data; name=\"f5\"\r\n\r\nv5\r\n--B\r\nContent-Disposition: form-data; name=\"f6\"\r\n\r\nv6\r\n--B\r\nContent-Disposition: form-data; name=\"f7\"\r\n\r\nv7\r\n--B\r\nContent-Disposition: form-data; name=\"f8\"\r\n\r\nv8\r\n--B\r\nContent-Disposition: form-data; name=\"f9\"\r\n\r\nv9\r\n--B\r\nContent-Disposition: form-data; name=\"f10\"\r\n\r\nv10\r\n--B\r\nContent-Disposition: form-data; name=\"f11\"\r\n\r\nv11\r\n--B\r\nContent-Disposition: form-data; name=\"f12\"\r\n\r\nv12\r\n--B\r\nContent-Disposition: form-data; name=\"f13\"\r\n\r\nv13\r\n--B\r\nContent-Disposition: form-data; name=\"f14\"\r\n\r\nv14\r\n--B\r\nContent-Disposition: form-data; name=\"f15\"\r\n\r\nv15\r\n--B\r\nContent-Disposition: form-data; name=\"f16\"\r\n\r\nv16\r\n--B\r\nContent-Disposition: form-data; name=\"f17\"\r\n\r\nv17\r\n--B\r\nContent-Disposition: form-data; name=\"f18\"\r\n\r\nv18\r\n--B\r\nContent-Disposition: form-data; name=\"f19\"\r\n\r\nv19\r\n--B\r\nContent-Disposition: form-data; name=\"f20\"\r\n\r\nv20\r\n--B\r\nContent-Disposition: form-data; name=\"f21\"\r\n\r\nv21\r\n--B\r\nContent-Disposition: form-data; name=\"f22\"\r\n\r\nv22\r\n--B\r\nContent-Disposition: form-data; name=\"f23\"\r\n\r\nv23\r\n--B\r\nContent-Disposition: form-data; name=\"f24\"\r\n\r\nv24\r\n--B\r\nContent-Disposition: form-data; name=\"f25\"\r\n\r\nv25\r\n--B\r\nContent-Disposition: form-data; name=\"f26\"\r\n\r\nv26\r\n--B\r\nContent-Disposition: form-data; name=\"f27\"\r\n\r\nv27\r\n--B\r\nContent-Disposition: form-data; name=\"f28\"\r\n\r\nv28\r\n--B\r\nContent-Disposition: form-data; name=\"f29\"\r\n\r\nv29\r\n--B\r\nContent-Disposition: form-data; name=\"f30\"\r\n\r\nv30\r\n--B\r\nContent-Disposition: form-data; name=\"f31\"\r\n\r\nv31\r\n--B\r\nContent-Disposition: form-data; name=\"f32\"\r\n\r\nv32\r\n--B\r\nContent-Disposition: form-data; name=\"f33\"\r\n\r\nv33\r\n--B\r\nContent-Disposition: form-data; name=\"f34\"\r\n\r\nv34\r\n--B\r\nContent-Disposition: form-data; name=\"f35\"\r\n\r\nv35\r\n--B\r\nContent-Disposition: form-data; name=\"f36\"\r\n\r\nv36\r\n--B\r\nContent-Disposition: form-data; name=\"f37\"\r\n\r\nv37\r\n--B\r\nContent-Disposition: form-data; name=\"f38\"\r\n\r\nv38\r\n--B\r\nContent-Disposition: form-data; name=\"f39\"\r\n\r\nv39\r\n--B\r\nContent-Disposition: form-data; name=\"f40\"\r\n\r\nv40\r\n--B\r\nContent-Disposition: form-data; name=\"f41\"\r\n\r\nv41\r\n--B\r\nContent-Disposition: form-data; name=\"f42\"\r\n\r\nv42\r\n--B\r\nContent-Disposition: form-data; name=\"f43\"\r\n\r\nv43\r\n--B\r\nContent-Disposition: form-data; name=\"f44\"\r\n\r\nv44\r\n--B\r\nContent-Disposition: form-data; name=\"f45\"\r\n\r\nv45\r\n--B\r\nContent-Disposition: form-data; name=\"f46\"\r\n\r\nv46\r\n--B\r\nContent-Disposition: form-data; name=\"f47\"\r\n\r\nv47\r\n--B\r\nContent-Disposition: form-data; name=\"f48\"\r\n\r\nv48\r\n--B\r\nContent-Disposition: form-data; name=\"f49\"\r\n\r\nv49\r\n--B\r\nContent-Disposition: form-data; name=\"f50\"\r\n\r\nv50\r\n--B\r\nContent-Disposition: form-data; name=\"f51\"\r\n\r\nv51\r\n--B\r\nContent-Disposition: form-data; name=\"f52\"\r\n\r\nv52\r\n--B\r\nContent-Disposition: form-data; name=\"f53\"\r\n\r\nv53\r\n--B\r\nContent-Disposition: form-data; name=\"f54\"\r\n\r\nv54\r\n--B\r\nContent-Disposition: form-data; name=\"f55\"\r\n\r\nv55\r\n--B\r\nContent-Disposition: form-data; name=\"f56\"\r\n\r\nv56\r\n--B\r\nContent-Disposition: form-data; name=\"f57\"\r\n\r\nv57\r\n--B\r\nContent-Disposition: form-data; name=\"f58\"\r\n\r\nv58\r\n--B\r\nContent-Disposition: form-data; name=\"f59\"\r\n\r\nv59\r\n--B\r\nContent-Disposition: form-data; name=\"f60\"\r\n\r\nv60\r\n--B\r\nContent-Disposition: form-data; name=\"f61\"\r\n\r\nv61\r\n--B\r\nContent-Disposition: form-data; name=\"f62\"\r\n\r\nv62\r\n--B\r\nContent-Disposition: form-data; name=\"f63\"\r\n\r\nv63\r\n--B\r\nContent-Disposition: form-data; name=\"f64\"\r\n\r\nv64\r\n--B\r\nContent-Disposition: form-data; name=\"f65\"\r\n\r\nv65\r\n--B\r\nContent-Disposition: form-data; name=\"f66\"\r\n\r\nv66\r\n--B\r\nContent-Disposition: form-data; name=\"f67\"\r\n\r\nv67\r\n--B\r\nContent-Disposition: form-data; name=\"f68\"\r\n\r\nv68\r\n--B\r\nContent-Disposition: form-data; name=\"f69\"\r\n\r\nv69\r\n--B\r\nContent-Disposition: form-data; name=\"f70\"\r\n\r\nv70\r\n--B\r\nContent-Disposition: form-data; name=\"f71\"\r\n\r\nv71\r\n--B\r\nContent-Disposition: form-data; name=\"f72\"\r\n\r\nv72\r\n--B\r\nContent-Disposition: form-data; name=\"f73\"\r\n\r\nv73\r\n--B\r\nContent-Disposition: form-data; name=\"f74\"\r\n\r\nv74\r\n--B\r\nContent-Disposition: form-data; name=\"f75\"\r\n\r\nv75\r\n--B\r\nContent-Disposition: form-data; name=\"f76\"\r\n\r\nv76\r\n--B\r\nContent-Disposition: form-data; name=\"f77\"\r\n\r\nv77\r\n--B\r\nContent-Disposition: form-data; name=\"f78\"\r\n\r\nv78\r\n--B\r\nContent-Disposition: form-data; name=\"f79\"\r\n\r\nv79\r\n--B\r\nContent-Disposition: form-data; name=\"f80\"\r\n\r\nv80\r\n--B\r\nContent-Disposition: form-data; name=\"f81\"\r\n\r\nv81\r\n--B\r\nContent-Disposition: form-data; name=\"f82\"\r\n\r\nv82\r\n--B\r\nContent-Disposition: form-data; name=\"f83\"\r\n\r\nv83\r\n--B\r\nContent-Disposition: form-data; name=\"f84\"\r\n\r\nv84\r\n--B\r\nContent-Disposition: form-data; name=\"f85\"\r\n\r\nv85\r\n--B\r\nContent-Disposition: form-data; name=\"f86\"\r\n\r\nv86\r\n--B\r\nContent-Disposition: form-data; name=\"f87\"\r\n\r\nv87\r\n--B\r\nContent-Disposition: form-data; name=\"f88\"\r\n\r\nv88\r\n--B\r\nContent-Disposition: form-data; name=\"f89\"\r\n\r\nv89\r\n--B\r\nContent-Disposition: form-data; name=\"f90\"\r\n\r\nv90\r\n--B\r\nContent-Disposition: form-data; name=\"f91\"\r\n\r\nv91\r\n--B\r\nContent-Disposition: form-data; name=\"f92\"\r\n\r\nv92\r\n--B\r\nContent-Disposition: form-data; name=\"f93\"\r\n\r\nv93\r\n--B\r\nContent-Disposition: form-data; name=\"f94\"\r\n\r\nv94\r\n--B\r\nContent-Disposition: form-data; name=\"f95\"\r\n\r\nv95\r\n--B\r\nContent-Disposition: form-data; name=\"f96\"\r\n\r\nv96\r\n--B\r\nContent-Disposition: form-data; name=\"f97\"\r\n\r\nv97\r\n--B\r\nContent-Disposition: form-data; name=\"f98\"\r\n\r\nv98\r\n--B\r\nContent-Disposition: form-data; name=\"f99\"\r\n\r\nv99\r\n--B\r\nContent-Disposition: form-data; name=\"f100\"\r\n\r\nv100\r\n--B\r\nContent-Disposition: form-data; name=\"last\"\r\n\r\nfield 101\r\n--B--\r\n",
+        "content_type": "multipart/form-data; boundary=B",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "multipart: the 101st field is read"
+    },
+    {
+      "expect": {
+        "kind": "multipart",
+        "text": "real boundary"
+      },
+      "input": {
+        "body": "--REAL\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nreal boundary\r\n--REAL--\r\n",
+        "content_type": "multipart/form-data; xboundary=\"FAKE\"; boundary=REAL",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "multipart: a parameter whose name ends in boundary is not the boundary"
+    },
+    {
+      "expect": {
+        "kind": "multipart",
+        "text": "real boundary"
+      },
+      "input": {
+        "body": "--REAL\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nreal boundary\r\n--REAL--\r\n",
+        "content_type": "multipart/form-data; foo=\"x;boundary=FAKE\"; boundary=REAL",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "multipart: boundary= inside another parameter's quoted value is not the boundary"
+    },
+    {
+      "expect": {
+        "kind": "multipart",
+        "text": "quoted boundary"
+      },
+      "input": {
+        "body": "--b \"q\"\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nquoted boundary\r\n--b \"q\"--\r\n",
+        "content_type": "multipart/form-data; boundary=\"b \\\"q\\\"\"",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "multipart: a quoted boundary with a space and an escape"
+    },
+    {
+      "expect": {
+        "kind": "multipart",
+        "text": "under A\nunder B"
+      },
+      "input": {
+        "body": "--A\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nunder A\r\n--A--\r\n--B\r\nContent-Disposition: form-data; name=\"b\"\r\n\r\nunder B\r\n--B--\r\n",
+        "content_type": "multipart/form-data; boundary=A, multipart/form-data; boundary=B",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "multipart: repeated Content-Type headers, each boundary read"
+    },
+    {
+      "expect": {
+        "kind": "multipart",
+        "text": "under the eighth"
+      },
+      "input": {
+        "body": "--X8\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nunder the eighth\r\n--X8--\r\n",
+        "content_type": "multipart/form-data; boundary=X1; boundary=X2; boundary=X3; boundary=X4; boundary=X5; boundary=X6; boundary=X7; boundary=X8",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "multipart: eight distinct boundaries are each read"
+    },
+    {
+      "expect": {
+        "kind": "boundaries",
+        "text": ""
+      },
+      "input": {
+        "body": "--X8\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nunder the eighth\r\n--X8--\r\n--X9\r\nContent-Disposition: form-data; name=\"b\"\r\n\r\nninth\r\n--X9--\r\n",
+        "content_type": "multipart/form-data; boundary=X1; boundary=X2; boundary=X3; boundary=X4; boundary=X5; boundary=X6; boundary=X7; boundary=X8; boundary=X9",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "multipart: past eight distinct boundaries nothing is read"
+    },
+    {
+      "expect": {
+        "kind": "multipart",
+        "text": "repeated"
+      },
+      "input": {
+        "body": "--B\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nrepeated\r\n--B--\r\n",
+        "content_type": "multipart/form-data; boundary=B; boundary=B; boundary=B; boundary=B; boundary=B; boundary=B; boundary=B; boundary=B; boundary=B; boundary=B; boundary=B; boundary=B; boundary=B; boundary=B; boundary=B; boundary=B; boundary=B; boundary=B; boundary=B; boundary=B",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "multipart: one boundary repeated is read once"
+    },
+    {
+      "expect": {
+        "kind": "multipart",
+        "text": "not a file"
+      },
+      "input": {
+        "body": "--B\r\nContent-Disposition: form-data; name=\"a\"\r\nContent-Type: application/octet-stream\r\nX-Note: filename=none\r\n\r\nnot a file\r\n--B--\r\n",
+        "content_type": "multipart/form-data; boundary=B",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "multipart: filename= in another header does not make a file"
+    },
+    {
+      "expect": {
+        "kind": "multipart",
+        "text": "not a file either"
+      },
+      "input": {
+        "body": "--B\r\nContent-Disposition: form-data; name=\"filename=x\"\r\nContent-Type: image/png\r\n\r\nnot a file either\r\n--B--\r\n",
+        "content_type": "multipart/form-data; boundary=B",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "multipart: filename= in the name does not make a file"
+    },
+    {
+      "expect": {
+        "kind": "multipart",
+        "text": "file without a type"
+      },
+      "input": {
+        "body": "--B\r\nContent-Disposition: form-data; name=\"f\"; filename=\"p.txt\"\r\n\r\nfile without a type\r\n--B\r\nContent-Disposition: form-data; name=\"g\"; filename*=UTF-8''q.bin\r\nContent-Type: application/octet-stream\r\n\r\nbinary-typed file\r\n--B--\r\n",
+        "content_type": "multipart/form-data; boundary=B",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "multipart: a file part with no Content-Type is text/plain"
+    },
+    {
+      "expect": {
         "kind": "json",
         "text": "Summarise this report"
       },

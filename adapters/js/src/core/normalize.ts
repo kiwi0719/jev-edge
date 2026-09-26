@@ -793,7 +793,8 @@ export function extractUntrustedValues(
   return extractUntrusted(decoded, spec, jsonDecode)[0];
 }
 
-export type ExtractKind = "json" | "scan" | "invalid" | "text" | "form" | "multipart" | "binary" | "none";
+/** "boundaries": a multipart type with more boundary parameters than MAX_BOUNDARIES, nothing read. */
+export type ExtractKind = "json" | "scan" | "invalid" | "text" | "form" | "multipart" | "boundaries" | "binary" | "none";
 
 /** Lua's tonumber(h, 16) + string.char: bytes, so %C3%BC is two bytes not one char. */
 function formDecode(v: string): string {
@@ -849,30 +850,171 @@ function formValues(body: string, out: string[]): void {
   }
 }
 
-const MAX_PARTS = 100;
-function multipartValues(body: string, contentType: string, out: string[]): void {
-  const bm = /boundary="([^"]+)"/i.exec(contentType) ?? /boundary=([^;\s,]+)/i.exec(contentType);
-  if (!bm) return;
-  const delim = "--" + bm[1];
-  let pos = body.indexOf(delim);
-  let parts = 0;
-  while (pos !== -1 && parts < MAX_PARTS) {
-    const after = pos + delim.length;
-    if (body.slice(after, after + 2) === "--") break; // closing delimiter
-    const next = body.indexOf(delim, after);
-    let part = body.slice(after, next === -1 ? body.length : next);
-    part = part.replace(/^\r?\n/, "").replace(/\r?\n$/, "");
-    const hm = /\r?\n\r?\n/.exec(part);
-    if (hm) {
-      const head = asciiLower(part.slice(0, hm.index));
-      const value = part.slice(hm.index + hm[0].length);
-      const hasFile = /filename\*?=/.test(head);
-      const pct = /content-type:[ \t\n\v\f\r]*([^\r\n;]+)/.exec(head)?.[1] ?? "";
-      if ((!hasFile || pct.startsWith("text/") || pct.includes("json")) && isText(value)) out.push(value);
+// Lua's %s: the ASCII whitespace its patterns know
+const isSpace = (c: string | undefined): boolean =>
+  c === " " || c === "\t" || c === "\n" || c === "\v" || c === "\f" || c === "\r";
+
+/**
+ * Port of header_params() in core/normalize.lua: the parameters of a header
+ * value such as Content-Type or Content-Disposition, in order, names trimmed
+ * and lowercased; split on ';' outside quoted strings, a value a quoted
+ * string (backslash escapes removed) or a token that ends at ';', ',' or
+ * whitespace. Linear.
+ */
+export function headerParams(s: string): { name: string; value: string }[] {
+  const out: { name: string; value: string }[] = [];
+  const n = s.length;
+  let i = s.indexOf(";");
+  if (i === -1) return out;
+  i++;
+  while (i < n) {
+    let eq = i;
+    while (eq < n && s[eq] !== "=" && s[eq] !== ";") eq++;
+    if (eq >= n) break;
+    if (s[eq] === ";") {
+      i = eq + 1; // a parameter without '=': nothing to read
+      continue;
     }
-    parts++;
-    pos = next;
+    let a = i;
+    while (a < eq && isSpace(s[a])) a++;
+    let e = eq - 1;
+    while (e >= a && isSpace(s[e])) e--;
+    const name = asciiLower(s.slice(a, e + 1));
+    let v = eq + 1;
+    while (v < n && isSpace(s[v])) v++;
+    let value = "";
+    let after: number;
+    if (s[v] === '"') {
+      // a quoted string, to its closing quote (or the end)
+      let j = v + 1;
+      for (;;) {
+        if (j >= n) break;
+        const c = s[j];
+        if (c === '"') {
+          j++;
+          break;
+        }
+        if (c === "\\") {
+          value += s.slice(j + 1, j + 2);
+          j += 2;
+        } else {
+          value += c;
+          j++;
+        }
+      }
+      after = j;
+    } else {
+      let e2 = v;
+      while (e2 < n && s[e2] !== ";" && s[e2] !== "," && !isSpace(s[e2])) e2++;
+      value = s.slice(v, e2);
+      after = e2;
+    }
+    out.push({ name, value });
+    const next = s.indexOf(";", after);
+    if (next === -1) break;
+    i = next + 1;
   }
+  return out;
+}
+
+// Port of delimiter_end(): the index just past a delimiter's line when the
+// "--" + boundary that ends before `at` is a delimiter: "--" (the close:
+// false), or optional space or tab and then `nl` (with no `nl` yet, "\r\n"
+// or "\n", returned as well). undefined when it only starts like one.
+function delimiterEnd(body: string, at: number, nl?: string): [number | false | undefined, string?] {
+  if (body.startsWith("--", at)) return [false];
+  let e = at;
+  while (body[e] === " " || body[e] === "\t") e++;
+  if (nl !== undefined) return body.startsWith(nl, e) ? [e + nl.length] : [undefined];
+  if (body.startsWith("\r\n", e)) return [e + 2, "\r\n"];
+  if (body[e] === "\n") return [e + 1, "\n"];
+  return [undefined];
+}
+
+// Port of multipart_part(): a part is a file when its Content-Disposition
+// has a filename or filename* parameter; it is read when it is not a file or
+// its Content-Type (text/plain when it has none) is text or JSON, and the
+// value reads as text.
+function multipartPart(part: string, out: string[]): void {
+  const hm = /^\r?\n/.exec(part) ?? /\r?\n\r?\n/.exec(part);
+  if (!hm) return;
+  const value = part.slice(hm.index + hm[0].length);
+  let hasFile = false, typed = false, textType = false;
+  for (const line of part.slice(0, hm.index).split(/[\r\n]+/)) {
+    const colon = line.indexOf(":");
+    if (colon === -1) continue;
+    const name = asciiLower(/^[ \t\n\v\f\r]*([^ \t\n\v\f\r]*)/.exec(line.slice(0, colon))![1]);
+    if (name === "content-disposition") {
+      for (const p of headerParams(line.slice(colon + 1))) if (p.name === "filename" || p.name === "filename*") hasFile = true;
+    } else if (name === "content-type") {
+      const v = line.slice(colon + 1);
+      const semi = v.indexOf(";");
+      const ct = asciiLower(semi === -1 ? v : v.slice(0, semi));
+      typed = true;
+      if (/^[ \t\n\v\f\r]*text\//.test(ct) || ct.includes("json")) textType = true;
+    }
+  }
+  if ((!hasFile || !typed || textType) && isText(value)) out.push(value);
+}
+
+// Port of multipart_parts(): the first delimiter at the start of the body or
+// of a line, its line ending CRLF or LF; then every delimiter is that line
+// ending, "--" and the boundary, followed by "--" (the close) or optional
+// space or tab and the line ending. A part's value runs to the line ending
+// before the next delimiter.
+function multipartParts(body: string, boundary: string, out: string[]): void {
+  const delim = "--" + boundary;
+  let after: number | false | undefined;
+  let nl: string | undefined;
+  if (body.startsWith(delim)) [after, nl] = delimiterEnd(body, delim.length);
+  let pos = 0;
+  while (after === undefined) {
+    const p = body.indexOf("\n" + delim, pos);
+    if (p === -1) return;
+    [after, nl] = delimiterEnd(body, p + 1 + delim.length);
+    pos = p + 1;
+  }
+  if (after === false) return; // the close before any part
+  const sep = nl! + delim;
+  for (;;) {
+    let stop: number | undefined;
+    let nextAfter: number | false | undefined;
+    let q: number = after;
+    for (;;) {
+      const m = body.indexOf(sep, q);
+      if (m === -1) break;
+      [nextAfter] = delimiterEnd(body, m + sep.length, nl);
+      if (nextAfter !== undefined) {
+        stop = m;
+        break;
+      }
+      q = m + 1;
+    }
+    multipartPart(body.slice(after, stop ?? body.length), out);
+    // undefined: no delimiter left (a body cut short); false: the close
+    if (nextAfter === undefined || nextAfter === false) return;
+    after = nextAfter;
+  }
+}
+
+// Port of multipart_values(): every field without a filename, and file parts
+// whose own Content-Type is text or JSON or that have none. Every part is
+// read; each distinct boundary parameter is read, the values of all of them
+// judged; past MAX_BOUNDARIES of them none is, and it returns true.
+export const MAX_BOUNDARIES = 8;
+function multipartValues(body: string, contentType: string, out: string[]): boolean {
+  const list: string[] = [];
+  const seen = new Set<string>();
+  for (const p of headerParams(contentType)) {
+    const b = p.value;
+    if (p.name === "boundary" && b !== "" && !/[\r\n]/.test(b) && !seen.has(b)) {
+      seen.add(b);
+      list.push(b);
+      if (list.length > MAX_BOUNDARIES) return true;
+    }
+  }
+  for (const b of list) multipartParts(body, b, out);
+  return false;
 }
 
 /**
@@ -999,7 +1141,7 @@ export function extract(
     const out = scanStrings(body, fieldKeys(fields), [], deepKeys(fields), seen);
     if (out.length > 0) {
       if (form && !declaredJson) formValues(body, out);
-      else if (multipart && !declaredJson) multipartValues(body, rawCt, out);
+      else if (multipart && !declaredJson && multipartValues(body, rawCt, out)) return ["", "boundaries", []];
       return [out.join("\n"), "scan", out, undefined, undefined, seen.tokenIds === true];
     }
     if (declaredJson) return ["", "invalid", [], undefined, undefined, seen.tokenIds === true];
@@ -1010,7 +1152,7 @@ export function extract(
     return [out.join("\n"), "form", out];
   }
   if (multipart) {
-    multipartValues(body, rawCt, out);
+    if (multipartValues(body, rawCt, out)) return ["", "boundaries", []];
     return [out.join("\n"), "multipart", out];
   }
   if (isText(body)) return [body, "text", [body]];

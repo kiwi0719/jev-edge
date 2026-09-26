@@ -543,6 +543,7 @@ async function judged(
     ids = tok === true;
     if (media && (kind === "binary" || kind === "none")) return { text: "", unj: CT_NOT_WATCHED };
     if (kind === "binary") return { text: "", unj: "unjudgeable: binary body" };
+    if (kind === "boundaries") return { text: "", unj: "unjudgeable: multipart boundaries" };
     // declared JSON the decoder refused, with no text-field value to scan
     if (kind === "invalid") return { text: "", unj: ids ? TOKEN_REASON : "unjudgeable: invalid json" };
     // a "**" field hit its bound: the text is not all there

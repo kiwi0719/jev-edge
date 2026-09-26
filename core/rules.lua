@@ -344,6 +344,7 @@ local function judged(req, rule, ctx, ct, size, ex)
     ids = ids == true
     if media and (kind == "binary" or kind == "none") then return nil, CT_NOT_WATCHED end
     if kind == "binary" then return nil, "unjudgeable: binary body" end
+    if kind == "boundaries" then return nil, "unjudgeable: multipart boundaries" end
     -- declared JSON the decoder refused, with no text-field value to scan
     if kind == "invalid" then return nil, ids and TOKEN_REASON or "unjudgeable: invalid json" end
     -- a "**" field hit its bound: the text is not all there

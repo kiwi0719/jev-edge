@@ -92,9 +92,15 @@ describe("Content-Encoding", () => {
     const small = new Uint8Array(Buffer.concat(Array.from({ length: 40 }, () => gzipSync(Buffer.from("x".repeat(100))))));
     const [s2, cut] = await gunzipMembers(small, 1000);
     expect([s2.byteLength, cut]).toEqual([1001, true]);
-    // members beyond the walk's budget of decodes: corrupt, not a partial read
+    // members beyond the walk's budget of decodes: corrupt, not a partial
+    // read. The walk runs only where DecompressionStream refuses a second
+    // member (Workers, Node 24); Node 22's decodes every member in one pass.
     const many = new Uint8Array(Buffer.concat(Array.from({ length: 40 }, () => gzipSync(Buffer.from("x")))));
-    await expect(gunzipMembers(many, 1 << 20)).rejects.toThrow(/corrupt gzip body/);
+    const two = new Uint8Array(Buffer.concat([gzipSync(Buffer.from("a")), gzipSync(Buffer.from("b"))]));
+    const oneStream = await new Response(new Blob([two]).stream().pipeThrough(new DecompressionStream("gzip")))
+      .text().then((t) => t === "ab", () => false);
+    if (oneStream) expect(td.decode((await gunzipMembers(many, 1 << 20))[0])).toBe("x".repeat(40));
+    else await expect(gunzipMembers(many, 1 << 20)).rejects.toThrow(/corrupt gzip body/);
     expect(td.decode((await decodeBody(many, "gzip", 1 << 20))[0]!)).toBe("x".repeat(40)); // node:zlib reads them all
   });
 

@@ -118,6 +118,69 @@ describe("pathMatches (twin of core/spec/rules_spec.lua)", () => {
   });
 });
 
+describe("rules: json_only_paths (twin of core/spec/rules_spec.lua)", () => {
+  const rule = load("llm-endpoints");
+  const ASK = "Please write a detailed summary of the attached quarterly report.";
+  const FORM = "username=alice%40example.com&password=hunter2hunter2&remember=on";
+  const root = (ct: string | undefined, body: string | undefined, over: Record<string, unknown> = {}) => ({
+    method: "POST", path: "/", headers: ct === undefined ? {} : { "content-type": ct }, body,
+    body_size: body === undefined ? 0 : Buffer.byteLength(body), client_ip: "203.0.113.7", ...over,
+  });
+  const ctx = (cache: Record<string, unknown> = {}) => ({
+    re_find: core.rules.reFind, json_decode: (s: string) => JSON.parse(s), clock: () => 1000,
+    cache: { get: (k: string) => cache[k] },
+  });
+
+  it("watches TGI's root for a JSON body only", async () => {
+    const json = JSON.stringify({ inputs: ASK });
+    for (const [ct, body] of [["application/json", json], [undefined, json], ["text/plain", " \n" + json]] as const) {
+      expect((await rulesEvaluate(root(ct, body), rule, ctx()))[0]).toBe("suspect");
+    }
+    for (const [ct, body] of [
+      ["application/x-www-form-urlencoded", FORM], [undefined, FORM], ["text/plain", ASK],
+      ["multipart/form-data; boundary=B", `--B\r\nContent-Disposition: form-data; name="a"\r\n\r\n${ASK}\r\n--B--\r\n`],
+      ["application/octet-stream", "\0\x01\x02 binary upload body"],
+    ] as const) {
+      expect(await rulesEvaluate(root(ct, body), rule, ctx())).toEqual(["pass", "", "path not watched: body not JSON"]);
+    }
+  });
+
+  it("decides before the reputation checks, on the Content-Type when there is no body", async () => {
+    const blocked = { "rep:203.0.113.7": { blocked_until: 2000 } };
+    expect((await rulesEvaluate(root("application/x-www-form-urlencoded", FORM), rule, ctx(blocked)))[0]).toBe("pass");
+    expect((await rulesEvaluate(root(undefined, undefined, { method: "GET" }), rule, ctx(blocked)))[0]).toBe("pass");
+    expect((await rulesEvaluate(root("application/json", JSON.stringify({ inputs: ASK })), rule, ctx(blocked)))[0]).toBe("block");
+    expect((await rulesEvaluate(root("application/json", undefined, { body_size: 100 }), rule, ctx(blocked)))[0]).toBe("block");
+  });
+
+  it("looks at the head past max_body_bytes", async () => {
+    const big = { body_size: 4 * 1048576 };
+    expect((await rulesEvaluate(root("application/x-www-form-urlencoded", FORM, big), rule, ctx()))[0]).toBe("pass");
+    expect((await rulesEvaluate(root(undefined, undefined, { body_head: `{"inputs":"${ASK}"`, ...big }), rule, ctx()))[0]).toBe("suspect");
+    expect((await rulesEvaluate(root(undefined, undefined, { body_head: FORM, ...big }), rule, ctx()))[0]).toBe("pass");
+  });
+
+  it("hands the request to the next rule, and L3 the same rule and text", async () => {
+    const site = resolve({ id: "site", watch_paths: ["^/$"] });
+    const req = root("application/x-www-form-urlencoded", "note=" + ASK.replace(/ /g, "+"));
+    const [r, text, , by] = await core.rules.evaluateAll(req, [rule, site], ctx());
+    expect([r, text, by?.id]).toEqual(["suspect", ASK, "site"]);
+    expect(core.rules.ruleFor(req, [rule, site])?.id).toBe("site");
+    expect(core.rules.ruleFor(req, [rule])).toBeUndefined();
+    expect(await core.rules.judgedText(req, rule, ctx())).toBe("");
+    expect(await core.rules.judgedText(req, site, ctx())).toBe(ASK);
+  });
+
+  it("applies only to the paths it lists", async () => {
+    const form = { "content-type": "application/x-www-form-urlencoded" };
+    const body = "prompt=" + ASK.replace(/ /g, "+");
+    const req = { method: "POST", path: "/v1/completions", headers: form, body, body_size: body.length };
+    expect((await rulesEvaluate(req, rule, ctx()))[0]).toBe("suspect");
+    const any = { ...rule, json_only_paths: [] };
+    expect((await rulesEvaluate(root("application/x-www-form-urlencoded", "note=" + ASK), any, ctx()))[0]).toBe("suspect");
+  });
+});
+
 describe("rules.resolve", () => {
   it("copies a rule set loaded by id so callers cannot mutate the module", () => {
     const a = resolve("llm-endpoints");
@@ -133,6 +196,14 @@ describe("rules.resolve", () => {
     expect(() => resolve({ id: "t", watch_paths: ["^/v1/["] })).toThrow(/watch_paths\[1\]/);
     expect(() => resolve({ id: "t", watch_paths: [42 as never] })).toThrow(/must be a string/);
     expect(() => resolve({ watch_paths: [] })).toThrow(/needs an id/);
+  });
+
+  it("checks json_only_paths like watch_paths, and inherits them", () => {
+    expect(() => resolve({ id: "t", watch_paths: ["^/"], json_only_paths: ["^/("] })).toThrow(/json_only_paths\[1\] unfinished capture/);
+    expect(() => resolve({ id: "t", watch_paths: ["^/"], json_only_paths: [42 as never] })).toThrow(/must be a string/);
+    expect(() => resolve({ id: "t", watch_paths: ["^/"], json_only_paths: "^/$" as never })).toThrow(/json_only_paths must be a list/);
+    expect(resolve("llm-endpoints").json_only_paths).toEqual(["^/$"]);
+    expect(resolve({ id: "any", extends: "llm-endpoints", json_only_paths: [] }).json_only_paths).toEqual([]);
   });
 
   it("llm-endpoints reads every content type but media types", () => {

@@ -229,6 +229,77 @@ describe("rules.evaluate_all", function()
   end)
 end)
 
+describe("rules: json_only_paths", function()
+  local ctx
+  before_each(function() ctx = H.ctx() end)
+  local ASK = "Please write a detailed summary of the attached quarterly report."
+  local FORM = "username=alice%40example.com&password=hunter2hunter2&remember=on"
+  local function root(ct, body, over)
+    local r = { method = "POST", path = "/", headers = { ["content-type"] = ct }, body = body,
+                body_size = body and #body or 0, client_ip = "203.0.113.7" }
+    for k, v in pairs(over or {}) do r[k] = v end
+    return r
+  end
+
+  it("watches TGI's root for a JSON body only", function()
+    local json = H.json.encode({ inputs = ASK })
+    assert.equals(R.SUSPECT, (R.evaluate(root("application/json", json), rule, ctx)))
+    assert.equals(R.SUSPECT, (R.evaluate(root(nil, json), rule, ctx)))
+    assert.equals(R.SUSPECT, (R.evaluate(root("text/plain", " \n" .. json), rule, ctx)))
+    for _, c in ipairs({
+      { "application/x-www-form-urlencoded", FORM }, { nil, FORM }, { "text/plain", ASK },
+      { "multipart/form-data; boundary=B", "--B\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\n"
+        .. ASK .. "\r\n--B--\r\n" },
+      { "application/octet-stream", "\0\1\2 binary upload body" },
+    }) do
+      local r, text, reason = R.evaluate(root(c[1], c[2]), rule, ctx)
+      assert.equals(R.PASS, r, c[1])
+      assert.equals("", text)
+      assert.equals("path not watched: body not JSON", reason)
+    end
+  end)
+
+  it("decides before the reputation checks, on the Content-Type when there is no body", function()
+    ctx.cache:set("rep:203.0.113.7", { blocked_until = 2000 })
+    ctx.clock = function() return 1000 end
+    assert.equals(R.PASS, (R.evaluate(root("application/x-www-form-urlencoded", FORM), rule, ctx)))
+    assert.equals(R.PASS, (R.evaluate(root(nil, nil, { method = "GET" }), rule, ctx)))
+    assert.equals(R.BLOCK, (R.evaluate(root("application/json", H.json.encode({ inputs = ASK })), rule, ctx)))
+    assert.equals(R.BLOCK, (R.evaluate(root("application/json", nil, { body_size = 100 }), rule, ctx)))
+  end)
+
+  it("looks at the head past max_body_bytes", function()
+    local big = { body_size = 4 * 1048576 }
+    assert.equals(R.PASS, (R.evaluate(root("application/x-www-form-urlencoded", FORM, big), rule, ctx)))
+    local r = R.evaluate(root(nil, nil, { body_head = '{"inputs":"' .. ASK .. '"', body_size = 4 * 1048576 }),
+      rule, ctx)
+    assert.equals(R.SUSPECT, r)
+    r = R.evaluate(root(nil, nil, { body_head = FORM, body_size = 4 * 1048576 }), rule, ctx)
+    assert.equals(R.PASS, r)
+  end)
+
+  it("hands the request to the next rule, and L3 the same rule and text", function()
+    local site = assert(R.resolve({ id = "site", watch_paths = { "^/$" } }, function() end))
+    local req = root("application/x-www-form-urlencoded", "note=" .. ASK:gsub(" ", "+"))
+    local r, text, _, by = R.evaluate_all(req, { rule, site }, ctx)
+    assert.equals(R.SUSPECT, r)
+    assert.equals(ASK, text)
+    assert.equals("site", by.id)
+    assert.equals("site", R.rule_for(req, { rule, site }).id)
+    assert.is_nil(R.rule_for(req, { rule }))
+    assert.equals("", R.judged_text(req, rule, ctx))
+    assert.equals(ASK, R.judged_text(req, site, ctx))
+  end)
+
+  it("applies only to the paths it lists", function()
+    local r = R.evaluate(H.chat_req("", { path = "/v1/completions", body = "prompt=" .. ASK:gsub(" ", "+"),
+      headers = { ["content-type"] = "application/x-www-form-urlencoded" } }), rule, ctx)
+    assert.equals(R.SUSPECT, r)
+    local any = setmetatable({ json_only_paths = {} }, { __index = rule })
+    assert.equals(R.SUSPECT, (R.evaluate(root("application/x-www-form-urlencoded", "note=" .. ASK), any, ctx)))
+  end)
+end)
+
 describe("rules.path_matches", function()
   local W = rule.watch_paths
 

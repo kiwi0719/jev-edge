@@ -453,6 +453,23 @@ function tooDeep(s: string): boolean {
   return false;
 }
 
+// declared JSON: a JSON media type (application/json, text/json,
+// application/*+json), not "json" in a parameter such as a multipart
+// boundary or "text/plain; profile=json". `ct` is lowercased.
+const declaresJson = (ct: string): boolean => ct.split(";")[0].includes("json");
+
+/**
+ * Port of json_like() in core/normalize.lua: true when extract() tries `s` as
+ * JSON, a JSON media type or a body that starts with { or [ (past a UTF-8 BOM
+ * and whitespace). For the head of a body past max_body_bytes.
+ */
+export function jsonLike(s: string | undefined | null, contentType: string | undefined | null): boolean {
+  if (declaresJson(asciiLower(typeof contentType === "string" ? contentType : ""))) return true;
+  if (typeof s !== "string") return false;
+  const first = /^[ \t\n\v\f\r]*([\s\S])/.exec(s.startsWith("\uFEFF") ? s.slice(1) : s)?.[1];
+  return first === "{" || first === "[";
+}
+
 /**
  * Extract text from a raw body. Returns the text (values joined with "\n"),
  * the kind, the values in order (newest last) for window(), and the decoded
@@ -470,10 +487,7 @@ export function extract(
   // A UTF-8 BOM is not JSON, but Python's json.loads on bytes and Express's
   // body-parser skip it: judge what the backend reads.
   if (body.startsWith("﻿")) body = body.slice(1);
-  // declared JSON: a JSON media type (application/json, text/json,
-  // application/*+json), not "json" in a parameter such as a multipart
-  // boundary or "text/plain; profile=json"
-  const declaredJson = ct.split(";")[0].includes("json");
+  const declaredJson = declaresJson(ct);
   const first = /^[ \t\n\v\f\r]*([\s\S])/.exec(body)?.[1];
   if (first === "{" || first === "[" || declaredJson) {
     let decoded: JsonValue | undefined;

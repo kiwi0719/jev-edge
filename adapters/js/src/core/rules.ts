@@ -1,5 +1,5 @@
 // Port of core/rules.lua: L1, cheap and short-circuiting.
-import { extract, extractUntrustedValues, isText, byteLength, head, tail, fieldKeys, scanStrings, window, chunks as splitChunks, utf8Bytes, type JsonValue } from "./normalize.js";
+import { extract, extractUntrustedValues, jsonLike, isText, byteLength, head, tail, fieldKeys, scanStrings, window, chunks as splitChunks, utf8Bytes, type JsonValue } from "./normalize.js";
 import { untrustedSpec, type UntrustedConfig } from "./defaults.js";
 import { repBlocked, type SubjectCtx, type ReputationConfig } from "./subject.js";
 
@@ -23,6 +23,8 @@ export interface Rule {
   watch_paths: string[];
   /** Match watch_paths without folding ASCII case (default: folded, see pathMatches). */
   paths_case_sensitive?: boolean;
+  /** Watched paths (Lua patterns) watched only for a JSON body (see core/rules.lua). */
+  json_only_paths?: string[];
   methods?: Record<string, boolean>;
   /** Allow list (the pre-0.4 behaviour); without it, skip_content_types applies. */
   content_types?: string[];
@@ -344,6 +346,17 @@ function ctWatched(ct: string, rule: Rule): boolean | "media" {
 
 const CT_NOT_WATCHED = "content-type not watched";
 
+// Port of json_only_miss() in core/rules.lua: a json_only_paths path is
+// watched only for a JSON body (a JSON media type, or a body that starts with
+// { or [), decided on the body the adapter kept or, with none, the
+// Content-Type alone. A site's own POST to TGI's root passes.
+const NOT_JSON = "path not watched: body not JSON";
+function jsonOnlyMiss(req: Req, rule: Rule, ct: string): boolean {
+  const jo = rule.json_only_paths;
+  if (!Array.isArray(jo) || jo.length === 0 || !pathMatches(req.path ?? "", jo, rule.paths_case_sensitive)) return false;
+  return !jsonLike(req.body_head ?? req.body, ct);
+}
+
 /**
  * Case-insensitive regex search with the same contract the OpenResty adapter
  * gives core: the 1-based inclusive UTF-8 byte span of the first match.
@@ -439,15 +452,19 @@ export async function judgedText(req: Req, rule: Rule | undefined, ctx?: RulesCt
   const declared = Number(req.body_size);
   const size = Math.max(Number.isFinite(declared) ? declared : 0, typeof req.body === "string" ? byteLength(req.body) : 0);
   // one window, never chunks: L3-style re-judging uses one call
-  const r = await judged(req, { ...rule, max_judge_chunks: 1 }, ctx, contentType(req.headers), size);
+  const ct = contentType(req.headers);
+  if (jsonOnlyMiss(req, rule, ct)) return "";
+  const r = await judged(req, { ...rule, max_judge_chunks: 1 }, ctx, ct, size);
   return r.text;
 }
 
 export async function evaluate(
   req: Req, rule: Rule, ctx?: RulesCtx,
 ): Promise<[RuleResult, string, string, boolean?, string[]?, boolean?, UntrustedPart?]> {
-  // 1. path watch list
+  // 1. path watch list; a json_only_paths path only for a JSON body
   if (!pathMatches(req.path ?? "", rule.watch_paths, rule.paths_case_sensitive)) return [PASS, "", "path not watched"];
+  const ct = contentType(req.headers);
+  if (jsonOnlyMiss(req, rule, ct)) return [PASS, "", NOT_JSON];
 
   // 2. reputation, before anything that needs a body. It only ever blocks:
   //    safe verdicts earn an IP nothing (see core/rules.lua)
@@ -465,7 +482,6 @@ export async function evaluate(
   //    content_types; the deny list of media types is only settled once the
   //    body shows it is binary, in step 6)
   if (rule.methods && !rule.methods[(req.method ?? "").toUpperCase()]) return [PASS, "", "method not watched"];
-  const ct = contentType(req.headers);
   if (!ctWatched(ct, rule)) return [PASS, "", CT_NOT_WATCHED];
 
   // 4. body size: the larger of what the adapter declared and what it handed
@@ -504,11 +520,12 @@ export async function evaluate(
   return [PASS, "", "text too short"];
 }
 
-/** Port of rules.rule_for: the first rule whose path, method and content type all match. */
+/** Port of rules.rule_for: the first rule whose path (json_only_paths included), method and content type all match. */
 export function ruleFor(req: Req, rules: Rule[] | undefined): Rule | undefined {
   const ct = contentType(req.headers);
   for (const r of rules ?? []) {
     if (pathMatches(req.path ?? "", r.watch_paths, r.paths_case_sensitive)
+      && !jsonOnlyMiss(req, r, ct)
       && !(r.methods && !r.methods[(req.method ?? "").toUpperCase()])
       && ctWatched(ct, r)) return r;
   }

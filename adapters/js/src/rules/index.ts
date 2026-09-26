@@ -17,7 +17,7 @@ export const llmEndpoints: Rule = {
     // Gemini generateContent and streamGenerateContent (the Gemini API, Vertex AI, LiteLLM), Gemini's OpenAI route
     "^/v1%w*/.+:%a*[Gg]enerate[Cc]ontent/?$", "^/models/.+:%a*[Gg]enerate[Cc]ontent/?$",
     "^/v1beta/openai/chat/completions",
-    // inference servers' native routes: SGLang, TGI (root POST included), vLLM and SageMaker-style /invocations
+    // inference servers' native routes: SGLang, TGI (root POST, JSON only), vLLM and SageMaker-style /invocations
     "^/$", "^/generate/?$", "^/generate_stream/?$", "^/vertex/?$", "^/invocations/?$",
     // Open WebUI: /api/v1 aliases, Anthropic Messages routes, Ollama and OpenAI proxies
     "^/api/v1/chat/completions", "^/api/v1/messages/?$", "^/api/message/?$",
@@ -28,6 +28,8 @@ export const llmEndpoints: Rule = {
     "^/api/v0/chat/completions", "^/api/v0/completions", "^/api/v1/chat/?$",
     "^/v2/chat/?$", "^/v1/generate/?$",
   ],
+  // watched only for a JSON body: TGI's root (see rules/llm-endpoints.lua)
+  json_only_paths: ["^/$"],
   methods: { POST: true, PUT: true, PATCH: true },
   skip_content_types: ["image/", "audio/", "video/", "font/", "application/pdf", "application/zip", "application/gzip"],
   min_body_bytes: 8,
@@ -96,12 +98,18 @@ export function resolve(spec: RuleSpec): Rule {
   const out = { ...base, ...over } as Rule;
   if (!out.id) throw new Error("rule needs an id");
   if (!Array.isArray(out.watch_paths)) throw new Error(`rule ${out.id} needs watch_paths`);
-  // watch_paths are Lua patterns; a malformed one raises on every request.
-  out.watch_paths.forEach((p, i) => {
-    if (typeof p !== "string") throw new Error(`rule ${out.id}: watch_paths[${i + 1}] must be a string`);
-    const perr = patternError(p);
-    if (perr) throw new Error(`rule ${out.id}: watch_paths[${i + 1}] ${perr}`);
-  });
+  if (out.json_only_paths !== undefined && out.json_only_paths !== null && !Array.isArray(out.json_only_paths)) {
+    throw new Error(`rule ${out.id}: json_only_paths must be a list of patterns`);
+  }
+  // watch_paths and json_only_paths are Lua patterns; a malformed one raises
+  // on every request.
+  for (const k of ["watch_paths", "json_only_paths"] as const) {
+    (out[k] ?? []).forEach((p, i) => {
+      if (typeof p !== "string") throw new Error(`rule ${out.id}: ${k}[${i + 1}] must be a string`);
+      const perr = patternError(p);
+      if (perr) throw new Error(`rule ${out.id}: ${k}[${i + 1}] ${perr}`);
+    });
+  }
   const [uok, uerr] = validateUntrusted(out.untrusted, `rule ${out.id}: untrusted`);
   if (!uok) throw new Error(uerr);
   out.text_fields ??= [

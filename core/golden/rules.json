@@ -2279,6 +2279,333 @@
     },
     {
       "expect": {
+        "reason": "path not watched: body not JSON",
+        "result": "pass",
+        "text": ""
+      },
+      "input": {
+        "cache": {},
+        "clock": 1000,
+        "req": {
+          "body": "username=alice%40example.com&password=hunter2hunter2&remember=on",
+          "body_size": 64,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/x-www-form-urlencoded"
+          },
+          "method": "POST",
+          "path": "/"
+        },
+        "rule": "llm-endpoints"
+      },
+      "name": "route: a form POST to / is not watched"
+    },
+    {
+      "expect": {
+        "reason": "path not watched: body not JSON",
+        "result": "pass",
+        "text": ""
+      },
+      "input": {
+        "cache": {},
+        "clock": 1000,
+        "req": {
+          "body": "--B1\r\nContent-Disposition: form-data; name=\"note\"\r\n\r\nPlease write a detailed summary of the attached quarterly report.\r\n--B1--\r\n",
+          "body_size": 128,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "multipart/form-data; boundary=B1"
+          },
+          "method": "POST",
+          "path": "/"
+        },
+        "rule": "llm-endpoints"
+      },
+      "name": "route: a multipart POST to / is not watched"
+    },
+    {
+      "expect": {
+        "reason": "path not watched: body not JSON",
+        "result": "pass",
+        "text": ""
+      },
+      "input": {
+        "cache": {},
+        "clock": 1000,
+        "req": {
+          "body": "Please write a detailed summary of the attached quarterly report.",
+          "body_size": 65,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "text/plain"
+          },
+          "method": "POST",
+          "path": "/"
+        },
+        "rule": "llm-endpoints"
+      },
+      "name": "route: plain text to / is not watched"
+    },
+    {
+      "expect": {
+        "reason": "path not watched: body not JSON",
+        "result": "pass",
+        "text": ""
+      },
+      "input": {
+        "cache": {},
+        "clock": 1000,
+        "req": {
+          "body": "username=alice%40example.com&password=hunter2hunter2&remember=on",
+          "body_size": 64,
+          "client_ip": "203.0.113.7",
+          "headers": {},
+          "method": "POST",
+          "path": "/"
+        },
+        "rule": "llm-endpoints"
+      },
+      "name": "route: a form POST to / with no Content-Type is not watched"
+    },
+    {
+      "expect": {
+        "reason": "natural language",
+        "result": "suspect",
+        "text": "Please write a detailed summary of the attached quarterly report."
+      },
+      "input": {
+        "cache": {},
+        "clock": 1000,
+        "req": {
+          "body": "{\"inputs\":\"Please write a detailed summary of the attached quarterly report.\"}",
+          "body_size": 78,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "text/plain"
+          },
+          "method": "POST",
+          "path": "/"
+        },
+        "rule": "llm-endpoints"
+      },
+      "name": "route: JSON to / under text/plain is judged"
+    },
+    {
+      "expect": {
+        "reason": "natural language",
+        "result": "suspect",
+        "text": "Please write a detailed summary of the attached quarterly report."
+      },
+      "input": {
+        "cache": {},
+        "clock": 1000,
+        "req": {
+          "body": "﻿ \n{\"inputs\":\"Please write a detailed summary of the attached quarterly report.\"}",
+          "body_size": 83,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/octet-stream"
+          },
+          "method": "POST",
+          "path": "/"
+        },
+        "rule": "llm-endpoints"
+      },
+      "name": "route: JSON to / after a BOM and whitespace is judged"
+    },
+    {
+      "expect": {
+        "reason": "natural language",
+        "result": "suspect",
+        "text": "Please write a detailed summary of the attached quarterly report."
+      },
+      "input": {
+        "cache": {},
+        "clock": 1000,
+        "req": {
+          "body": "{\"inputs\":\"Please write a detailed summary of the attached quarterly report.\"",
+          "body_size": 77,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/"
+        },
+        "rule": "llm-endpoints"
+      },
+      "name": "route: declared JSON to / the decoder refuses is read"
+    },
+    {
+      "expect": {
+        "reason": "path not watched: body not JSON",
+        "result": "pass",
+        "text": ""
+      },
+      "input": {
+        "cache": {
+          "rep:203.0.113.7": {
+            "blocked_until": 2000
+          }
+        },
+        "clock": 1000,
+        "req": {
+          "body": "username=alice%40example.com&password=hunter2hunter2&remember=on",
+          "body_size": 64,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/x-www-form-urlencoded"
+          },
+          "method": "POST",
+          "path": "/"
+        },
+        "rule": "llm-endpoints"
+      },
+      "name": "route: a form POST to / from a blocked IP is not watched"
+    },
+    {
+      "expect": {
+        "reason": "ip reputation",
+        "result": "block",
+        "text": ""
+      },
+      "input": {
+        "cache": {
+          "rep:203.0.113.7": {
+            "blocked_until": 2000
+          }
+        },
+        "clock": 1000,
+        "req": {
+          "body": "{\"inputs\":\"Please write a detailed summary of the attached quarterly report.\"}",
+          "body_size": 78,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/"
+        },
+        "rule": "llm-endpoints"
+      },
+      "name": "route: JSON to / from a blocked IP is blocked"
+    },
+    {
+      "expect": {
+        "reason": "path not watched: body not JSON",
+        "result": "pass",
+        "text": ""
+      },
+      "input": {
+        "cache": {
+          "rep:203.0.113.7": {
+            "blocked_until": 2000
+          }
+        },
+        "clock": 1000,
+        "req": {
+          "body_size": 0,
+          "client_ip": "203.0.113.7",
+          "headers": {},
+          "method": "GET",
+          "path": "/"
+        },
+        "rule": "llm-endpoints"
+      },
+      "name": "route: GET / with no body is not watched"
+    },
+    {
+      "expect": {
+        "reason": "path not watched: body not JSON",
+        "result": "pass",
+        "text": ""
+      },
+      "input": {
+        "cache": {},
+        "clock": 1000,
+        "req": {
+          "body": "username=alice%40example.com&password=hunter2hunter2&remember=on",
+          "body_size": 2000000,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/x-www-form-urlencoded"
+          },
+          "method": "POST",
+          "path": "/"
+        },
+        "rule": "llm-endpoints"
+      },
+      "name": "route: an oversized form POST to / is not watched"
+    },
+    {
+      "expect": {
+        "reason": "natural language (window)",
+        "result": "suspect",
+        "text": "Please write a detailed summary of the attached quarterly report."
+      },
+      "input": {
+        "cache": {},
+        "clock": 1000,
+        "req": {
+          "body": "{\"inputs\":\"Please write a detailed summary of the attached quarterly report.\"}",
+          "body_size": 2000000,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/"
+        },
+        "rule": "llm-endpoints"
+      },
+      "name": "route: an oversized JSON POST to / is scanned"
+    },
+    {
+      "expect": {
+        "reason": "unjudgeable: body too large",
+        "result": "unjudgeable",
+        "text": ""
+      },
+      "input": {
+        "cache": {},
+        "clock": 1000,
+        "req": {
+          "body_size": 2000000,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/"
+        },
+        "rule": "llm-endpoints"
+      },
+      "name": "route: a JSON POST to / the adapter kept nothing of is unjudgeable"
+    },
+    {
+      "expect": {
+        "reason": "path not watched: body not JSON",
+        "result": "pass",
+        "text": ""
+      },
+      "input": {
+        "cache": {},
+        "clock": 1000,
+        "req": {
+          "body_size": 2000000,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/x-www-form-urlencoded"
+          },
+          "method": "POST",
+          "path": "/"
+        },
+        "rule": "llm-endpoints"
+      },
+      "name": "route: a form POST to / the adapter kept nothing of is not watched"
+    },
+    {
+      "expect": {
         "reason": "natural language",
         "result": "suspect",
         "text": "Please write a detailed summary of the attached quarterly report."

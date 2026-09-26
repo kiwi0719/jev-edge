@@ -293,17 +293,17 @@ rule("rule-parity", function(r)
   local chunk = loadfile("rules/llm-endpoints.lua")
   local luarule = chunk and chunk() or {}
   local luapats = luarule.always_suspect or {}
-  -- watch_paths and text_fields: the same entries in the same order (a route
-  -- left out of one copy is "path not watched" on that runtime only; the
-  -- order of text_fields is the order of the judged text). resolve() fills
-  -- in the same text_fields for an inline rule that lists none.
+  -- watch_paths, json_only_paths and text_fields: the same entries in the
+  -- same order (a route left out of one copy is "path not watched" on that
+  -- runtime only; the order of text_fields is the order of the judged text).
+  -- resolve() fills in the same text_fields for an inline rule that lists none.
   local function strings(s)
     local out = {}
     for v in (s or ""):gmatch('"([^"]*)"') do out[#out + 1] = v end
     return out
   end
   local want = table.concat(luarule.text_fields or {}, ",")
-  for _, k in ipairs({ "watch_paths", "text_fields" }) do
+  for _, k in ipairs({ "watch_paths", "json_only_paths", "text_fields" }) do
     if table.concat(luarule[k] or {}, ",") ~= table.concat(strings(tsrule:match(k .. ":%s*(%b[])")), ",") then
       fail(r, k .. " differ between rules/llm-endpoints.lua and src/rules/index.ts")
     end

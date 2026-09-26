@@ -178,6 +178,21 @@ end
 
 local CT_NOT_WATCHED = "content-type not watched"
 
+-- A path in the rule's json_only_paths is watched only for a JSON body: a
+-- JSON media type, or a body that starts with { or [ (normalize.json_like).
+-- TGI serves generation at the site root, where a site's own POST (a login
+-- form, an upload) must not reach the judge, or the IP and subject
+-- reputation checks. Decided on the body the adapter kept (its head past
+-- max_body_bytes), or on the Content-Type alone when there is none.
+local NOT_JSON = "path not watched: body not JSON"
+local function json_only_miss(req, rule, ct)
+  local jo = rule.json_only_paths
+  if type(jo) ~= "table" or #jo == 0 or not path_matches(req.path, jo, rule.paths_case_sensitive) then
+    return false
+  end
+  return not normalize.json_like(req.body_head or req.body, ct)
+end
+
 -- Retrieved content (tool results, untrusted.fields) when untrusted judging is
 -- on for `rule`, cut to its own judging window. Only from a body parsed whole:
 -- past max_body_bytes there is no JSON structure to find it in.
@@ -265,9 +280,14 @@ end
 -- @return result, text, reason, windowed, chunks, capped, untrusted ({ text,
 --         windowed } of retrieved content to judge on its own, or nil)
 function _M.evaluate(req, rule, ctx)
-  -- 1. path watch list
+  -- 1. path watch list; a json_only_paths path only for a JSON body (its
+  --    first byte, or the Content-Type when there is no body to look at)
   if not path_matches(req.path, rule.watch_paths, rule.paths_case_sensitive) then
     return _M.PASS, "", "path not watched"
+  end
+  local ct = _M.content_type(req.headers)
+  if json_only_miss(req, rule, ct) then
+    return _M.PASS, "", NOT_JSON
   end
 
   -- 2. reputation: one dict lookup, before anything that needs a body, so a
@@ -294,7 +314,6 @@ function _M.evaluate(req, rule, ctx)
   if rule.methods and not rule.methods[(req.method or ""):upper()] then
     return _M.PASS, "", "method not watched"
   end
-  local ct = _M.content_type(req.headers)
   if not ct_watched(ct, rule) then
     return _M.PASS, "", CT_NOT_WATCHED
   end
@@ -350,9 +369,11 @@ end
 function _M.judged_text(req, rule, ctx)
   if not rule or not req then return "" end
   local size = math.max(tonumber(req.body_size) or 0, req.body and #req.body or 0)
+  local ct = _M.content_type(req.headers)
+  if json_only_miss(req, rule, ct) then return "" end
   -- one window, never chunks: L3 re-judges off the request path with one call
   local one = setmetatable({ max_judge_chunks = 1 }, { __index = rule })
-  local text = judged(req, one, ctx, _M.content_type(req.headers), size)
+  local text = judged(req, one, ctx, ct, size)
   return text or ""
 end
 
@@ -453,11 +474,17 @@ function _M.resolve(spec, load)
   for k, v in pairs(spec) do if k ~= "extends" then out[k] = v end end
   if not out.id then return nil, "rule needs an id" end
   if type(out.watch_paths) ~= "table" then return nil, "rule " .. out.id .. " needs watch_paths" end
-  -- watch_paths are Lua patterns; a malformed one raises on every request.
-  for i, p in ipairs(out.watch_paths) do
-    if type(p) ~= "string" then return nil, "rule " .. out.id .. ": watch_paths[" .. i .. "] must be a string" end
-    local perr = _M.pattern_error(p)
-    if perr then return nil, "rule " .. out.id .. ": watch_paths[" .. i .. "] " .. perr end
+  if out.json_only_paths ~= nil and type(out.json_only_paths) ~= "table" then
+    return nil, "rule " .. out.id .. ": json_only_paths must be a list of patterns"
+  end
+  -- watch_paths and json_only_paths are Lua patterns; a malformed one raises
+  -- on every request.
+  for _, k in ipairs({ "watch_paths", "json_only_paths" }) do
+    for i, p in ipairs(out[k] or {}) do
+      if type(p) ~= "string" then return nil, "rule " .. out.id .. ": " .. k .. "[" .. i .. "] must be a string" end
+      local perr = _M.pattern_error(p)
+      if perr then return nil, "rule " .. out.id .. ": " .. k .. "[" .. i .. "] " .. perr end
+    end
   end
   local uok, uerr = defaults.validate_untrusted(out.untrusted, "rule " .. out.id .. ": untrusted")
   if not uok then return nil, uerr end
@@ -485,15 +512,16 @@ function _M.resolve_all(specs, load)
   return out
 end
 
---- The rule evaluate_all judged a request with: the first one whose path,
--- method and content type all match. Adapters that rebuild the prompt off the
--- request path (L3, sampling) use it; path alone is not enough, since a
--- tenant rule can match the path and still hand the request to the general
--- rule on method or content type.
+--- The rule evaluate_all judged a request with: the first one whose path
+-- (json_only_paths included), method and content type all match. Adapters
+-- that rebuild the prompt off the request path (L3, sampling) use it; path
+-- alone is not enough, since a tenant rule can match the path and still hand
+-- the request to the general rule on method or content type.
 function _M.rule_for(req, rules)
   local ct = _M.content_type(req.headers)
   for _, r in ipairs(rules or {}) do
     if path_matches(req.path, r.watch_paths, r.paths_case_sensitive)
+      and not json_only_miss(req, r, ct)
       and not (r.methods and not r.methods[(req.method or ""):upper()])
       and ct_watched(ct, r) then
       return r

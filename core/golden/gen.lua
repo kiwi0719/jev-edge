@@ -507,6 +507,39 @@ rules_case("field: Gemini function response in one content, one part", raw("/mod
   '{"contents":{"role":"user","parts":{"functionResponse":{"name":"fetch","response":{"result":' .. SYS .. '}}}}}'))
 rules_case("field: Responses stored prompt variables", raw("/v1/responses",
   '{"model":"m","prompt":{"id":"pmpt_1","variables":{"topic":' .. SYS .. '}},"input":' .. HI .. '}'))
+-- TGI's root is watched only for a JSON body: a site's own POST to / passes
+do
+  local FORM = "username=alice%40example.com&password=hunter2hunter2&remember=on"
+  local function root(ct, body, over)
+    local r = { method = "POST", path = "/", headers = { ["content-type"] = ct }, body = body,
+                body_size = body and #body or 0, client_ip = "203.0.113.7" }
+    for k, v in pairs(over or {}) do r[k] = v end
+    return r
+  end
+  rules_case("route: a form POST to / is not watched", root("application/x-www-form-urlencoded", FORM))
+  rules_case("route: a multipart POST to / is not watched", root("multipart/form-data; boundary=B1",
+    "--B1\r\nContent-Disposition: form-data; name=\"note\"\r\n\r\n" .. LONG .. "\r\n--B1--\r\n"))
+  rules_case("route: plain text to / is not watched", root("text/plain", LONG))
+  rules_case("route: a form POST to / with no Content-Type is not watched", root(nil, FORM))
+  rules_case("route: JSON to / under text/plain is judged", root("text/plain", '{"inputs":' .. ASK .. '}'))
+  rules_case("route: JSON to / after a BOM and whitespace is judged",
+    root("application/octet-stream", "\239\187\191 \n" .. '{"inputs":' .. ASK .. '}'))
+  rules_case("route: declared JSON to / the decoder refuses is read", root("application/json", '{"inputs":' .. ASK))
+  rules_case("route: a form POST to / from a blocked IP is not watched",
+    root("application/x-www-form-urlencoded", FORM), { cache = { ["rep:203.0.113.7"] = { blocked_until = 2000 } } })
+  rules_case("route: JSON to / from a blocked IP is blocked", root("application/json", '{"inputs":' .. ASK .. '}'),
+    { cache = { ["rep:203.0.113.7"] = { blocked_until = 2000 } } })
+  rules_case("route: GET / with no body is not watched", root(nil, nil, { method = "GET" }),
+    { cache = { ["rep:203.0.113.7"] = { blocked_until = 2000 } } })
+  rules_case("route: an oversized form POST to / is not watched",
+    root("application/x-www-form-urlencoded", FORM, { body_size = 2000000 }))
+  rules_case("route: an oversized JSON POST to / is scanned",
+    root("application/json", '{"inputs":' .. ASK .. '}', { body_size = 2000000 }))
+  local headers_only = root("application/json", nil, { body_size = 2000000 })
+  rules_case("route: a JSON POST to / the adapter kept nothing of is unjudgeable", headers_only)
+  headers_only = root("application/x-www-form-urlencoded", nil, { body_size = 2000000 })
+  rules_case("route: a form POST to / the adapter kept nothing of is not watched", headers_only)
+end
 -- watch paths match every character, line terminators included, on both cores
 rules_case("route: a newline in the model name", raw("/v1beta/models/gem\nini:generateContent", GEM))
 rules_case("route: a carriage return in the model name", raw("/models/gpt\r4o:streamGenerateContent", GEM))
@@ -999,6 +1032,25 @@ eval_case("paths_case_sensitive: Gemini's camelCase route is watched", {
 eval_case("paths_case_sensitive: LiteLLM's Gemini route is watched", {
   req = raw("/models/gpt-4o:generateContent", '{"contents":[{"parts":[{"text":' .. escape(ATTACK) .. '}]}]}'),
   rules = { STRICT }, judge = { answers = { injection = 0.9 } } })
+-- TGI's root is watched only for a JSON body; the next rule may watch it for any
+do
+  local form = "note=" .. ATTACK:gsub(" ", "+")
+  local function root_form(over)
+    local r = { method = "POST", path = "/", headers = { ["content-type"] = "application/x-www-form-urlencoded" },
+                body = form, body_size = #form, client_ip = "203.0.113.7" }
+    for k, v in pairs(over or {}) do r[k] = v end
+    return r
+  end
+  eval_case("a form POST to the site root passes as not watched", { req = root_form(),
+    config = { policy = { mode = "enforce" } }, judge = { answers = { injection = 0.95 } } })
+  eval_case("a form POST to the site root goes on to the next rule", { req = root_form(),
+    rules = { "llm-endpoints", { id = "site", watch_paths = { "^/$" }, methods = { POST = true } } },
+    config = { policy = { mode = "enforce" } }, judge = { answers = { injection = 0.95 } } })
+  -- (json_only_paths = {} does the same; an empty list cannot be written in these vectors)
+  eval_case("a rule that extends llm-endpoints can watch the root for any body", { req = root_form(),
+    rules = { { id = "any", extends = "llm-endpoints", json_only_paths = { "^/upload$" } } },
+    config = { policy = { mode = "enforce" } }, judge = { answers = { injection = 0.95 } } })
+end
 eval_case("a tenant pattern with capitals and a set is folded like the path", {
   req = req(LONG, { path = "/tenants/acme/Chat" }),
   rules = { { id = "tenant", extends = "llm-endpoints", watch_paths = { "^/Tenants/[A-Z]+/chat" },

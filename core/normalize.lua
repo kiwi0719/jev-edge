@@ -398,6 +398,23 @@ function _M.lone_surrogates(s)
   return table.concat(out)
 end
 
+-- declared JSON: a JSON media type (application/json, text/json,
+-- application/*+json), not "json" in a parameter such as a multipart
+-- boundary or "text/plain; profile=json". `ct` is lowercased.
+local function declares_json(ct)
+  return ct:match("^[^;]*"):find("json", 1, true) ~= nil
+end
+
+--- True when extract() tries body `s` as JSON: a JSON media type, or a body
+-- that starts with { or [ (past a UTF-8 BOM and whitespace). `s` may be
+-- nil (a gateway that forwards headers only): the media type decides.
+function _M.json_like(s, content_type)
+  if declares_json(type(content_type) == "string" and content_type:lower() or "") then return true end
+  if type(s) ~= "string" then return false end
+  local first = s:match("^%s*(.)", s:sub(1, 3) == BOM and 4 or 1)
+  return first == "{" or first == "["
+end
+
 --- Extract text from a raw body.
 -- @param body         string
 -- @param content_type string (may be nil)
@@ -414,10 +431,7 @@ function _M.extract(body, content_type, fields, json_decode)
   -- A UTF-8 BOM is not JSON (cjson rejects it) but Python's json.loads on
   -- bytes and Express's body-parser skip it: judge what the backend reads.
   if body:sub(1, 3) == BOM then body = body:sub(4) end
-  -- declared JSON: a JSON media type (application/json, text/json,
-  -- application/*+json), not "json" in a parameter such as a multipart
-  -- boundary or "text/plain; profile=json"
-  local declared_json = ct:match("^[^;]*"):find("json", 1, true) ~= nil
+  local declared_json = declares_json(ct)
   local first = body:match("^%s*(.)")
   if first == "{" or first == "[" or declared_json then
     if not json_decode then return "", "none", {} end

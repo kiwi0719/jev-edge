@@ -34,7 +34,8 @@ return {
     "^/v1beta/openai/chat/completions",
     -- Inference servers' native routes, beside their /v1 ones: SGLang
     -- /generate; TGI / (POST), /generate, /generate_stream, /vertex and
-    -- /invocations; vLLM and SageMaker-style /invocations.
+    -- /invocations; vLLM and SageMaker-style /invocations. The site root is
+    -- watched only for a JSON body (json_only_paths below).
     "^/$", "^/generate/?$", "^/generate_stream/?$", "^/vertex/?$", "^/invocations/?$",
     -- Open WebUI: /api/v1/chat/completions (the /api/chat/completions
     -- handler), its Anthropic Messages routes, and its Ollama and OpenAI
@@ -47,6 +48,13 @@ return {
     "^/api/v0/chat/completions", "^/api/v0/completions", "^/api/v1/chat/?$",
     "^/v2/chat/?$", "^/v1/generate/?$",
   },
+  -- Of the watch_paths, those watched only for a JSON body (a JSON media
+  -- type, or a body that starts with { or [): TGI's root. A site's own POST
+  -- to / (a login form, an upload) passes as "path not watched: body not
+  -- JSON", before the judge and the reputation checks. Lua patterns, like
+  -- watch_paths; a rule that extends this one and watches / for any body
+  -- sets json_only_paths = {}.
+  json_only_paths = { "^/$" },
   methods = { POST = true, PUT = true, PATCH = true },
   -- Media types that are never a prompt. Any other Content-Type (or none) is
   -- read and the body decides the format: backends parse JSON whatever the

@@ -702,6 +702,94 @@ class ClientGone(unittest.TestCase):
         self.assertRegex(log, r"client gone mid-request: hung up after \d+ of \d+ body bytes")
 
 
+class ContentLength(unittest.TestCase):
+    """python-adapters#8: Content-Length went through int(), which takes
+    "-1" (rfile.read(-1) then read until the client closed, past
+    LAYA_MAX_BODY_BYTES), "+5" and "1_0"; a length int() refused raised out
+    of the 401 path as a 500 backend_error, and out of do_PUT."""
+
+    def exchange(self, head: str, body: bytes = b"", env=None):
+        """One raw request on a fresh connection, left open for writing (no
+        EOF from the client): the answer's status and bytes, the status of a
+        good request after it, and what the server wrote on stderr."""
+        e = {"LAYA_MAX_BODY_BYTES": "1000", "LAYA_ACCESS_LOG": "1", "LAYA_IDLE_TIMEOUT_S": "30"}
+        e.update(env or {})
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            srv, url = serve(e)
+            try:
+                s = socket.create_connection(("127.0.0.1", srv.server_address[1]), timeout=3)
+                got = b""
+                try:
+                    s.sendall(head.encode("latin-1") + b"\r\n" + body)
+                    while True:
+                        chunk = s.recv(65536)
+                        if not chunk:
+                            break
+                        got += chunk
+                except ConnectionResetError:
+                    pass  # the server closed with our unread body: what it sent is in `got`
+                finally:
+                    s.close()
+                after = post(url)[0]
+            finally:
+                stop(srv)
+        self.assertTrue(got.startswith(b"HTTP/1.1 "), got)
+        return int(got.split(b" ", 2)[1]), got, after, err.getvalue()
+
+    @staticmethod
+    def head(length: str, method: str = "POST", extra: str = "") -> str:
+        return (f"{method} /v1/systemone HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+                f"Content-Length: {length}\r\n{extra}")
+
+    def test_a_negative_length_is_411_without_reading_to_eof(self):
+        # before: 200 with a score for a body past the limit, once the
+        # client closed; here the client never closes, and the answer
+        # comes at once
+        body = json.dumps({"state": "x " * 1000, "questions": {"q": Q}}).encode()[:2048]
+        status, got, after, log = self.exchange(self.head("-1"), body)
+        self.assertEqual(status, 411, got)
+        self.assertIn(b"Connection: close", got)
+        self.assertIn(b"length_required", got)
+        self.assertEqual(after, 200)
+        self.assertNotIn("Traceback", log)
+
+    def test_lengths_int_takes_and_no_gateway_sends_are_411(self):
+        for length in ["+5", "1_0", " -0", "5 5", "0x5", "5.0", "\xb2", "\xb3\xb9", ""]:
+            status, got, after, log = self.exchange(self.head(length), b'{"a":1}')
+            self.assertEqual(status, 411, (length, got))
+            self.assertEqual(after, 200)
+            self.assertNotIn("Traceback", log)
+        # two different lengths: which one frames the body is anyone's guess
+        status, got, _, _ = self.exchange(self.head("7", extra="Content-Length: 70\r\n"), b'{"a":1}')
+        self.assertEqual(status, 411, got)
+
+    def test_an_honest_length_is_read_and_one_over_the_limit_is_413(self):
+        body = json.dumps({"state": "hello", "questions": {"q": Q}}).encode()
+        status, got, _, _ = self.exchange(self.head(f" {len(body)}\t", extra="Connection: close\r\n"), body)
+        self.assertEqual(status, 200, got)
+        status, got, _, _ = self.exchange(self.head(str(len(body)), extra=f"Content-Length: {len(body)}\r\n"
+                                                                          "Connection: close\r\n"), body)
+        self.assertEqual(status, 200, got)  # the same length twice frames it the same way
+        status, got, _, _ = self.exchange(self.head("5000"), b"x" * 100)
+        self.assertEqual(status, 413, got)
+
+    def test_a_bad_length_on_a_refused_request_is_that_refusal_not_a_500(self):
+        status, got, after, log = self.exchange(self.head("abc"), b"xyz", env={"LAYA_API_KEY": "k"})
+        self.assertEqual(status, 401, got)
+        self.assertIn(b"Connection: close", got)  # the body's end is unknown: the stream is not reused
+        self.assertEqual(after, 401)  # post() sends no key
+        self.assertNotIn("backend error", log)
+        for method in ("PUT", "DELETE", "PATCH"):
+            status, got, _, log = self.exchange(self.head("-1", method=method), b"xyz")
+            self.assertEqual(status, 405, got)
+            self.assertIn(b"Connection: close", got)
+            self.assertNotIn("Traceback", log)
+        status, got, _, log = self.exchange(self.head("abc", method="POST").replace("/v1/systemone", "/nope"), b"x")
+        self.assertEqual(status, 404, got)
+        self.assertNotIn("Traceback", log)
+
+
 class Cpus(unittest.TestCase):
     """Pool sizes come from the CPUs this process may use, not the host's
     count: a container limited to 2 CPUs on a 64-core host got 64 workers,

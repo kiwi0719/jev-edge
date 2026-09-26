@@ -799,13 +799,29 @@ class Handler(BaseHTTPRequestHandler):
             raise ClientGone(f"hung up after {len(raw)} of {n} body bytes")
         return raw
 
+    def _content_length(self) -> int | None:
+        """The body's length, or None when Content-Length is missing, sent
+        twice with different values, or anything but ASCII digits. int()
+        alone takes "-1", and rfile.read(-1) reads until the client closes,
+        past LAYA_MAX_BODY_BYTES; it takes "+5", "1_0" and digits of other
+        scripts too, which no gateway sends."""
+        vals = {v.strip(" \t") for v in self.headers.get_all("Content-Length") or ()}
+        if len(vals) != 1:
+            return None
+        v = vals.pop()
+        return int(v) if v and v.isascii() and v.isdigit() else None
+
     def _drain(self) -> None:
-        # read (and drop) a body we are refusing, so the keepalive stream stays in step
-        n = int(self.headers.get("Content-Length") or 0)
-        if 0 < n <= self.max_body:
-            self._read(n)
-        elif n > self.max_body:
+        """Read (and drop) a body we are refusing, so the keepalive stream
+        stays in step; a body too large, or of a length we cannot read,
+        closes the connection instead. Never raises but ClientGone."""
+        if self.headers.get("Content-Length") is None:
+            return
+        n = self._content_length()
+        if n is None or n > self.max_body:
             self.close_connection = True
+        elif n > 0:
+            self._read(n)
 
     def _shed(self) -> bool:
         """On a connection past LAYA_MAX_CONNECTIONS: answer 503 and close.
@@ -851,11 +867,10 @@ class Handler(BaseHTTPRequestHandler):
                 if not hmac.compare_digest(got.encode(), ("Bearer " + self.api_key).encode()):
                     self._drain()
                     raise Refused(401, "unauthorized", "missing or wrong bearer token")
-            try:
-                n = int(self.headers.get("Content-Length") or "")
-            except ValueError:
+            n = self._content_length()
+            if n is None:
                 self.close_connection = True
-                raise Refused(411, "length_required", "Content-Length required") from None
+                raise Refused(411, "length_required", "Content-Length required")
             if n > self.max_body:
                 self.close_connection = True
                 raise Refused(413, "body_too_large", f"body over {self.max_body} bytes")

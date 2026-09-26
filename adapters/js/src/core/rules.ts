@@ -376,7 +376,8 @@ function untrustedPart(decoded: JsonValue | undefined, rule: Rule, ctx: RulesCtx
 
 // Port of tools_part() in core/rules.lua: the tool definitions the model
 // reads, judged as their own part: all of them scanned by always_suspect, cut
-// to one window of their own. `cut`: a bound, or the body's size, left some out.
+// to one window of their own. `cut`: a bound, the body's size or JSON the
+// decoder refused (scanned, not walked) left some out.
 function toolsPart(values: string[], cut: boolean, rule: Rule, ctx: RulesCtx | undefined): ToolsPart | undefined {
   const ttext = values.join("\n");
   if (ttext === "") return undefined;
@@ -448,6 +449,11 @@ async function judged(
       const [tvalues, tcut] = extractTools(decoded, rule.tool_fields, ctx?.json_decode);
       tools = toolsPart(tvalues, tcut, rule, ctx);
       if (tcut) bound = true;
+    } else if (hasToolFields(rule) && kind === "scan") {
+      // declared JSON the decoder refused (nesting past 1000, bytes after
+      // the value), which the backend's parser may take: scanned for the
+      // tool definitions as past max_body_bytes
+      tools = toolsPart(scanTools(req.body as string, fieldKeys(rule.tool_fields), []), true, rule, ctx);
     }
   }
   if (text === "") return { text: "", untrusted, tools, bound };

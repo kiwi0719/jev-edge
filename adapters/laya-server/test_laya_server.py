@@ -808,6 +808,7 @@ class Pool(unittest.TestCase):
     def test_cost_is_learned_per_size_class(self):
         c = L.CostModel()
         self.assertEqual(c.estimate(100), 0.0)  # nothing scored yet
+        self.assertEqual(c.estimate(100, unknown=250.0), 250.0)  # what Workers asks with
         c.observe(100, 5.0)     # a short text: 0.05 ms per unit
         c.observe(6000, 420.0)  # the worst case: 0.07 ms per unit
         self.assertAlmostEqual(c.estimate(120), 6.0)
@@ -818,6 +819,70 @@ class Pool(unittest.TestCase):
         self.assertAlmostEqual(c.estimate(100), 10.0)
         c.observe(100, 5.0)   # a faster one a tenth of the way
         self.assertAlmostEqual(c.estimate(100), 9.5)
+
+    def test_before_any_scoring_a_request_waits_for_no_one(self):
+        # r5 fix/audit-high-laya: with no rate, estimate() gave 0 ms, so
+        # every request of a first burst queued, waited out the answer time
+        # and timed out at the gateway together. Now one that finds every
+        # worker busy is refused at once, before the gateway stops reading
+        w = L.Workers(1, 1000)
+        held = w.slot(100)
+        held.__enter__()  # scoring, nothing learned yet
+        try:
+            t0 = time.perf_counter()
+            with self.assertRaises(L.Refused) as cm:
+                with w.slot(100):
+                    pass
+            self.assertLess((time.perf_counter() - t0) * 1000, 50)
+            self.assertEqual((cm.exception.status, cm.exception.code), (503, "overloaded"))
+        finally:
+            held.__exit__(None, None, None)
+        self.assertTrue(w.cost.rate)  # the scoring that ran taught it a rate
+        with w.slot(100):  # a free worker is taken whatever the estimate
+            pass
+
+    def test_warm_up_prices_a_first_burst_before_the_server_listens(self):
+        log = io.StringIO()
+        env = {"LAYA_HOST": "127.0.0.1", "LAYA_PORT": "0", "LAYA_ACCESS_LOG": "0"}
+        srv = L.start(env, backend=SlowBatch(60, short_ms=5), log=log)
+        try:
+            cost = srv.RequestHandlerClass.workers.cost
+            self.assertEqual(len(cost.rate), 2, log.getvalue())  # a short text and the worst case
+            short = L.cost_units({"assistant": L.WARM_ASSISTANT, "user_message": L.WARM_SHORT},
+                                 {"injection": L.WARM_QUESTION})
+            self.assertLess(cost.estimate(short), 30)
+            t = conformance.Target(f"http://127.0.0.1:{srv.server_address[1]}/v1/systemone", None, "laya", 5)
+            worst = json.loads(conformance.worst_body(t, 4096, conformance.DEFAULT_ASSISTANT, ctx_questions()))
+            self.assertGreater(cost.estimate(L.cost_units(worst["state"], worst["questions"])), 40)
+            out = log.getvalue()
+            self.assertRegex(out, r"warm-up: short text \(\d+ units\) scored in [\d.]+ ms")
+            self.assertRegex(out, r"warm-up: worst case \(4096 bytes, \d+ units\) scored in [\d.]+ ms")
+            self.assertLess(out.index("warm-up"), out.index("laya-server on 127.0.0.1:"))
+            self.assertNotIn("127.0.0.1:0/", out)  # the line comes after the bind, with the real port
+            run = threading.Thread(target=srv.serve_forever, daemon=True)
+            run.start()
+            self.assertEqual(post(f"http://127.0.0.1:{srv.server_address[1]}/v1/systemone")[0], 200)
+        finally:
+            stop(srv)
+
+    def test_warm_up_halves_a_worst_case_the_server_refuses_and_logs_a_failure(self):
+        srv = L.make_server({"LAYA_HOST": "127.0.0.1", "LAYA_PORT": "0", "LAYA_MAX_WINDOWS": "2"},
+                            backend=Hostile(), activate=False)
+        self.addCleanup(srv.server_close)
+        lines = L.warm_up(srv)
+        self.assertRegex(lines[1], r"warm-up: worst case \((1024|2048) bytes, ")
+        self.assertEqual(len(srv.RequestHandlerClass.workers.cost.rate), 2)
+
+        class Broken(L.MockBackend):
+            def logit(self, first, second):
+                raise RuntimeError("no model")
+
+        srv = L.make_server({"LAYA_HOST": "127.0.0.1", "LAYA_PORT": "0"}, backend=Broken(), activate=False)
+        self.addCleanup(srv.server_close)
+        lines = L.warm_up(srv)
+        self.assertEqual(len(lines), 2)
+        self.assertIn("warm-up: scoring the short text failed: RuntimeError('no model')", lines[0])
+        self.assertFalse(srv.RequestHandlerClass.workers.cost.rate)  # the answer-time fallback then applies
 
     def test_queue_takes_what_fits_in_order_and_refuses_the_rest_at_once(self):
         cost = L.CostModel()

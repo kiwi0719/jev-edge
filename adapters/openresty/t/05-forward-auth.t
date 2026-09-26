@@ -256,3 +256,67 @@ X-Jev-Score: 0.97
 X-Jev-Source: l2
 --- no_error_log
 [error]
+
+
+
+=== TEST 11: a subject header the relay does not forward is reported once per worker
+--- http_config eval: $::HttpConfig
+--- user_files eval: ::conf('subject = { enabled = true, from = "header", name = "x-api-key", salt = "pepper" },')
+--- config
+location = /_jev/forward-auth { content_by_lua_block { require("resty.jev.edge").forward_auth() } }
+location = /count {
+    content_by_lua_block {
+        -- the whole error log: a check on the last request would miss the first's
+        local f = assert(io.open(ngx.config.prefix() .. "logs/error.log"))
+        local log = f:read("*a")
+        f:close()
+        local _, n = log:gsub("a request through forward_auth carried no header x%-api%-key; the gateway must forward it %(Traefik's authRequestHeaders%)", "")
+        ngx.say(n)
+    }
+}
+--- request eval
+["GET /_jev/forward-auth", "GET /_jev/forward-auth", "GET /count"]
+--- more_headers
+X-Forwarded-Method: POST
+X-Forwarded-Uri: /v1/chat/completions
+X-Forwarded-For: 198.51.100.9
+--- response_body eval
+["", "", "1\n"]
+
+
+
+=== TEST 12: once a request through the relay carried the subject header, one without it is a client's, not reported
+--- http_config eval: $::HttpConfig
+--- user_files eval: ::conf('subject = { enabled = true, from = "header", name = "x-api-key", salt = "pepper" },')
+--- config
+location /_jev/authz/ { content_by_lua_block { require("resty.jev.edge").authz() } }
+location = /count {
+    content_by_lua_block {
+        local f = assert(io.open(ngx.config.prefix() .. "logs/error.log"))
+        local log = f:read("*a")
+        f:close()
+        local _, n = log:gsub("carried no", "")
+        ngx.say(n)
+    }
+}
+--- request eval
+["GET /_jev/authz/v1/chat/completions", "GET /_jev/authz/v1/chat/completions", "GET /count"]
+--- more_headers eval
+["X-Forwarded-For: 198.51.100.9\nX-Api-Key: k-1", "X-Forwarded-For: 198.51.100.9", ""]
+--- response_body eval
+["", "", "0\n"]
+
+
+
+=== TEST 13: a subject cookie the relay does not forward is reported, naming the Cookie header
+--- http_config eval: $::HttpConfig
+--- user_files eval: ::conf('subject = { enabled = true, from = "cookie", name = "sid", salt = "pepper" },')
+--- config
+location /_jev/authz/ { content_by_lua_block { require("resty.jev.edge").authz() } }
+--- request
+GET /_jev/authz/v1/chat/completions
+--- more_headers
+X-Forwarded-For: 198.51.100.9
+--- error_code: 200
+--- error_log
+a request through authz carried no cookie sid (Cookie header); the gateway must forward it (Envoy's allowed_headers)

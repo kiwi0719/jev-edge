@@ -36,6 +36,11 @@ http:
           - Content-Length
           - X-Forwarded-For
           - X-Jev-Mock-Score           # e2e only; drop in production
+          # subject.from = "header" or "cookie": the subject never reaches
+          # jev-edge unless it is listed here (jev-edge logs a warning once per
+          # worker when a request through /_jev/forward-auth has none)
+          # - X-Api-Key                # subject.name for from = "header"
+          # - Cookie                   # from = "cookie"
   routers:
     app:
       rule: "PathPrefix(`/`)"

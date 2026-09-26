@@ -212,10 +212,33 @@ local function maybe_sample(cfg, v, req, rules)
   if not ok then ngx.log(ngx.WARN, "jev-edge: sampling failed: ", err) end
 end
 
+-- A relay (authz, forward_auth) passes on only the headers it is told to:
+-- Envoy's allowed_headers, Traefik's authRequestHeaders. A subject header or
+-- cookie left off that list never arrives, and every request quietly goes
+-- without a subject. Said once per worker for each entry and name, while no
+-- request through that entry has carried it (a client that sends none is
+-- then likely, not a relay that drops it).
+local relay_subject_seen, relay_subject_warned = {}, {}
+local RELAY_LIST = { authz = "Envoy's allowed_headers", forward_auth = "Traefik's authRequestHeaders" }
+
+local function note_relay_subject(scfg, relay, found)
+  if not relay or (scfg.from ~= "header" and scfg.from ~= "cookie") then return end
+  local key = relay .. ":" .. scfg.from .. ":" .. tostring(scfg.name)
+  if found then relay_subject_seen[key] = true return end
+  if relay_subject_seen[key] or relay_subject_warned[key] then return end
+  relay_subject_warned[key] = true
+  local what = scfg.from == "header" and ("header " .. tostring(scfg.name))
+    or ("cookie " .. tostring(scfg.name) .. " (Cookie header)")
+  ngx.log(ngx.WARN, "jev-edge: subject.from = ", scfg.from, ": a request through ", relay,
+    " carried no ", what, "; the gateway must forward it (", RELAY_LIST[relay] or "its header list",
+    "), or no request gets a subject")
+end
+
 -- Per-subject trajectory: id extracted per cfg.subject, hashed with the salt
 -- before anything stores or logs it; history read once here; the write is a
--- ring append (see core/subject.lua) and does not yield.
-local function subject_ctx(cfg, req)
+-- ring append (see core/subject.lua) and does not yield. relay: the entry a
+-- relay called (authz, forward_auth), nil for access().
+local function subject_ctx(cfg, req, relay)
   local scfg = cfg.subject
   if not scfg or not scfg.enabled then return nil end
   local raw = subject_m.extract(scfg, {
@@ -223,6 +246,7 @@ local function subject_ctx(cfg, req)
     header = function(n) return req.headers[n] end,
     cookie = function(n) return ngx.var["cookie_" .. tostring(n)] end,
   })
+  note_relay_subject(scfg, relay, raw ~= nil)
   local id = subject_m.hash_id(scfg, raw, sha256_hex)
   if not id then return nil end
   local rep_on = type(scfg.reputation) == "table" and (tonumber(scfg.reputation.block_at) or 0) > 0
@@ -242,13 +266,13 @@ local function subject_ctx(cfg, req)
   }
 end
 
-local function evaluate_current(cfg, rules, over)
+local function evaluate_current(cfg, rules, over, relay)
   -- first: when anything below throws, access() fails open with no client
   -- X-Jev-* left on the request
   strip_inbound()
   ensure_runtime(cfg)
   local req = build_req(rules, over)
-  local subj = subject_ctx(cfg, req)
+  local subj = subject_ctx(cfg, req, relay)
   ngx.ctx.jev_subject = subj and subj.id or nil
   local v = core.evaluate(req, {
     config = cfg, rules = rules, cache = cache, trust = state_store(), judge = judge, breaker = breaker, subject = subj,
@@ -620,7 +644,7 @@ end
 local function respond_authz(cfg, rules, over, who)
   local v
   local ok, err = pcall(function()
-    v = evaluate_current(cfg, rules, over)
+    v = evaluate_current(cfg, rules, over, who)
   end)
   if not ok then
     ngx.log(ngx.ERR, "jev-edge: ", who, " error, failing open: ", err)

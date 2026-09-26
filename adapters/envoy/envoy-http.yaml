@@ -77,6 +77,11 @@ static_resources:
                           - exact: x-forwarded-for
                           - exact: x-request-id
                           - exact: x-e2e-mock-score     # e2e only; drop in production
+                          # subject.from = "header" or "cookie": the subject never reaches
+                          # jev-edge unless it is listed here (jev-edge logs a warning once
+                          # per worker when a request through /_jev/authz has none)
+                          # - exact: x-api-key          # subject.name for from = "header"
+                          # - exact: cookie             # from = "cookie"
                       with_request_body:
                         max_request_bytes: 1048576     # matches rules.max_body_bytes (1 MiB)
                         allow_partial_message: true    # larger bodies arrive cut, with x-envoy-auth-partial-body: true; jev-edge scans them as a head

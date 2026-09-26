@@ -851,7 +851,8 @@ function _M.resolve(spec, load)
                         "prompt", "prompt.prompt_string", "prompt[*].prompt_string", "prompt.variables.**",
                         "input", "input[*].arguments.**", "input[*].input", "input[*].output",
                         "inputs", "instances[*].inputs", "instances[*].messages[*].content",
-                        "query", "text", "suffix", "input_prefix", "input_suffix", "input_extra[*].text" }
+                        "query", "text", "suffix", "input_prefix", "input_suffix", "input_extra[*].filename",
+                        "input_extra[*].text" }
   end
   if out.tool_fields == nil then
     out.tool_fields = { "tools", "functions", "response_format.json_schema", "text.format" }

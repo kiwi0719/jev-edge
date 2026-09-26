@@ -52,7 +52,8 @@ export const llmEndpoints: Rule = {
     "prompt", "prompt.prompt_string", "prompt[*].prompt_string", "prompt.variables.**",
     "input", "input[*].arguments.**", "input[*].input", "input[*].output",
     "inputs", "instances[*].inputs", "instances[*].messages[*].content",
-    "query", "text", "suffix", "input_prefix", "input_suffix", "input_extra[*].text",
+    "query", "text", "suffix", "input_prefix", "input_suffix", "input_extra[*].filename",
+    "input_extra[*].text",
   ],
   // tool definitions and output schemas (Gemini's functionDeclarations are
   // under tools), judged as a part of their own with their own verdict-cache
@@ -224,7 +225,8 @@ export function resolve(spec: RuleSpec): Rule {
     "prompt", "prompt.prompt_string", "prompt[*].prompt_string", "prompt.variables.**",
     "input", "input[*].arguments.**", "input[*].input", "input[*].output",
     "inputs", "instances[*].inputs", "instances[*].messages[*].content",
-    "query", "text", "suffix", "input_prefix", "input_suffix", "input_extra[*].text",
+    "query", "text", "suffix", "input_prefix", "input_suffix", "input_extra[*].filename",
+    "input_extra[*].text",
   ];
   out.tool_fields ??= ["tools", "functions", "response_format.json_schema", "text.format"];
   for (const k of ["text_fields", "tool_fields"] as const) {

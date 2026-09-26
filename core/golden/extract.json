@@ -1983,6 +1983,7 @@
           "suffix",
           "input_prefix",
           "input_suffix",
+          "input_extra[*].filename",
           "input_extra[*].text"
         ]
       },
@@ -2033,6 +2034,7 @@
           "suffix",
           "input_prefix",
           "input_suffix",
+          "input_extra[*].filename",
           "input_extra[*].text"
         ]
       },
@@ -2083,6 +2085,7 @@
           "suffix",
           "input_prefix",
           "input_suffix",
+          "input_extra[*].filename",
           "input_extra[*].text"
         ]
       },

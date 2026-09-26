@@ -107,7 +107,8 @@ return {
   -- input[*].output: a Responses API function_call_output (a tool result).
   -- inputs, instances: TGI /generate, / and /vertex.
   -- suffix: OpenAI completions and Ollama; input_prefix, input_suffix,
-  -- input_extra: llama.cpp /infill.
+  -- input_extra: llama.cpp /infill, each extra file's filename and text (it
+  -- renders both for the model).
   text_fields = { "system", "instructions", "preamble", "system_prompt", "systemInstruction.parts",
                   "system_instruction.parts", "documents", "template",
                   "messages[*].content", "messages[*].tool_calls[*].function.arguments.**",
@@ -118,7 +119,8 @@ return {
                   "prompt", "prompt.prompt_string", "prompt[*].prompt_string", "prompt.variables.**",
                   "input", "input[*].arguments.**", "input[*].input", "input[*].output",
                   "inputs", "instances[*].inputs", "instances[*].messages[*].content",
-                  "query", "text", "suffix", "input_prefix", "input_suffix", "input_extra[*].text" },
+                  "query", "text", "suffix", "input_prefix", "input_suffix", "input_extra[*].filename",
+                  "input_extra[*].text" },
   -- Tool definitions and output schemas, judged as a part of their own with
   -- the rule's templates and their own verdict-cache entry, so an unchanged
   -- tool set costs one judge call per cache lifetime: OpenAI chat, Ollama,

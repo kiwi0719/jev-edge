@@ -74,10 +74,15 @@ return {
   -- max_judge_bytes = 4096 keeps every text inside that limit even at one
   -- byte per token, the worst a hostile text can force a byte-level
   -- tokenizer into: with ~400 tokens taken by the question and a short
-  -- deployment_context, 8 windows cover ~4300 tokens. Longer deployment
-  -- contexts leave less room per window: lower max_judge_bytes, or raise
-  -- LAYA_MAX_WINDOWS, until `make conformance` and your own longest texts
-  -- pass. It also sets the worst-case latency above: fewer bytes, fewer
+  -- deployment_context, 8 windows cover ~4300 tokens. One byte per token
+  -- is not the worst for a tokenizer with an NFKC normalizer (SentencePiece
+  -- nmt_nfkc: XLM-R, mDeBERTa, T5): 3 bytes of U+FDFA become 18 characters
+  -- and 4096 bytes of it about 20,000 tokens. `make conformance` sends that
+  -- text too (the NFKC case) and prints the tokens per byte it cost; size
+  -- max_judge_bytes and LAYA_MAX_WINDOWS from the worse of the two cases.
+  -- Longer deployment contexts leave less room per window: lower
+  -- max_judge_bytes, or raise LAYA_MAX_WINDOWS, until `make conformance`
+  -- and your own longest texts pass. It also sets the worst-case latency above: fewer bytes, fewer
   -- windows. Text past max_judge_bytes is handled by the gateway as for
   -- jev (window around the suspicious part, or max_judge_chunks), and that
   -- shows up in the verdict reason, never silently.

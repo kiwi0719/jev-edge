@@ -92,6 +92,7 @@ within them (pool_sizes), and the server says at start what it chose.
 
 from __future__ import annotations
 
+import bisect
 import collections
 import contextlib
 import heapq
@@ -466,8 +467,29 @@ def sigmoid(x: float) -> float:
 
 
 # Tokens kept free in every window: a slice re-tokenized next to the question
-# can come out a token or two longer than its span count said.
+# can come out a token or two longer than it does alone.
 SLACK = 8
+
+
+def units(spans) -> tuple[list[int], list[int], list[int]]:
+    """The text's tokens grouped into units a slice can cut between: runs of
+    tokens that share characters. A tokenizer with an NFKC normalizer
+    (SentencePiece nmt_nfkc: XLM-R, mDeBERTa, T5) turns one character such
+    as U+FDFA into 18, and gives each of their tokens the one character's
+    span; byte-level BPE can do the same for the bytes of one character. A
+    token with no characters of its own joins the unit before it.
+    Returns each unit's first character, its end, and its first token's
+    index, with len(spans) appended to the last."""
+    starts, ends, tok = [], [], []
+    for i, (a, b) in enumerate(spans):
+        if ends and (a < ends[-1] or b <= a):
+            ends[-1] = max(ends[-1], b)
+        else:
+            starts.append(a)
+            ends.append(b)
+            tok.append(i)
+    tok.append(len(spans))
+    return starts, ends, tok
 
 
 class Scorer:
@@ -480,10 +502,12 @@ class Scorer:
         self.overlap = overlap
         self.max_windows = max_windows
 
-    def windows(self, first: str, text: str, spans=None) -> list[str]:
-        """The slices of `text` scored next to `first`. spans: the text's
-        token spans, when the caller has them (logits tokenizes the text
-        once for every question of a request)."""
+    def windows(self, first: str, text: str, spans=None, counts: dict | None = None) -> list[str]:
+        """The slices of `text` scored next to `first`, each at most the
+        room the question leaves, adjacent ones sharing LAYA_WINDOW_OVERLAP
+        tokens or more where the text allows. spans: the text's token spans, when the
+        caller has them (logits tokenizes the text once for every question
+        of a request); counts: filled with the tokens of each window."""
         room = self.max_tokens - self.b.pair_overhead - self.b.count(first) - SLACK
         if room <= self.overlap:
             # the question and the assistant description alone fill the model:
@@ -496,18 +520,51 @@ class Scorer:
             spans = self.b.spans(text)
         if len(spans) <= room:
             return [text]
-        step = room - self.overlap
-        need = 1 + math.ceil((len(spans) - room) / step)
-        if need > self.max_windows:
+        least = math.ceil(len(spans) / room)  # each window holds at most `room`
+        if least > self.max_windows:
             raise Refused(413, "input_too_long",
-                          f"text of {len(spans)} tokens needs {need} windows of {room}; "
+                          f"text of {len(spans)} tokens needs at least {least} windows of {room}; "
                           f"LAYA_MAX_WINDOWS is {self.max_windows}")
+        # A window is cut between units only, since a slice cannot split a
+        # character, and each is counted again once cut: it holds at most
+        # `room` tokens by span, but a character of many tokens at either
+        # end came in whole, and a pair of 1027 tokens broke a model of
+        # 1024 positions (a 500: the request passed unjudged). One too
+        # long loses units off its end until it fits. The next starts
+        # `overlap` tokens or more before its end, or less when the unit
+        # after it would not fit otherwise, never after it: coverage stays
+        # whole. With one token per unit these are the windows of
+        # 1 + ceil((tokens - room) / (room - overlap)).
+        starts, ends, tok = units(spans)
+        n_units = len(starts)
         out = []
-        for k in range(need):
-            a = k * step
-            b = min(a + room, len(spans))
-            out.append(text[spans[a][0]:spans[b - 1][1]])
-        return out
+        u = 0
+        while True:
+            v = max(u + 1, min(n_units, bisect.bisect_right(tok, tok[u] + room) - 1))
+            w = text[starts[u]:ends[v - 1]]
+            n = self.b.count(w)
+            while n > room and v - u > 1:
+                cut = v - 1  # units off the end that hold at least the excess
+                while cut - u > 1 and tok[v] - tok[cut] < n - room:
+                    cut -= 1
+                v = cut
+                w = text[starts[u]:ends[v - 1]]
+                n = self.b.count(w)
+            if n > room:
+                raise Refused(413, "input_too_long",
+                              f"one character of the text is {n} tokens, over the {room} of a window")
+            out.append(w)
+            if counts is not None:
+                counts[w] = n
+            if v >= n_units:
+                return out
+            if len(out) == self.max_windows:
+                raise Refused(413, "input_too_long",
+                              f"text of {len(spans)} tokens needs more than {self.max_windows} windows "
+                              f"of {room}; LAYA_MAX_WINDOWS is {self.max_windows}")
+            back = bisect.bisect_right(tok, tok[v] - self.overlap) - 1  # `overlap` tokens or more
+            fits = bisect.bisect_left(tok, tok[v + 1] - room)            # room for the next unit
+            u = max(u + 1, min(v, max(back, fits)))
 
     def logits(self, state, questions: dict) -> tuple[dict, dict]:
         """Raw "yes" logit per question (highest over the windows), before the
@@ -518,11 +575,10 @@ class Scorer:
         # request no scoring. Questions differ only in the room they leave,
         # so their windows are mostly the same strings, counted once.
         spans = self.b.spans(text)
-        plan = []
+        plan, counts = [], {}
         for name, q in questions.items():
             first = question_segment(q, assistant)
-            plan.append((name, first, self.windows(first, text, spans)))
-        counts: dict[str, int] = {}
+            plan.append((name, first, self.windows(first, text, spans, counts)))
 
         def count(w: str) -> int:
             n = counts.get(w)

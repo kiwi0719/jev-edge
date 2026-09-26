@@ -138,6 +138,112 @@ class Windows(unittest.TestCase):
         self.assertGreater(usage["windows"], 1)
 
 
+class Expanding(L.MockBackend):
+    """The mock with an NFKC normalizer's worst character: U+FDFA becomes
+    18 characters, each a token here, and every one of them maps back to
+    the one character's span, as tokenizers report offsets."""
+
+    N = 18
+
+    def spans(self, text):
+        out = []
+        for a, b in super().spans(text):
+            i = a
+            for j in range(a, b):
+                if text[j] == "\ufdfa":
+                    if j > i:
+                        out.append((i, j))
+                    out.extend([(j, j + 1)] * self.N)
+                    i = j + 1
+            if b > i:
+                out.append((i, b))
+        return out
+
+
+class ExpandingWindows(unittest.TestCase):
+    """python-adapters#11: windows were sliced on character spans, which
+    cannot split a character, and never counted again: a window that began
+    or ended inside U+FDFA took all 18 of its tokens, past the room, and a
+    pair of 1027 tokens broke a model of 1024 positions (500, fail open)."""
+
+    def setUp(self):
+        self.s = L.Scorer(Expanding(), max_tokens=64, overlap=8, max_windows=8)
+        self.room = 64 - 3 - 1 - L.SLACK  # question "q": one token
+
+    def placed(self, text, ws):
+        """Each window's (start, end) in text, in order."""
+        out, pos = [], 0
+        for w in ws:
+            pos = text.find(w, pos)
+            self.assertGreaterEqual(pos, 0, w)
+            out.append((pos, pos + len(w)))
+        return out
+
+    def test_every_window_fits_and_the_text_is_covered_with_overlap(self):
+        text = " ".join(f"w{i}" + "\ufdfa" * (i % 3) for i in range(24))
+        self.assertGreater(self.s.b.count(text), 4 * self.room)
+        self.s.max_windows = 32
+        counts = {}
+        ws = self.s.windows("q", text, counts=counts)
+        self.assertGreater(len(ws), 1)
+        for w in ws:
+            self.assertLessEqual(self.s.b.count(w), self.room, w)
+            self.assertEqual(counts[w], self.s.b.count(w))
+        at = self.placed(text, ws)
+        self.assertEqual(at[0][0], 0)
+        self.assertEqual(at[-1][1], len(text))
+        for (a0, a1), (b0, _) in zip(at, at[1:]):
+            self.assertLess(a0, b0)  # it moves on
+            self.assertLess(b0, a1)  # and overlaps the one before: nothing between them is skipped
+            self.assertGreaterEqual(self.s.b.count(text[b0:a1]), 8)  # by at least LAYA_WINDOW_OVERLAP
+
+    def test_a_run_of_the_character_alone(self):
+        # 6 of it (108 tokens) needs windows of 2 (36): the next holds one
+        # back for the overlap, so 5, each well inside the model
+        text = "\ufdfa" * 6
+        ws = self.s.windows("q", text)
+        self.assertEqual(ws, ["\ufdfa" * 2] * 5)
+        pair = self.s.b.pair_overhead + self.s.b.count("q") + max(self.s.b.count(w) for w in ws)
+        self.assertLessEqual(pair, 64)
+
+    def test_more_than_max_windows_is_refused_not_cut(self):
+        with self.assertRaises(L.Refused) as cm:
+            self.s.windows("q", "\ufdfa" * 12)  # 216 tokens: 11 windows of 2
+        self.assertEqual((cm.exception.status, cm.exception.code), (413, "input_too_long"))
+        self.assertIn("needs more than 8 windows", cm.exception.message)
+
+    def test_one_character_over_the_room_is_refused(self):
+        s = L.Scorer(Expanding(), max_tokens=29, overlap=8, max_windows=8)
+        self.assertEqual(29 - 3 - 1 - L.SLACK, Expanding.N - 1)  # the room
+        with self.assertRaises(L.Refused) as cm:
+            s.windows("q", "a " * 30 + "\ufdfa")
+        self.assertEqual((cm.exception.status, cm.exception.code), (413, "input_too_long"))
+        self.assertIn("one character of the text is 18 tokens, over the 17 of a window", cm.exception.message)
+
+    def test_a_short_window_before_a_long_character_does_not_repeat(self):
+        # the words before the character fill a window that cannot take it;
+        # the next starts where the character fits, rather than 8 tokens
+        # back each time, which cut the same window over and over
+        s = L.Scorer(Expanding(), max_tokens=40, overlap=8, max_windows=8)  # room 28
+        text = " ".join(f"w{i}" for i in range(24)) + " \ufdfa\ufdfa x"
+        ws = s.windows("q", text)
+        self.assertEqual(len(set(ws)), len(ws), ws)
+        at = self.placed(text, ws)
+        self.assertEqual((at[0][0], at[-1][1]), (0, len(text)))
+        for (_, a1), (b0, b1) in zip(at, at[1:]):
+            self.assertLess(a1, b1)
+            self.assertLessEqual(b0, a1)
+
+    def test_the_attack_after_the_characters_is_seen_and_the_usage_counts_each_window(self):
+        text = "\ufdfa" * 4 + " ATTACK"
+        ans, usage = self.s.score(text, {"injection": Q})
+        self.assertGreater(ans["injection"]["noul"], 0.5)
+        ws = self.s.windows("Is this an attack?", text)
+        head = self.s.b.count("Is this an attack?") + self.s.b.pair_overhead
+        self.assertEqual(usage["windows"], len(ws))
+        self.assertEqual(usage["input_tokens"], sum(head + self.s.b.count(w) for w in ws))
+
+
 def questions(n: int) -> dict:
     return {f"q{i}": dict(Q) for i in range(n)}
 
@@ -309,6 +415,7 @@ class Http(unittest.TestCase):
             srv.server_close()
         self.assertEqual(rc, 0, out)
         self.assertRegex(out, r"ok    worst case .* 64 at once: .*, [2-8] windows\)")
+        self.assertRegex(out, r"ok    NFKC case .* \(alone p99 [\d.]+ ms, [2-8] windows, [\d.]+ input tokens per byte")
         self.assertRegex(out, r"ok    burst: 64 new connections at once")
         self.assertRegex(out, r"timeout_ms: \d+(-\d+)?, 2-3x the worst-case p99 of .* with 64 at once")
 
@@ -430,6 +537,37 @@ class Http(unittest.TestCase):
         finally:
             stop(srv)
         self.assertRegex(err, r"^status 413 for 4096 bytes .*LAYA_MAX_WINDOWS")
+
+    def test_nfkc_case_the_windows_cannot_hold_is_a_failure(self):
+        # python-adapters#11: a tokenizer with an NFKC normalizer reads
+        # 4096 bytes of U+FDFA as 24,534 tokens, past 8 windows; a 413 is a
+        # bypass, and the run says which setting to change
+        srv, url = serve(backend=Expanding())
+        try:
+            t = conformance.Target(url, None, "laya", 5)
+            body = conformance.worst_body(t, 4096, conformance.DEFAULT_ASSISTANT, ctx_questions(),
+                                          conformance.nfkc_text(4096))
+            err, _, _ = conformance.check_nfkc(t, body, 4096, 2, 1000, mock=True)
+        finally:
+            stop(srv)
+        self.assertRegex(err, r"^status 413 for 4096 bytes of U\+FDFA .*raise LAYA_MAX_WINDOWS")
+        # with the windows to hold it, it is judged whole and priced per byte
+        srv, url = serve({"LAYA_MAX_WINDOWS": "40"}, backend=Expanding())
+        try:
+            t = conformance.Target(url, None, "laya", 5)
+            err, info, _ = conformance.check_nfkc(t, body, 4096, 2, 1000, mock=True)
+        finally:
+            stop(srv)
+        self.assertIsNone(err, err)
+        tpb = float(re.search(r", ([\d.]+) input tokens per byte", info).group(1))
+        self.assertGreater(tpb, 5.0)  # 18 tokens per 3 bytes, and the question per window
+
+    def test_nfkc_text_is_the_asked_size(self):
+        for n in (4096, 4095, 4094, 7):
+            text = conformance.nfkc_text(n)
+            self.assertEqual(len(text.encode()), n)
+            self.assertTrue(text.endswith(" ATTACK"))
+        self.assertEqual(conformance.nfkc_text(4096).count("\ufdfa"), 1363)
 
     def test_worst_text_is_fixed_ascii_of_the_asked_size(self):
         a, b = conformance.worst_text(4096), conformance.worst_text(4096)
@@ -955,6 +1093,42 @@ class SpecialTokensInText(unittest.TestCase):
         self.assertEqual([text[x:y] for x, y in b.spans(text)], ["a", "[", "SEP", "]", "b"])
         s = L.Scorer(b, max_tokens=64, overlap=8, max_windows=4)
         self.assertEqual(s.windows("is it ?", text), [text])
+
+
+@unittest.skipUnless(_has_tokenizers(), "tokenizers not installed")
+class NfkcTokenizer(unittest.TestCase):
+    """python-adapters#11 with a real tokenizers tokenizer: an NFKC
+    normalizer turns U+FDFA into 18 characters, 15 tokens here, all with
+    the one character's offsets."""
+
+    def test_windows_fit_the_model_after_expansion(self):
+        import unicodedata
+
+        from tokenizers import Regex, Tokenizer, models, normalizers, pre_tokenizers, processors
+
+        chars = sorted(set(unicodedata.normalize("NFKC", "\ufdfa") + "abcdefghijklmnopqrstuvwxyz?ATCK") - {" "})
+        vocab = {w: i for i, w in enumerate(["[UNK]", "[CLS]", "[SEP]", "[PAD]"] + chars)}
+        tok = Tokenizer(models.WordLevel(vocab, unk_token="[UNK]"))
+        tok.normalizer = normalizers.NFKC()
+        tok.pre_tokenizer = pre_tokenizers.Sequence([pre_tokenizers.WhitespaceSplit(),
+                                                     pre_tokenizers.Split(Regex("."), "isolated")])
+        tok.post_processor = processors.BertProcessing(("[SEP]", vocab["[SEP]"]), ("[CLS]", vocab["[CLS]"]))
+        d = tempfile.mkdtemp()
+        self.addCleanup(os.rmdir, d)
+        tok.save(os.path.join(d, "tokenizer.json"))
+        self.addCleanup(os.unlink, os.path.join(d, "tokenizer.json"))
+        b = L.OnnxBackend.__new__(L.OnnxBackend)  # the tokenizer part only: no model needed
+        b.tok = L.load_tokenizer(d)
+        b.pair_overhead = b.tok.post_processor.num_special_tokens_to_add(True)
+        self.assertEqual(b.count("\ufdfa"), 15)
+        s = L.Scorer(b, max_tokens=128, overlap=16, max_windows=8)
+        text = "is it " + "\ufdfa" * 20 + " ATTACK"
+        ws = s.windows("q?", text)
+        self.assertGreater(len(ws), 1)
+        for w in ws:  # before: pairs up to 14 tokens past the room, past the model
+            self.assertLessEqual(len(b.tok.encode("q?", w).ids), 128 - L.SLACK, w)
+        self.assertTrue(ws[0].startswith("is it "))
+        self.assertTrue(ws[-1].endswith(" ATTACK"))
 
 
 class Cpus(unittest.TestCase):

@@ -31,6 +31,13 @@ gateway depends on:
                 that concurrency fits with 2x headroom. A 503 sent after
                 the gateway stopped reading (60% of --budget-ms) is named
                 on its own: the gateway logs a timeout instead
+  NFKC case     --judge-bytes of U+FDFA, one at a time: 3 bytes that an
+                NFKC normalizer (SentencePiece nmt_nfkc: XLM-R, mDeBERTa,
+                T5) turns into 18 characters, so several tokens per byte
+                where the worst case above forces one. Answered 200 and
+                judged whole (a 413 is a bypass: raise LAYA_MAX_WINDOWS or
+                lower max_judge_bytes), the p99 with 2x headroom, and the
+                input tokens per byte the server reports
 
 --budget-ms is the L2 timeout floor the gateway runs with (jev.timeout_ms).
 Under steady traffic the adaptive timeout sits at the floor, so a hostile
@@ -432,13 +439,60 @@ def worst_text(nbytes: int) -> str:
     return "".join(out) + tail
 
 
-def worst_body(t: Target, nbytes: int, assistant: str, ctx_questions: dict) -> bytes:
-    """The request the gateway sends for that text under a deployment
-    context: object state, the _ctx wording (longer, so less room per
-    window) and the llm-endpoints rule's one question."""
-    state = {"assistant": assistant, "user_message": worst_text(nbytes)}
+def worst_body(t: Target, nbytes: int, assistant: str, ctx_questions: dict, text=None) -> bytes:
+    """The request the gateway sends for that text (by default worst_text)
+    under a deployment context: object state, the _ctx wording (longer, so
+    less room per window) and the llm-endpoints rule's one question."""
+    state = {"assistant": assistant, "user_message": worst_text(nbytes) if text is None else text}
     return json.dumps({"model": t.model, "state": state,
                        "questions": {"injection": ctx_questions["injection"]}}).encode()
+
+
+# U+FDFA, ARABIC LIGATURE SALLALLAHOU ALAYHE WASALLAM: 3 bytes of UTF-8 that
+# NFKC turns into 18 characters. A tokenizer with an NFKC normalizer gives
+# each of them its tokens, all mapped back to the one character, so the text
+# costs several tokens per byte: one byte per token is not the worst case
+# for such a tokenizer. One without NFKC reads it as a token or two.
+NFKC_CHAR = "\ufdfa"
+
+
+def nfkc_text(nbytes: int) -> str:
+    """nbytes of U+FDFA (a few ASCII dots where 3 does not divide), ending
+    in " ATTACK" like worst_text, so --mock also shows the tail was judged."""
+    tail = " ATTACK"
+    n, pad = divmod(max(0, nbytes - len(tail)), len(NFKC_CHAR.encode()))
+    return NFKC_CHAR * n + "." * pad + tail
+
+
+def check_nfkc(t: Target, body: bytes, nbytes: int, samples: int, budget_ms: float,
+               mock: bool) -> tuple[str | None, str, None]:
+    """The NFKC-expanding text one at a time: answered 200 and judged whole,
+    the p99 with the headroom, and the input tokens per byte it cost."""
+    what = f"{nbytes} bytes of U+FDFA one at a time, a text the gateway sends as is (max_judge_bytes)"
+    err, lat, data = timed(t, body, samples)
+    if err:
+        why = (": the model's tokenizer expands it to more windows than the server judges; raise "
+               "LAYA_MAX_WINDOWS (laya-server) or lower max_judge_bytes" if err == "status 413" else "")
+        return f"{err} for {what}. An L2 error passes the request unjudged{why}", "", None
+    aerr, scores = check_answers(data, ["injection"])
+    if aerr:
+        return aerr, "", None
+    if mock and scores["injection"] <= 0.5:
+        return f"mock: injection = {scores['injection']:.3f} with ATTACK at the tail, want high", "", None
+    try:
+        usage = json.loads(data).get("usage") or {}
+    except (ValueError, AttributeError):
+        usage = {}
+    p99 = pct(lat, 0.99)
+    nw, tokens = usage.get("windows"), usage.get("input_tokens")
+    info = (f"alone p99 {p99:.1f} ms"
+            + (f", {nw} window{'' if nw == 1 else 's'}" if isinstance(nw, int) else "")
+            + (f", {tokens / nbytes:.2f} input tokens per byte (question and overlaps included)"
+               if isinstance(tokens, (int, float)) and nbytes > 0 else ""))
+    if over_headroom(p99, budget_ms):
+        return (f"p99 {p99:.1f} ms {needs(p99, budget_ms)} ({info}). With this tokenizer the NFKC case, "
+                f"not the ASCII one, is the worst: size timeout_ms and max_judge_bytes from it"), info, None
+    return None, info, None
 
 
 def at_once(t: Target, body: bytes, warm: bytes, n: int, rounds: int) -> list:
@@ -652,6 +706,11 @@ def main(argv=None) -> int:
          f"per byte, deployment context wording",
          lambda: check_worst(t, worst, short_body(t, vectors), args.judge_bytes, args.samples,
                              args.concurrency, args.budget_ms, args.mock)),
+        (f"NFKC case {within} at p99, one at a time: {args.judge_bytes} bytes of U+FDFA, deployment "
+         f"context wording",
+         lambda: check_nfkc(t, worst_body(t, args.judge_bytes, args.assistant, ctx_questions,
+                                          nfkc_text(args.judge_bytes)),
+                            args.judge_bytes, args.samples, args.budget_ms, args.mock)),
     ]
     measured = []
     for name, fn in timing:

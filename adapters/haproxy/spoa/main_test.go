@@ -1,10 +1,14 @@
 package main
 
 import (
+	"bytes"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -367,5 +371,64 @@ func TestMethodNetHTTPCannotSendIsRefusedWith400(t *testing.T) {
 		if v := check(msg(map[string]string{"method": m, "path": "/v1/chat/completions", "body": "{}"})); v["verdict"] != "safe" || method != m {
 			t.Fatalf("%q: vars = %v, jev-edge saw %q", m, v, method)
 		}
+	}
+}
+
+// envoy-haproxy-fwdauth#4: the agent used net/http's default transport,
+// which keeps 2 idle connections per host, and drained 4 KiB of an answer:
+// with 32 checks in flight nearly every one opened a new connection to
+// jev-edge, and so did every answer with a body past 4 KiB. The client
+// keeps -max-idle (64) and drains up to 64 KiB.
+func TestChecksReuseConnectionsToJevEdge(t *testing.T) {
+	for _, bodySize := range []int{0, 16 << 10} {
+		var opened atomic.Int64
+		ts := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("X-Jev-Verdict", "malicious")
+			w.WriteHeader(403)
+			w.Write(bytes.Repeat([]byte("x"), bodySize))
+		}))
+		ts.Config.ConnState = func(_ net.Conn, s http.ConnState) {
+			if s == http.StateNew {
+				opened.Add(1)
+			}
+		}
+		ts.Start()
+		oldUp, oldClient := *upstream, client
+		*upstream, client = ts.URL+"/_jev/authz", newClient(5*time.Second, 64)
+		var wg sync.WaitGroup
+		var blocked atomic.Int64
+		jobs := make(chan struct{})
+		for w := 0; w < 32; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for range jobs {
+					v := check(msg(map[string]string{"method": "POST", "path": "/v1/chat/completions", "body": "{}"}))
+					if v["action"] == "block" {
+						blocked.Add(1)
+					}
+				}
+			}()
+		}
+		for i := 0; i < 1600; i++ {
+			jobs <- struct{}{}
+		}
+		close(jobs)
+		wg.Wait()
+		*upstream, client = oldUp, oldClient
+		ts.Close()
+		if blocked.Load() != 1600 {
+			t.Fatalf("body %d: %d of 1600 checks blocked", bodySize, blocked.Load())
+		}
+		if n := opened.Load(); n > 64 {
+			t.Fatalf("body %d: 1600 checks at 32 in flight opened %d connections, want at most 64", bodySize, n)
+		}
+	}
+}
+
+func TestNewClientPool(t *testing.T) {
+	tr := newClient(time.Second, 64).Transport.(*http.Transport)
+	if tr.MaxIdleConnsPerHost != 64 || tr.MaxIdleConns != 256 || tr.IdleConnTimeout != 90*time.Second {
+		t.Fatalf("pool: per host %d, total %d, idle timeout %s", tr.MaxIdleConnsPerHost, tr.MaxIdleConns, tr.IdleConnTimeout)
 	}
 }

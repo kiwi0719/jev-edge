@@ -57,9 +57,28 @@ var (
 	timeout  = flag.Duration("timeout", 1500*time.Millisecond, "per-check timeout (fail-open when exceeded); keep it below spoe.conf's `timeout processing` so the fail-open answer still reaches HAProxy")
 	message  = flag.String("message", "check-request", "SPOE message name")
 	unjudged = flag.String("unjudged", "pass", "a request jev-edge's server answered without X-Jev-Verdict (refused before judging): pass, marked verdict=skipped, or block with 403; keep it equal to jev-edge's policy.unjudgeable")
+	maxIdle  = flag.Int("max-idle", 64, "idle keepalive connections kept open to jev-edge; at least the checks in flight at once, or each check past it opens a new connection")
 )
 
 var client *http.Client
+
+// maxDrain is how much of an answer's body is read so its connection goes
+// back to the pool; a longer one (jev-edge's block body is a few bytes)
+// closes it instead.
+const maxDrain = 64 << 10
+
+// newClient is the client the agent asks jev-edge with: net/http's default
+// transport keeps 2 idle connections per host, so with more checks than
+// that in flight every answer past the second closed its connection and
+// the next check opened a new one (a TCP handshake, and a TIME_WAIT socket,
+// per request under load).
+func newClient(timeout time.Duration, maxIdle int) *http.Client {
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.MaxIdleConns = 4 * maxIdle
+	tr.MaxIdleConnsPerHost = maxIdle
+	tr.IdleConnTimeout = 90 * time.Second
+	return &http.Client{Timeout: timeout, Transport: tr}
+}
 
 func str(v interface{}) string {
 	switch t := v.(type) {
@@ -359,7 +378,7 @@ func check(get func(string) string) map[string]string {
 		return failOpen("unreachable")
 	}
 	defer res.Body.Close()
-	io.Copy(io.Discard, io.LimitReader(res.Body, 4096))
+	io.Copy(io.Discard, io.LimitReader(res.Body, maxDrain))
 
 	if res.Header.Get("X-Jev-Verdict") == "" {
 		// a 5xx is the server (or a proxy in front of it) failing, like an
@@ -397,7 +416,10 @@ func main() {
 	if *unjudged != "pass" && *unjudged != "block" {
 		log.Fatalf("-unjudged must be pass or block, got %q", *unjudged)
 	}
-	client = &http.Client{Timeout: *timeout}
+	if *maxIdle < 1 {
+		log.Fatalf("-max-idle must be at least 1, got %d", *maxIdle)
+	}
+	client = newClient(*timeout, *maxIdle)
 	ln, err := net.Listen("tcp", *listen)
 	if err != nil {
 		log.Fatalf("listen: %v", err)

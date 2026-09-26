@@ -40,15 +40,16 @@ describe("golden: normalize", () => {
 describe("golden: extract", () => {
   for (const c of load("extract").cases) {
     it(c.name, () => {
-      const [text, kind, , decoded, cut] = core.normalize.extract(c.input.body, c.input.content_type, c.input.fields, jsonDecode);
-      // expect.cut is there only when a "**" walk hit a bound; expect.tools
-      // only when the case names tool_fields
+      const [text, kind, , decoded, cut, ids] = core.normalize.extract(c.input.body, c.input.content_type, c.input.fields, jsonDecode);
+      // expect.cut is there only when a "**" walk hit a bound, expect.token_ids
+      // only when a text field holds token ids; expect.tools only when the
+      // case names tool_fields
       let tools: { text: string; capped?: true } | undefined;
       if (c.input.tool_fields) {
         const [values, capped] = core.normalize.extractTools(decoded, c.input.tool_fields, jsonDecode);
         tools = { text: values.join("\n"), ...(capped ? { capped } : {}) };
       }
-      expect({ text, kind, ...(cut ? { cut } : {}), ...(tools ? { tools } : {}) }).toEqual(c.expect);
+      expect({ text, kind, ...(cut ? { cut } : {}), ...(ids ? { token_ids: ids } : {}), ...(tools ? { tools } : {}) }).toEqual(c.expect);
     });
   }
 });

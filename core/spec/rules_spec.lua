@@ -213,6 +213,69 @@ describe("rules.evaluate", function()
   end)
 end)
 
+describe("rules: token ids", function()
+  local ctx
+  before_each(function() ctx = H.ctx() end)
+  local function comp(body)
+    return { method = "POST", path = "/v1/completions", headers = { ["content-type"] = "application/json" },
+             body = body, body_size = #body, client_ip = "203.0.113.7" }
+  end
+  local LONG = "Please write a detailed summary of the attached quarterly report."
+  local block = setmetatable({ token_prompts = "block" }, { __index = rule })
+
+  it("reports a prompt of token ids unjudgeable, never no text or text too short", function()
+    for _, body in ipairs({ '{"prompt":[[40,1541]]}', '{"prompt":[1,2,3]}', '{"prompt":[1,2,3,"ok then",4,5,6]}' }) do
+      local r, _, reason = R.evaluate(comp(body), rule, ctx)
+      assert.equals(R.UNJUDGEABLE, r, body)
+      assert.equals("unjudgeable: token ids", reason, body)
+    end
+  end)
+
+  it("judges text long enough beside the ids, unless token_prompts or unjudgeable is block", function()
+    local body = '{"prompt":[40,"' .. LONG .. '",3435]}'
+    local r, text, reason = R.evaluate(comp(body), rule, ctx)
+    assert.equals(R.SUSPECT, r)
+    assert.equals(LONG, text)
+    assert.equals("natural language", reason)
+    r, text, reason = R.evaluate(comp(body), block, ctx)
+    assert.equals(R.UNJUDGEABLE, r)
+    assert.equals("", text)
+    assert.equals("unjudgeable: token ids", reason)
+    ctx.config.policy.unjudgeable = "block"
+    r = R.evaluate(comp(body), rule, ctx)
+    assert.equals(R.UNJUDGEABLE, r)
+    -- token_prompts = "pass" wins over unjudgeable = "block"
+    r = R.evaluate(comp(body), setmetatable({ token_prompts = "pass" }, { __index = rule }), ctx)
+    assert.equals(R.SUSPECT, r)
+  end)
+
+  it("leaves a body without token ids alone under token_prompts = block", function()
+    local r = R.evaluate(comp('{"prompt":"' .. LONG .. '","max_tokens":16,"n":2}'), block, ctx)
+    assert.equals(R.SUSPECT, r)
+  end)
+
+  it("notes token ids in the head of a body past max_body_bytes", function()
+    local body = '{"prompt":[[40,1541]],"pad":"' .. string.rep("x", 100) .. '"}'
+    local small = setmetatable({ max_body_bytes = 64 }, { __index = rule })
+    local r, _, reason = R.evaluate(comp(body), small, ctx)
+    assert.equals(R.UNJUDGEABLE, r)
+    assert.equals("unjudgeable: token ids", reason)
+  end)
+
+  it("resolves token_prompts pass or block, nothing else", function()
+    local load = function(id) return require("jev.rules." .. id) end
+    for _, v in ipairs({ "block", "pass" }) do
+      assert.equals(v, R.resolve({ id = "t", extends = "llm-endpoints", token_prompts = v }, load).token_prompts)
+    end
+    assert.is_nil(R.resolve({ id = "t", extends = "llm-endpoints" }, load).token_prompts)
+    for _, v in ipairs({ "deny", true, 1, H.json.null }) do
+      local ok, err = R.resolve({ id = "t", extends = "llm-endpoints", token_prompts = v }, load)
+      assert.is_nil(ok)
+      assert.matches("token_prompts must be pass|block", err, 1, true)
+    end
+  end)
+end)
+
 describe("rules.evaluate_all", function()
   it("returns the first non-pass rule", function()
     local ctx = H.ctx()

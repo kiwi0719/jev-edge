@@ -137,13 +137,20 @@ function functionResponses(part: { [k: string]: JsonValue }, out: string[]): voi
 // Cohere v2 `document` part (a tool result's) under `document`; the last two
 // are read whole (readWhole).
 // The depth leaves room for a content document inside a tool_result.
-// Anything else (numbers, images) contributes nothing.
+// Anything else (images, null) contributes nothing. A number contributes no
+// text either, but it is noted (`st.tokenIds`, when the caller passes a walk
+// state): a prompt given as token ids reaches the model as the text they
+// decode to, which L1 never sees (see the Lua original).
 // Mirrors collect() in core/normalize.lua, including Lua's "array if [1] is
 // set" test: an empty array is a table with no array part and yields nothing.
 const LEAF_DEPTH = 6;
-function collect(node: JsonValue | undefined, out: string[], depth: number): void {
+function collect(node: JsonValue | undefined, out: string[], depth: number, st?: WalkState): void {
   if (typeof node === "string") {
     out.push(node);
+    return;
+  }
+  if (typeof node === "number") {
+    if (st && depth <= LEAF_DEPTH) st.tokenIds = true;
     return;
   }
   if (!isObj(node) || depth > LEAF_DEPTH) return;
@@ -152,18 +159,18 @@ function collect(node: JsonValue | undefined, out: string[], depth: number): voi
     // cjson: cjson.null is a value, ipairs goes on past it)
     for (const item of node) {
       if (item === null || item === undefined) continue;
-      collect(item, out, depth + 1);
+      collect(item, out, depth + 1, st);
     }
     return;
   }
   if (typeof node.text === "string") out.push(node.text);
-  if (node.content !== undefined && node.content !== null) collect(node.content, out, depth + 1);
+  if (node.content !== undefined && node.content !== null) collect(node.content, out, depth + 1, st);
   const src = node.source;
   if (isObj(src) && !Array.isArray(src)) {
     if (src.type === "text" && typeof src.data === "string") out.push(src.data);
-    if (src.type === "content" && src.content !== undefined && src.content !== null) collect(src.content, out, depth + 1);
+    if (src.type === "content" && src.content !== undefined && src.content !== null) collect(src.content, out, depth + 1, st);
   }
-  if (node.type === "file_search_call" && isObj(node.results)) collect(node.results, out, depth + 1);
+  if (node.type === "file_search_call" && isObj(node.results)) collect(node.results, out, depth + 1, st);
   functionResponses(node, out);
   if (node.type === "document" && node.document !== undefined) readWhole(node.document, out, 1);
 }
@@ -230,6 +237,8 @@ interface WalkState {
   decode?: Decode;
   /** the "**" values, in document order */
   defer: Slot[];
+  /** a text field holds a number: token ids (collect) */
+  tokenIds?: boolean;
 }
 
 function newState(decode?: Decode): WalkState {
@@ -610,7 +619,7 @@ function walk(node: JsonValue | undefined, plan: Plan, st: WalkState): void {
       if (st.leaf) st.leaf(node, st);
       else if (op.whole) readWhole(node, st.out as string[], op.depth);
       else {
-        collect(node, st.out as string[], op.depth);
+        collect(node, st.out as string[], op.depth, st);
         if (op.keyed && isObj(node) && !Array.isArray(node)) for (const k of objectKeys(node)) take(st, k);
       }
     } else if (op.kind === OP_DEEP) {
@@ -655,11 +664,11 @@ export function extractJsonValues(decoded: JsonValue, fields: string[], jsonDeco
   return extractJsonState(decoded, fields, jsonDecode).out;
 }
 
-function extractJsonState(decoded: JsonValue, fields: string[], jsonDecode?: Decode): { out: string[]; capped: boolean } {
+function extractJsonState(decoded: JsonValue, fields: string[], jsonDecode?: Decode): { out: string[]; capped: boolean; tokenIds: boolean } {
   const st = newState(jsonDecode);
   sortLeft = WHOLE_SORT;
   walk(decoded, planOf(fields, false), st);
-  return { out: settle(st), capped: st.capped };
+  return { out: settle(st), capped: st.capped, tokenIds: st.tokenIds === true };
 }
 
 /**
@@ -942,15 +951,16 @@ export function jsonLike(s: string | undefined | null, contentType: string | und
 /**
  * Extract text from a raw body. Returns the text (values joined with "\n"),
  * the kind, the values in order (newest last) for window(), the decoded
- * JSON value when the kind is "json", and true when a "**" walk hit a bound
- * and left something out.
+ * JSON value when the kind is "json", true when a "**" walk hit a bound
+ * and left something out, and true when a text field holds token ids (kinds
+ * "json", "scan" and "invalid"; see collect and scanStrings).
  */
 export function extract(
   body: string | undefined | null,
   contentType: string | undefined | null,
   fields: string[],
   jsonDecode: (s: string) => JsonValue = (s) => JSON.parse(s) as JsonValue,
-): [string, ExtractKind, string[], JsonValue?, boolean?] {
+): [string, ExtractKind, string[], JsonValue?, boolean?, boolean?] {
   if (typeof body !== "string" || body === "") return ["", "none", []];
   const rawCt = typeof contentType === "string" ? contentType : "";
   const ct = asciiLower(rawCt);
@@ -972,7 +982,7 @@ export function extract(
     if (ok && isObj(decoded) && tooDeep(body)) ok = false;
     if (ok && isObj(decoded)) {
       const st = extractJsonState(decoded as JsonValue, fields, jsonDecode);
-      return [st.out.join("\n"), "json", st.out, decoded as JsonValue, st.capped];
+      return [st.out.join("\n"), "json", st.out, decoded as JsonValue, st.capped, st.tokenIds];
     }
     // a JSON scalar has no text fields
     if (declaredJson && ok && decoded !== undefined) return ["", "none", []];
@@ -985,13 +995,14 @@ export function extract(
     // values that reading gives follow, since a backend of that kind reads
     // the body so. Declared JSON with nothing to scan is unjudgeable, never
     // "no text"; any other body with nothing to scan is read as before.
-    const out = scanStrings(body, fieldKeys(fields), [], deepKeys(fields));
+    const seen: { tokenIds?: boolean } = {};
+    const out = scanStrings(body, fieldKeys(fields), [], deepKeys(fields), seen);
     if (out.length > 0) {
       if (form && !declaredJson) formValues(body, out);
       else if (multipart && !declaredJson) multipartValues(body, rawCt, out);
-      return [out.join("\n"), "scan", out];
+      return [out.join("\n"), "scan", out, undefined, undefined, seen.tokenIds === true];
     }
-    if (declaredJson) return ["", "invalid", []];
+    if (declaredJson) return ["", "invalid", [], undefined, undefined, seen.tokenIds === true];
   }
   const out: string[] = [];
   if (form) {
@@ -1099,9 +1110,12 @@ export function deepKeys(fields: string[] | undefined): Map<string, "any" | "obj
  * `deep` (from deepKeys), the value of a "**" path's key is read as the walk
  * reads it, every key and string in it in the order they come: an object,
  * and an array when no other path ends at that key; otherwise the scan goes
- * on inside it, as for any other key.
+ * on inside it, as for any other key. With `seen`, seen.tokenIds is set when
+ * one of `keys` holds an array that starts with a number: token ids.
  */
-export function scanStrings(s: string, keys: Set<string>, out: string[], deep?: Map<string, "any" | "object">): string[] {
+export function scanStrings(
+  s: string, keys: Set<string>, out: string[], deep?: Map<string, "any" | "object">, seen?: { tokenIds?: boolean },
+): string[] {
   // key characters: ASCII word characters, U+017F and U+212A; the value
   // starts with a quote or a bracket (a number or a literal is passed over)
   const re = /"([A-Za-z0-9_\-\u017F\u212A]+)"[ \t\n\v\f\r]*:[ \t\n\v\f\r]*(?=["{[])/g;
@@ -1113,11 +1127,23 @@ export function scanStrings(s: string, keys: Set<string>, out: string[], deep?: 
       if (keys.has(fold(m[1])) && value !== "") out.push(value);
       re.lastIndex = next;
     } else {
+      if (seen && s[at] === "[" && keys.has(fold(m[1])) && startsWithNumber(s, at + 1)) seen.tokenIds = true;
       const d = deep?.get(fold(m[1]));
       if (d !== undefined && (s[at] === "{" || d === "any")) re.lastIndex = scanValue(s, at, out, false);
     }
   }
   return out;
+}
+
+// Lua's s:find("^[%s%[]*[%-%d]", i): past whitespace and brackets, a number
+// starts at `i` (token ids: "prompt":[40 or "prompt":[[40).
+function startsWithNumber(s: string, i: number): boolean {
+  for (; i < s.length; i++) {
+    const c = s[i];
+    if (c === " " || c === "\t" || c === "\n" || c === "\v" || c === "\f" || c === "\r" || c === "[") continue;
+    return c === "-" || (c >= "0" && c <= "9");
+  }
+  return false;
 }
 
 // The first index at or after `i` of a character other than JSON white space, or -1.

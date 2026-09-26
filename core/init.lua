@@ -306,8 +306,11 @@ function _M.evaluate(req, ctx)
   end
   if r == rules_mod.UNJUDGEABLE then
     -- A watched request nobody read. Not judged, so `skipped`; blocked only
-    -- when the operator chose that and the gateway enforces.
-    local block = cfg.policy.mode == "enforce" and cfg.policy.unjudgeable == "block"
+    -- when the operator chose that and the gateway enforces. For a prompt
+    -- given as token ids the rule's token_prompts chooses, when it has one.
+    local choice = cfg.policy.unjudgeable
+    if reason == rules_mod.TOKEN_REASON then choice = rules_mod.token_prompts(rule, cfg.policy) end
+    local block = cfg.policy.mode == "enforce" and choice == "block"
     return finish(ctx, verdict.new({
       action = block and verdict.ACTION_BLOCK or verdict.ACTION_PASS,
       verdict = verdict.SKIPPED, source = verdict.SRC_L1, reason = reason,

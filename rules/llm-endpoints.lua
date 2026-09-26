@@ -132,6 +132,15 @@ return {
   -- {} turns it off for a rule.
   tool_fields = { "tools", "functions", "response_format.json_schema", "text.format" },
   min_text_chars = 20,
+  -- A prompt given as token ids ("prompt": [40, 1541] or [[...]], or ids
+  -- mixed with strings: OpenAI completions, vLLM, llama.cpp) reaches the
+  -- model as text L1 never sees. With nothing else to judge it is
+  -- unjudgeable ("unjudgeable: token ids"), and policy.unjudgeable decides;
+  -- beside text long enough to judge, that text is judged. Set
+  -- token_prompts = "block" to refuse every such prompt in enforce mode,
+  -- text or not, whatever policy.unjudgeable says ("pass" lets them through
+  -- under unjudgeable = "block"). Unset: policy.unjudgeable decides.
+  -- token_prompts = "block",
   always_suspect = {
     [[\b(ignore|disregard|forget)\b.{0,20}\b(previous|prior|above|earlier|all)\b]]
       .. [[.{0,20}\b(instructions?|rules?|prompts?)\b]],

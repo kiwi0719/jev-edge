@@ -52,14 +52,14 @@ end)
 describe("golden: extract", function()
   for _, c in ipairs(load("extract").cases) do
     it(c.name, function()
-      local text, kind, _, decoded, cut = normalize.extract(c.input.body, c.input.content_type, c.input.fields,
+      local text, kind, _, decoded, cut, ids = normalize.extract(c.input.body, c.input.content_type, c.input.fields,
         H.body_decode)
       local tools
       if c.input.tool_fields then
         local ttext, _, capped = normalize.extract_tools(decoded, c.input.tool_fields, H.body_decode)
         tools = { text = ttext, capped = capped or nil }
       end
-      same(c.expect, { text = text, kind = kind, cut = cut or nil, tools = tools })
+      same(c.expect, { text = text, kind = kind, cut = cut or nil, token_ids = ids or nil, tools = tools })
     end)
   end
 end)

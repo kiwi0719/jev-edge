@@ -236,8 +236,10 @@ export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
   }
   if (r === rulesMod.UNJUDGEABLE) {
     // A watched request nobody read: `skipped`, blocked only when the operator
-    // chose that and the gateway enforces.
-    const block = cfg.policy.mode === "enforce" && cfg.policy.unjudgeable === "block";
+    // chose that and the gateway enforces. For a prompt given as token ids the
+    // rule's token_prompts chooses, when it has one.
+    const choice = reason === rulesMod.TOKEN_REASON ? rulesMod.tokenPrompts(rule, cfg.policy) : cfg.policy.unjudgeable;
+    const block = cfg.policy.mode === "enforce" && choice === "block";
     return finish(ctx, verdict.newVerdict({
       action: block ? verdict.ACTION_BLOCK : verdict.ACTION_PASS,
       verdict: verdict.SKIPPED, source: verdict.SRC_L1, reason,

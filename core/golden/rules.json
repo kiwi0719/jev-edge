@@ -1566,6 +1566,202 @@
     },
     {
       "expect": {
+        "reason": "unjudgeable: token ids",
+        "result": "unjudgeable",
+        "text": ""
+      },
+      "input": {
+        "cache": {},
+        "clock": 1000,
+        "req": {
+          "body": "{\"model\":\"m\",\"prompt\":[40,1541,6766,3435]}",
+          "body_size": 42,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/v1/completions"
+        },
+        "rule": "llm-endpoints"
+      },
+      "name": "token ids: a flat prompt is unjudgeable"
+    },
+    {
+      "expect": {
+        "reason": "unjudgeable: token ids",
+        "result": "unjudgeable",
+        "text": ""
+      },
+      "input": {
+        "cache": {},
+        "clock": 1000,
+        "req": {
+          "body": "{\"prompt\":[[40,1541,6766,3435]]}",
+          "body_size": 32,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/v1/completions"
+        },
+        "rule": "llm-endpoints"
+      },
+      "name": "token ids: a nested prompt is unjudgeable"
+    },
+    {
+      "expect": {
+        "reason": "unjudgeable: token ids",
+        "result": "unjudgeable",
+        "text": ""
+      },
+      "input": {
+        "cache": {},
+        "clock": 1000,
+        "req": {
+          "body": "{\"prompt\":[1,2,3,\" ok then\",4,5,6]}",
+          "body_size": 35,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/completion"
+        },
+        "rule": "llm-endpoints"
+      },
+      "name": "token ids: a short string between ids is unjudgeable, not too short"
+    },
+    {
+      "expect": {
+        "reason": "unjudgeable: token ids",
+        "result": "unjudgeable",
+        "text": ""
+      },
+      "input": {
+        "cache": {},
+        "clock": 1000,
+        "req": {
+          "body": "{\"messages\":[{\"role\":\"user\",\"content\":[40,1541,6766]}]}",
+          "body_size": 55,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/v1/chat/completions"
+        },
+        "rule": "llm-endpoints"
+      },
+      "name": "token ids: chat content as ids is unjudgeable"
+    },
+    {
+      "expect": {
+        "reason": "natural language",
+        "result": "suspect",
+        "text": "Please write a detailed summary of the attached quarterly report."
+      },
+      "input": {
+        "cache": {},
+        "clock": 1000,
+        "req": {
+          "body": "{\"prompt\":[40,\"Please write a detailed summary of the attached quarterly report.\",3435]}",
+          "body_size": 88,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/v1/completions"
+        },
+        "rule": "llm-endpoints"
+      },
+      "name": "token ids beside a long string: the string is judged"
+    },
+    {
+      "expect": {
+        "reason": "unjudgeable: token ids",
+        "result": "unjudgeable",
+        "text": ""
+      },
+      "input": {
+        "cache": {},
+        "clock": 1000,
+        "req": {
+          "body": "{\"prompt\":[40,\"Please write a detailed summary of the attached quarterly report.\",3435]}",
+          "body_size": 88,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/v1/completions"
+        },
+        "rule": {
+          "extends": "llm-endpoints",
+          "id": "tok",
+          "token_prompts": "block"
+        }
+      },
+      "name": "token ids beside a long string, token_prompts = block: unjudgeable"
+    },
+    {
+      "expect": {
+        "reason": "natural language",
+        "result": "suspect",
+        "text": "Please write a detailed summary of the attached quarterly report."
+      },
+      "input": {
+        "cache": {},
+        "clock": 1000,
+        "req": {
+          "body": "{\"prompt\":\"Please write a detailed summary of the attached quarterly report.\",\"max_tokens\":16}",
+          "body_size": 94,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/v1/completions"
+        },
+        "rule": {
+          "extends": "llm-endpoints",
+          "id": "tok",
+          "token_prompts": "block"
+        }
+      },
+      "name": "token_prompts = block: a numeric max_tokens is not token ids"
+    },
+    {
+      "expect": {
+        "reason": "unjudgeable: token ids",
+        "result": "unjudgeable",
+        "text": ""
+      },
+      "input": {
+        "cache": {},
+        "clock": 1000,
+        "req": {
+          "body": "{\"prompt\":[[40,1541]],\"pad\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}",
+          "body_size": 101,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/v1/completions"
+        },
+        "rule": {
+          "extends": "llm-endpoints",
+          "id": "small",
+          "max_body_bytes": 64
+        }
+      },
+      "name": "token ids past max_body_bytes, nothing else: unjudgeable"
+    },
+    {
+      "expect": {
         "reason": "natural language",
         "result": "suspect",
         "text": "Please write a detailed summary of the attached quarterly report."

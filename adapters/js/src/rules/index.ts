@@ -59,6 +59,10 @@ export const llmEndpoints: Rule = {
   // entry (see rules/llm-endpoints.lua)
   tool_fields: ["tools", "functions", "response_format.json_schema", "text.format"],
   min_text_chars: 20,
+  // token-id prompts: unjudgeable with nothing else to judge; "block" refuses
+  // every one in enforce mode (see rules/llm-endpoints.lua). Unset:
+  // policy.unjudgeable decides.
+  // token_prompts: "block",
   always_suspect: [
     String.raw`\b(ignore|disregard|forget)\b.{0,20}\b(previous|prior|above|earlier|all)\b.{0,20}\b(instructions?|rules?|prompts?)\b`,
     String.raw`\byou are now\b`,
@@ -125,6 +129,9 @@ export function resolve(spec: RuleSpec): Rule {
   }
   const [uok, uerr] = validateUntrusted(out.untrusted, `rule ${out.id}: untrusted`);
   if (!uok) throw new Error(uerr);
+  if (out.token_prompts !== undefined && out.token_prompts !== "pass" && out.token_prompts !== "block") {
+    throw new Error(`rule ${out.id}: token_prompts must be pass|block`);
+  }
   out.text_fields ??= [
     "system", "instructions", "preamble", "system_prompt", "systemInstruction.parts",
     "system_instruction.parts", "documents", "template",

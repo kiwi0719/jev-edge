@@ -81,6 +81,49 @@ describe("normalize.extract", function()
   end)
 end)
 
+describe("normalize: token ids", function()
+  local decode = function(s) return json.decode(s) end
+  local F = { "messages[*].content", "prompt" }
+
+  it("notes a text field that holds numbers: flat, nested or mixed with strings", function()
+    for _, body in ipairs({ '{"prompt":[40,1541,6766]}', '{"prompt":[[40,1541],[6766]]}', '{"prompt":7}',
+                            '{"messages":[{"role":"user","content":[40,1541]}]}' }) do
+      local t, kind, _, _, _, ids = N.extract(body, "application/json", F, decode)
+      assert.equals("", t, body)
+      assert.equals("json", kind, body)
+      assert.is_true(ids, body)
+    end
+    local t, _, _, _, _, ids = N.extract('{"prompt":[40,"a string",3435]}', "application/json", F, decode)
+    assert.equals("a string", t)
+    assert.is_true(ids)
+  end)
+
+  it("notes nothing for numbers outside the text fields or below the leaf depth", function()
+    local _, _, _, _, _, ids = N.extract('{"prompt":"text","max_tokens":16,"temperature":0.5}',
+      "application/json", F, decode)
+    assert.is_false(ids)
+    _, _, _, _, _, ids = N.extract('{"prompt":[[[[[[[1]]]]]]]}', "application/json", F, decode)
+    assert.is_false(ids)
+    -- a tool-call argument's numbers are no prompt
+    _, _, _, _, _, ids = N.extract('{"messages":[{"role":"assistant","tool_calls":[{"function":'
+      .. '{"arguments":"{\\"n\\":5}"}}]}]}', "application/json",
+      { "messages[*].tool_calls[*].function.arguments.**" }, decode)
+    assert.is_false(ids)
+  end)
+
+  it("notes an array that starts with a number where the body is scanned", function()
+    local seen = {}
+    N.scan_strings('{"prompt": [ [40,1541]], "text": "x"', N.field_keys(F), {}, nil, seen)
+    assert.is_true(seen.token_ids)
+    seen = {}
+    N.scan_strings('{"prompt":["a",40],"max":[1,2]}', N.field_keys(F), {}, nil, seen)
+    assert.is_nil(seen.token_ids)
+    local _, kind, _, _, _, ids = N.extract('{"prompt":[40,1541', "application/json", F, decode)
+    assert.equals("invalid", kind)
+    assert.is_true(ids)
+  end)
+end)
+
 describe("normalize.scan_strings", function()
   it("pulls text-field strings out of truncated JSON, escapes decoded", function()
     local keys = N.field_keys({ "messages[*].content", "prompt" })

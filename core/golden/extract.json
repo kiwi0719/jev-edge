@@ -71,7 +71,8 @@
     {
       "expect": {
         "kind": "json",
-        "text": "a\nb"
+        "text": "a\nb",
+        "token_ids": true
       },
       "input": {
         "body": "{\"prompt\":42,\"messages\":[{\"content\":[\"a\",\"b\"]}]}",
@@ -84,7 +85,139 @@
           "text"
         ]
       },
-      "name": "numbers are ignored, string arrays are joined"
+      "name": "a number in a text field adds no text but is noted, string arrays are joined"
+    },
+    {
+      "expect": {
+        "kind": "json",
+        "text": "",
+        "token_ids": true
+      },
+      "input": {
+        "body": "{\"model\":\"m\",\"prompt\":[40,1541,6766,3435]}",
+        "content_type": "application/json",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "token ids: a flat list"
+    },
+    {
+      "expect": {
+        "kind": "json",
+        "text": "",
+        "token_ids": true
+      },
+      "input": {
+        "body": "{\"prompt\":[[40,1541],[6766,3435]]}",
+        "content_type": "application/json",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "token ids: nested lists"
+    },
+    {
+      "expect": {
+        "kind": "json",
+        "text": "a string between ids",
+        "token_ids": true
+      },
+      "input": {
+        "body": "{\"prompt\":[40,\"a string between ids\",3435]}",
+        "content_type": "application/json",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "token ids mixed with a string: the string is read"
+    },
+    {
+      "expect": {
+        "kind": "json",
+        "text": "",
+        "token_ids": true
+      },
+      "input": {
+        "body": "{\"messages\":[{\"role\":\"user\",\"content\":[40,1541]}]}",
+        "content_type": "application/json",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "token ids in chat content"
+    },
+    {
+      "expect": {
+        "kind": "json",
+        "text": "text"
+      },
+      "input": {
+        "body": "{\"prompt\":\"text\",\"max_tokens\":16,\"temperature\":0.5,\"logit_bias\":{\"50256\":-100}}",
+        "content_type": "application/json",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "a number outside the text fields is not token ids"
+    },
+    {
+      "expect": {
+        "kind": "invalid",
+        "text": "",
+        "token_ids": true
+      },
+      "input": {
+        "body": "{\"prompt\":[40,1541]} ]",
+        "content_type": "application/json",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "token ids in JSON the decoder refuses, nothing else: invalid, noted"
+    },
+    {
+      "expect": {
+        "kind": "scan",
+        "text": "scanned text",
+        "token_ids": true
+      },
+      "input": {
+        "body": "{\"prompt\":[[40,1541]],\"text\":\"scanned text\"} ]",
+        "content_type": "application/json",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "token ids in JSON the decoder refuses, beside text: scanned, noted"
     },
     {
       "expect": {

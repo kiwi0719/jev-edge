@@ -266,6 +266,20 @@ local function has_tool_fields(rule)
   return type(rule.tool_fields) == "table" and #rule.tool_fields > 0
 end
 
+-- A prompt given as token ids (normalize.collect): the model reads the text
+-- they decode to, and L1 has none of it.
+_M.TOKEN_REASON = "unjudgeable: token ids"
+local TOKEN_REASON = _M.TOKEN_REASON
+
+--- What a request whose prompt holds token ids gets under `rule`: the rule's
+-- token_prompts ("pass" | "block"), or policy.unjudgeable when it has none.
+-- "block": L1 reports it unjudgeable even beside text long enough to judge,
+-- and core blocks it in enforce mode.
+-- @param pol the merged config's policy, or nil
+function _M.token_prompts(rule, pol)
+  return (rule and rule.token_prompts) or (type(pol) == "table" and pol.unjudgeable) or "pass"
+end
+
 -- Text to judge from the body (or, past max_body_bytes, from the head and
 -- tail the adapter handed over), cut to the judging window. `ex`: the body's
 -- extract() results json_only_miss already has, or nil.
@@ -274,9 +288,10 @@ end
 --         untrusted ({ text, windowed } when untrusted judging is on and the
 --         body carries retrieved content), tools (tools_part), bound
 --         (true when a walk bound left text fields, retrieved content or
---         tool definitions unread), and retrieved (untrusted judging is on
+--         tool definitions unread), retrieved (untrusted judging is on
 --         and the text holds retrieved content: holds_retrieved, or the body
---         was scanned, not walked, and nothing tells the two apart)
+--         was scanned, not walked, and nothing tells the two apart), and
+--         token_ids (a text field holds token ids)
 local function judged(req, rule, ctx, ct, size, ex)
   local max = rule.max_body_bytes or _M.MAX_BODY_BYTES
   -- a media type is taken at its word only when the bytes agree (or there
@@ -284,7 +299,7 @@ local function judged(req, rule, ctx, ct, size, ex)
   local media = ct_watched(ct, rule) == "media"
   local values, text
   local partial, bound, retrieved = false, false, false
-  local untrusted, tools
+  local untrusted, tools, ids
   -- the gateway in front forwarded only the first part of the body: what the
   -- adapter has is a head, whatever its size, never a whole document
   local gateway_cut = req.body_partial == true
@@ -306,9 +321,11 @@ local function judged(req, rule, ctx, ct, size, ex)
     local pol = ctx and ctx.config and ctx.config.policy
     if gateway_cut and pol and pol.partial == "unjudgeable" then return nil, "unjudgeable: partial body" end
     local keys, deep = normalize.field_keys(rule.text_fields), normalize.deep_keys(rule.text_fields)
-    values = normalize.scan_strings(head, keys, {}, deep)
-    if tail then normalize.scan_strings(tail, keys, values, deep) end
-    if #values == 0 then return nil, "unjudgeable: body too large" end
+    local seen = {}
+    values = normalize.scan_strings(head, keys, {}, deep, seen)
+    if tail then normalize.scan_strings(tail, keys, values, deep, seen) end
+    ids = seen.token_ids == true
+    if #values == 0 then return nil, ids and TOKEN_REASON or "unjudgeable: body too large" end
     text, partial = table.concat(values, "\n"), true
     retrieved = untrusted_on(rule, ctx)
     if has_tool_fields(rule) then
@@ -320,14 +337,15 @@ local function judged(req, rule, ctx, ct, size, ex)
   else
     local kind, decoded, cut
     if ex then
-      text, kind, values, decoded, cut = ex[1], ex[2], ex[3], ex[4], ex[5]
+      text, kind, values, decoded, cut, ids = ex[1], ex[2], ex[3], ex[4], ex[5], ex[6]
     else
-      text, kind, values, decoded, cut = normalize.extract(req.body, ct, rule.text_fields, ctx and ctx.json_decode)
+      text, kind, values, decoded, cut, ids = normalize.extract(req.body, ct, rule.text_fields, ctx and ctx.json_decode)
     end
+    ids = ids == true
     if media and (kind == "binary" or kind == "none") then return nil, CT_NOT_WATCHED end
     if kind == "binary" then return nil, "unjudgeable: binary body" end
     -- declared JSON the decoder refused, with no text-field value to scan
-    if kind == "invalid" then return nil, "unjudgeable: invalid json" end
+    if kind == "invalid" then return nil, ids and TOKEN_REASON or "unjudgeable: invalid json" end
     -- a "**" field hit its bound: the text is not all there
     if cut then partial, bound = true, true end
     local ucut, uvalues
@@ -349,7 +367,7 @@ local function judged(req, rule, ctx, ct, size, ex)
       tools = tools_part(normalize.scan_tools(req.body, normalize.field_keys(rule.tool_fields), {}), true, rule, ctx)
     end
   end
-  if text == "" then return "", nil, nil, nil, nil, nil, untrusted, tools, bound, false end
+  if text == "" then return "", nil, nil, nil, nil, nil, untrusted, tools, bound, false, ids end
   local hit, from, to = text_matches(text, rule.always_suspect, ctx)
   local budget = rule.max_judge_bytes or _M.MAX_JUDGE_BYTES
   local maxc = math.floor(tonumber(rule.max_judge_chunks) or 1)
@@ -359,7 +377,7 @@ local function judged(req, rule, ctx, ct, size, ex)
     -- window over everything older (capped: some of the text is not judged)
     local pieces, starts = normalize.chunks(text, budget)
     if #pieces <= maxc then
-      return table.concat(pieces, "\n"), nil, hit, partial, pieces, false, untrusted, tools, bound, retrieved
+      return table.concat(pieces, "\n"), nil, hit, partial, pieces, false, untrusted, tools, bound, retrieved, ids
     end
     local first_kept = #pieces - (maxc - 1) + 1
     local older = text:sub(1, starts[first_kept] - 1):gsub("\n$", "")
@@ -367,11 +385,11 @@ local function judged(req, rule, ctx, ct, size, ex)
     local win = normalize.window(older, { older }, budget, inside and from or nil, inside and to or nil)
     local out = { win }
     for k = first_kept, #pieces do out[#out + 1] = pieces[k] end
-    return table.concat(out, "\n"), nil, hit, true, out, true, untrusted, tools, bound, retrieved
+    return table.concat(out, "\n"), nil, hit, true, out, true, untrusted, tools, bound, retrieved, ids
   end
   local windowed
   text, windowed = normalize.window(text, values, budget, from, to)
-  return text, nil, hit, windowed or partial, nil, nil, untrusted, tools, bound, retrieved
+  return text, nil, hit, windowed or partial, nil, nil, untrusted, tools, bound, retrieved, ids
 end
 
 -- A request the walk bounds cut and that would otherwise pass unjudged for
@@ -449,23 +467,33 @@ function _M.evaluate(req, rule, ctx)
 
   -- 6+7. extract text (whole body, or head + tail past max_body_bytes), regex
   --      prefilter over all of it, judging window, natural-language length
-  local text, unj, hit, windowed, chunks, capped, untrusted, tools, bound, retrieved =
+  local text, unj, hit, windowed, chunks, capped, untrusted, tools, bound, retrieved, ids =
     judged(req, rule, ctx, ct, size, ex)
   if unj == CT_NOT_WATCHED then return _M.PASS, "", unj end
   if unj then return _M.UNJUDGEABLE, "", unj end
+  -- token ids: whatever else the body holds, when the rule (or
+  -- policy.unjudgeable) says to block them
+  if ids and _M.token_prompts(rule, ctx and ctx.config and ctx.config.policy) == "block" then
+    return _M.UNJUDGEABLE, "", TOKEN_REASON
+  end
   local min_chars = rule.min_text_chars or 20
   -- retrieved content is judged on its own when there is enough of it, even
   -- beside a short message or none (an untrusted.fields value outside text_fields)
   if untrusted and #untrusted.text < min_chars then untrusted = nil end
   -- so are the tool definitions, and short ones an always_suspect pattern hit
   if tools and not tools.hit and #tools.text < min_chars then tools = nil end
+  -- Token ids with nothing else to judge are unjudgeable, never "no text";
+  -- beside text (or parts) enough to judge, that is judged, so that adding
+  -- ids to a prompt does not skip judging under unjudgeable = "pass".
   if text == "" and not untrusted and not tools then
+    if ids then return _M.UNJUDGEABLE, "", TOKEN_REASON end
     if bound then return _M.UNJUDGEABLE, "", BOUND_REASON end
     return _M.PASS, "", "no text"
   end
   local judged_too = hit or #text >= min_chars
   if not judged_too then
     if not (untrusted or tools) then
+      if ids then return _M.UNJUDGEABLE, "", TOKEN_REASON end
       if bound then return _M.UNJUDGEABLE, "", BOUND_REASON end
       return _M.PASS, "", "text too short"
     end
@@ -621,6 +649,9 @@ function _M.resolve(spec, load)
   end
   local uok, uerr = defaults.validate_untrusted(out.untrusted, "rule " .. out.id .. ": untrusted")
   if not uok then return nil, uerr end
+  if out.token_prompts ~= nil and out.token_prompts ~= "pass" and out.token_prompts ~= "block" then
+    return nil, "rule " .. out.id .. ": token_prompts must be pass|block"
+  end
   if not out.text_fields then
     out.text_fields = { "system", "instructions", "preamble", "system_prompt", "systemInstruction.parts",
                         "system_instruction.parts", "documents", "template",

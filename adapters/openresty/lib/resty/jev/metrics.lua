@@ -53,7 +53,12 @@ function _M.incr_async_dropped() incr("async_dropped") end
 --                 hops than client_ip.trusted_hops): no IP reputation, no
 --                 subject = "ip"
 --   cut_at_cap    a body at or past max_body_bytes the gateway did not flag
---                 as cut, taken as cut
+--                 as cut, taken as cut. It counts what jev-edge did, cut or
+--                 not: a body Envoy cut there and called whole, and a whole
+--                 one of that size (or larger, where the gateway's cap is
+--                 higher). Behind a gateway that answers 413 past its cap
+--                 (Envoy Gateway, allow_partial_message: false) every count
+--                 is a whole body.
 local AUTHZ_EVENTS = { no_client_ip = true, cut_at_cap = true }
 function _M.incr_authz(event)
   if AUTHZ_EVENTS[event] then incr("authz:" .. event) end

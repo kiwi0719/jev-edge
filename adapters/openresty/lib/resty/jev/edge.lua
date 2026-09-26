@@ -133,7 +133,11 @@ local function build_req(rules, over)
     -- whole (x-envoy-auth-partial-body: false) when the bytes it had so far
     -- end exactly there, and a client places that point with its own pauses;
     -- parsed as whole, the head would read as truncated JSON. Past
-    -- max_body_bytes it is still scanned head and tail.
+    -- max_body_bytes it is still scanned head and tail. cut_at_cap counts
+    -- what jev-edge did, not what the gateway did: it cannot tell a body
+    -- Envoy cut and called whole from a whole one of exactly max_body_bytes,
+    -- and behind a gateway that answers 413 past its cap every count is a
+    -- whole body.
     if over.cut_at_cap and not cut and (req.body_received or 0) >= max then
       cut = true
       metrics.incr_authz("cut_at_cap")

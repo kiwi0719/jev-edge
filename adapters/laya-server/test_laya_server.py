@@ -9,6 +9,7 @@ import json
 import math
 import os
 import random
+import re
 import socket
 import sys
 import tempfile
@@ -53,6 +54,28 @@ class Hostile(L.MockBackend):
         for a, b in super().spans(text):
             out.extend([(i, i + 1) for i in range(a, b)] if b - a > 32 else [(a, b)])
         return out
+
+
+class SlowBatch(Hostile):
+    """Hostile, and a text of several windows takes `ms` to score, as one
+    batched model call: the worst case costs `ms`, a short text nothing."""
+
+    def __init__(self, ms: float):
+        self.ms = ms
+
+    def logits(self, first, seconds):
+        time.sleep(self.ms / 1000)
+        return [self.logit(first, s) for s in seconds]
+
+
+def ctx_questions():
+    with open(os.path.join(ROOT, "conformance", "questions.json")) as f:
+        return json.load(f)["ctx"]
+
+
+def profile_timeout_ms() -> int:
+    with open(os.path.join(HERE, "jev-laya.conf.lua")) as f:
+        return int(re.search(r"^\s*timeout_ms\s*=\s*(\d+)", f.read(), re.M).group(1))
 
 
 def stop(srv):
@@ -159,16 +182,19 @@ class Temperature(unittest.TestCase):
 class Http(unittest.TestCase):
     def test_passes_conformance_strict_with_auth(self):
         # Hostile: the worst case is judged in several windows, and --mock
-        # checks the attack at its tail is seen
+        # checks the attack at its tail is seen. At the profile's floor, 64
+        # of it at once (max_inflight), with the default queue wait.
         srv, url = serve({"LAYA_API_KEY": "k"}, backend=Hostile())
         try:
-            rc, out = conformance_run(url, "--strict", "--mock", "--api-key", "k")
+            rc, out = conformance_run(url, "--strict", "--mock", "--api-key", "k",
+                                      "--budget-ms", str(profile_timeout_ms()))
         finally:
             srv.shutdown()
             srv.server_close()
         self.assertEqual(rc, 0, out)
-        self.assertRegex(out, r"ok    worst case .*, [2-8] windows\)")
+        self.assertRegex(out, r"ok    worst case .* 64 at once: .*, [2-8] windows\)")
         self.assertRegex(out, r"ok    burst: 64 new connections at once")
+        self.assertRegex(out, r"timeout_ms: \d+(-\d+)?, 2-3x the worst-case p99 of .* with 64 at once")
 
     def test_conformance_catches_silent_truncation(self):
         class Truncating(L.Scorer):
@@ -266,28 +292,28 @@ class Http(unittest.TestCase):
                 time.sleep(0.03)
                 return super().logit(first, second)
 
-        srv, url = serve(backend=PerWindow())
+        srv, url = serve({"LAYA_WORKERS": "4"}, backend=PerWindow())
         try:
             rc, out = conformance_run(url, "--budget-ms", "100", "--concurrency", "4")
         finally:
             stop(srv)
         self.assertEqual(rc, 1, out)
-        self.assertIn("ok    latency within 100 ms at p99", out)
-        self.assertRegex(out, r"FAIL  worst case within 100 ms at p99: 4096 bytes .* windows\)")
-        self.assertRegex(out, r"timeout_ms: \d+-\d+, 2-3x the worst-case p99")
+        self.assertIn("ok    latency within 100 ms with 2x headroom at p99", out)
+        self.assertRegex(out, r"FAIL  worst case within 100 ms with 2x headroom at p99, 4 at once: "
+                              r"4096 bytes .* windows\)\. Alone it needs a timeout_ms of \d+")
+        self.assertRegex(out, r"timeout_ms: \d+-\d+, 2-3x the worst-case p99 of .* with 4 at once")
 
     def test_worst_case_refused_is_a_failure(self):
         # a 413 for a text inside max_judge_bytes is an L2 error: a bypass
         srv, url = serve({"LAYA_MAX_WINDOWS": "2"}, backend=Hostile())
         try:
             t = conformance.Target(url, None, "laya", 5)
-            with open(os.path.join(ROOT, "conformance", "questions.json")) as f:
-                ctx = json.load(f)["ctx"]
-            body = conformance.worst_body(t, 4096, conformance.DEFAULT_ASSISTANT, ctx)
-            err, _, _ = conformance.check_worst(t, body, 4096, 2, 1000, mock=False)
+            body = conformance.worst_body(t, 4096, conformance.DEFAULT_ASSISTANT, ctx_questions())
+            err, _, _ = conformance.check_worst(t, body, conformance.short_body(t, VECTORS), 4096, 2, 4,
+                                                1000, mock=False)
         finally:
             stop(srv)
-        self.assertRegex(err, r"^status 413 for 4096 bytes")
+        self.assertRegex(err, r"^status 413 for 4096 bytes .*LAYA_MAX_WINDOWS")
 
     def test_worst_text_is_fixed_ascii_of_the_asked_size(self):
         a, b = conformance.worst_text(4096), conformance.worst_text(4096)
@@ -295,6 +321,88 @@ class Http(unittest.TestCase):
         self.assertEqual(len(a.encode()), 4096)
         self.assertTrue(a.endswith(" ATTACK"))
         self.assertNotIn(" ", a[:-7])
+
+    def test_worst_case_is_timed_at_the_gateways_concurrency(self):
+        # Fast enough one at a time, but one worker: of 4 worst-case texts at
+        # once (the gateway at max_inflight), 3 wait past the queue wait and
+        # get 503, which the gateway treats as an L2 error. The check fails
+        # and says how many at once the server holds.
+        srv, url = serve({"LAYA_WORKERS": "1"}, backend=SlowBatch(120))
+        try:
+            rc, out = conformance_run(url, "--budget-ms", "500", "--concurrency", "4")
+        finally:
+            stop(srv)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("ok    burst: 4 new connections at once", out)  # short texts: fast
+        self.assertRegex(out, r"FAIL  worst case within 500 ms with 2x headroom at p99, 4 at once: "
+                              r"4096 bytes .* wording: \d+ of 8 not answered 200 \(503: \d+\)")
+        self.assertIn("set max_inflight (summed over the gateways that call this server) to at most 1", out)
+        self.assertNotIn("a 503 took", out)  # the default queue wait answers while the gateway reads
+        self.assertRegex(out, r"timeout_ms: \d+-\d+ for the worst case one at a time .* With 4 at once, "
+                              r"1 per round were answered in time at timeout_ms 500: set max_inflight "
+                              r"to at most 1")
+
+
+class Verdicts(unittest.TestCase):
+    """conformance/run.py's timing verdicts from given latencies: a check
+    passes only with the headroom the run recommends, and a 503 must come
+    while the gateway still reads."""
+
+    t = conformance.Target("http://127.0.0.1:9/v1/systemone", None, "laya", 1)
+
+    def worst(self, alone, rounds, budget=500.0):
+        with mock.patch.object(conformance, "timed", return_value=(None, sorted(alone), b'{"answers": '
+                               b'{"injection": {"noul": 0.9}}, "usage": {"windows": 6}}')), \
+             mock.patch.object(conformance, "at_once", return_value=rounds):
+            return conformance.check_worst(self.t, b"", b"", 4096, len(alone), len(rounds[0]), budget,
+                                           mock=True)
+
+    def test_latency_passes_only_with_headroom(self):
+        for p99, ok in ((40.0, True), (50.0, True), (60.0, False), (99.0, False)):
+            with mock.patch.object(conformance, "timed", return_value=(None, [10.0, p99], b"")):
+                err, _, got = conformance.check_latency(self.t, VECTORS, 2, 100)
+            self.assertEqual(got, p99)
+            if ok:
+                self.assertIsNone(err, p99)
+            else:
+                self.assertRegex(err, rf"^p99 {p99:.1f} ms needs a timeout_ms of {math.ceil(2 * p99)} at 2x "
+                                      r"headroom, over the 100 ms budget \(the gateway reads for 60% of it\)")
+
+    def test_worst_case_under_budget_but_without_headroom_fails(self):
+        # every one answered 200 inside the 500 ms budget, yet the p99 of 300 ms
+        # is all the gateway's read wait: the tail past it would time out
+        err, _, w = self.worst([100.0] * 4, [[(200, 300.0)] * 4] * 2)
+        self.assertRegex(err, r"^p99 300\.0 ms needs a timeout_ms of 600 at 2x headroom")
+        self.assertIn("Raise timeout_ms to 600-900", err)
+        self.assertEqual(w.together, 300.0)
+        self.assertEqual(conformance.timeout_line(w, 5.0)[:48], "timeout_ms: 600-900, 2-3x the worst-case p99 of ")
+
+    def test_worst_case_with_headroom_passes(self):
+        err, info, w = self.worst([100.0] * 4, [[(200, 240.0)] * 4] * 2)
+        self.assertIsNone(err, info)
+        self.assertEqual((w.alone, w.together, w.fit), (100.0, 240.0, 4))
+
+    def test_a_503_after_the_gateway_stopped_reading_is_flagged(self):
+        # at 500 ms the gateway reads for 300: a 503 at 400 ms reaches no one
+        late = [(200, 150.0), (200, 240.0), (503, 400.0), (503, 400.0)]
+        err, _, w = self.worst([100.0] * 4, [late, late])
+        self.assertIn("a 503 took 400 ms, after the gateway stopped reading at 300 ms", err)
+        self.assertIn("LAYA_QUEUE_MS", err)
+        self.assertEqual(w.fit, 2)
+        prompt = [(200, 150.0), (200, 240.0), (503, 60.0), (503, 60.0)]
+        err, _, _ = self.worst([100.0] * 4, [prompt, prompt])
+        self.assertNotIn("a 503 took", err)
+        self.assertIn("to at most 2", err)
+
+    def test_too_slow_alone_says_so_first(self):
+        # max_inflight advice would be wrong here: one at a time already misses
+        err, _, w = self.worst([400.0] * 4, [[(200, 900.0)] * 4] * 2)
+        self.assertIn("Alone it needs a timeout_ms of 800 at 2x headroom", err)
+        err, _, w = self.worst([400.0] * 4, [[(503, 50.0)] * 4] * 2)
+        line = conformance.timeout_line(w, 0.0)
+        self.assertIn("timeout_ms: 800-1200 for the worst case one at a time", line)
+        self.assertIn("Run again with --budget-ms 800 or more", line)
+        self.assertNotIn("max_inflight to at most", line)
 
 
 class Load(unittest.TestCase):
@@ -342,7 +450,7 @@ class Load(unittest.TestCase):
                 release.wait(5)
                 return super().logit(first, second)
 
-        srv, url = serve({"LAYA_WORKERS": "1", "LAYA_QUEUE_MS": "50"}, backend=Held())
+        srv, url = serve({"LAYA_WORKERS": "1"}, backend=Held())  # the default queue wait
         first = []
         th = threading.Thread(target=lambda: first.append(post(url, "ATTACK")))
         try:
@@ -357,8 +465,22 @@ class Load(unittest.TestCase):
         self.assertEqual(status, 503)
         self.assertEqual(json.loads(data)["error"]["code"], "overloaded")
         self.assertNotIn("answers", json.loads(data))
-        self.assertLess(ms, 2000)
+        # answered while the gateway at the profile's floor still reads
+        self.assertLess(ms, conformance.READ_SHARE * profile_timeout_ms())
         self.assertEqual(first[0][0], 200)
+
+    def test_default_queue_wait_is_derived_from_the_profile(self):
+        # the gateway reads for 60% of timeout_ms, and conformance passes a
+        # worst case of up to half of it: what is left is the queue wait
+        floor = profile_timeout_ms()
+        want = (conformance.READ_SHARE - 1 / conformance.HEADROOM[0]) * floor
+        self.assertAlmostEqual(L.QUEUE_MS_DEFAULT, want)
+        self.assertLessEqual(L.QUEUE_MS_DEFAULT, floor / 5)
+        srv, _ = serve()
+        try:
+            self.assertEqual(srv.RequestHandlerClass.workers.wait_ms, L.QUEUE_MS_DEFAULT)
+        finally:
+            stop(srv)
 
     def test_connection_past_the_cap_gets_503_and_is_closed(self):
         srv, url = serve({"LAYA_MAX_CONNECTIONS": "1"})
@@ -525,7 +647,7 @@ class Cpus(unittest.TestCase):
         srv, threads = self.onnx_server({})
         self.assertEqual((srv.RequestHandlerClass.workers.n, threads), (2, 4))
         lines = L.startup_lines(srv)
-        self.assertRegex(lines[0], r": 2 workers, 4 onnxruntime threads on 8 CPUs \(test CPUs\), queue wait 1000 ms")
+        self.assertRegex(lines[0], r": 2 workers, 4 onnxruntime threads on 8 CPUs \(test CPUs\), queue wait 50 ms")
         self.assertFalse(any("slow each other down" in x or "LAYA_ORT_THREADS=0" in x for x in lines), lines)
 
     def test_startup_warns_when_the_pool_outgrows_the_cpus(self):

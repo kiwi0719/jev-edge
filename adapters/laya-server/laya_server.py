@@ -27,7 +27,8 @@ Guarantees the gateway relies on, checked by conformance/ (make conformance):
     listen backlog is LAYA_BACKLOG, not socketserver's 5; at most
     LAYA_WORKERS requests are scored at once; a request that waits longer
     than LAYA_QUEUE_MS for a worker, and a connection past
-    LAYA_MAX_CONNECTIONS, get a 503 `overloaded`;
+    LAYA_MAX_CONNECTIONS, get a 503 `overloaded` while the gateway still
+    reads (QUEUE_MS_DEFAULT);
   * a client that hangs up or stalls in the middle of its request gets an
     access-log line at most, never a backend-fault warning;
   * errors are JSON with a non-200 status (400, 401, 404, 405, 411, 413,
@@ -36,7 +37,8 @@ Guarantees the gateway relies on, checked by conformance/ (make conformance):
 Cost: on CPU a text split in N windows costs about N model calls. Batching
 the windows saves the per-call overhead, not the per-window compute, so a
 hostile text that tokenizes to one token per byte costs many times a short
-one. Size the gateway's timeout floor from the worst-case line that
+one, and max_inflight of them at once cost more again. Size the gateway's
+timeout floor and max_inflight from the worst-case line that
 `make conformance` prints, not from the short-text p99 (README.md).
 
 Standard library only, apart from the backend: `onnx` needs onnxruntime,
@@ -66,7 +68,11 @@ Configuration (environment):
                      (CPUs / LAYA_WORKERS; neither set: CPUs / 2, at most 4)
   LAYA_WORKERS       requests scored at once
                      (onnx: CPUs / LAYA_ORT_THREADS; mock: CPUs; python: 1)
-  LAYA_QUEUE_MS      wait for a free worker before 503            (1000)
+  LAYA_QUEUE_MS      wait for a free worker before 503: at most the
+                     gateway's read wait (60% of jev.timeout_ms) minus the
+                     worst-case p99; 10% of the profile's timeout_ms, for a
+                     server that just passes conformance (QUEUE_MS_DEFAULT)
+                                                                  (50)
   LAYA_BACKLOG       listen backlog: at least the sum of jev.max_inflight of
                      the gateways calling this server; the kernel caps it at
                      its somaxconn                                (1024)
@@ -541,13 +547,28 @@ def validate(req) -> None:
 
 
 
+# LAYA_QUEUE_MS by default. The gateway waits for the answer 60% of its L2
+# timeout (resty/jev/http.lua: connect 30%, send 10%, read 60%): 300 ms at
+# the Laya profile's floor, timeout_ms = 500 (jev-laya.conf.lua). Past it the
+# gateway has given up: a 503 sent later reaches no one, the gateway logs a
+# timeout instead, and a request scored later spends a worker on an answer
+# no one reads. conformance passes a server whose worst case, at the
+# gateway's max_inflight, fits half of timeout_ms (2x headroom). A request
+# that gets a worker at the end of its wait and is then scored in that
+# worst case is answered in time only if the wait is at most 60% - 50% =
+# 10% of timeout_ms: 50 ms. For another timeout_ms, or a server faster than
+# that, LAYA_QUEUE_MS = 0.6 x timeout_ms - the worst-case p99.
+QUEUE_MS_DEFAULT = 50
+
+
 class Workers:
     """The scoring pool: at most `n` requests are scored at once.
 
     A request that finds every worker busy waits up to `wait_ms` for one,
-    then gets 503 `overloaded`. By then the gateway has given up on it (its
-    L2 timeout is under a second), and scoring it anyway would only push the
-    requests queued behind it past their own timeouts.
+    then gets 503 `overloaded`, soon enough for the gateway to read it
+    (QUEUE_MS_DEFAULT). Scoring it later would only spend a worker on an
+    answer no one reads, and push the requests behind it past their own
+    timeouts.
     """
 
     def __init__(self, n: int, wait_ms: float):
@@ -799,7 +820,7 @@ def make_server(env=os.environ, backend=None, cpus: tuple[int, str] | None = Non
     )
     attrs = {
         "scorer": scorer,
-        "workers": Workers(workers, float(env.get("LAYA_QUEUE_MS", "1000"))),
+        "workers": Workers(workers, float(env.get("LAYA_QUEUE_MS") or QUEUE_MS_DEFAULT)),
         "model_name": env.get("LAYA_MODEL_NAME", "laya"),
         "api_key": env.get("LAYA_API_KEY") or None,
         "max_body": int(env.get("LAYA_MAX_BODY_BYTES", "262144")),

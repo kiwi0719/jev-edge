@@ -15,23 +15,34 @@ gateway depends on:
   stalled       while one client sits on an open request, others are served
   burst         --concurrency new connections at once (the gateway's
                 jev.max_inflight): each connects within the gateway's
-                connect budget (30% of --budget-ms) and is answered 200
-                within --budget-ms. A listen backlog smaller than the burst
-                drops connections, and the gateway sees each as a timeout
-  latency       --samples sequential short requests; p99 must fit
-                --budget-ms
-  worst case    --samples requests with the longest text the gateway sends
-                (--judge-bytes, the profile's max_judge_bytes), built to
-                tokenize at about one token per byte, in the deployment
-                context wording: answered 200 (a 413 here is a bypass), and
-                p99 within --budget-ms
+                connect budget (30% of --budget-ms) and is answered 200,
+                the slowest with 2x headroom. A listen backlog smaller than
+                the burst drops connections, and the gateway sees each as a
+                timeout
+  latency       --samples sequential short requests; p99 with 2x headroom
+  worst case    the longest text the gateway sends (--judge-bytes, the
+                profile's max_judge_bytes), built to tokenize at about one
+                token per byte, in the deployment context wording: first
+                --samples of it one at a time, then --concurrency of it at
+                once, in rounds, on warm connections. The client picks
+                both the text and how many it sends at once, up to the
+                gateway's max_inflight. Every request is answered 200 (a
+                413 here is a bypass, and so is a 503), and the p99 at
+                that concurrency fits with 2x headroom. A 503 sent after
+                the gateway stopped reading (60% of --budget-ms) is named
+                on its own: the gateway logs a timeout instead
 
 --budget-ms is the L2 timeout floor the gateway runs with (jev.timeout_ms).
 Under steady traffic the adaptive timeout sits at the floor, so a hostile
-text that forces the worst case must fit it too. The run ends with the
-timeout_ms to set: 2-3x the worst-case p99. On CPU that can be tens of times
-the short-text p99, because a text split in N windows costs about N model
-calls.
+text that forces the worst case must fit it too. The gateway reads the
+answer for 60% of it (resty/jev/http.lua: connect 30%, send 10%, read 60%),
+so a timing check passes only with the headroom the run recommends: its p99
+at most half of --budget-ms. The run ends with the timeout_ms to set, 2-3x
+the worst-case p99 at --concurrency, or, when the server cannot answer that
+many at once in time, the max_inflight it can. On CPU the worst case can be
+tens of times the short-text p99, because a text split in N windows costs
+about N model calls, and several of them at once take several times as
+long again.
 
 --strict requires the exact status codes this suite chose (400, 404, 405,
 413); without it any 4xx passes where a 4xx is expected. --mock also checks
@@ -56,6 +67,13 @@ import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+# resty/jev/http.lua splits the L2 timeout: connect 30%, send 10%, read 60%.
+CONNECT_SHARE, READ_SHARE = 0.3, 0.6
+# A timing check passes at p99 x HEADROOM[0] <= --budget-ms; the run
+# recommends a timeout_ms of HEADROOM[0]-HEADROOM[1] x the worst-case p99.
+# At 2x the gateway's read wait is 1.2x the p99, room for the tail past it.
+HEADROOM = (2, 3)
 
 
 class Target:
@@ -281,12 +299,12 @@ def check_stalled(t: Target, vectors, budget_ms: float) -> str | None:
 def check_burst(t: Target, vectors, n: int, budget_ms: float) -> tuple[str | None, str]:
     """n fresh connections at once, as the gateway opens them when its
     keepalive pool is cold or used up: each must connect within the
-    gateway's connect budget and be answered 200 within budget_ms. The
-    client retries a SYN that the server's listen queue dropped only after
-    about a second, far past the connect budget, so the gateway sees a
-    timeout."""
+    gateway's connect budget and be answered 200, the slowest with the
+    headroom. The client retries a SYN that the server's listen queue
+    dropped only after about a second, far past the connect budget, so the
+    gateway sees a timeout."""
     body = short_body(t, vectors)
-    connect_s = max(0.01, 0.3 * budget_ms / 1000)  # resty/jev/http.lua: 30% of the L2 timeout
+    connect_s = max(0.01, CONNECT_SHARE * budget_ms / 1000)
     start = threading.Barrier(n)
     cls = http.client.HTTPSConnection if t.https else http.client.HTTPConnection
 
@@ -325,9 +343,18 @@ def check_burst(t: Target, vectors, n: int, budget_ms: float) -> tuple[str | Non
         what = ", ".join(f"{k}: {v}" for k, v in sorted(bad.items(), key=str))
         return (f"{sum(bad.values())} of {n} not answered 200 ({what}). A connect failure means a "
                 f"listen backlog under the burst (laya-server: LAYA_BACKLOG)"), info
-    if slowest > budget_ms:
-        return f"slowest answer {slowest:.1f} ms is over the {budget_ms:.0f} ms budget ({info})", info
+    if over_headroom(slowest, budget_ms):
+        return f"slowest answer {slowest:.1f} ms {needs(slowest, budget_ms)} ({info})", info
     return None, info
+
+
+def over_headroom(ms: float, budget_ms: float) -> bool:
+    return ms * HEADROOM[0] > budget_ms
+
+
+def needs(ms: float, budget_ms: float) -> str:
+    return (f"needs a timeout_ms of {math.ceil(ms * HEADROOM[0])} at {HEADROOM[0]}x headroom, over the "
+            f"{budget_ms:.0f} ms budget (the gateway reads for {READ_SHARE:.0%} of it)")
 
 
 def timed(t: Target, body: bytes, samples: int) -> tuple[str | None, list, bytes]:
@@ -358,8 +385,8 @@ def check_latency(t: Target, vectors, samples: int, budget_ms: float) -> tuple[s
         return f"{err} during the latency run", "", 0.0
     p99 = pct(lat, 0.99)
     info = f"p50 {pct(lat, 0.5):.1f} ms, p99 {p99:.1f} ms over {samples}"
-    if p99 > budget_ms:
-        return f"p99 {p99:.1f} ms is over the {budget_ms:.0f} ms budget ({info})", info, p99
+    if over_headroom(p99, budget_ms):
+        return f"p99 {p99:.1f} ms {needs(p99, budget_ms)} ({info})", info, p99
     return None, info, p99
 
 
@@ -392,33 +419,147 @@ def worst_body(t: Target, nbytes: int, assistant: str, ctx_questions: dict) -> b
                        "questions": {"injection": ctx_questions["injection"]}}).encode()
 
 
-def check_worst(t: Target, body: bytes, nbytes: int, samples: int, budget_ms: float,
-                mock: bool) -> tuple[str | None, str, float]:
+def at_once(t: Target, body: bytes, warm: bytes, n: int, rounds: int) -> list:
+    """n clients, each on its own connection warmed by one `warm` request,
+    send `body` at the same moment, `rounds` times: the gateway at
+    max_inflight, every slot taken by the client's worst text. Returns one
+    list of (status, ms) per round; a status that is not a number names the
+    transport error."""
+    start = threading.Barrier(n)
+    out = [[("not sent", 0.0)] * n for _ in range(rounds)]
+
+    def client(i):
+        c = t.conn()
+        try:
+            try:
+                t.request("POST", "/v1/systemone", warm, conn=c)
+            except (http.client.HTTPException, OSError):
+                c.close()  # the round's request says what is wrong
+            for r in range(rounds):
+                try:
+                    start.wait(timeout=t.timeout + 30)
+                except threading.BrokenBarrierError:
+                    return
+                t0 = time.perf_counter()
+                try:
+                    s, _, ms = t.request("POST", "/v1/systemone", body, conn=c)
+                    out[r][i] = (s, ms)
+                except (http.client.HTTPException, OSError) as e:
+                    timed_out = isinstance(e, (socket.timeout, TimeoutError))
+                    out[r][i] = ("timeout" if timed_out else type(e).__name__, (time.perf_counter() - t0) * 1000)
+                    c.close()  # http.client opens a new one for the next round
+        finally:
+            c.close()
+
+    with ThreadPoolExecutor(max_workers=n) as ex:
+        list(ex.map(client, range(n)))
+    return out
+
+
+class Worst:
+    """What the worst-case check measured, for its advice and the closing
+    timeout_ms line."""
+
+    def __init__(self, n: int, budget_ms: float):
+        self.n, self.budget_ms = n, budget_ms
+        self.alone = 0.0      # p99, one at a time
+        self.together = None  # p99 with n at once, when every one was answered 200
+        self.fit = None       # the fewest answered 200 within the headroom in one round of n
+
+    def advice(self) -> str:
+        if over_headroom(self.alone, self.budget_ms):
+            return (f"Alone it {needs(self.alone, self.budget_ms)}: raise timeout_ms to {span(self.alone)} "
+                    f"and run again to size max_inflight, lower max_judge_bytes, or run the model on a GPU")
+        if self.together is not None:
+            return (f"Raise timeout_ms to {span(self.together)}, or lower max_inflight (summed over the "
+                    f"gateways that call this server) or add capacity (CPUs) and run again")
+        return (f"About {self.fit} of {self.n} at once are answered in time: set max_inflight (summed over "
+                f"the gateways that call this server) to at most {max(1, self.fit or 0)}, add capacity "
+                f"(CPUs, LAYA_WORKERS), or lower max_judge_bytes")
+
+
+def check_worst(t: Target, body: bytes, warm: bytes, nbytes: int, samples: int, n: int,
+                budget_ms: float, mock: bool) -> tuple[str | None, str, Worst]:
+    """The worst text one at a time (answered 200 and judged whole), then n
+    of it at once: every one answered 200, the p99 with the headroom, and a
+    503 soon enough for the gateway to read it."""
+    w = Worst(n, budget_ms)
     err, lat, data = timed(t, body, samples)
     if err:
-        return (f"{err} for {nbytes} bytes, a text the gateway sends as is (max_judge_bytes). An L2 "
-                f"error passes the request unjudged: lower max_judge_bytes, or let the server judge "
-                f"more (laya-server: LAYA_MAX_WINDOWS)"), "", 0.0
+        why = (": lower max_judge_bytes, or let the server judge more (laya-server: LAYA_MAX_WINDOWS)"
+               if err == "status 413" else "")
+        return (f"{err} for {nbytes} bytes one at a time, a text the gateway sends as is (max_judge_bytes). "
+                f"An L2 error passes the request unjudged{why}"), "", w
     aerr, scores = check_answers(data, ["injection"])
     if aerr:
-        return aerr, "", 0.0
+        return aerr, "", w
     if mock and scores["injection"] <= 0.5:
-        return f"mock: injection = {scores['injection']:.3f} with ATTACK at the tail, want high", "", 0.0
+        return f"mock: injection = {scores['injection']:.3f} with ATTACK at the tail, want high", "", w
     windows = ""
     try:
-        w = json.loads(data).get("usage", {}).get("windows")
-        windows = f", {w} window{'' if w == 1 else 's'}" if isinstance(w, int) else ""
+        nw = json.loads(data).get("usage", {}).get("windows")
+        windows = f", {nw} window{'' if nw == 1 else 's'}" if isinstance(nw, int) else ""
     except (ValueError, AttributeError):
         pass
-    p99 = pct(lat, 0.99)
-    info = f"p50 {pct(lat, 0.5):.1f} ms, p99 {p99:.1f} ms over {samples}{windows}"
-    if p99 > budget_ms:
-        return (f"p99 {p99:.1f} ms is over the {budget_ms:.0f} ms budget ({info}): raise timeout_ms "
-                f"or lower max_judge_bytes"), info, p99
-    return None, info, p99
+    w.alone = pct(lat, 0.99)
+
+    rounds = at_once(t, body, warm, n, max(2, math.ceil(samples / n)))
+    flat = [x for r in rounds for x in r]
+    ok = sorted(ms for s, ms in flat if s == 200)
+    w.fit = min(sum(1 for s, ms in r if s == 200 and not over_headroom(ms, budget_ms)) for r in rounds)
+    info = (f"alone p99 {w.alone:.1f} ms; {n} at once"
+            + (f" p50 {pct(ok, 0.5):.1f} ms, p99 {pct(ok, 0.99):.1f} ms" if ok else "")
+            + f" over {len(flat)}{windows}")
+    problems = []
+    bad = {}
+    for s, _ in flat:
+        if s != 200:
+            bad[s] = bad.get(s, 0) + 1
+    if bad:
+        what = ", ".join(f"{k}: {v}" for k, v in sorted(bad.items(), key=str))
+        problems.append(f"{sum(bad.values())} of {len(flat)} not answered 200 ({what}); an L2 error "
+                        f"passes the request unjudged")
+    else:
+        w.together = pct(ok, 0.99)
+        if over_headroom(w.together, budget_ms):
+            problems.append(f"p99 {w.together:.1f} ms {needs(w.together, budget_ms)}")
+    read_ms = READ_SHARE * budget_ms
+    late = max((ms for s, ms in flat if s == 503 and ms > read_ms), default=None)
+    if late is not None:
+        problems.append(f"a 503 took {late:.0f} ms, after the gateway stopped reading at {read_ms:.0f} ms, "
+                        f"so it logs a timeout instead: shorten the server's queue wait (laya-server: "
+                        f"LAYA_QUEUE_MS)")
+    if problems:
+        return f"{'; '.join(problems)} ({info}). {w.advice()}", info, w
+    return None, info, w
 
 
 # ---------------------------------------------------------------------------
+
+
+def span(ms: float) -> str:
+    lo, hi = (math.ceil(k * ms) for k in HEADROOM)
+    return f"{lo}-{hi}" if hi > lo else f"{hi}"
+
+
+def timeout_line(w: Worst, short: float) -> str:
+    """The closing advice: the timeout_ms that covers the worst case at the
+    gateway's concurrency; when the server did not answer that many at once,
+    what one at a time needs and, if that fits the budget, the max_inflight
+    the server holds at it."""
+    also = f"; short text: {short:.1f} ms" if short else ""
+    why = (". Size the gateway's floor from the worst case: the client chooses the text, and how many "
+           "it sends at once.")
+    if w.together is not None:
+        return (f"timeout_ms: {span(w.together)}, {HEADROOM[0]}-{HEADROOM[1]}x the worst-case p99 of "
+                f"{w.together:.1f} ms with {w.n} at once (alone: {w.alone:.1f} ms{also})" + why)
+    head = f"timeout_ms: {span(w.alone)} for the worst case one at a time (p99 {w.alone:.1f} ms{also}). "
+    if over_headroom(w.alone, w.budget_ms):
+        return head + (f"Run again with --budget-ms {math.ceil(w.alone * HEADROOM[0])} or more to see how many "
+                       f"at once the server answers in time") + why
+    return head + (f"With {w.n} at once, {w.fit} per round were answered in time at timeout_ms "
+                   f"{w.budget_ms:.0f}: set max_inflight to at most {max(1, w.fit or 0)} there, or add "
+                   f"capacity, and run again") + why
 
 
 def main(argv=None) -> int:
@@ -436,7 +577,7 @@ def main(argv=None) -> int:
     ap.add_argument("--judge-bytes", type=int, default=4096,
                     help="the longest text the gateway sends: the profile's max_judge_bytes")
     ap.add_argument("--concurrency", type=int, default=64,
-                    help="connections at once in the burst check: the gateway's jev.max_inflight")
+                    help="requests at once in the burst and worst-case checks: the gateway's jev.max_inflight")
     ap.add_argument("--assistant", default=DEFAULT_ASSISTANT,
                     help="deployment context for the worst case: your jev.deployment_context")
     ap.add_argument("--questions", default=os.path.join(HERE, "questions.json"))
@@ -478,35 +619,32 @@ def main(argv=None) -> int:
         except (http.client.HTTPException, OSError) as e:
             report(name, f"transport error: {e!r}")
 
-    budget = f"{args.budget_ms:.0f} ms"
+    within = f"within {args.budget_ms:.0f} ms with {HEADROOM[0]}x headroom"
     worst = worst_body(t, args.judge_bytes, args.assistant, ctx_questions)
     timing = [
-        (f"burst: {args.concurrency} new connections at once, each answered within {budget}",
+        (f"burst: {args.concurrency} new connections at once, each answered {within}",
          lambda: check_burst(t, vectors, args.concurrency, args.budget_ms) + (0.0,)),
-        (f"latency within {budget} at p99",
+        (f"latency {within} at p99",
          lambda: check_latency(t, vectors, args.samples, args.budget_ms)),
-        (f"worst case within {budget} at p99: {args.judge_bytes} bytes at ~1 token per byte, "
-         f"deployment context wording",
-         lambda: check_worst(t, worst, args.judge_bytes, args.samples, args.budget_ms, args.mock)),
+        (f"worst case {within} at p99, {args.concurrency} at once: {args.judge_bytes} bytes at ~1 token "
+         f"per byte, deployment context wording",
+         lambda: check_worst(t, worst, short_body(t, vectors), args.judge_bytes, args.samples,
+                             args.concurrency, args.budget_ms, args.mock)),
     ]
-    p99 = []
+    measured = []
     for name, fn in timing:
         try:
-            err, info, ms = fn()
+            err, info, m = fn()
         except (http.client.HTTPException, OSError) as e:
-            err, info, ms = f"transport error: {e!r}", "", 0.0
+            err, info, m = f"transport error: {e!r}", "", None
         report(name, err, info)
-        p99.append(ms)
+        measured.append(m)
+    short, w = measured[1] or 0.0, measured[2]
 
     total = len(vectors) + len(checks) + len(timing)
     print(f"\n{total - failed}/{total} passed" + ("" if args.strict else "  (not --strict: exact error codes not checked)"))
-    short, longest = p99[1], p99[2]
-    if longest:
-        lo, hi = (math.ceil(k * longest) for k in (2, 3))
-        print(f"timeout_ms: {lo}-{hi}" if hi > lo else f"timeout_ms: {hi}",
-              f"2-3x the worst-case p99 of {longest:.1f} ms"
-              + (f" (short text: {short:.1f} ms)" if short else "")
-              + ". Size the gateway's floor from the worst case: the client chooses the text.", sep=", ")
+    if w is not None and w.alone:
+        print(timeout_line(w, short))
     return 1 if failed else 0
 
 

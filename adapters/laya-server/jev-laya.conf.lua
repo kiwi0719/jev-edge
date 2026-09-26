@@ -21,17 +21,22 @@ return {
     -- per-call overhead, not the compute). At max_judge_bytes = 4096 a text
     -- of punctuation and rare letters, about one token per byte, needs ~6
     -- windows with the deployment-context wording: ~200 ms at the ~33 ms per
-    -- window Laya is reported at on CPU, and 500 ms is 2.5x that. Measure
+    -- window Laya is reported at on CPU, and 500 ms is 2.5x that, for one
+    -- at a time. A client can also send max_inflight of them at once. Measure
     -- yours with
     --   make conformance ENDPOINT=... BUDGET_MS=<timeout_ms>
-    -- It times a short text and that worst case, and prints the timeout_ms
-    -- to set: 2-3x the worst-case p99. Size the floor from that line, never
-    -- from the short-text p99, which can be 30x smaller. If the result is
-    -- more than one request may add to your latency, lower max_judge_bytes
-    -- (below) and measure again, or run the model on a GPU
+    -- It times a short text and that worst case, alone and max_inflight
+    -- (--concurrency) at once, passes a p99 of at most half of timeout_ms
+    -- (the gateway reads for 60% of it), and prints the timeout_ms to set:
+    -- 2-3x the worst-case p99 at max_inflight, or the max_inflight the
+    -- server holds in time. Size the floor from that line, never from the
+    -- short-text p99, which can be 30x smaller. If the result is more than
+    -- one request may add to your latency, lower max_judge_bytes (below) or
+    -- max_inflight and measure again, add CPUs, or run the model on a GPU
     -- (LAYA_ORT_PROVIDERS), which runs the windows of a batch in parallel.
-    -- The ceiling is what one request may add when the server as a whole
-    -- slows down.
+    -- laya-server's queue wait (LAYA_QUEUE_MS, 50 ms) is sized for this
+    -- floor: a 503 must come while the gateway still reads. The ceiling is
+    -- what one request may add when the server as a whole slows down.
     timeout_ms       = 500,
     timeout_max_ms   = 800,
     timeout_headroom = 1.5,
@@ -41,7 +46,10 @@ return {
     -- kernel drops connections past the backlog, each dropped connection is
     -- an L2 timeout, and once half the calls in the breaker's window fail,
     -- L2 is off for every tenant. conformance/run.py opens --concurrency
-    -- (64) connections at once to check it.
+    -- (64) connections at once to check it, and sends that many worst-case
+    -- texts at once: a server that cannot score them in time answers some
+    -- with 503, which also passes the request and counts toward the breaker.
+    -- Lower max_inflight to what the run says the server holds, or add CPUs.
     max_inflight = 64,
 
     -- Question wording for this provider only. The bundled wording was

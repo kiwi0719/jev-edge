@@ -3,6 +3,7 @@ import type { Policy } from "./policy.js";
 import type { BreakerConfig } from "./breaker.js";
 import type { FeedbackConfig } from "./trust.js";
 import { pathError } from "./normalize.js";
+import { get as getTemplate } from "./judge.js";
 
 export interface QuestionWording {
   instructions?: string;
@@ -203,10 +204,31 @@ export function untrustedSpec(cfg: { untrusted?: UntrustedConfig } | undefined, 
   return { ...base, ...over };
 }
 
-/** Port of defaults.validate_untrusted: type check for the config section or a rule's override. */
+/** Port of defaults.string_list_error: why `v` is not a list of non-empty strings (`nonempty`: with one at least), or null. */
+export function stringListError(v: unknown, what: string, nonempty = false): string | null {
+  if (!Array.isArray(v)) return `${what} must be a list of strings`;
+  if (nonempty && v.length === 0) return `${what} must not be empty`;
+  for (let i = 0; i < v.length; i++) {
+    if (typeof v[i] !== "string" || v[i] === "") return `${what}[${i + 1}] must be a non-empty string`;
+  }
+  return null;
+}
+
+/** Port of defaults.templates_error: why `v` is not a list of template names judge knows, or null. */
+export function templatesError(v: unknown, what: string): string | null {
+  const err = stringListError(v, what, true);
+  if (err) return err;
+  const names = v as string[];
+  for (let i = 0; i < names.length; i++) {
+    if (!getTemplate(names[i])) return `${what}[${i + 1}] ${names[i]} is not a template`;
+  }
+  return null;
+}
+
+/** Port of defaults.validate_untrusted: type check for the config section or a rule's override (JSON null is not one). */
 export function validateUntrusted(u: unknown, where: string): [true, null] | [null, string] {
-  if (u === undefined || u === null) return [true, null];
-  if (typeof u !== "object" || Array.isArray(u)) return [null, `${where} must be a table`];
+  if (u === undefined) return [true, null];
+  if (typeof u !== "object" || u === null || Array.isArray(u)) return [null, `${where} must be a table`];
   const t = u as Record<string, unknown>;
   for (const k of ["enabled", "tool_results"]) {
     if (t[k] !== undefined && typeof t[k] !== "boolean") return [null, `${where}.${k} must be true|false`];

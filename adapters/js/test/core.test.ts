@@ -258,6 +258,61 @@ describe("rules.resolve", () => {
     expect(resolve({ id: "any", extends: "llm-endpoints", json_only_paths: [] }).json_only_paths).toEqual([]);
   });
 
+  // twin of core/spec/rules_resolve_spec.lua "field types"
+  describe("field types", () => {
+    const tryR = (over: Record<string, unknown>) => resolve({ id: "t", extends: "llm-endpoints", ...over } as never);
+
+    it("normalizes methods, a list or a map, to an uppercase map", () => {
+      expect(tryR({ methods: ["post", "Put"] }).methods).toEqual({ POST: true, PUT: true });
+      expect(tryR({ methods: { post: true, GET: false } }).methods).toEqual({ POST: true });
+      expect(tryR({}).methods).toEqual({ POST: true, PUT: true, PATCH: true });
+      for (const bad of ["POST", {}, [], { GET: false }, { POST: 1 }, [""], [1], null]) {
+        expect(() => tryR({ methods: bad }), JSON.stringify(bad)).toThrow(/methods must be/);
+      }
+    });
+
+    it("wants lists of non-empty strings, and lowercases content types", () => {
+      for (const k of ["always_suspect", "skip_content_types", "content_types"]) {
+        expect(tryR({ [k]: [] })).toBeTruthy();
+        for (const bad of ["image/", [""], [1], { a: "x" }, null]) expect(() => tryR({ [k]: bad }), k).toThrow(k);
+      }
+      expect(tryR({ content_types: ["Application/JSON"] }).content_types).toEqual(["application/json"]);
+      expect(tryR({ skip_content_types: ["IMAGE/"] }).skip_content_types).toEqual(["image/"]);
+      expect(load("llm-endpoints").skip_content_types?.[0]).toBe("image/");
+      for (const k of ["watch_paths", "json_only_paths", "text_fields", "tool_fields"]) {
+        expect(() => tryR({ [k]: { a: "^/x" } }), k).toThrow();
+        expect(() => tryR({ [k]: null }), k).toThrow();
+      }
+    });
+
+    it("wants templates judge knows, at least one", () => {
+      expect(tryR({ templates: ["injection", "abuse"] }).templates).toEqual(["injection", "abuse"]);
+      for (const bad of [[], ["nope"], "injection", [""], null]) expect(() => tryR({ templates: bad })).toThrow(/templates/);
+      expect(() => tryR({ templates: ["injection", "injeciton"] })).toThrow("rule t: templates[2] injeciton is not a template");
+    });
+
+    it("wants limits that are numbers in range", () => {
+      expect(tryR({ min_text_chars: 0, min_body_bytes: 0 }).min_text_chars).toBe(0);
+      expect(tryR({ max_judge_chunks: 4 }).max_judge_chunks).toBe(4);
+      const cases: Record<string, unknown[]> = {
+        max_body_bytes: [0, -1, "1048576", NaN, null],
+        max_judge_bytes: [0, "32768", NaN, null],
+        min_body_bytes: [-1, "8", NaN, null],
+        min_text_chars: [-1, "20", NaN, null],
+        max_judge_chunks: [0, 1.5, "4", Infinity, null],
+      };
+      for (const [k, list] of Object.entries(cases)) {
+        for (const bad of list) expect(() => tryR({ [k]: bad }), `${k} ${String(bad)}`).toThrow(k);
+      }
+    });
+
+    it("wants a string id and deployment context", () => {
+      expect(tryR({ deployment_context: "Billing." }).deployment_context).toBe("Billing.");
+      for (const bad of [1, ["x"], null]) expect(() => tryR({ deployment_context: bad })).toThrow(/deployment_context/);
+      for (const bad of ["", 1, null]) expect(() => tryR({ id: bad })).toThrow("rule id must be a non-empty string");
+    });
+  });
+
   it("llm-endpoints reads every content type but media types", () => {
     const r = load("llm-endpoints");
     expect(r.content_types).toBeUndefined();

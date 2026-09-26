@@ -81,6 +81,88 @@ describe("rules.resolve", function()
     assert.matches("rules%[2%]", err)
   end)
 
+  describe("field types", function()
+    -- cjson.null is a lightuserdata: any userdata stands in for it here
+    local NULL = io.stdout
+    local function try(over)
+      local spec = { id = "t", extends = "llm-endpoints" }
+      for k, v in pairs(over) do spec[k] = v end
+      return rules.resolve(spec, load)
+    end
+
+    it("normalizes methods, a list or a map, to an uppercase map", function()
+      assert.same({ POST = true, PUT = true }, try({ methods = { "post", "Put" } }).methods)
+      assert.same({ POST = true }, try({ methods = { post = true, GET = false } }).methods)
+      assert.same({ POST = true, PUT = true, PATCH = true }, try({}).methods)
+      for _, bad in ipairs({ "POST", {}, { GET = false }, { POST = 1 }, { "" }, { 1 }, NULL }) do
+        local r, err = try({ methods = bad })
+        assert.is_nil(r)
+        assert.matches("methods must be", err, 1, true)
+      end
+    end)
+
+    it("wants lists of non-empty strings, and lowercases content types", function()
+      for _, k in ipairs({ "always_suspect", "skip_content_types", "content_types" }) do
+        assert.is_table(try({ [k] = {} })[k])
+        for _, bad in ipairs({ "image/", { "" }, { 1 }, { a = "x" }, NULL }) do
+          local r, err = try({ [k] = bad })
+          assert.is_nil(r, k)
+          assert.matches(k, err, 1, true)
+        end
+      end
+      assert.same({ "application/json" }, try({ content_types = { "Application/JSON" } }).content_types)
+      assert.same({ "image/" }, try({ skip_content_types = { "IMAGE/" } }).skip_content_types)
+      -- the module's own lists are not touched
+      assert.equals("image/", require("jev.rules.llm-endpoints").skip_content_types[1])
+      for _, k in ipairs({ "watch_paths", "json_only_paths", "text_fields", "tool_fields" }) do
+        assert.is_nil((try({ [k] = { a = "^/x" } })), k)
+        assert.is_nil((try({ [k] = NULL })), k)
+      end
+    end)
+
+    it("wants templates judge knows, at least one", function()
+      assert.same({ "injection", "abuse" }, try({ templates = { "injection", "abuse" } }).templates)
+      for _, bad in ipairs({ {}, { "nope" }, "injection", { "" }, NULL }) do
+        local r, err = try({ templates = bad })
+        assert.is_nil(r)
+        assert.matches("templates", err, 1, true)
+      end
+      local _, err = try({ templates = { "injection", "injeciton" } })
+      assert.equals("rule t: templates[2] injeciton is not a template", err)
+    end)
+
+    it("wants limits that are numbers in range", function()
+      assert.equals(0, try({ min_text_chars = 0, min_body_bytes = 0 }).min_text_chars)
+      assert.equals(4, try({ max_judge_chunks = 4 }).max_judge_chunks)
+      local cases = {
+        max_body_bytes = { 0, -1, "1048576", 0 / 0, NULL },
+        max_judge_bytes = { 0, "32768", 0 / 0, NULL },
+        min_body_bytes = { -1, "8", 0 / 0, NULL },
+        min_text_chars = { -1, "20", 0 / 0, NULL },
+        max_judge_chunks = { 0, 1.5, "4", math.huge, NULL },
+      }
+      for k, list in pairs(cases) do
+        for _, bad in ipairs(list) do
+          local r, err = try({ [k] = bad })
+          assert.is_nil(r, k .. " " .. tostring(bad))
+          assert.matches(k, err, 1, true)
+        end
+      end
+    end)
+
+    it("wants a string id and deployment context", function()
+      assert.equals("Billing.", try({ deployment_context = "Billing." }).deployment_context)
+      for _, bad in ipairs({ 1, { "x" }, NULL }) do
+        assert.is_nil((try({ deployment_context = bad })))
+      end
+      for _, bad in ipairs({ "", 1, NULL }) do
+        local r, err = try({ id = bad })
+        assert.is_nil(r)
+        assert.equals("rule id must be a non-empty string", err)
+      end
+    end)
+  end)
+
   it("gives each tenant its own deployment context, first match wins", function()
     local list = rules.resolve_all({
       { id = "billing", extends = "llm-endpoints", watch_paths = { "^/v1/billing" }, deployment_context = "Billing." },

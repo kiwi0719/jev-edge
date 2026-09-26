@@ -609,6 +609,83 @@ function _M.pattern_error(p)
   return nil
 end
 
+local is_list, string_list_error = defaults.is_list, defaults.string_list_error
+
+-- A rule's methods as the uppercase map evaluate() looks methods up in:
+-- from a map { POST = true } (a false value leaves the method out) or a list
+-- { "POST" }; nil when `v` is neither, or names no method. A lowercase key
+-- would never match, and the rule would watch no request.
+local function methods_of(v)
+  if type(v) ~= "table" then return nil end
+  local out, any = {}, false
+  if is_list(v) and #v > 0 then
+    for _, m in ipairs(v) do
+      if type(m) ~= "string" or m == "" then return nil end
+      out[m:upper()], any = true, true
+    end
+  else
+    for k, on in pairs(v) do
+      if type(k) ~= "string" or k == "" or type(on) ~= "boolean" then return nil end
+      if on then out[k:upper()], any = true, true end
+    end
+  end
+  return any and out or nil
+end
+
+-- Type checks for the fields resolve() does not fill in: a mistyped one
+-- (a string for a list, a lowercase method, JSON null, a limit that is not a
+-- number) would turn judging off for the rule or fail open on every
+-- request. Normalizes methods to an uppercase map and content types to
+-- lowercase (the Content-Type they are matched against is lowercased).
+-- @return nil, or the error
+local function check_fields(out)
+  local id = out.id
+  if out.methods ~= nil then
+    local m = methods_of(out.methods)
+    if not m then
+      return "rule " .. id .. ": methods must be a list of method names, or a map of them to true"
+    end
+    out.methods = m
+  end
+  for _, k in ipairs({ "always_suspect", "skip_content_types", "content_types" }) do
+    if out[k] ~= nil then
+      local err = string_list_error(out[k], "rule " .. id .. ": " .. k)
+      if err then return err end
+    end
+  end
+  for _, k in ipairs({ "skip_content_types", "content_types" }) do
+    if out[k] ~= nil then
+      local low = {}
+      for i, v in ipairs(out[k]) do low[i] = v:lower() end
+      out[k] = low
+    end
+  end
+  for _, k in ipairs({ "max_body_bytes", "max_judge_bytes" }) do
+    local v = out[k]
+    if v ~= nil and not (type(v) == "number" and v > 0) then
+      return "rule " .. id .. ": " .. k .. " must be a number > 0"
+    end
+  end
+  -- 0 is no minimum; NaN, which every comparison fails, is not a number here
+  for _, k in ipairs({ "min_body_bytes", "min_text_chars" }) do
+    local v = out[k]
+    if v ~= nil and not (type(v) == "number" and v >= 0) then
+      return "rule " .. id .. ": " .. k .. " must be a number >= 0"
+    end
+  end
+  local c = out.max_judge_chunks
+  if c ~= nil and not (type(c) == "number" and c >= 1 and c % 1 == 0) then
+    return "rule " .. id .. ": max_judge_chunks must be an integer >= 1"
+  end
+  if out.deployment_context ~= nil and type(out.deployment_context) ~= "string" then
+    return "rule " .. id .. ": deployment_context must be a string"
+  end
+  if out.token_prompts ~= nil and out.token_prompts ~= "pass" and out.token_prompts ~= "block" then
+    return "rule " .. id .. ": token_prompts must be pass|block"
+  end
+  return nil
+end
+
 --- Resolve a rule spec into a rule table.
 -- A spec is a rule set id (string, loaded through `load`), or a table. A
 -- table with `extends = "<id>"` starts from that rule set and overrides the
@@ -634,9 +711,10 @@ function _M.resolve(spec, load)
   local out = {}
   for k, v in pairs(base) do out[k] = v end
   for k, v in pairs(spec) do if k ~= "extends" then out[k] = v end end
-  if not out.id then return nil, "rule needs an id" end
-  if type(out.watch_paths) ~= "table" then return nil, "rule " .. out.id .. " needs watch_paths" end
-  if out.json_only_paths ~= nil and type(out.json_only_paths) ~= "table" then
+  if out.id == nil then return nil, "rule needs an id" end
+  if type(out.id) ~= "string" or out.id == "" then return nil, "rule id must be a non-empty string" end
+  if not is_list(out.watch_paths) then return nil, "rule " .. out.id .. " needs watch_paths" end
+  if out.json_only_paths ~= nil and not is_list(out.json_only_paths) then
     return nil, "rule " .. out.id .. ": json_only_paths must be a list of patterns"
   end
   -- watch_paths and json_only_paths are Lua patterns; a malformed one raises
@@ -650,10 +728,9 @@ function _M.resolve(spec, load)
   end
   local uok, uerr = defaults.validate_untrusted(out.untrusted, "rule " .. out.id .. ": untrusted")
   if not uok then return nil, uerr end
-  if out.token_prompts ~= nil and out.token_prompts ~= "pass" and out.token_prompts ~= "block" then
-    return nil, "rule " .. out.id .. ": token_prompts must be pass|block"
-  end
-  if not out.text_fields then
+  local ferr = check_fields(out)
+  if ferr then return nil, ferr end
+  if out.text_fields == nil then
     out.text_fields = { "system", "instructions", "preamble", "system_prompt", "systemInstruction.parts",
                         "system_instruction.parts", "documents", "template",
                         "messages[*].content", "messages[*].tool_calls[*].function.arguments.**",
@@ -666,17 +743,19 @@ function _M.resolve(spec, load)
                         "inputs", "instances[*].inputs", "instances[*].messages[*].content",
                         "query", "text", "suffix", "input_prefix", "input_suffix", "input_extra[*].text" }
   end
-  if not out.tool_fields then
+  if out.tool_fields == nil then
     out.tool_fields = { "tools", "functions", "response_format.json_schema", "text.format" }
   end
   for _, k in ipairs({ "text_fields", "tool_fields" }) do
-    if type(out[k]) ~= "table" then return nil, "rule " .. out.id .. ": " .. k .. " must be a list of paths" end
+    if not is_list(out[k]) then return nil, "rule " .. out.id .. ": " .. k .. " must be a list of paths" end
     for i, p in ipairs(out[k]) do
       local perr = normalize.path_error(p)
       if perr then return nil, "rule " .. out.id .. ": " .. k .. "[" .. i .. "] " .. perr end
     end
   end
-  if not out.templates then out.templates = { "injection" } end
+  if out.templates == nil then out.templates = { "injection" } end
+  local terr = defaults.templates_error(out.templates, "rule " .. out.id .. ": templates")
+  if terr then return nil, terr end
   return out
 end
 

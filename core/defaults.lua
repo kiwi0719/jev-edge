@@ -2,6 +2,7 @@
 -- Default configuration and a deep-merge helper.
 
 local normalize = require "jev.core.normalize"
+local judge     = require "jev.core.judge"
 
 local _M = {}
 
@@ -155,6 +156,41 @@ function _M.untrusted_spec(cfg, rule)
   for k, v in pairs(base) do out[k] = v end
   for k, v in pairs(over) do out[k] = v end
   return out
+end
+
+--- True when `t` is a list: a table whose keys are exactly 1..#t (an empty
+-- table is one). A JSON object is not, nor is JSON null (cjson.null).
+function _M.is_list(t)
+  if type(t) ~= "table" then return false end
+  local n, count = #t, 0
+  for k in pairs(t) do
+    if type(k) ~= "number" or k < 1 or k > n or k % 1 ~= 0 then return false end
+    count = count + 1
+  end
+  return count == n
+end
+
+--- Why `v` is not a list of non-empty strings (`nonempty`: with one at
+-- least), or nil.
+function _M.string_list_error(v, what, nonempty)
+  if not _M.is_list(v) then return what .. " must be a list of strings" end
+  if nonempty and #v == 0 then return what .. " must not be empty" end
+  for i, s in ipairs(v) do
+    if type(s) ~= "string" or s == "" then return what .. "[" .. i .. "] must be a non-empty string" end
+  end
+  return nil
+end
+
+--- Why `v` is not a list of template names judge knows, or nil: a rule's
+-- templates (core/rules.lua resolve). A name judge.build cannot find turns
+-- every request the rule judges into an L2 error, which fails open.
+function _M.templates_error(v, what)
+  local err = _M.string_list_error(v, what, true)
+  if err then return err end
+  for i, name in ipairs(v) do
+    if not judge.get(name) then return what .. "[" .. i .. "] " .. name .. " is not a template" end
+  end
+  return nil
 end
 
 --- Type check for an untrusted table (config section or a rule's override).

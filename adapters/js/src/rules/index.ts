@@ -2,7 +2,7 @@
 // core/golden/rules.json has one positive per always_suspect pattern and
 // fails a named case when the two drift.
 import { patternError, type Rule } from "../core/rules.js";
-import { validateUntrusted } from "../core/defaults.js";
+import { validateUntrusted, stringListError, templatesError } from "../core/defaults.js";
 import { pathError } from "../core/normalize.js";
 
 export const llmEndpoints: Rule = {
@@ -102,7 +102,79 @@ export function load(id: string): Rule {
 }
 
 /** Inline rule spec: a complete Rule, or a partial one with `extends: "<id>"`. Mirrors core/rules.lua resolve(). */
-export type RuleSpec = string | (Partial<Rule> & { id?: string; extends?: string });
+export type RuleSpec = string | (Omit<Partial<Rule>, "methods"> & {
+  id?: string; extends?: string;
+  /** a map { POST: true } or a list ["POST"]; resolve() makes it an uppercase map */
+  methods?: Record<string, boolean> | string[];
+});
+
+// Port of methods_of() in core/rules.lua: a rule's methods as the uppercase
+// map evaluate() looks methods up in, from a map { POST: true } (false leaves
+// the method out) or a list ["POST"]; undefined when neither, or none.
+function methodsOf(v: unknown): Record<string, boolean> | undefined {
+  if (typeof v !== "object" || v === null) return undefined;
+  const out: Record<string, boolean> = {};
+  let any = false;
+  if (Array.isArray(v) && v.length > 0) {
+    for (const m of v) {
+      if (typeof m !== "string" || m === "") return undefined;
+      out[m.toUpperCase()] = true;
+      any = true;
+    }
+  } else {
+    for (const [k, on] of Object.entries(v)) {
+      if (k === "" || typeof on !== "boolean") return undefined;
+      if (on) {
+        out[k.toUpperCase()] = true;
+        any = true;
+      }
+    }
+  }
+  return any ? out : undefined;
+}
+
+const asciiLower = (s: string): string => s.replace(/[A-Z]+/g, (m) => m.toLowerCase());
+
+// Port of check_fields() in core/rules.lua: type checks for the fields
+// resolve() does not fill in, which would otherwise turn judging off for the
+// rule or fail open; methods become an uppercase map, content types lowercase.
+function checkFields(out: Rule): void {
+  const id = out.id;
+  const r = out as unknown as Record<string, unknown>;
+  if (r.methods !== undefined) {
+    const m = methodsOf(r.methods);
+    if (!m) throw new Error(`rule ${id}: methods must be a list of method names, or a map of them to true`);
+    out.methods = m;
+  }
+  for (const k of ["always_suspect", "skip_content_types", "content_types"] as const) {
+    if (r[k] === undefined) continue;
+    const err = stringListError(r[k], `rule ${id}: ${k}`);
+    if (err) throw new Error(err);
+  }
+  for (const k of ["skip_content_types", "content_types"] as const) {
+    const v = out[k];
+    if (v !== undefined) out[k] = v.map(asciiLower);
+  }
+  for (const k of ["max_body_bytes", "max_judge_bytes"] as const) {
+    const v = r[k];
+    if (v !== undefined && !(typeof v === "number" && v > 0)) throw new Error(`rule ${id}: ${k} must be a number > 0`);
+  }
+  // 0 is no minimum; NaN, which every comparison fails, is not a number here
+  for (const k of ["min_body_bytes", "min_text_chars"] as const) {
+    const v = r[k];
+    if (v !== undefined && !(typeof v === "number" && v >= 0)) throw new Error(`rule ${id}: ${k} must be a number >= 0`);
+  }
+  const c = r.max_judge_chunks;
+  if (c !== undefined && !(typeof c === "number" && c >= 1 && c % 1 === 0)) {
+    throw new Error(`rule ${id}: max_judge_chunks must be an integer >= 1`);
+  }
+  if (r.deployment_context !== undefined && typeof r.deployment_context !== "string") {
+    throw new Error(`rule ${id}: deployment_context must be a string`);
+  }
+  if (r.token_prompts !== undefined && r.token_prompts !== "pass" && r.token_prompts !== "block") {
+    throw new Error(`rule ${id}: token_prompts must be pass|block`);
+  }
+}
 
 export function resolve(spec: RuleSpec): Rule {
   // A string is the same as `{ extends: "<id>" }`: the loaded module is
@@ -113,9 +185,10 @@ export function resolve(spec: RuleSpec): Rule {
   const base: Partial<Rule> = spec.extends ? load(spec.extends) : {};
   const { extends: _ext, ...over } = spec;
   const out = { ...base, ...over } as Rule;
-  if (!out.id) throw new Error("rule needs an id");
+  if (out.id === undefined) throw new Error("rule needs an id");
+  if (typeof out.id !== "string" || out.id === "") throw new Error("rule id must be a non-empty string");
   if (!Array.isArray(out.watch_paths)) throw new Error(`rule ${out.id} needs watch_paths`);
-  if (out.json_only_paths !== undefined && out.json_only_paths !== null && !Array.isArray(out.json_only_paths)) {
+  if (out.json_only_paths !== undefined && !Array.isArray(out.json_only_paths)) {
     throw new Error(`rule ${out.id}: json_only_paths must be a list of patterns`);
   }
   // watch_paths and json_only_paths are Lua patterns; a malformed one raises
@@ -129,9 +202,12 @@ export function resolve(spec: RuleSpec): Rule {
   }
   const [uok, uerr] = validateUntrusted(out.untrusted, `rule ${out.id}: untrusted`);
   if (!uok) throw new Error(uerr);
-  if (out.token_prompts !== undefined && out.token_prompts !== "pass" && out.token_prompts !== "block") {
-    throw new Error(`rule ${out.id}: token_prompts must be pass|block`);
+  checkFields(out);
+  // JSON null is a wrong type, as in Lua (cjson.null), not a field left out
+  for (const k of ["text_fields", "tool_fields"] as const) {
+    if (out[k] === null) throw new Error(`rule ${out.id}: ${k} must be a list of paths`);
   }
+  if (out.templates === null) throw new Error(`rule ${out.id}: templates must be a list of strings`);
   out.text_fields ??= [
     "system", "instructions", "preamble", "system_prompt", "systemInstruction.parts",
     "system_instruction.parts", "documents", "template",
@@ -155,5 +231,7 @@ export function resolve(spec: RuleSpec): Rule {
     });
   }
   out.templates ??= ["injection"];
+  const terr = templatesError(out.templates, `rule ${out.id}: templates`);
+  if (terr) throw new Error(terr);
   return out;
 }

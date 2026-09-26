@@ -81,6 +81,80 @@ func TestBlockWithAnyStatusAndVerdict(t *testing.T) {
 	}
 }
 
+// g2-block-response-verdict-oracle#3: Envoy puts DeniedHttpResponse.Headers
+// on the reply to the client as they are, and the block handed it every
+// X-Jev-* header of the authz answer: the score to two decimals, the
+// question that fired and the source, an oracle to walk a prompt under the
+// threshold. The client gets Content-Type, X-Jev-Verdict and
+// X-Jev-Request-Id only; an allowed request still gets every header upstream.
+func TestBlockHandsTheClientNoScoreReasonOrSource(t *testing.T) {
+	s, _ := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Jev-Verdict", "malicious")
+		w.Header().Set("X-Jev-Score", "0.97")
+		w.Header().Set("X-Jev-Reason", "injection+0.97")
+		w.Header().Set("X-Jev-Source", "cache")
+		w.Header().Set("X-Jev-Request-Id", "req-1")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(403)
+		w.Write([]byte(`{"error":"request rejected"}`))
+	})
+	res, _ := s.Check(context.Background(), checkReq("/v1/chat/completions", map[string]string{"x-jev-score": "forged"}))
+	d := res.GetDeniedResponse()
+	if res.Status.Code != int32(codes.PermissionDenied) || d == nil || d.Status.Code != 403 {
+		t.Fatalf("expected a 403 deny, got %v", res)
+	}
+	for _, k := range []string{"X-Jev-Score", "X-Jev-Reason", "X-Jev-Source"} {
+		if v, ok := header(d.Headers, k); ok {
+			t.Fatalf("the blocked client gets %s: %q", k, v)
+		}
+	}
+	want := map[string]string{"Content-Type": "application/json", "X-Jev-Verdict": "malicious", "X-Jev-Request-Id": "req-1"}
+	if len(d.Headers) != len(want) {
+		t.Fatalf("headers = %v, want %v", d.Headers, want)
+	}
+	for k, v := range want {
+		if got, _ := header(d.Headers, k); got != v {
+			t.Fatalf("%s = %q, want %q", k, got, v)
+		}
+	}
+	for _, o := range d.Headers {
+		if o.AppendAction != corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD {
+			t.Fatalf("%s not overwritten", o.Header.Key)
+		}
+	}
+
+	// without a request id or a content type, only the verdict
+	s, _ = newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Jev-Verdict", "malicious")
+		w.Header().Set("X-Jev-Score", "1.00")
+		w.Header().Set("X-Jev-Reason", "ip+reputation")
+		w.Header()["Content-Type"] = nil
+		w.WriteHeader(429)
+	})
+	res, _ = s.Check(context.Background(), checkReq("/v1/chat/completions", nil))
+	d = res.GetDeniedResponse()
+	if d == nil || len(d.Headers) != 1 {
+		t.Fatalf("expected a deny with X-Jev-Verdict only, got %v", res)
+	}
+	if v, _ := header(d.Headers, "X-Jev-Verdict"); v != "malicious" {
+		t.Fatalf("verdict = %q", v)
+	}
+
+	// the allow path still copies score, reason and source upstream
+	s, _ = newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Jev-Verdict", "suspicious")
+		w.Header().Set("X-Jev-Score", "0.60")
+		w.Header().Set("X-Jev-Reason", "injection+0.60")
+		w.Header().Set("X-Jev-Source", "l2")
+		w.Header().Set("X-Jev-Request-Id", "req-2")
+	})
+	res, _ = s.Check(context.Background(), checkReq("/v1/chat/completions", nil))
+	ok := res.GetOkResponse()
+	if ok == nil || len(ok.Headers) != 5 || len(ok.HeadersToRemove) != 0 {
+		t.Fatalf("expected every X-Jev-* header upstream, got %v", res)
+	}
+}
+
 // An answer without X-Jev-Verdict below 500 (nginx refusing an oversized
 // header or URI with 400 / 414 before jev-edge runs, or something that is
 // not jev-edge) is unjudgeable: passed marked skipped, never an unmarked

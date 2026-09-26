@@ -64,6 +64,17 @@ local function judge_all(judge, parts, timeout)
   return results, failed
 end
 
+-- How long a reputation entry is kept: cache.rep_ttl, or longer while the
+-- entry carries a block (new or carried over) that outlasts it. A block of
+-- async.rep_block_ttl past cache.rep_ttl would otherwise vanish with the
+-- entry, and a later write for the same IP would cut a running block short.
+local function rep_ttl(cfg, rep)
+  local ttl = tonumber(cfg.cache.rep_ttl) or 0
+  local left = tonumber(rep.blocked_until) and rep.blocked_until - ngx.now()
+  if ttl > 0 and left and left > 0 then ttl = math.max(ttl, math.ceil(left)) end
+  return ttl
+end
+
 local function handler(premature, job)
   -- A timer that never ran still holds a slot: the shared dict outlives the
   -- worker (HUP reload), so the slot must be given back or it is lost forever.
@@ -109,7 +120,7 @@ local function handler(premature, job)
           ngx.log(ngx.ERR, "jev-edge: ALERT ip=", job.client_ip, " score=", res.score, " reason=", res.reason)
         end
       end
-      cache:set(key, rep, cfg.cache.rep_ttl)
+      cache:set(key, rep, rep_ttl(cfg, rep))
     end
   end)
   if not ok then

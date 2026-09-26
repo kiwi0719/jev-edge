@@ -837,3 +837,25 @@ Content-Type: application/json
  '^jev_l2_latency_ms_bucket\{le="25"\}\njev_l2_latency_ms_bucket\{le="50"\}\njev_l2_latency_ms_bucket\{le="100"\}\njev_l2_latency_ms_bucket\{le="200"\}\njev_l2_latency_ms_bucket\{le="300"\}\njev_l2_latency_ms_bucket\{le="500"\}\njev_l2_latency_ms_bucket\{le="1000"\}\njev_l2_latency_ms_bucket\{le="2000"\}\njev_l2_latency_ms_bucket\{le="3000"\}\njev_l2_latency_ms_bucket\{le="5000"\}\njev_l2_latency_ms_bucket\{le="10000"\}\njev_l2_latency_ms_bucket\{le="30000"\}\njev_l2_latency_ms_bucket\{le="\+Inf"\}\njev_l2_latency_ms_sum\njev_l2_latency_ms_count\n$']
 --- no_error_log
 [error]
+
+
+
+=== TEST 39: an IP reputation block outlives cache.rep_ttl when rep_block_ttl is longer
+--- http_config eval: $::HttpConfig
+--- user_files eval: ::conf('jev = { provider = "mock", mock_header = "x-jev-mock-score", mock_score = 0.95, timeout_ms = 300 }, cache = { rep_ttl = 0.2 }, async = { enabled = true, max_async = 8, rep_block_after = 1, rep_block_ttl = 60 },')
+--- config eval
+"location /v1/chat/completions { $::Access $::Echo }
+ location /wait { content_by_lua_block { ngx.sleep(0.7) ngx.say('ok') } }"
+--- request eval
+["POST /v1/chat/completions\n{\"messages\":[{\"role\":\"user\",\"content\":\"a sentence that the sync path fails to judge\"}]}",
+ "GET /wait",
+ "POST /v1/chat/completions\n{\"messages\":[{\"role\":\"user\",\"content\":\"a completely different sentence from the same ip\"}]}"]
+--- more_headers
+Content-Type: application/json
+X-Jev-Mock-Score: fail
+--- response_body eval
+["verdict=error score=0.00 source=l2 reason=mock+failure+%28header%29\n",
+ "ok\n",
+ "verdict=malicious score=1.00 source=l1 reason=ip+reputation\n"]
+--- no_error_log
+L3 error

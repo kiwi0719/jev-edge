@@ -116,20 +116,24 @@ GEMINI_CONTENTS = "contents"
 # `content`, which jev-edge would read in-line too) is sent.
 MEDIA_PARTS = frozenset({"image_url", "input_image", "image", "input_audio", "audio", "file", "input_file"})
 # Keys whose values are media payloads wherever they appear (`bytes`: a
-# Bedrock Converse image, document or video source), except in tool-call
-# arguments (TOOL_ARGUMENTS).
+# Bedrock Converse image, document or video source), except in tool calls
+# and tool results sent whole (SENT_WHOLE).
 MEDIA_KEYS = frozenset({"image_url", "input_audio", "file_data", "inline_data", "inlineData", "bytes"})
 # Strings under these keys name structure, not text: a body with nothing else
-# is not worth a round trip.
+# is not worth a round trip. Below a path sent whole every key and string is
+# text.
 STRUCTURAL_KEYS = frozenset({"role", "type", "id", "call_id", "tool_call_id", "tool_use_id", "name",
                              "media_type", "status", "model", "cache_control"})
-# Tool-call arguments, sent whole like the tool definitions: jev-edge reads
-# every key and string below the ones it knows (messages[*].tool_calls[*]
-# .function.arguments.**, messages[*].content[*].input.**, ...), so a key
-# the media filter drops elsewhere (`bytes`, `image_url`) is model-visible
-# text here. Paths from a top-level key, keys folded as jev-edge folds them,
-# "*" for each item of an array. Bedrock Converse's toolUse.input and
-# Gemini's functionCall.args are tool-call arguments too.
+# Paths from a top-level key, keys folded as jev-edge folds them, "*" for
+# each item of an array.
+# Tool-call arguments, sent whole like the tool definitions: they are
+# model-visible text, so a key the media filter drops elsewhere (`bytes`,
+# `image_url`) is text here. jev-edge's rules for tool-call arguments read
+# every key and string of OpenAI's, Anthropic's and the Responses API's
+# (messages[*].tool_calls[*].function.arguments.**,
+# messages[*].content[*].input.**, ...). None reads Bedrock Converse's
+# toolUse.input or Gemini's functionCall.args: sent as the model gets them
+# all the same.
 TOOL_ARGUMENTS = frozenset({
     ("messages", "*", "tool_calls", "*", "function", "arguments"),
     ("messages", "*", "tool_calls", "*", "custom", "input"),
@@ -139,9 +143,24 @@ TOOL_ARGUMENTS = frozenset({
     ("input", "*", "arguments"),
     ("input", "*", "input"),
     ("contents", "*", "parts", "*", "functioncall", "args"),
+    ("contents", "*", "parts", "*", "function_call", "args"),
     ("contents", "parts", "*", "functioncall", "args"),
+    ("contents", "parts", "*", "function_call", "args"),
 })
-_TOOL_ARGUMENT_PREFIXES = frozenset(p[:i] for p in TOOL_ARGUMENTS for i in range(1, len(p)))
+# Tool results the model reads as JSON, sent whole for the same reason:
+# Gemini's functionResponse.response (function_response in the REST API's
+# snake_case), which jev-edge reads whole, every key and string, as a tool
+# result, and a Bedrock Converse toolResult's `json` blocks. A toolResult's
+# image, document and video blocks are media: their `bytes` are left out.
+TOOL_RESULTS = frozenset({
+    ("contents", "*", "parts", "*", "functionresponse", "response"),
+    ("contents", "*", "parts", "*", "function_response", "response"),
+    ("contents", "parts", "*", "functionresponse", "response"),
+    ("contents", "parts", "*", "function_response", "response"),
+    ("messages", "*", "content", "*", "toolresult", "content", "*", "json"),
+})
+SENT_WHOLE = TOOL_ARGUMENTS | TOOL_RESULTS
+_SENT_WHOLE_PREFIXES = frozenset(p[:i] for p in SENT_WHOLE for i in range(1, len(p)))
 # Containers nested deeper than this below a top-level key are dropped:
 # jev-edge's decoder (cjson) refuses JSON nested more than 1000 levels, and
 # the body's own top-level object is the first of them. Below that, jev-edge
@@ -267,19 +286,33 @@ def _fold(key: str) -> str:
     return key.lower().replace("\u017f", "s")
 
 
+_WHOLE = object()
+
+
+def _step(path: Any, seg: str) -> Any:
+    """Where a child at `seg` is: _WHOLE below a path sent whole, the path
+    while it can still lead to one, None once it cannot."""
+    if path is None or path is _WHOLE:
+        return path
+    path = path + (seg,)
+    if path in SENT_WHOLE:
+        return _WHOLE
+    return path if path in _SENT_WHOLE_PREFIXES else None
+
+
 def _clean(node: Any, media: bool = True, key: Optional[str] = None) -> Any:
     """A JSON-safe copy of `node`, the value of top-level key `key`, to
-    MAX_DEPTH, without media payloads outside tool-call arguments (with
-    `media` false, everything JSON can carry is kept). Built with a stack of
-    its own, so a client's nesting cannot exhaust Python's recursion limit;
-    every container is placed when its parent is copied, so keys and items
-    keep their order."""
+    MAX_DEPTH, without media payloads outside the paths sent whole
+    (SENT_WHOLE; with `media` false, everything JSON can carry is kept).
+    Built with a stack of its own, so a client's nesting cannot exhaust
+    Python's recursion limit; every container is placed when its parent is
+    copied, so keys and items keep their order."""
     stack: list = []
 
     def start(v: Any, depth: int, media: bool, path: Optional[tuple]) -> Any:
         """A scalar as it is sent, an empty container queued to be filled,
-        or _DROP. `path` is where `v` is while it can still lead to tool-call
-        arguments, None once it cannot."""
+        or _DROP. `path` is where `v` is while it can still lead to a path
+        sent whole, None once it cannot."""
         if isinstance(v, str) or v is None or isinstance(v, (bool, int)):
             return v
         if isinstance(v, float):
@@ -302,15 +335,11 @@ def _clean(node: Any, media: bool = True, key: Optional[str] = None) -> Any:
 
     def below(media: bool, path: Optional[tuple], seg: str) -> tuple:
         """`media` and `path` for a child at `seg` ("*" for an array item)."""
-        if path is None:
-            return media, None
-        path = path + (seg,)
-        if path in TOOL_ARGUMENTS:
-            return False, None
-        return media, (path if path in _TOOL_ARGUMENT_PREFIXES else None)
+        p = _step(path, seg)
+        return (False, None) if p is _WHOLE else (media, p)
 
     top = (_fold(key),) if media and key is not None else None
-    root = start(node, 1, media, top if top in _TOOL_ARGUMENT_PREFIXES else None)
+    root = start(node, 1, media, top if top in _SENT_WHOLE_PREFIXES else None)
     while stack:
         src, out, depth, media, path = stack.pop()
         if isinstance(out, list):
@@ -329,8 +358,11 @@ def _clean(node: Any, media: bool = True, key: Optional[str] = None) -> Any:
         for k, v in src.items():
             k = str(k)
             cmedia, cpath = below(media, path, _fold(k)) if path is not None else (media, None)
-            # tool-call arguments are read whatever the part they are in
-            if cmedia and (k in MEDIA_KEYS or (keep is not None and k not in keep)):
+            # a path sent whole, and the keys on the way to one, are kept
+            # whatever the part they are in: LiteLLM's generateContent
+            # adapter reads a part's functionResponse next to a `type` of
+            # "image", and jev-edge reads a part's `input` whatever its type
+            if cmedia and cpath is None and (k in MEDIA_KEYS or (keep is not None and k not in keep)):
                 continue
             c = start(v, depth + 1, cmedia, cpath)
             if c is not _DROP:
@@ -387,19 +419,23 @@ def _dumps(node: Any) -> str:
     return "".join(out)
 
 
-def _has_text(node: Any) -> bool:
-    """Whether any string in `node` is text, not a structural name; without
-    recursion, as _clean."""
-    stack = [(node, "")]
+def _has_text(body: dict) -> bool:
+    """Whether any string in `body` is text, not a structural name: below a
+    path sent whole every key and string is (jev-edge reads a Gemini
+    function response whole, keys too). Without recursion, as _clean."""
+    stack: list = [(body, "", ())]
     while stack:
-        n, key = stack.pop()
+        n, key, path = stack.pop()
         if isinstance(n, str):
-            if n != "" and key not in STRUCTURAL_KEYS:
+            if n != "" and (path is _WHOLE or key not in STRUCTURAL_KEYS):
                 return True
         elif isinstance(n, dict):
-            stack.extend((v, k) for k, v in n.items())
+            for k, v in n.items():
+                if path is _WHOLE and k != "":
+                    return True
+                stack.append((v, k, _step(path, _fold(k))))
         elif isinstance(n, list):
-            stack.extend((v, key) for v in n)
+            stack.extend((v, key, _step(path, "*")) for v in n)
     return False
 
 
@@ -761,7 +797,8 @@ class JevEdgeGuardrail(_ApplyGuardrailBase):
         `extra_fields`, `query`, `text`, `prompt`, `input` and `messages`,
         with the system prompt (`system`, `instructions`) as the first
         message, and Gemini's `contents`; media payloads removed outside
-        tool-call arguments. None when no value holds any text."""
+        the tool calls and tool results sent whole. None when no value holds
+        any text."""
         body = _body_dict(data, _parse_fields(extra_fields) if extra_fields else ())
         return None if body is None else _dumps(body)
 

@@ -13,6 +13,8 @@ export interface Sample {
   text: string;
   /** the tool definitions (rule.tool_fields), normalized like `text`; absent when there are none */
   tools?: string;
+  /** the id of the rule that judged it, as core/sampling.lua records it */
+  rule?: string;
 }
 
 export function shouldSample(cfg: Config, v: Verdict, rand: () => number = Math.random): boolean {
@@ -50,6 +52,6 @@ export function buildSample(cfg: Config, v: Verdict, req: Req, rules: Rule[], ri
   return {
     ts, rid, path: req.path ?? "", ip: req.client_ip ?? "", method: req.method ?? "",
     fp: v.fingerprint, score: v.score, verdict: v.verdict, action: v.action, source: v.source, reason: v.reason, l2_ms: v.l2_ms,
-    text, ...(tools !== undefined ? { tools } : {}),
+    text, ...(tools !== undefined ? { tools } : {}), ...(rule?.id !== undefined ? { rule: rule.id } : {}),
   };
 }

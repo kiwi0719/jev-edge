@@ -223,12 +223,21 @@ local function maybe_async(rt, v, req)
     client_ip = req.client_ip })
 end
 
+-- every route's samples go into the one jev_cache ring: each names its route
+local warned_ring = false
 local function maybe_sample(rt, v, req)
   if not sampling.should_sample(rt.cfg, v, math.random) then return end
   local ok, err = pcall(function()
     local s = sampling.build(rt.cfg, v, req, rules_mod.rule_for(req, rt.rules, { json_decode = cjson.decode }),
       { rid = ngx.var.request_id, ts = ngx.now(), json_decode = cjson.decode })
-    sampling.store(rt.cfg, cache, s)
+    local route = kong.router.get_route()
+    s.route = route and (route.id or route.name) or nil
+    local _, other = sampling.store(rt.cfg, cache, s)
+    if other and not warned_ring then
+      warned_ring = true
+      kong.log.warn("jev-edge: sampling.max_samples differs from the ring's size in jev_cache; ",
+        "samples go into the ring as its first writer sized it")
+    end
     if rt.cfg.sampling.log then kong.log.info("jev-edge sample: ", cjson.encode(s)) end
   end)
   if not ok then kong.log.warn("jev-edge: sampling failed: ", err) end

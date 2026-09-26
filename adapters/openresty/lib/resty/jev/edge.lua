@@ -212,12 +212,18 @@ end
 
 -- Decision sampling: a share of judged requests, normalized text only, kept
 -- in the cache dict ring for /_jev/samples. Off unless sampling.enabled.
+local warned_ring = false
 local function maybe_sample(cfg, v, req, rules)
   if not sampling.should_sample(cfg, v, math.random) then return end
   local ok, err = pcall(function()
     local s = sampling.build(cfg, v, req, rules_mod.rule_for(req, rules, { json_decode = cjson.decode }),
       { rid = ngx.var.request_id, ts = ngx.now(), json_decode = cjson.decode })
-    sampling.store(cfg, cache, s)
+    local _, other = sampling.store(cfg, cache, s)
+    if other and not warned_ring then
+      warned_ring = true
+      ngx.log(ngx.WARN, "jev-edge: sampling.max_samples differs from the ring's size in the shared dict; ",
+        "samples go into the ring as its first writer sized it")
+    end
     if cfg.sampling.log then ngx.log(ngx.INFO, "jev-edge sample: ", cjson.encode(s)) end
   end)
   if not ok then ngx.log(ngx.WARN, "jev-edge: sampling failed: ", err) end

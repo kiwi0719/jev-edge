@@ -263,12 +263,20 @@ end
 
 -- Decision sampling into the shared dict ring; read it with
 -- `resty.jev.edge.samples()` on the OpenResty side or through sampling.log.
+-- Every route's samples go into the one jev_cache ring: each names its route.
+local warned_ring = false
 local function maybe_sample(rt, v, req, ctx)
   if not sampling.should_sample(rt.cfg, v, math.random) then return end
   local ok, err = pcall(function()
     local s = sampling.build(rt.cfg, v, req, rule_for(rt, req),
       { rid = ctx.var.request_id, ts = ngx.now(), json_decode = cjson.decode })
-    sampling.store(rt.cfg, cache, s)
+    s.route = ctx.route_id or ctx.var.route_id
+    local _, other = sampling.store(rt.cfg, cache, s)
+    if other and not warned_ring then
+      warned_ring = true
+      core.log.warn("jev-edge: sampling.max_samples differs from the ring's size in jev_cache; ",
+        "samples go into the ring as its first writer sized it")
+    end
     if rt.cfg.sampling.log then core.log.info("jev-edge sample: ", cjson.encode(s)) end
   end)
   if not ok then core.log.warn("jev-edge: sampling failed: ", err) end

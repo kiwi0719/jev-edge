@@ -285,6 +285,10 @@ describe("rules: json_only_paths (twin of core/spec/rules_spec.lua)", () => {
     const chat = { method: "POST", path: "/v1/chat/completions", headers: { "content-type": "application/json" },
       body: JSON.stringify({ messages: [{ role: "user", content: ASK }] }) };
     expect(buildSample(cfg, v, chat, [tenant, rule], "r3").text).toBe(normalize(ASK));
+    // the sample names its rule, as core/sampling.lua records it
+    // (g2-cache-scope-and-cross-instance-state#4)
+    expect(buildSample(cfg, v, chat, [tenant, rule], "r3").rule).toBe("llm-endpoints");
+    expect("rule" in buildSample(cfg, v, root("application/x-www-form-urlencoded", FORM), [rule], "r2")).toBe(false);
   });
 
   it("applies only to the paths it lists", async () => {

@@ -70,6 +70,6 @@ location /v1/ { $::Access $::Echo }
 Content-Type: application/json
 X-Jev-Mock-Score: 0.2
 --- response_body_like eval
-['"ok":true', "verdict=safe score=0.20 source=l2", "verdict=safe score=0.20 source=l2", '"path":"\\\\/v1\\\\/chat\\\\/completions".*"path":"\\\\/v1\\\\/billing\\\\/chat"']
+['"ok":true', "verdict=safe score=0.20 source=l2", "verdict=safe score=0.20 source=l2", '^(?=.*"rule":"billing")(?=.*"rule":"llm-endpoints").*"path":"\\\\/v1\\\\/chat\\\\/completions".*"path":"\\\\/v1\\\\/billing\\\\/chat"']
 --- no_error_log
 [error]

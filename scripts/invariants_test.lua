@@ -231,6 +231,34 @@ local cases = {
     { [REL] = edit(rel, "pnpm install %-%-frozen%-lockfile %-%-ignore%-scripts", "pnpm install --frozen-lockfile") },
     "release-token", "job build: pnpm install runs dependency scripts" },
 
+  -- release-on-main: both jobs check that a tag's commit is on main (lead-github-ops#32)
+  { "release-npm.yml: build does not check main",
+    { [REL] = edit(rel, "\n        run: |\n          if ! git merge%-base[^\n]*\n[^\n]*\n[^\n]*\n          fi\n",
+        "\n        run: echo skipped\n") },
+    "release-on-main", "job build does not check that a tag's commit is on main" },
+  { "release-npm.yml: publish does not check main",
+    { [REL] = edit(rel, "compare/main%.%.%.%$GITHUB_SHA", "compare/$GITHUB_SHA...$GITHUB_SHA") },
+    "release-on-main", "job publish does not check that a tag's commit is on main" },
+  { "release-npm.yml: build checks a release branch instead of main",
+    { [REL] = edit(rel, '(%-%-is%-ancestor "%$GITHUB_SHA" origin/)main', "%1release/0.6") },
+    "release-on-main", "job build does not check that a tag's commit is on main" },
+  { "release-npm.yml: build's check never runs",
+    { [REL] = edit(rel, "(\n      %- name: A tag's commit is on main\n        if: )github%.ref_type == 'tag'"
+        .. "(\n        working%-directory: %.)", "%1false%2") },
+    "release-on-main", "job build: the check that a tag's commit is on main runs only if false" },
+  { "release-npm.yml: publish's check runs on dry runs only",
+    { [REL] = edit(rel, "(\n      %- name: A tag's commit is on main\n        if: )github%.ref_type == 'tag'"
+        .. "(\n        env:\n          GH_TOKEN)", "%1${{ inputs.dry_run }}%2") },
+    "release-on-main", "job publish: the check that a tag's commit is on main runs only if inputs.dry_run" },
+  { "release-npm.yml: build's check as ${{ }}",
+    { [REL] = edit(rel, "(\n      %- name: A tag's commit is on main\n        if: )github%.ref_type == 'tag'"
+        .. "(\n        working%-directory: %.)", "%1${{ github.ref_type == 'tag' }}%2") } },
+  { "release-npm.yml: shallow checkout",
+    { [REL] = edit(rel, "\n          fetch%-depth: 0[^\n]*", "") },
+    "release-on-main", "job build: checks main's history without fetching it" },
+  { "security.yml: package_json_file with a trailing comment",
+    { [SEC] = edit(sec, "(package_json_file: adapters/js/package%.json)", "%1 # the pin") } },
+
   -- rule-parity: a path watched for any body on one runtime only
   { "rules: json_only_paths emptied in the TS copy",
     { [TSRULES] = edit(tsr, 'json_only_paths: %["%^/%$"%]', "json_only_paths: []") },

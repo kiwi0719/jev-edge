@@ -102,11 +102,11 @@ local function workflow_jobs(src)
 end
 
 -- the steps of a workflow (or of one job's lines) whose `uses:` matches the
--- Lua pattern pat, each as "\n<its lines>\n" without comment lines
+-- Lua pattern pat, each as "\n<its lines>\n" without comments
 local function steps_using(ls, pat)
   local code_ls = {}
   for _, l in ipairs(ls) do
-    if not l:match("^%s*#") then code_ls[#code_ls + 1] = l end
+    if not l:match("^%s*#") then code_ls[#code_ls + 1] = (l:gsub("%s+#.*$", "")) end
   end
   local out = {}
   for i, l in ipairs(code_ls) do
@@ -523,8 +523,7 @@ rule("pnpm-pin", function(r)
   end
   for _, wf in ipairs(tracked(".github/workflows", "%.ya?ml$")) do
     for _, step in ipairs(steps_using(yaml_lines(read(wf)), "pnpm/action%-setup@")) do
-      if not step:find("\n%s*package_json_file:%s*adapters/js/package%.json%s*\n")
-         and not step:find("\n%s*package_json_file:%s*adapters/js/package%.json%s+#[^\n]*\n") then
+      if not step:find("\n%s*package_json_file:%s*adapters/js/package%.json%s*\n") then
         fail(r, wf .. ": pnpm/action-setup does not read the version from adapters/js/package.json")
       end
       if step:find("\n%s*version:") then fail(r, wf .. ": pnpm/action-setup sets a pnpm version of its own") end
@@ -637,6 +636,63 @@ rule("release-token", function(r)
   end
   if #holders ~= 1 then
     fail(r, WF .. ": " .. #holders .. " jobs hold the OIDC token (" .. table.concat(holders, ", ") .. "), not one")
+  end
+end)
+
+-- 16. A release comes from a commit already on main, checked by both jobs of
+--     release-npm.yml on every tag run (lead-github-ops#32: a v* tag pushed
+--     on an unmerged commit published it with provenance). The build job
+--     asks git, with main's history fetched; the publish job, which checks
+--     nothing out, asks GitHub's compare API.
+local function job_steps(ls)
+  local steps, cur, ind = {}, nil, nil
+  for _, l in ipairs(code_lines(ls)) do
+    local sp = l:match("^(%s*)steps:%s*$")
+    if sp then
+      ind, cur = #sp, nil
+    elseif ind then
+      local lead = #l:match("^(%s*)")
+      if l:match("%S") and lead <= ind then
+        ind, cur = nil, nil
+      elseif l:match("^%s*%- ") and (lead == ind + 2 or lead == ind) then
+        cur = { l }
+        steps[#steps + 1] = cur
+      elseif cur then
+        cur[#cur + 1] = l
+      end
+    end
+  end
+  return steps
+end
+
+rule("release-on-main", function(r)
+  local WF = ".github/workflows/release-npm.yml"
+  local jobs, body = workflow_jobs(read(WF))
+  if #jobs == 0 then return fail(r, WF .. ": no jobs found") end
+  for _, j in ipairs(jobs) do
+    local found = false
+    for _, st in ipairs(job_steps(body[j])) do
+      local t = "\n" .. table.concat(st, "\n") .. "\n"
+      local git = t:find('git merge-base --is-ancestor "$GITHUB_SHA" origin/main', 1, true)
+      local api = t:find("compare/main...$GITHUB_SHA", 1, true) and t:find("ahead_by", 1, true)
+      if git or api then
+        found = true
+        local cond = t:match("\n[%s%-]*if:%s*([^\n]-)%s*\n")
+        if cond then
+          cond = cond:match("^%${{%s*(.-)%s*}}$") or cond
+          if cond ~= "github.ref_type == 'tag'" then
+            fail(r, "job " .. j .. ": the check that a tag's commit is on main runs only if " .. cond)
+          end
+        end
+        if git then
+          local co = steps_using(body[j], "actions/checkout@")[1] or ""
+          if not co:find("\n%s*fetch%-depth:%s*0%s*\n") then
+            fail(r, "job " .. j .. ": checks main's history without fetching it (checkout fetch-depth: 0)")
+          end
+        end
+      end
+    end
+    if not found then fail(r, "job " .. j .. " does not check that a tag's commit is on main") end
   end
 end)
 

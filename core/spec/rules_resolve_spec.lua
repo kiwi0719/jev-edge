@@ -58,6 +58,17 @@ describe("rules.resolve", function()
     assert.same({}, r.json_only_paths)
   end)
 
+  it("checks token_prompts and fills in unjudgeable", function()
+    assert.equals("unjudgeable", rules.resolve("llm-endpoints", load).token_prompts)
+    assert.equals("unjudgeable", rules.resolve({ id = "x", watch_paths = { "^/x" } }, load).token_prompts)
+    assert.equals("block", rules.resolve({ id = "b", extends = "llm-endpoints", token_prompts = "block" }, load)
+      .token_prompts)
+    local r, err = rules.resolve({ id = "t", extends = "llm-endpoints", token_prompts = "pass" }, load)
+    assert.is_nil(r)
+    assert.matches("rule t: token_prompts must be unjudgeable|block", err, 1, true)
+    assert.is_nil(rules.resolve({ id = "t", watch_paths = { "^/" }, token_prompts = true }, load))
+  end)
+
   it("rejects capture errors that only raise once a subject reaches them", function()
     for _, p in ipairs({ "^/v1/(chat", "^/v1/chat)", "^/v1/%1", "^/(v1)/%2", "^/(v1%1)", "^/%0" }) do
       local r, err = rules.resolve({ id = "t", watch_paths = { p } }, load)

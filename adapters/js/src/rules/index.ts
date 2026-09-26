@@ -52,13 +52,16 @@ export const llmEndpoints: Rule = {
     "prompt", "prompt.prompt_string", "prompt[*].prompt_string", "prompt.variables.**",
     "input", "input[*].arguments.**", "input[*].input", "input[*].output",
     "inputs", "instances[*].inputs", "instances[*].messages[*].content",
-    "query", "text", "suffix", "input_prefix", "input_suffix", "input_extra[*].text",
+    "query", "text", "input_ids", "suffix", "input_prefix", "input_suffix", "input_extra[*].text",
   ],
   // tool definitions and output schemas (Gemini's functionDeclarations are
   // under tools), judged as a part of their own with their own verdict-cache
   // entry (see rules/llm-endpoints.lua)
   tool_fields: ["tools", "functions", "response_format.json_schema", "text.format"],
   min_text_chars: 20,
+  // a prompt sent as token ids: "unjudgeable" (policy.unjudgeable decides) or
+  // "block" (refused in enforce mode); see rules/llm-endpoints.lua
+  token_prompts: "unjudgeable",
   always_suspect: [
     String.raw`\b(ignore|disregard|forget)\b.{0,20}\b(previous|prior|above|earlier|all)\b.{0,20}\b(instructions?|rules?|prompts?)\b`,
     String.raw`\byou are now\b`,
@@ -125,6 +128,12 @@ export function resolve(spec: RuleSpec): Rule {
   }
   const [uok, uerr] = validateUntrusted(out.untrusted, `rule ${out.id}: untrusted`);
   if (!uok) throw new Error(uerr);
+  // a prompt sent as token ids: "unjudgeable" leaves it to policy.unjudgeable,
+  // "block" refuses it in enforce mode whatever that says
+  if (out.token_prompts === undefined || out.token_prompts === null) out.token_prompts = "unjudgeable";
+  if (out.token_prompts !== "unjudgeable" && out.token_prompts !== "block") {
+    throw new Error(`rule ${out.id}: token_prompts must be unjudgeable|block`);
+  }
   out.text_fields ??= [
     "system", "instructions", "preamble", "system_prompt", "systemInstruction.parts",
     "system_instruction.parts", "documents", "template",
@@ -136,7 +145,7 @@ export function resolve(spec: RuleSpec): Rule {
     "prompt", "prompt.prompt_string", "prompt[*].prompt_string", "prompt.variables.**",
     "input", "input[*].arguments.**", "input[*].input", "input[*].output",
     "inputs", "instances[*].inputs", "instances[*].messages[*].content",
-    "query", "text", "suffix", "input_prefix", "input_suffix", "input_extra[*].text",
+    "query", "text", "input_ids", "suffix", "input_prefix", "input_suffix", "input_extra[*].text",
   ];
   out.tool_fields ??= ["tools", "functions", "response_format.json_schema", "text.format"];
   for (const k of ["text_fields", "tool_fields"] as const) {

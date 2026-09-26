@@ -137,11 +137,14 @@ function functionResponses(part: { [k: string]: JsonValue }, out: string[]): voi
 // Cohere v2 `document` part (a tool result's) under `document`; the last two
 // are read whole (readWhole).
 // The depth leaves room for a content document inside a tool_result.
-// Anything else (numbers, images) contributes nothing.
+// Anything else (images) contributes nothing, and so do numbers, but a number
+// that is an item of a list is a token id (a prompt as token ids: OpenAI
+// completions, vLLM, SGLang, llama.cpp ids and strings mixed): `st.tokens`
+// is set then.
 // Mirrors collect() in core/normalize.lua, including Lua's "array if [1] is
 // set" test: an empty array is a table with no array part and yields nothing.
 const LEAF_DEPTH = 6;
-function collect(node: JsonValue | undefined, out: string[], depth: number): void {
+function collect(node: JsonValue | undefined, out: string[], depth: number, st?: { tokens: boolean }): void {
   if (typeof node === "string") {
     out.push(node);
     return;
@@ -152,18 +155,22 @@ function collect(node: JsonValue | undefined, out: string[], depth: number): voi
     // cjson: cjson.null is a value, ipairs goes on past it)
     for (const item of node) {
       if (item === null || item === undefined) continue;
-      collect(item, out, depth + 1);
+      if (typeof item === "number") {
+        if (st) st.tokens = true;
+      } else {
+        collect(item, out, depth + 1, st);
+      }
     }
     return;
   }
   if (typeof node.text === "string") out.push(node.text);
-  if (node.content !== undefined && node.content !== null) collect(node.content, out, depth + 1);
+  if (node.content !== undefined && node.content !== null) collect(node.content, out, depth + 1, st);
   const src = node.source;
   if (isObj(src) && !Array.isArray(src)) {
     if (src.type === "text" && typeof src.data === "string") out.push(src.data);
-    if (src.type === "content" && src.content !== undefined && src.content !== null) collect(src.content, out, depth + 1);
+    if (src.type === "content" && src.content !== undefined && src.content !== null) collect(src.content, out, depth + 1, st);
   }
-  if (node.type === "file_search_call" && isObj(node.results)) collect(node.results, out, depth + 1);
+  if (node.type === "file_search_call" && isObj(node.results)) collect(node.results, out, depth + 1, st);
   functionResponses(node, out);
   if (node.type === "document" && node.document !== undefined) readWhole(node.document, out, 1);
 }
@@ -226,6 +233,8 @@ interface WalkState {
   /** what nodesBelow() may still count (see counted) */
   counts: number;
   capped: boolean;
+  /** a text field holds token ids (collect) */
+  tokens: boolean;
   /** json_decode, for "**" values that are a string of JSON */
   decode?: Decode;
   /** the "**" values, in document order */
@@ -233,7 +242,7 @@ interface WalkState {
 }
 
 function newState(decode?: Decode): WalkState {
-  return { out: [], nodes: DEEP.nodes, counts: DEEP.count * DEEP.nodes, capped: false, decode, defer: [] };
+  return { out: [], nodes: DEEP.nodes, counts: DEEP.count * DEEP.nodes, capped: false, tokens: false, decode, defer: [] };
 }
 
 /** Lua string order (bytes): UTF-16 order except that a character above U+FFFF sorts after all others. */
@@ -469,8 +478,8 @@ function fieldPath(f: string): Segs {
 }
 
 const OP_END = 1, OP_DEEP = 2, OP_KEY = 3;
-/** A path that ends here; `depth`: collect()'s or readWhole()'s, 2 for a path that ends at an array read item by item; `whole`, `keyed`: fieldPath's flags (`keyed` only for the value the path ends at). */
-interface EndOp { kind: typeof OP_END; depth: number; whole?: boolean; keyed?: boolean }
+/** A path that ends here; `depth`: collect()'s or readWhole()'s, 2 for a path that ends at an array read item by item; `whole`, `keyed`: fieldPath's flags (`keyed` only for the value the path ends at); `item`: the value is an item of the list the path ends at, where a number is a token id. */
+interface EndOp { kind: typeof OP_END; depth: number; whole?: boolean; keyed?: boolean; item?: boolean }
 /** A "**" here. */
 interface DeepOp { kind: typeof OP_DEEP }
 /** A key the paths go on through: the plan for its value when that is not an array (`whole`), and when it is, the plans for the array and for each item. */
@@ -479,8 +488,8 @@ type Op = EndOp | DeepOp | KeyOp;
 /** What to do at a node, in the order the first path for each op comes; `folded`, `first`, `lens`, `exact`: for variantsOf. */
 interface Plan { ops: Op[]; folded?: Map<string, number[]>; first?: Set<number>; lens?: Set<number>; exact?: Set<string> }
 
-/** One path from a node: its segments and the next one's index; `depth`: collect()'s, for a path read item by item. */
-interface Cursor { segs: Segs; i: number; depth?: number }
+/** One path from a node: its segments and the next one's index; `depth`: collect()'s, for a path read item by item; `item`: an item of the list a path that ends with "[*]" ends at. */
+interface Cursor { segs: Segs; i: number; depth?: number; item?: boolean }
 
 // Port of compile: `leaf` (tool_fields) reads an array that ends a path whole.
 function compile(cursors: Cursor[], leaf: boolean): Plan {
@@ -489,7 +498,10 @@ function compile(cursors: Cursor[], leaf: boolean): Plan {
   for (const c of cursors) {
     const seg = c.segs[c.i];
     if (seg === undefined) {
-      ops.push({ kind: OP_END, depth: c.depth ?? 1, whole: c.segs.whole, keyed: c.segs.keyed && c.depth === undefined });
+      ops.push({
+        kind: OP_END, depth: c.depth ?? 1, whole: c.segs.whole, keyed: c.segs.keyed && c.depth === undefined,
+        item: c.item === true || c.depth === 2,
+      });
     } else if (seg.deep) {
       ops.push({ kind: OP_DEEP });
     } else {
@@ -509,8 +521,10 @@ function compile(cursors: Cursor[], leaf: boolean): Plan {
     const wholeArr: Cursor[] = [];
     const itemsArr: Cursor[] = [];
     for (const c of groups.get(op.key)!) {
-      const nxt = { segs: c.segs, i: c.i + 1 };
+      const nxt: Cursor = { segs: c.segs, i: c.i + 1 };
       if (c.segs[c.i].each) {
+        // a path that ends with "[*]": each item is a value it ends at
+        if (c.i === c.segs.length - 1) nxt.item = true;
         itemsArr.push(nxt);
       } else {
         whole.push(nxt);
@@ -610,7 +624,8 @@ function walk(node: JsonValue | undefined, plan: Plan, st: WalkState): void {
       if (st.leaf) st.leaf(node, st);
       else if (op.whole) readWhole(node, st.out as string[], op.depth);
       else {
-        collect(node, st.out as string[], op.depth);
+        if (op.item && typeof node === "number") st.tokens = true;
+        collect(node, st.out as string[], op.depth, st);
         if (op.keyed && isObj(node) && !Array.isArray(node)) for (const k of objectKeys(node)) take(st, k);
       }
     } else if (op.kind === OP_DEEP) {
@@ -655,11 +670,11 @@ export function extractJsonValues(decoded: JsonValue, fields: string[], jsonDeco
   return extractJsonState(decoded, fields, jsonDecode).out;
 }
 
-function extractJsonState(decoded: JsonValue, fields: string[], jsonDecode?: Decode): { out: string[]; capped: boolean } {
+function extractJsonState(decoded: JsonValue, fields: string[], jsonDecode?: Decode): { out: string[]; capped: boolean; tokens: boolean } {
   const st = newState(jsonDecode);
   sortLeft = WHOLE_SORT;
   walk(decoded, planOf(fields, false), st);
-  return { out: settle(st), capped: st.capped };
+  return { out: settle(st), capped: st.capped, tokens: st.tokens };
 }
 
 /**
@@ -942,15 +957,16 @@ export function jsonLike(s: string | undefined | null, contentType: string | und
 /**
  * Extract text from a raw body. Returns the text (values joined with "\n"),
  * the kind, the values in order (newest last) for window(), the decoded
- * JSON value when the kind is "json", and true when a "**" walk hit a bound
- * and left something out.
+ * JSON value when the kind is "json", true when a "**" walk hit a bound
+ * and left something out, and true when a text field holds token ids (kind
+ * "json" or "scan").
  */
 export function extract(
   body: string | undefined | null,
   contentType: string | undefined | null,
   fields: string[],
   jsonDecode: (s: string) => JsonValue = (s) => JSON.parse(s) as JsonValue,
-): [string, ExtractKind, string[], JsonValue?, boolean?] {
+): [string, ExtractKind, string[], JsonValue?, boolean?, boolean?] {
   if (typeof body !== "string" || body === "") return ["", "none", []];
   const rawCt = typeof contentType === "string" ? contentType : "";
   const ct = asciiLower(rawCt);
@@ -972,7 +988,7 @@ export function extract(
     if (ok && isObj(decoded) && tooDeep(body)) ok = false;
     if (ok && isObj(decoded)) {
       const st = extractJsonState(decoded as JsonValue, fields, jsonDecode);
-      return [st.out.join("\n"), "json", st.out, decoded as JsonValue, st.capped];
+      return [st.out.join("\n"), "json", st.out, decoded as JsonValue, st.capped, st.tokens];
     }
     // a JSON scalar has no text fields
     if (declaredJson && ok && decoded !== undefined) return ["", "none", []];
@@ -984,12 +1000,14 @@ export function extract(
     // objects under a "**" path's key. Under a form or multipart type the
     // values that reading gives follow, since a backend of that kind reads
     // the body so. Declared JSON with nothing to scan is unjudgeable, never
-    // "no text"; any other body with nothing to scan is read as before.
-    const out = scanStrings(body, fieldKeys(fields), [], deepKeys(fields));
-    if (out.length > 0) {
+    // "no text"; any other body with nothing to scan is read as before. A
+    // text field that holds token ids is found the same way.
+    const found = { tokens: false };
+    const out = scanStrings(body, fieldKeys(fields), [], deepKeys(fields), found);
+    if (out.length > 0 || found.tokens) {
       if (form && !declaredJson) formValues(body, out);
       else if (multipart && !declaredJson) multipartValues(body, rawCt, out);
-      return [out.join("\n"), "scan", out];
+      return [out.join("\n"), "scan", out, undefined, undefined, found.tokens];
     }
     if (declaredJson) return ["", "invalid", []];
   }
@@ -1093,15 +1111,43 @@ export function deepKeys(fields: string[] | undefined): Map<string, "any" | "obj
   return out;
 }
 
+// Port of holds_number: true when the JSON list that starts at `i` (a "[")
+// holds a number, a token id, before anything ends the look: the list's own
+// end, an object or a literal, or the end of `s`. Nested lists and strings
+// are passed over (llama.cpp takes ids and strings mixed).
+function holdsNumber(s: string, i: number): boolean {
+  let depth = 0;
+  for (;;) {
+    while (i < s.length && (s[i] === " " || s[i] === "\t" || s[i] === "\n" || s[i] === "\r" || s[i] === ",")) i++;
+    if (i >= s.length) return false;
+    const c = s[i];
+    if (c === "[") {
+      depth++;
+      i++;
+    } else if (c === "]") {
+      depth--;
+      if (depth <= 0) return false;
+      i++;
+    } else if (c === '"') {
+      i = readString(s, i + 1)[1];
+    } else {
+      return c === "-" || (c >= "0" && c <= "9");
+    }
+  }
+}
+
 /**
  * Collect the string values of `keys` (from fieldKeys) from possibly
  * truncated JSON. Keys match the way walk() matches them: folded. With
  * `deep` (from deepKeys), the value of a "**" path's key is read as the walk
  * reads it, every key and string in it in the order they come: an object,
  * and an array when no other path ends at that key; otherwise the scan goes
- * on inside it, as for any other key.
+ * on inside it, as for any other key. With `found`, found.tokens is set when
+ * one of `keys` holds a list with a number in it: token ids (see collect).
  */
-export function scanStrings(s: string, keys: Set<string>, out: string[], deep?: Map<string, "any" | "object">): string[] {
+export function scanStrings(
+  s: string, keys: Set<string>, out: string[], deep?: Map<string, "any" | "object">, found?: { tokens: boolean },
+): string[] {
   // key characters: ASCII word characters, U+017F and U+212A; the value
   // starts with a quote or a bracket (a number or a literal is passed over)
   const re = /"([A-Za-z0-9_\-\u017F\u212A]+)"[ \t\n\v\f\r]*:[ \t\n\v\f\r]*(?=["{[])/g;
@@ -1115,6 +1161,7 @@ export function scanStrings(s: string, keys: Set<string>, out: string[], deep?: 
     } else {
       const d = deep?.get(fold(m[1]));
       if (d !== undefined && (s[at] === "{" || d === "any")) re.lastIndex = scanValue(s, at, out, false);
+      else if (found && s[at] === "[" && !found.tokens && keys.has(fold(m[1])) && holdsNumber(s, at)) found.tokens = true;
     }
   }
   return out;

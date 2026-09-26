@@ -288,6 +288,13 @@ rule("rule-parity", function(r)
   if lua:find("\n%s*content_types%s*=") then
     fail(r, "llm-endpoints lists content_types again (the allow list L1 used to pass requests on)")
   end
+  -- token_prompts: a token prompt refused on one runtime and left to
+  -- policy.unjudgeable on the other
+  local ltp = lua:match('\n%s*token_prompts%s*=%s*"([^"]*)"')
+  local ttp = tsrule:match('token_prompts:%s*"([^"]*)"')
+  if not ltp or ltp ~= ttp then
+    fail(r, "token_prompts: Lua " .. tostring(ltp) .. " vs TS " .. tostring(ttp))
+  end
   -- always_suspect: the same patterns, in the same order (the golden rules
   -- cases name the first pattern that fires)
   local chunk = loadfile("rules/llm-endpoints.lua")

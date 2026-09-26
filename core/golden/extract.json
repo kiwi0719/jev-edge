@@ -89,6 +89,171 @@
     {
       "expect": {
         "kind": "json",
+        "text": "",
+        "tokens": true
+      },
+      "input": {
+        "body": "{\"prompt\":[40,1541,6766,3435],\"max_tokens\":8}",
+        "content_type": "application/json",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "token ids: a prompt as a list of ids"
+    },
+    {
+      "expect": {
+        "kind": "json",
+        "text": "",
+        "tokens": true
+      },
+      "input": {
+        "body": "{\"prompt\":[[40,1541],[6766,3435]]}",
+        "content_type": "application/json",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "token ids: a list of lists of ids"
+    },
+    {
+      "expect": {
+        "kind": "json",
+        "text": " ok then",
+        "tokens": true
+      },
+      "input": {
+        "body": "{\"prompt\":[40,\" ok then\",1541]}",
+        "content_type": "application/json",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "token ids: ids and strings mixed keep the strings"
+    },
+    {
+      "expect": {
+        "kind": "json",
+        "text": "",
+        "tokens": true
+      },
+      "input": {
+        "body": "{\"messages\":[{\"role\":\"user\",\"content\":[40,1541]}]}",
+        "content_type": "application/json",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "token ids: in a text field's content list"
+    },
+    {
+      "expect": {
+        "kind": "json",
+        "text": "",
+        "tokens": true
+      },
+      "input": {
+        "body": "{\"input\":[40,1541]}",
+        "content_type": "application/json",
+        "fields": [
+          "input[*]"
+        ]
+      },
+      "name": "token ids: a path that ends with [*] reads each item"
+    },
+    {
+      "expect": {
+        "kind": "json",
+        "text": "Summarise this"
+      },
+      "input": {
+        "body": "{\"prompt\":\"Summarise this\",\"logit_bias\":{\"50256\":-100},\"stop\":[13]}",
+        "content_type": "application/json",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "token ids: numbers outside a text field are not token ids"
+    },
+    {
+      "expect": {
+        "kind": "scan",
+        "text": "",
+        "tokens": true
+      },
+      "input": {
+        "body": "{\"prompt\":[40,1541]} trailing",
+        "content_type": "application/json",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "token ids: JSON the decoder refuses is scanned for them"
+    },
+    {
+      "expect": {
+        "kind": "scan",
+        "text": "",
+        "tokens": true
+      },
+      "input": {
+        "body": "{\"prompt\":[\"a\",[40,1541]]} x",
+        "content_type": "application/json",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "token ids: the scan finds ids after strings and in nested lists"
+    },
+    {
+      "expect": {
+        "kind": "scan",
+        "text": "hi"
+      },
+      "input": {
+        "body": "{\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hi\",\"n\":1}]}]} x",
+        "content_type": "application/json",
+        "fields": [
+          "messages[*].content",
+          "prompt",
+          "input",
+          "query",
+          "text"
+        ]
+      },
+      "name": "token ids: the scan does not take a list of objects for them"
+    },
+    {
+      "expect": {
+        "kind": "json",
         "text": "part one\npart two"
       },
       "input": {
@@ -1397,6 +1562,7 @@
           "instances[*].messages[*].content",
           "query",
           "text",
+          "input_ids",
           "suffix",
           "input_prefix",
           "input_suffix",
@@ -1447,6 +1613,7 @@
           "instances[*].messages[*].content",
           "query",
           "text",
+          "input_ids",
           "suffix",
           "input_prefix",
           "input_suffix",
@@ -1497,6 +1664,7 @@
           "instances[*].messages[*].content",
           "query",
           "text",
+          "input_ids",
           "suffix",
           "input_prefix",
           "input_suffix",

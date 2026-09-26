@@ -81,6 +81,15 @@ local function finish(ctx, v, rep)
   return v
 end
 
+-- Whether an unjudgeable request is blocked: only in enforce mode, when
+-- policy.unjudgeable = "block", or for a prompt sent as token ids (L1's
+-- `tokens`) when its rule says token_prompts = "block".
+local function unjudgeable_blocks(cfg, rule, tokens)
+  if cfg.policy.mode ~= "enforce" then return false end
+  if cfg.policy.unjudgeable == "block" then return true end
+  return tokens == true and rule ~= nil and rule.token_prompts == "block"
+end
+
 -- Tell the breaker how a request it admitted went. Only calls that reached
 -- the provider and found it failing count against it (judge.counts); a
 -- request that says nothing about its health releases a half-open probe.
@@ -298,7 +307,7 @@ function _M.evaluate(req, ctx)
   local cfg = ctx.config
 
   -- L1 ------------------------------------------------------------------
-  local r, text, reason, rule, windowed, chunks, capped, untrusted, tools, retrieved =
+  local r, text, reason, rule, windowed, chunks, capped, untrusted, tools, retrieved, tokens =
     rules_mod.evaluate_all(req, ctx.rules, ctx)
 
   if r == rules_mod.PASS then
@@ -307,7 +316,7 @@ function _M.evaluate(req, ctx)
   if r == rules_mod.UNJUDGEABLE then
     -- A watched request nobody read. Not judged, so `skipped`; blocked only
     -- when the operator chose that and the gateway enforces.
-    local block = cfg.policy.mode == "enforce" and cfg.policy.unjudgeable == "block"
+    local block = unjudgeable_blocks(cfg, rule, tokens)
     return finish(ctx, verdict.new({
       action = block and verdict.ACTION_BLOCK or verdict.ACTION_PASS,
       verdict = verdict.SKIPPED, source = verdict.SRC_L1, reason = reason,
@@ -318,6 +327,18 @@ function _M.evaluate(req, ctx)
     return finish(ctx, verdict.new({
       action = action, verdict = verdict.MALICIOUS, score = 1,
       source = verdict.SRC_L1, reason = reason,
+    }))
+  end
+
+  -- Token ids beside the text L1 hands on: the text is judged, the ids never
+  -- can be, and the stricter of the two decides. When the ids alone block
+  -- the request, it is blocked here, before anything that speaks for the
+  -- text only (a trusted fingerprint, a cached score, the breaker) and
+  -- without a judge call; otherwise the text is judged as always.
+  if tokens and unjudgeable_blocks(cfg, rule, true) then
+    return finish(ctx, verdict.new({
+      action = verdict.ACTION_BLOCK, verdict = verdict.SKIPPED, source = verdict.SRC_L1,
+      reason = rules_mod.TOKENS,
     }))
   end
 

@@ -105,6 +105,10 @@ return {
   -- filled with, every key and string below them.
   -- input[*].output: a Responses API function_call_output (a tool result).
   -- inputs, instances: TGI /generate, / and /vertex.
+  -- input_ids: SGLang's prompt as token ids. A text field that holds token
+  -- ids (a list of numbers, a list of such lists, ids and strings mixed, as
+  -- prompt takes them on OpenAI completions, vLLM, SGLang and llama.cpp) makes
+  -- the request unjudgeable: see token_prompts below.
   -- suffix: OpenAI completions and Ollama; input_prefix, input_suffix,
   -- input_extra: llama.cpp /infill.
   text_fields = { "system", "instructions", "preamble", "system_prompt", "systemInstruction.parts",
@@ -117,7 +121,7 @@ return {
                   "prompt", "prompt.prompt_string", "prompt[*].prompt_string", "prompt.variables.**",
                   "input", "input[*].arguments.**", "input[*].input", "input[*].output",
                   "inputs", "instances[*].inputs", "instances[*].messages[*].content",
-                  "query", "text", "suffix", "input_prefix", "input_suffix", "input_extra[*].text" },
+                  "query", "text", "input_ids", "suffix", "input_prefix", "input_suffix", "input_extra[*].text" },
   -- Tool definitions and output schemas, judged as a part of their own with
   -- the rule's templates and their own verdict-cache entry, so an unchanged
   -- tool set costs one judge call per cache lifetime: OpenAI chat, Ollama,
@@ -132,6 +136,13 @@ return {
   -- {} turns it off for a rule.
   tool_fields = { "tools", "functions", "response_format.json_schema", "text.format" },
   min_text_chars = 20,
+  -- A prompt sent as token ids, which L1 cannot read: "unjudgeable" reports
+  -- it as "unjudgeable: token prompt" and policy.unjudgeable decides;
+  -- "block" refuses it in enforce mode whatever policy.unjudgeable says.
+  -- Ids beside text: the text is judged as always and the ids still count,
+  -- the stricter of the two decides. Normal SDKs send text; "block" refuses
+  -- token prompts without making every unjudgeable request block.
+  token_prompts = "unjudgeable",
   always_suspect = {
     [[\b(ignore|disregard|forget)\b.{0,20}\b(previous|prior|above|earlier|all)\b]]
       .. [[.{0,20}\b(instructions?|rules?|prompts?)\b]],

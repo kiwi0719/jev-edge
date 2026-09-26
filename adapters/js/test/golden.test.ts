@@ -40,15 +40,16 @@ describe("golden: normalize", () => {
 describe("golden: extract", () => {
   for (const c of load("extract").cases) {
     it(c.name, () => {
-      const [text, kind, , decoded, cut] = core.normalize.extract(c.input.body, c.input.content_type, c.input.fields, jsonDecode);
-      // expect.cut is there only when a "**" walk hit a bound; expect.tools
-      // only when the case names tool_fields
+      const [text, kind, , decoded, cut, tokens] = core.normalize.extract(c.input.body, c.input.content_type, c.input.fields, jsonDecode);
+      // expect.cut is there only when a "**" walk hit a bound, expect.tokens
+      // only when a text field holds token ids; expect.tools only when the
+      // case names tool_fields
       let tools: { text: string; capped?: true } | undefined;
       if (c.input.tool_fields) {
         const [values, capped] = core.normalize.extractTools(decoded, c.input.tool_fields, jsonDecode);
         tools = { text: values.join("\n"), ...(capped ? { capped } : {}) };
       }
-      expect({ text, kind, ...(cut ? { cut } : {}), ...(tools ? { tools } : {}) }).toEqual(c.expect);
+      expect({ text, kind, ...(cut ? { cut } : {}), ...(tokens ? { tokens } : {}), ...(tools ? { tools } : {}) }).toEqual(c.expect);
     });
   }
 });
@@ -59,9 +60,9 @@ describe("golden: rules", () => {
       const ctx = { cache: storeFrom(c.input.cache), clock: () => c.input.clock, json_decode: jsonDecode, re_find: reFind };
       // a rule set id, or an inline spec resolved the way a config's `rules` list is
       const rule = typeof c.input.rule === "string" ? loadRule(c.input.rule) : resolveRule(c.input.rule);
-      const [result, text, reason, , , , , t] = await core.rules.evaluate(c.input.req, rule, ctx);
+      const [result, text, reason, , , , , t, , tokens] = await core.rules.evaluate(c.input.req, rule, ctx);
       const tools = t && { text: t.text, windowed: t.windowed, ...(t.hit ? { hit: t.hit } : {}), ...(t.only ? { only: t.only } : {}) };
-      expect({ result, text, reason, ...(tools ? { tools } : {}) }).toEqual(c.expect);
+      expect({ result, text, reason, ...(tokens ? { tokens } : {}), ...(tools ? { tools } : {}) }).toEqual(c.expect);
     });
   }
 });

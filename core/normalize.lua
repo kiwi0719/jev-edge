@@ -112,29 +112,40 @@ end
 -- Cohere v2 `document` part (a tool result's) under `document`; the last two
 -- are read whole (read_whole).
 -- The depth leaves room for a content document inside a tool_result. Anything
--- else (numbers, images, JSON null) contributes nothing. A decoder that keeps
--- null as a value (cjson.null) is assumed: `[null, {...}]` goes on past the
--- null, as the backend's parser does.
+-- else (images, JSON null) contributes nothing, and so do numbers, but a
+-- number that is an item of a list is a token id: the OpenAI completions API,
+-- vLLM, SGLang and llama.cpp take a prompt as a list of token ids, a list of
+-- such lists, or (llama.cpp) ids and strings mixed, and the model reads the
+-- text the ids stand for. `st.tokens` is set then (no text to judge: L1
+-- reports the request unjudgeable). A decoder that keeps null as a value
+-- (cjson.null) is assumed: `[null, {...}]` goes on past the null, as the
+-- backend's parser does.
 local LEAF_DEPTH = 6
-local function collect(node, out, depth)
+local function collect(node, out, depth, st)
   if type(node) == "string" then
     out[#out + 1] = node
     return
   end
   if type(node) ~= "table" or depth > LEAF_DEPTH then return end
   if node[1] ~= nil then
-    for _, item in ipairs(node) do collect(item, out, depth + 1) end
+    for _, item in ipairs(node) do
+      if type(item) == "number" then
+        if st then st.tokens = true end
+      else
+        collect(item, out, depth + 1, st)
+      end
+    end
     return
   end
   if type(node.text) == "string" then out[#out + 1] = node.text end
-  if node.content ~= nil then collect(node.content, out, depth + 1) end
+  if node.content ~= nil then collect(node.content, out, depth + 1, st) end
   local src = node.source
   if type(src) == "table" then
     if src.type == "text" and type(src.data) == "string" then out[#out + 1] = src.data end
-    if src.type == "content" and src.content ~= nil then collect(src.content, out, depth + 1) end
+    if src.type == "content" and src.content ~= nil then collect(src.content, out, depth + 1, st) end
   end
   if node.type == "file_search_call" and type(node.results) == "table" then
-    collect(node.results, out, depth + 1)
+    collect(node.results, out, depth + 1, st)
   end
   function_responses(node, out)
   if node.type == "document" and node.document ~= nil then read_whole(node.document, out, 1) end
@@ -200,7 +211,7 @@ _M.DEEP_COUNT = 4
 -- @param decode json_decode, for "**" values that are a string of JSON
 local function new_state(decode)
   return { out = {}, nodes = _M.DEEP_NODES, counts = _M.DEEP_COUNT * _M.DEEP_NODES, capped = false,
-           decode = decode, defer = {} }
+           tokens = false, decode = decode, defer = {} }
 end
 
 -- The string keys of object `node` in byte order, counted against the node
@@ -404,8 +415,10 @@ end
 -- A list of paths is compiled once into a plan (plan_of), so the walk itself
 -- allocates nothing but the "**" slots: at a node, what to do there, in the
 -- order the first path for it comes. An op is a path that ends here
--- ({ kind = END, depth, whole, keyed }: collect()'s or read_whole()'s depth,
--- 2 for a path that ends at an array read item by item; field_path's flags),
+-- ({ kind = END, depth, whole, keyed, item }: collect()'s or read_whole()'s
+-- depth, 2 for a path that ends at an array read item by item; field_path's
+-- flags; `item` when the value is an item of the list the path ends at, where
+-- a number is a token id),
 -- a "**" here ({ kind = DEEP }), or a key the
 -- paths go on through ({ kind = KEY, key, whole, whole_arr, items_arr }):
 -- the plan for the value under the key when it is not an array (`whole`),
@@ -450,7 +463,8 @@ local function compile(cursors, leaf)
     local seg = c.segs[c.i]
     if not seg then
       -- keyed: only the value the path ends at, not the items of an array there
-      ops[#ops + 1] = { kind = END, depth = c.depth or 1, whole = c.segs.whole, keyed = c.segs.keyed and not c.depth }
+      ops[#ops + 1] = { kind = END, depth = c.depth or 1, whole = c.segs.whole, keyed = c.segs.keyed and not c.depth,
+                        item = c.item or c.depth == 2 }
     elseif seg.deep then
       ops[#ops + 1] = { kind = DEEP }
     else
@@ -469,6 +483,8 @@ local function compile(cursors, leaf)
       for _, c in ipairs(op.cursors) do
         local nxt = { segs = c.segs, i = c.i + 1 }
         if c.segs[c.i].each then
+          -- a path that ends with "[*]": each item is a value it ends at
+          nxt.item = c.i == #c.segs or nil
           items_arr[#items_arr + 1] = nxt
         else
           whole[#whole + 1] = nxt
@@ -593,7 +609,8 @@ walk = function(node, plan, st)
       elseif op.whole then
         read_whole(node, st.out, op.depth)
       else
-        collect(node, st.out, op.depth)
+        if op.item and type(node) == "number" then st.tokens = true end
+        collect(node, st.out, op.depth, st)
         if op.keyed and type(node) == "table" and node[1] == nil then
           for _, k in ipairs(object_keys(node)) do take(st, k) end
         end
@@ -639,14 +656,15 @@ end
 -- @param fields      list of path strings
 -- @param json_decode optional: reads a "**" value that is a string of JSON
 -- @return string (joined with "\n"), may be ""; the list of strings found,
---         in document order; and true when a "**" walk hit a bound and left
---         something out
+--         in document order; true when a "**" walk hit a bound and left
+--         something out; and true when a text field holds token ids (see
+--         collect)
 function _M.extract_json(decoded, fields, json_decode)
   local st = new_state(json_decode)
   sort_left = WHOLE_SORT
   walk(decoded, plan_of(fields, false), st)
   local out = settle(st)
-  return table.concat(out, "\n"), out, st.capped
+  return table.concat(out, "\n"), out, st.capped, st.tokens
 end
 
 --- Tool definitions in a decoded JSON body (rule.tool_fields): what the
@@ -914,8 +932,9 @@ end
 -- @return text string (the values joined with "\n"),
 --         kind ("json"|"scan"|"invalid"|"form"|"multipart"|"text"|"binary"|"none"),
 --         list of the values found (newest last), for window(),
---         the decoded JSON value when kind is "json", and true when a "**"
---         walk hit a bound and left something out
+--         the decoded JSON value when kind is "json", true when a "**"
+--         walk hit a bound and left something out, and true when a text
+--         field holds token ids (kind "json" or "scan")
 function _M.extract(body, content_type, fields, json_decode)
   if type(body) ~= "string" or body == "" then return "", "none", {} end
   local raw_ct = type(content_type) == "string" and content_type or ""
@@ -932,8 +951,8 @@ function _M.extract(body, content_type, fields, json_decode)
     if not json_decode then return "", "none", {} end
     local ok, decoded = pcall(json_decode, _M.lone_surrogates(body))
     if ok and type(decoded) == "table" then
-      local text, out, capped = _M.extract_json(decoded, fields, json_decode)
-      return text, "json", out, decoded, capped
+      local text, out, capped, tokens = _M.extract_json(decoded, fields, json_decode)
+      return text, "json", out, decoded, capped, tokens
     end
     -- a JSON scalar has no text fields
     if declared_json and ok and decoded ~= nil then return "", "none", {} end
@@ -945,15 +964,17 @@ function _M.extract(body, content_type, fields, json_decode)
     -- objects under a "**" path's key. Under a form or multipart type the
     -- values that reading gives follow, since a backend of that kind reads
     -- the body so. Declared JSON with nothing to scan is unjudgeable, never
-    -- "no text"; any other body with nothing to scan is read as before.
-    local out = _M.scan_strings(body, _M.field_keys(fields), {}, _M.deep_keys(fields))
-    if #out > 0 then
+    -- "no text"; any other body with nothing to scan is read as before. A
+    -- text field that holds token ids is found the same way.
+    local found = {}
+    local out = _M.scan_strings(body, _M.field_keys(fields), {}, _M.deep_keys(fields), found)
+    if #out > 0 or found.tokens then
       if form and not declared_json then
         form_values(body, out)
       elseif multipart and not declared_json then
         multipart_values(body, raw_ct, out)
       end
-      return table.concat(out, "\n"), "scan", out
+      return table.concat(out, "\n"), "scan", out, nil, nil, found.tokens
     end
     if declared_json then return "", "invalid", {} end
   end
@@ -1068,6 +1089,32 @@ end
 
 local scan_value
 
+-- True when the JSON list that starts at `i` (a "[") holds a number, a token
+-- id, before anything ends the look: the list's own end, an object or a
+-- literal (a list of content parts, not of ids), or the end of `s`. Nested
+-- lists and strings are passed over: llama.cpp takes ids and strings mixed.
+-- Linear: it stops at the first byte that is none of those, and the colon
+-- after any key inside the list is one.
+local function holds_number(s, i)
+  local depth = 0
+  while true do
+    local j = s:find("[^ \t\n\r,]", i)
+    if not j then return false end
+    local c = s:byte(j)
+    if c == 91 then
+      depth, i = depth + 1, j + 1
+    elseif c == 93 then
+      depth = depth - 1
+      if depth <= 0 then return false end
+      i = j + 1
+    elseif c == 34 then
+      i = select(2, read_string(s, j + 1))
+    else
+      return c == 45 or (c >= 48 and c <= 57)
+    end
+  end
+end
+
 --- Collect the string values of `keys` (from field_keys) from possibly
 -- truncated JSON. Keys match the way walk() matches them: folded, so every
 -- spelling a case-insensitive backend reads is collected. With `deep` (from
@@ -1075,7 +1122,9 @@ local scan_value
 -- every key and string in it, in the order they come: an object (Ollama and
 -- Anthropic tool-call arguments), and an array when no other path ends at
 -- that key; otherwise the scan goes on inside it, as for any other key.
-function _M.scan_strings(s, keys, out, deep)
+-- With `found`, found.tokens is set when one of `keys` holds a list with a
+-- number in it: token ids (see collect).
+function _M.scan_strings(s, keys, out, deep, found)
   local i = 1
   while true do
     -- key bytes: ASCII word characters and the bytes of U+017F and U+212A;
@@ -1094,6 +1143,9 @@ function _M.scan_strings(s, keys, out, deep)
       if d and (c == 123 or d == "any") then
         i = scan_value(s, b, out, false)
       else
+        if found and c == 91 and not found.tokens and keys[fold(key)] and holds_number(s, b) then
+          found.tokens = true
+        end
         i = b + 1
       end
     end

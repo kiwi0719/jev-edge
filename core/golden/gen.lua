@@ -159,11 +159,12 @@ norm_case("whitespace-only text still fingerprints, one value for all of it", st
 local extract_cases = {}
 local FIELDS = { "messages[*].content", "prompt", "input", "query", "text" }
 
--- expect.cut is present (true) only when a "**" walk hit a bound. With
+-- expect.cut is present (true) only when a "**" walk hit a bound, and
+-- expect.tokens only when a text field holds token ids. With
 -- `tools` ({ fields }), expect.tools is what extract_tools reads
 -- from the decoded body: its text, and capped (true) when a bound cut it.
 local function extract_case(name, body, ct, fields, tools)
-  local text, kind, _, decoded, cut = normalize.extract(body, ct, fields or FIELDS, H.body_decode)
+  local text, kind, _, decoded, cut, tokens = normalize.extract(body, ct, fields or FIELDS, H.body_decode)
   local texp
   if tools then
     local ttext, _, capped = normalize.extract_tools(decoded, tools.fields, H.body_decode)
@@ -173,7 +174,7 @@ local function extract_case(name, body, ct, fields, tools)
     name = name,
     input = { body = body, content_type = ct or NULL, fields = fields or FIELDS,
               tool_fields = tools and tools.fields },
-    expect = { text = text, kind = kind, cut = cut or nil, tools = texp },
+    expect = { text = text, kind = kind, cut = cut or nil, tokens = tokens or nil, tools = texp },
   }
 end
 
@@ -186,6 +187,24 @@ extract_case("several fields present, in field order",
 extract_case("nested path", '{"input":{"text":"deep"}}', "application/json", { "input.text" })
 extract_case("numbers are ignored, string arrays are joined",
   '{"prompt":42,"messages":[{"content":["a","b"]}]}', "application/json")
+-- a number that is an item of a list is a token id: no text, and `tokens`
+extract_case("token ids: a prompt as a list of ids", '{"prompt":[40,1541,6766,3435],"max_tokens":8}',
+  "application/json")
+extract_case("token ids: a list of lists of ids", '{"prompt":[[40,1541],[6766,3435]]}', "application/json")
+extract_case("token ids: ids and strings mixed keep the strings", '{"prompt":[40," ok then",1541]}',
+  "application/json")
+extract_case("token ids: in a text field's content list", '{"messages":[{"role":"user","content":[40,1541]}]}',
+  "application/json")
+extract_case("token ids: a path that ends with [*] reads each item",
+  '{"input":[40,1541]}', "application/json", { "input[*]" })
+extract_case("token ids: numbers outside a text field are not token ids",
+  '{"prompt":"Summarise this","logit_bias":{"50256":-100},"stop":[13]}', "application/json")
+extract_case("token ids: JSON the decoder refuses is scanned for them", '{"prompt":[40,1541]} trailing',
+  "application/json")
+extract_case("token ids: the scan finds ids after strings and in nested lists", '{"prompt":["a",[40,1541]]} x',
+  "application/json")
+extract_case("token ids: the scan does not take a list of objects for them",
+  '{"messages":[{"role":"user","content":[{"type":"text","text":"hi","n":1}]}]} x', "application/json")
 extract_case("openai content parts",
   '{"messages":[{"role":"user","content":[{"type":"text","text":"part one"},'
   .. '{"type":"image_url","image_url":{"url":"x"}},{"type":"text","text":"part two"}]}]}',
@@ -469,11 +488,11 @@ local function rules_case(name, req, state)
   }
   local rule = llm
   if state.rule then rule = assert(rules_mod.resolve(state.rule, function(x) return require("jev.rules." .. x) end)) end
-  local r, text, reason, _, _, _, _, tools = rules_mod.evaluate(req, rule, ctx)
+  local r, text, reason, _, _, _, _, tools, _, tokens = rules_mod.evaluate(req, rule, ctx)
   rules_cases[#rules_cases + 1] = {
     name = name,
     input = { rule = state.rule or "llm-endpoints", req = req, cache = state.cache or {}, clock = state.clock or 1000 },
-    expect = { result = r, text = text, reason = reason,
+    expect = { result = r, text = text, reason = reason, tokens = tokens or nil,
                tools = tools and { text = tools.text, windowed = tools.windowed, hit = tools.hit, only = tools.only } },
   }
 end
@@ -688,6 +707,24 @@ rules_case("field: Anthropic system as text blocks", raw("/v1/messages",
 rules_case("field: llama.cpp prompt object", raw("/v1/completions", '{"prompt":{"prompt_string":' .. ASK .. '}}'))
 rules_case("field: llama.cpp prompt objects in a list", raw("/completion",
   '{"prompt":[{"prompt_string":' .. ASK .. ',"multimodal_data":[]}],"n_predict":16}'))
+-- a prompt sent as token ids: unjudgeable, not "no text" (core-l1#11)
+rules_case("token ids: /v1/completions prompt as ids is unjudgeable",
+  raw("/v1/completions", '{"model":"m","prompt":[40,1541,6766,3435,11,1234,5678]}'))
+rules_case("token ids: a list of lists of ids is unjudgeable",
+  raw("/v1/completions", '{"model":"m","prompt":[[40,1541,6766],[3435,11,1234]]}'))
+rules_case("token ids: llama.cpp ids and a short string mixed are unjudgeable, not too short",
+  raw("/completion", '{"prompt":[40,1541," ok then",6766,3435],"n_predict":16}'))
+rules_case("token ids: beside text long enough to judge, the text is judged and the ids flagged",
+  raw("/completion", '{"prompt":[40,1541,' .. ASK .. ',6766]}'))
+rules_case("token ids: SGLang input_ids on /generate", raw("/generate", '{"input_ids":[40,1541,6766,3435]}'))
+rules_case("token ids: SGLang input_ids as a batch", raw("/generate", '{"input_ids":[[40,1541],[6766,3435]]}'))
+rules_case("token ids: a prompt that is one number is no text", raw("/v1/completions", '{"model":"m","prompt":42}'))
+rules_case("token ids: past max_body_bytes the scan finds them", raw("/v1/completions",
+  '{"prompt":[40,1541,6766,3435],"text":"' .. string.rep("padding ", 12) .. '"}'),
+  { rule = { id = "small", extends = "llm-endpoints", max_body_bytes = 64 } })
+rules_case("token ids: past max_body_bytes with nothing else to read", raw("/v1/completions",
+  '{"prompt":[40,1541,6766,3435],"x":"' .. string.rep("padding ", 12) .. '"}'),
+  { rule = { id = "small", extends = "llm-endpoints", max_body_bytes = 64 } })
 -- Gemini generateContent and streamGenerateContent, on the Gemini API,
 -- Vertex AI and LiteLLM (which serves them for every model)
 local GEM = '{"contents":[{"role":"user","parts":[{"text":' .. ASK .. '}]}]}'
@@ -1802,6 +1839,34 @@ do
 end
 eval_case("a scanned oversized body says its score is for a window", { req = req(ATTACK, { body_size = 2000000 }),
   judge = { answers = { injection = 0.9 } } })
+do
+  -- a prompt sent as token ids: unjudgeable. policy.unjudgeable decides, or
+  -- the rule's token_prompts = "block"; beside text, the stricter of the two
+  local ids = raw_req('{"model":"m","prompt":[40,1541,6766,3435,11,1234]}', { path = "/v1/completions" })
+  local mixed = raw_req('{"model":"m","prompt":[40,1541,' .. escape(LONG) .. ',6766]}', { path = "/completion" })
+  local BLOCK_IDS = { id = "noids", extends = "llm-endpoints", token_prompts = "block" }
+  eval_case("token ids: unjudgeable, passed as skipped by default", { req = ids,
+    config = { policy = { mode = "enforce" } }, judge = { answers = { injection = 0.9 } } })
+  eval_case("token ids: blocked when policy.unjudgeable = block in enforce", { req = ids,
+    config = { policy = { mode = "enforce", unjudgeable = "block" } }, judge = { answers = { injection = 0.9 } } })
+  eval_case("token ids: blocked when the rule says token_prompts = block in enforce", { req = ids,
+    rules = { BLOCK_IDS }, config = { policy = { mode = "enforce" } }, judge = { answers = { injection = 0.1 } } })
+  eval_case("token ids: token_prompts = block never blocks in monitor", { req = ids,
+    rules = { BLOCK_IDS }, config = { policy = { mode = "monitor" } }, judge = { answers = { injection = 0.1 } } })
+  eval_case("token ids: token_prompts = block leaves other unjudgeable requests to policy.unjudgeable", {
+    req = req("", { body = "\0\1\2\3 binary payload", headers = { ["content-type"] = "application/octet-stream" } }),
+    rules = { BLOCK_IDS }, config = { policy = { mode = "enforce" } }, judge = { answers = { injection = 0.9 } } })
+  eval_case("token ids beside text: the text is judged by default", { req = mixed,
+    config = { policy = { mode = "enforce" } }, judge = { answers = { injection = 0.9 } } })
+  eval_case("token ids beside text: blocked without a judge call when token_prompts = block", { req = mixed,
+    rules = { BLOCK_IDS }, config = { policy = { mode = "enforce" } }, judge = { answers = { injection = 0.1 } } })
+  eval_case("token ids beside text: a cached score for the text does not speak for them", { req = mixed,
+    config = { policy = { mode = "enforce", unjudgeable = "block" } },
+    cache = { [key_of(LONG)] = { score = 0.05, reason = "injection 0.05" } },
+    judge = { answers = { injection = 0.1 } } })
+  eval_case("token ids beside text: judged in monitor whatever token_prompts says", { req = mixed,
+    rules = { BLOCK_IDS }, config = { policy = { mode = "monitor" } }, judge = { answers = { injection = 0.9 } } })
+end
 eval_case("custom cache ttl and prefix", { req = req(LONG),
   config = { cache = { fp_ttl = 60, fp_prefix_bytes = 16 } }, judge = { answers = { injection = 0.1 } } })
 

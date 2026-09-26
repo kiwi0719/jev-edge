@@ -225,6 +225,38 @@ describe("core.evaluate end to end", function()
     assert.is_true(v.async)
   end)
 
+  it("token ids beside text: neither a trusted fingerprint nor an open breaker lets them through", function()
+    local T = require "jev.core.trust"
+    local rules = require "jev.core.rules"
+    local noids = assert(rules.resolve({ id = "noids", extends = "llm-endpoints", token_prompts = "block" },
+      function(id) return require("jev.rules." .. id) end))
+    local calls = 0
+    local ctx = H.ctx({
+      config = { policy = { mode = "enforce" }, feedback = { enabled = true, token = "s3cret" } },
+      judge = { call = function() calls = calls + 1; return { injection = 0.1 } end },
+    })
+    local text = H.chat_req(LONG)
+    local fp = core.evaluate(text, ctx).fingerprint
+    assert.equals(1, calls)
+    ctx.cache:set(T.key(fp), { trusted_until = ctx.clock() + 3600, renewals = 0 })
+    assert.equals(V.SRC_TRUST, core.evaluate(text, ctx).source)
+    ctx.rules = { noids }
+    ctx.breaker = B.new(H.store(), ctx.clock, {})
+    ctx.breaker:trip()
+    local body = '{"prompt":[40,1541,' .. H.json.encode(LONG) .. ',6766]}'
+    local req = { method = "POST", path = "/completion", headers = { ["content-type"] = "application/json" },
+                  body = body, body_size = #body, client_ip = "203.0.113.7" }
+    local v = core.evaluate(req, ctx)
+    assert.equals(V.ACTION_BLOCK, v.action)
+    assert.equals(V.SKIPPED, v.verdict)
+    assert.equals(V.SRC_L1, v.source)
+    assert.equals("unjudgeable: token prompt", v.reason)
+    assert.equals(1, calls)
+    -- the same text without the ids is still the trusted one
+    ctx.rules = { noids }
+    assert.equals(V.SRC_TRUST, core.evaluate(text, ctx).source)
+  end)
+
   it("blocks bad reputation at L1 in enforce mode without calling L2", function()
     local calls = 0
     local ctx = H.ctx({

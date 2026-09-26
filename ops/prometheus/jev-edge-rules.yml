@@ -150,3 +150,24 @@ groups:
             Same as JevBreakerOpen: check /_jev/health, the provider and the
             key. The verdict cache keeps serving known texts; new texts pass
             unjudged until L2 recovers.
+
+      # A request judging threw on (a bad override or rule, a bug) was failed
+      # open unjudged by the adapter (X-Jev-Source: adapter). Nothing else
+      # counts it; while every request fails this way the ratio alerts above
+      # see no L2 traffic at all. increase() misses the very first error of a
+      # new series, not a sustained failure.
+      - alert: JevAdapterErrors
+        expr: increase(jev_adapter_errors_total[5m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "jev-edge failing requests open on adapter errors on {{ $labels.instance }} ({{ $labels.entry }})"
+          description: >-
+            {{ $value | humanize }} requests through {{ $labels.entry }} on
+            {{ $labels.instance }} passed unjudged in the last 5 minutes
+            because judging threw (verdict=error, source=adapter).
+          runbook: >-
+            Read the error log for "jev-edge: {{ $labels.entry }} error,
+            failing open". After a config change: GET /_jev/config, then
+            DELETE /_jev/config to drop the override, or fix the rule in the
+            config file. Otherwise it is a bug: report the log line.

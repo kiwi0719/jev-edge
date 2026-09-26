@@ -211,3 +211,38 @@ tests:
       - eval_time: 25m
         alertname: JevAsyncDropped
         exp_alerts: []
+
+  # Adapter errors: gw1's access handler fails 3 requests a minute from minute
+  # 6 to 10 and then stops; gw2 never fails.
+  - interval: 1m
+    input_series:
+      - series: 'jev_adapter_errors_total{job="jev",instance="gw1",entry="access"}'
+        values: '0x5 3+3x4 15x15'
+      - series: 'jev_adapter_errors_total{job="jev",instance="gw2",entry="authz"}'
+        values: '0x20'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: JevAdapterErrors
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: JevAdapterErrors
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: jev
+              instance: gw1
+              entry: access
+            exp_annotations:
+              summary: "jev-edge failing requests open on adapter errors on gw1 (access)"
+              description: >-
+                15 requests through access on
+                gw1 passed unjudged in the last 5 minutes
+                because judging threw (verdict=error, source=adapter).
+              runbook: >-
+                Read the error log for "jev-edge: access error,
+                failing open". After a config change: GET /_jev/config, then
+                DELETE /_jev/config to drop the override, or fix the rule in the
+                config file. Otherwise it is a bug: report the log line.
+      - eval_time: 20m
+        alertname: JevAdapterErrors
+        exp_alerts: []

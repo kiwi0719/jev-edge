@@ -242,8 +242,10 @@ local function subject_ctx(cfg, req)
 end
 
 local function evaluate_current(cfg, rules, over)
-  ensure_runtime(cfg)
+  -- first: when anything below throws, access() fails open with no client
+  -- X-Jev-* left on the request
   strip_inbound()
+  ensure_runtime(cfg)
   local req = build_req(rules, over)
   local subj = subject_ctx(cfg, req)
   ngx.ctx.jev_subject = subj and subj.id or nil
@@ -278,6 +280,7 @@ function _M.access()
 
   if not ok then
     ngx.log(ngx.ERR, "jev-edge: access error, failing open: ", err)
+    pcall(metrics.incr_adapter_error, "access")
     ngx.req.set_header("X-Jev-Verdict", verdict.ERROR)
     ngx.req.set_header("X-Jev-Source", "adapter")
     return
@@ -620,6 +623,7 @@ local function respond_authz(cfg, rules, over, who)
   end)
   if not ok then
     ngx.log(ngx.ERR, "jev-edge: ", who, " error, failing open: ", err)
+    pcall(metrics.incr_adapter_error, who)
     ngx.header["X-Jev-Verdict"] = verdict.ERROR
     ngx.header["X-Jev-Source"] = "adapter"
     ngx.status = 200

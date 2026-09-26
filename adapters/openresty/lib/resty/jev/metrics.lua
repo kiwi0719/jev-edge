@@ -64,6 +64,18 @@ function _M.incr_authz(event)
   if AUTHZ_EVENTS[event] then incr("authz:" .. event) end
 end
 
+-- A request the adapter failed open on because judging threw (a bad override
+-- or rule, a bug): it passed unjudged, and nothing else counts it. entry is
+-- the handler it came through, a fixed set so traffic cannot mint labels. It
+-- is also counted as jev_requests_total{source="adapter",verdict="error"},
+-- so the request-rate queries see that traffic.
+local ADAPTER_ENTRIES = { access = true, authz = true, forward_auth = true }
+function _M.incr_adapter_error(entry)
+  if not ADAPTER_ENTRIES[entry] then entry = "other" end
+  incr("adapter_error:" .. entry)
+  incr("req:adapter:error")
+end
+
 -- The effective adaptive L2 timeout and, when given, the ceiling it is
 -- clamped to (jev.timeout_max_ms after adaptive.lua's defaulting), so an
 -- alert can tell "pinned at the ceiling" from "high but adapting".
@@ -106,6 +118,7 @@ function _M.render()
   line("# TYPE jev_l2_timeout_max_ms gauge")
   line("# TYPE jev_feedback_total counter")
   line("# TYPE jev_authz_events_total counter")
+  line("# TYPE jev_adapter_errors_total counter")
   for _, key in ipairs(d:get_keys(0)) do
     local val = d:get(key)
     local src, verdict = key:match("^req:([^:]+):(.+)$")
@@ -137,6 +150,8 @@ function _M.render()
       line("jev_subject_blocks_total " .. val)
     elseif key == "l2_timeout_max_ms" then
       line("jev_l2_timeout_max_ms " .. val)
+    elseif key:match("^adapter_error:") then
+      line(string.format('jev_adapter_errors_total{entry="%s"} %d', key:sub(15), val))
     elseif key:match("^authz:") then
       line(string.format('jev_authz_events_total{event="%s"} %d', key:sub(7), val))
     elseif key:match("^feedback:") then

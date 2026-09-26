@@ -78,8 +78,12 @@ local function sha256_hex(s)
   return to_hex(h:final())
 end
 
+-- The rules, and the ids of the ones that did not load (nil when all did).
+-- A rule set missing from this node's disk passes schema validation on a
+-- data plane (schema.lua); dropping it would leave the route judged by the
+-- rest, or by none ("no rules", a pass even in enforce), with nothing said.
 local function load_rules(specs)
-  local out = {}
+  local out, failed = {}, {}
   for i, spec in ipairs(specs or {}) do
     local rule, err = rules_mod.resolve(spec, function(id)
       local ok, r = pcall(require, "jev.rules." .. id)
@@ -87,9 +91,26 @@ local function load_rules(specs)
       return nil, tostring(r)
     end)
     if rule then out[#out + 1] = rule
-    else kong.log.err("jev-edge: rules[", i, "] failed to load: ", tostring(err)) end
+    else
+      local id = type(spec) == "table" and (spec.id or spec.extends) or spec
+      failed[#failed + 1] = tostring(id)
+      kong.log.err("jev-edge: rules[", i, "] (", tostring(id), ") failed to load: ", tostring(err))
+    end
   end
-  return out
+  if #failed == 0 then return out, nil end
+  return out, table.concat(failed, ", ")
+end
+
+-- The verdict for a request on a conf whose rules did not all load: not
+-- judged, so an error that fails open, or a block where the operator chose
+-- policy.unjudgeable = "block" and the plugin enforces.
+local function rules_failed(rt)
+  local p = rt.cfg.policy
+  local block = p.mode == "enforce" and p.unjudgeable == "block"
+  return verdict.new({
+    action = block and verdict.ACTION_BLOCK or verdict.ACTION_PASS,
+    verdict = verdict.ERROR, source = "adapter", reason = "rules failed to load: " .. rt.rules_err,
+  })
 end
 
 local function config_from(conf)
@@ -152,8 +173,9 @@ local function runtime_for(conf)
     kong.log.err("jev-edge: ", err)
     judge = { call = function() return nil, err end }
   end
+  local rules, rules_err = load_rules(cfg.rules)
   rt = {
-    cfg = cfg, rules = load_rules(cfg.rules), judge = judge, state = st,
+    cfg = cfg, rules = rules, rules_err = rules_err, judge = judge, state = st,
     breaker = breaker_m.new(st, ngx.now, cfg.breaker),
     log_line = conf.log_line == true,
     src_api_key = key, src_salt = salt,
@@ -305,18 +327,22 @@ function JevEdge:access(conf)
   local rt, v
   local ok, err = pcall(function()
     rt = runtime_for(conf)
-    local req = build_req(rt)
-    local subj = subject_ctx(rt, req)
-    kong.ctx.plugin.subject = subj and subj.id or nil
-    v = jev_core.evaluate(req, {
-      config = rt.cfg, rules = rt.rules, cache = cache, trust = cache, judge = rt.judge, breaker = rt.breaker,
-      subject = subj,
-      clock = ngx.now, hash = sha256_hex,
-      json_decode = cjson.decode, re_find = re_find,
-      log = function(level, msg) if level == "error" then kong.log.err(msg) else kong.log.warn(msg) end end,
-    })
-    maybe_async(rt, v, req)
-    maybe_sample(rt, v, req)
+    if rt.rules_err then
+      v = rules_failed(rt)
+    else
+      local req = build_req(rt)
+      local subj = subject_ctx(rt, req)
+      kong.ctx.plugin.subject = subj and subj.id or nil
+      v = jev_core.evaluate(req, {
+        config = rt.cfg, rules = rt.rules, cache = cache, trust = cache, judge = rt.judge, breaker = rt.breaker,
+        subject = subj,
+        clock = ngx.now, hash = sha256_hex,
+        json_decode = cjson.decode, re_find = re_find,
+        log = function(level, msg) if level == "error" then kong.log.err(msg) else kong.log.warn(msg) end end,
+      })
+      maybe_async(rt, v, req)
+      maybe_sample(rt, v, req)
+    end
     sweep_inbound(rt.cfg.subject)
     for k, val in pairs(verdict.headers(v)) do kong.service.request.set_header(k, val) end
     kong.service.request.set_header("X-Jev-Request-Id", ngx.var.request_id or "")

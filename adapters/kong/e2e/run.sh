@@ -134,3 +134,6 @@ check "log_line writes the decision" "yes" "$(docker compose logs kong 2>/dev/nu
 
 if [ $fail -ne 0 ]; then echo; echo "--- kong logs"; docker compose logs kong | tail -40; exit 1; fi
 echo "kong e2e: all checks passed"
+
+# hybrid mode (control plane + data plane), its own project and no host ports
+sh ./hybrid.sh

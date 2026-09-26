@@ -48,16 +48,35 @@ local function decode_rules_json(s)
   return specs
 end
 
+-- A data plane validates every config its control plane pushes, and one
+-- invalid plugin conf refuses the whole push: no route or plugin anywhere
+-- changes after it. The rule files are each node's own, so a DP missing one
+-- would stop syncing altogether. There a rule set that is not on disk is
+-- taken as found (its own fields are still checked), and the plugin answers
+-- verdict=error on the routes that name it (handler.lua). Traditional and
+-- control plane nodes check the disk.
+local function on_data_plane()
+  local k = rawget(_G, "kong")
+  local c = type(k) == "table" and k.configuration
+  return type(c) == "table" and c.role == "data_plane"
+end
+
+local function load_rule_to_check(id)
+  local r, err = load_rule(id)
+  if r or not on_data_plane() then return r, err end
+  return { id = id, watch_paths = {} }
+end
+
 local function check_rules_json(s)
   local specs, err = decode_rules_json(s)
   if not specs then return nil, err end
-  local _, rerr = rules_mod.resolve_all(specs, load_rule)
+  local _, rerr = rules_mod.resolve_all(specs, load_rule_to_check)
   if rerr then return nil, rerr end
   return true
 end
 
 local function check_rule_ids(ids)
-  local _, err = rules_mod.resolve_all(ids, load_rule)
+  local _, err = rules_mod.resolve_all(ids, load_rule_to_check)
   if err then return nil, err end
   return true
 end

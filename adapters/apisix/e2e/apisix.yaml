@@ -114,6 +114,29 @@ routes:
         rules: [{ id: secmiss, extends: llm-endpoints, watch_paths: ["^/secmiss/"] }]
         policy: { mode: enforce }
         async: { enabled: false }
+  # A rule set that is not on this node's disk: not judged, and said so
+  # (verdict error), never passed as "no rules"; blocked in enforce with
+  # policy.unjudgeable = block.
+  - uri: /norule/*
+    upstream:
+      nodes:
+        "app:8081": 1
+      type: roundrobin
+    plugins:
+      jev-edge:
+        jev: { provider: mock, mock_score: 0.95, timeout_ms: 300 }
+        rules: ["no-such-rule", { id: norule, extends: llm-endpoints, watch_paths: ["^/norule/"] }]
+        policy: { mode: enforce }
+  - uri: /norule-block/*
+    upstream:
+      nodes:
+        "app:8081": 1
+      type: roundrobin
+    plugins:
+      jev-edge:
+        jev: { provider: mock, mock_score: 0.2, timeout_ms: 300 }
+        rules: ["no-such-rule"]
+        policy: { mode: enforce, unjudgeable: block }
   # Keys the schema used to refuse: subject.reputation (one malicious
   # verdict blocks the subject), provider laya, jev.ssl_verify and
   # jev.questions. A route whose plugin conf fails the schema is not loaded.

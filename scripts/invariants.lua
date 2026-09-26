@@ -74,6 +74,61 @@ local function rule(name, fn)
   if not ok then fail(name, "check raised: " .. tostring(err)) end
 end
 
+-- a GitHub workflow's lines, CRLF read as LF
+local function yaml_lines(src)
+  local out = {}
+  for l in ((src or ""):gsub("\r\n?", "\n") .. "\n"):gmatch("([^\n]*)\n") do out[#out + 1] = l end
+  return out
+end
+
+-- a workflow's top-level jobs: their ids in order, and each one's lines
+local function workflow_jobs(src)
+  local jobs, body, cur, injobs = {}, {}, nil, false
+  for _, l in ipairs(yaml_lines(src)) do
+    if not injobs then
+      injobs = l:match("^jobs:%s*$") or l:match("^jobs:%s*#")
+    elseif l:match("^[^%s#]") then
+      break
+    else
+      local name = l:match("^  ([%w_%-]+):")
+      if name then
+        jobs[#jobs + 1], cur, body[name] = name, name, {}
+      elseif cur then
+        table.insert(body[cur], l)
+      end
+    end
+  end
+  return jobs, body
+end
+
+-- the steps of a workflow (or of one job's lines) whose `uses:` matches the
+-- Lua pattern pat, each as "\n<its lines>\n" without comments
+local function steps_using(ls, pat)
+  local code_ls = {}
+  for _, l in ipairs(ls) do
+    if not l:match("^%s*#") then code_ls[#code_ls + 1] = (l:gsub("%s+#.*$", "")) end
+  end
+  local out = {}
+  for i, l in ipairs(code_ls) do
+    if l:match("^%s*%-?%s*uses:%s*[\"']?" .. pat) then
+      local s, ui = i, #l:match("^(%s*)")
+      if not l:match("^%s*%- ") then -- `uses:` under `- name:`: back to that line
+        s = i - 1
+        while s > 0 and not (code_ls[s]:match("^%s*%- ") and #code_ls[s]:match("^(%s*)") + 2 == ui) do
+          s = s - 1
+        end
+        if s == 0 then s = i end
+      end
+      local ind, e = #code_ls[s]:match("^(%s*)"), i
+      while code_ls[e + 1] and (code_ls[e + 1]:match("^%s*$") or #code_ls[e + 1]:match("^(%s*)") > ind) do
+        e = e + 1
+      end
+      out[#out + 1] = "\n" .. table.concat(code_ls, "\n", s, e) .. "\n"
+    end
+  end
+  return out
+end
+
 -- 1. One version everywhere --------------------------------------------------
 rule("version", function(r)
   local want = (read("dist.ini") or ""):match("\nversion = ([%d%.]+)")
@@ -398,23 +453,8 @@ end)
 --     counts as passing, so its `if:` is exactly always(): !cancelled() skips
 --     it in a cancelled run, `!cancelled() && !failure()` when a job failed)
 rule("ci-ok", function(r)
-  local ci = (read(".github/workflows/ci.yml") or ""):gsub("\r\n?", "\n")
   -- the top-level jobs mapping: job ids at two spaces, each with its lines
-  local jobs, body, cur, injobs = {}, {}, nil, false
-  for l in (ci .. "\n"):gmatch("([^\n]*)\n") do
-    if not injobs then
-      injobs = l:match("^jobs:%s*$") or l:match("^jobs:%s*#")
-    elseif l:match("^[^%s#]") then
-      break
-    else
-      local name = l:match("^  ([%w_%-]+):")
-      if name then
-        jobs[#jobs + 1], cur, body[name] = name, name, {}
-      elseif cur then
-        table.insert(body[cur], l)
-      end
-    end
-  end
+  local jobs, body = workflow_jobs(read(".github/workflows/ci.yml"))
   if #jobs < 2 then return fail(r, "found " .. #jobs .. " jobs in ci.yml") end
   if not body["ci-ok"] then return fail(r, "ci.yml has no ci-ok job") end
   local ok_job = "\n" .. table.concat(body["ci-ok"], "\n")
@@ -473,6 +513,224 @@ rule("breaker-failures", function(r)
   if not code("adapters/openresty/lib/resty/jev/http.lua"):find("judge%.status_kind%(res%.status%)") then
     fail(r, "resty/jev/http.lua: a failed parse is not classified by the provider's status")
   end
+end)
+
+-- 14. One pnpm, pinned exactly by "packageManager" in adapters/js/package.json,
+--     and every workflow's pnpm/action-setup reads it (audit ci-release#10: CI
+--     pinned pnpm 9 while a local pnpm 11 wrote a pnpm-workspace.yaml that
+--     pnpm 9 rejects, and CI ran the dependency build scripts local installs
+--     block). pnpm-workspace.yaml records a decision for each dependency
+--     build script, and none of them runs.
+rule("pnpm-pin", function(r)
+  local pm = (read("adapters/js/package.json") or ""):match('\n%s*"packageManager":%s*"([^"]*)"')
+  if not pm then
+    fail(r, 'adapters/js/package.json has no "packageManager"')
+  elseif not (pm:match("^pnpm@%d+%.%d+%.%d+$") or pm:match("^pnpm@%d+%.%d+%.%d+%+sha%d+%.%x+$")) then
+    fail(r, 'adapters/js/package.json "packageManager" is ' .. pm .. ", not an exact pnpm@X.Y.Z")
+  end
+  for _, wf in ipairs(tracked(".github/workflows", "%.ya?ml$")) do
+    for _, step in ipairs(steps_using(yaml_lines(read(wf)), "pnpm/action%-setup@")) do
+      if not step:find("\n%s*package_json_file:%s*adapters/js/package%.json%s*\n") then
+        fail(r, wf .. ": pnpm/action-setup does not read the version from adapters/js/package.json")
+      end
+      if step:find("\n%s*version:") then fail(r, wf .. ": pnpm/action-setup sets a pnpm version of its own") end
+    end
+  end
+  local ws = read("adapters/js/pnpm-workspace.yaml")
+  if not ws then
+    return fail(r, "adapters/js/pnpm-workspace.yaml is missing (the dependency build-script decisions)")
+  end
+  local inblock, n = false, 0
+  for _, l in ipairs(yaml_lines(ws)) do
+    local t = l:gsub("%s+#.*$", ""):gsub("^#.*$", "")
+    if t:match("^allowBuilds:%s*$") then
+      inblock = true
+    elseif t:match("^%S") then
+      inblock = false
+      if t:match("^dangerouslyAllowAllBuilds:%s*true") then
+        fail(r, "pnpm-workspace.yaml: dangerouslyAllowAllBuilds runs every dependency build script")
+      end
+    elseif inblock and t:match("%S") then
+      n = n + 1
+      local name, v = t:match("^%s+[\"']?([^\"':]+)[\"']?:%s*(.-)%s*$")
+      if v ~= "false" then
+        fail(r, "pnpm-workspace.yaml: allowBuilds " .. tostring(name) .. " is " .. tostring(v)
+          .. ", not false (no dependency build script runs)")
+      end
+    end
+  end
+  if n == 0 then fail(r, "pnpm-workspace.yaml has no allowBuilds decisions") end
+end)
+
+-- 15. Only the publish job of release-npm.yml holds the npm-publishing OIDC
+--     token, and it runs no code from the repository or its dependencies: no
+--     checkout, no install, a pinned npm publishing the tarball the build job
+--     packed, in the `npm` environment npm's Trusted Publisher names (audit
+--     ci-release#1: the token was granted to the whole workflow, so a
+--     dependency's install script or test-time code could publish).
+local function code_lines(ls)
+  local out = {}
+  for _, l in ipairs(ls) do
+    if not l:match("^%s*#") then out[#out + 1] = (l:gsub("%s+#.*$", "")) end
+  end
+  return out
+end
+
+rule("release-token", function(r)
+  local WF = ".github/workflows/release-npm.yml"
+  local src = read(WF)
+  if not src then return fail(r, WF .. " missing") end
+  local perms, inperms = {}, false
+  for _, l in ipairs(code_lines(yaml_lines(src))) do
+    if l:match("^permissions:") then
+      inperms = true
+      local inline = l:match("^permissions:%s*(%S.-)%s*$")
+      if inline then perms[#perms + 1] = inline end
+    elseif l:match("^%S") then
+      inperms = false
+    elseif inperms and l:match("%S") then
+      perms[#perms + 1] = l:match("^%s*(.-)%s*$")
+    end
+  end
+  if #perms ~= 1 or perms[1] ~= "contents: read" then
+    fail(r, WF .. ": workflow-level permissions are not just `contents: read` ("
+      .. table.concat(perms, ", ") .. "); the publish job adds id-token itself")
+  end
+  local jobs, body = workflow_jobs(src)
+  local holders = {}
+  for _, j in ipairs(jobs) do
+    local ls = code_lines(body[j])
+    local text = "\n" .. table.concat(ls, "\n") .. "\n"
+    if text:find("\n%s+id%-token:%s*write%s*\n") then
+      holders[#holders + 1] = j
+      local env = text:match("\n    environment:([^\n]*)\n") or ""
+      local envname = text:match("\n    environment:%s*\n%s+name:([^\n]*)\n") or env
+      if not (envname:match("^%s*npm%s*$") or envname:find("'npm'", 1, true)) then
+        fail(r, "job " .. j .. " holds the OIDC token outside the npm environment")
+      end
+      if text:find("actions/checkout", 1, true) then
+        fail(r, "job " .. j .. " holds the OIDC token and checks out the repository")
+      end
+      for _, l in ipairs(ls) do
+        if l:find("pnpm", 1, true) or l:match("%f[%w]npx%f[^%w]") or l:match("npm%s+ci%f[^%w]")
+           or l:match("npm%s+run%f[^%w]") or l:match("npm%s+exec%f[^%w]")
+           or ((l:match("npm%s+install%f[^%w]") or l:match("npm%s+i%s")) and not l:match("npm install %-g npm@")) then
+          fail(r, "job " .. j .. " holds the OIDC token and installs or runs packages: " .. l:match("^%s*(.-)$"))
+        end
+        local npmv = l:match("npm install %-g [\"']?npm@([^%s\"']*)")
+        if npmv and not npmv:match("^%d+%.%d+%.%d+$") then
+          fail(r, "job " .. j .. " publishes with npm@" .. npmv .. ", not an exact version")
+        end
+      end
+      local pub = text:match("\n[^\n]*npm publish([^\n]*)\n")
+      if not pub then
+        fail(r, "job " .. j .. " holds the OIDC token and runs no npm publish")
+      else
+        if not pub:match("^%s+[\"']?%./%S+") then
+          fail(r, "job " .. j .. ": npm publish is not given the packed tarball")
+        end
+        if not pub:find("--ignore-scripts", 1, true) then
+          fail(r, "job " .. j .. ": npm publish runs lifecycle scripts")
+        end
+      end
+    else
+      for _, l in ipairs(ls) do
+        if l:match("pnpm install") and not l:find("--ignore-scripts", 1, true) then
+          fail(r, "job " .. j .. ": pnpm install runs dependency scripts (--ignore-scripts)")
+        end
+      end
+    end
+  end
+  if #holders ~= 1 then
+    fail(r, WF .. ": " .. #holders .. " jobs hold the OIDC token (" .. table.concat(holders, ", ") .. "), not one")
+  end
+end)
+
+-- 16. A release comes from a commit already on main, checked by both jobs of
+--     release-npm.yml on every tag run (lead-github-ops#32: a v* tag pushed
+--     on an unmerged commit published it with provenance). The build job
+--     asks git, with main's history fetched; the publish job, which checks
+--     nothing out, asks GitHub's compare API.
+local function job_steps(ls)
+  local steps, cur, ind = {}, nil, nil
+  for _, l in ipairs(code_lines(ls)) do
+    local sp = l:match("^(%s*)steps:%s*$")
+    if sp then
+      ind, cur = #sp, nil
+    elseif ind then
+      local lead = #l:match("^(%s*)")
+      if l:match("%S") and lead <= ind then
+        ind, cur = nil, nil
+      elseif l:match("^%s*%- ") and (lead == ind + 2 or lead == ind) then
+        cur = { l }
+        steps[#steps + 1] = cur
+      elseif cur then
+        cur[#cur + 1] = l
+      end
+    end
+  end
+  return steps
+end
+
+rule("release-on-main", function(r)
+  local WF = ".github/workflows/release-npm.yml"
+  local jobs, body = workflow_jobs(read(WF))
+  if #jobs == 0 then return fail(r, WF .. ": no jobs found") end
+  for _, j in ipairs(jobs) do
+    local found = false
+    for _, st in ipairs(job_steps(body[j])) do
+      local t = "\n" .. table.concat(st, "\n") .. "\n"
+      local git = t:find('git merge-base --is-ancestor "$GITHUB_SHA" origin/main', 1, true)
+      local api = t:find("compare/main...$GITHUB_SHA", 1, true) and t:find("ahead_by", 1, true)
+      if git or api then
+        found = true
+        local cond = t:match("\n[%s%-]*if:%s*([^\n]-)%s*\n")
+        if cond then
+          cond = cond:match("^%${{%s*(.-)%s*}}$") or cond
+          if cond ~= "github.ref_type == 'tag'" then
+            fail(r, "job " .. j .. ": the check that a tag's commit is on main runs only if " .. cond)
+          end
+        end
+        if git then
+          local co = steps_using(body[j], "actions/checkout@")[1] or ""
+          if not co:find("\n%s*fetch%-depth:%s*0%s*\n") then
+            fail(r, "job " .. j .. ": checks main's history without fetching it (checkout fetch-depth: 0)")
+          end
+        end
+      end
+    end
+    if not found then fail(r, "job " .. j .. " does not check that a tag's commit is on main") end
+  end
+end)
+
+-- 17. @jev-edge/js loads from require() as well as import (audit packaging#6:
+--     the exports named only "import", so a CommonJS consumer got
+--     ERR_PACKAGE_PATH_NOT_EXPORTED even on a Node that can require() ESM).
+--     Each entry's last condition is "default", the file "import" names, and
+--     ci.yml's js job loads every entry both ways.
+rule("npm-exports", function(r)
+  local ex = (read("adapters/js/package.json") or ""):match('\n%s*"exports":%s*(%b{})')
+  if not ex then return fail(r, "adapters/js/package.json has no exports map") end
+  local ci = "\n" .. table.concat(code_lines(yaml_lines(read(".github/workflows/ci.yml"))), "\n") .. "\n"
+  local req = ci:match("\n[^\n]*(%[[^%]\n]*%][^\n]*require%('@jev%-edge/js' %+ s%))") or ""
+  local imp_line = ci:match("\n[^\n]*(%[[^%]\n]*%][^\n]*await import%('@jev%-edge/js' %+ s%))") or ""
+  local n = 0
+  for sub, entry in ex:gmatch('"([^"]+)":%s*(%b{})') do
+    n = n + 1
+    local keys = {}
+    for k in entry:gmatch('"([^"]+)":') do keys[#keys + 1] = k end
+    local imp = entry:match('"import":%s*"([^"]*)"')
+    local def = entry:match('"default":%s*"([^"]*)"')
+    if imp and def ~= imp then
+      fail(r, "exports " .. sub .. ': "default" is ' .. tostring(def) .. ', not the "import" file ' .. imp)
+    elseif def and keys[#keys] ~= "default" then
+      fail(r, "exports " .. sub .. ': "default" is not the last condition (Node takes the first that matches)')
+    end
+    local s = "'" .. sub:gsub("^%.", "") .. "'"
+    if not req:find(s, 1, true) then fail(r, "ci.yml does not require() exports " .. sub) end
+    if not imp_line:find(s, 1, true) then fail(r, "ci.yml does not import exports " .. sub) end
+  end
+  if n == 0 then fail(r, "adapters/js/package.json exports no conditions") end
 end)
 
 -- ---------------------------------------------------------------------------

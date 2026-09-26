@@ -127,7 +127,8 @@ jobs:
       - uses: actions/checkout@v7
       - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
-          version: 9
+          # the version is package.json's "packageManager"
+          package_json_file: adapters/js/package.json
       - uses: actions/setup-node@v7
         with:
           node-version: 22
@@ -138,6 +139,12 @@ jobs:
       - run: pnpm test
       # the published build config, not only the typecheck one
       - run: pnpm build
+      # every export loads from ESM and, through the "default" condition, from
+      # CommonJS (require(esm), Node >= 20.19 / 22.12)
+      - name: every export loads with import and require()
+        run: |
+          node --input-type=module -e "for (const s of ['', '/core', '/cloudflare', '/frameworks', '/aws', '/deno']) await import('@jev-edge/js' + s)"
+          node -e "for (const s of ['', '/core', '/cloudflare', '/frameworks', '/aws', '/deno']) require('@jev-edge/js' + s)"
 
   go:
     runs-on: ubuntu-24.04

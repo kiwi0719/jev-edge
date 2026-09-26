@@ -33,6 +33,7 @@ local function run(files)
       open = function(path, mode)
         local s = files[path]
         if s == nil then return io.open(path, mode) end
+        if s == false then return nil, path .. ": No such file or directory" end
         return { read = function() return s end, close = function() return true end }
       end,
       stderr = { write = function(_, s) out[#out + 1] = s end },
@@ -60,8 +61,13 @@ end
 p:close()
 assert(spec, "no rockspec at the repo root")
 local CI = ".github/workflows/ci.yml"
+local SEC = ".github/workflows/security.yml"
+local REL = ".github/workflows/release-npm.yml"
+local PKG = "adapters/js/package.json"
+local WS = "adapters/js/pnpm-workspace.yaml"
 local TSRULES = "adapters/js/src/rules/index.ts"
 local rs, ci, tsr = read(spec), read(CI), read(TSRULES)
+local sec, rel, pkg, ws = read(SEC), read(REL), read(PKG), read(WS)
 
 local function with_newjob(s)
   return edit(s, "\n  ci%-ok:\n",
@@ -142,6 +148,139 @@ local cases = {
     "ci-ok", "ci-ok does not run jq -e" },
   { "ci.yml: jq line commented out", { [CI] = edit(ci, "\n(%s*)(echo[^\n]*jq %-e 'all)", "\n%1# %2") },
     "ci-ok", "ci-ok does not run jq -e" },
+
+  -- pnpm-pin: one exact pnpm, read by every workflow (audit ci-release#10)
+  { "package.json: no packageManager", { [PKG] = edit(pkg, ',\n%s*"packageManager": "[^"]*"', "") },
+    "pnpm-pin", 'has no "packageManager"' },
+  { "package.json: packageManager is a range",
+    { [PKG] = edit(pkg, '"packageManager": "pnpm@[^"]*"', '"packageManager": "pnpm@^11.9.0"') },
+    "pnpm-pin", "not an exact pnpm@X.Y.Z" },
+  { "package.json: packageManager is a major",
+    { [PKG] = edit(pkg, '"packageManager": "pnpm@[^"]*"', '"packageManager": "pnpm@11"') },
+    "pnpm-pin", "not an exact pnpm@X.Y.Z" },
+  { "package.json: packageManager with its hash",
+    { [PKG] = edit(pkg, '("packageManager": "pnpm@[%d%.]+)"', '%1+sha512.0123abcdef"') } },
+  { "ci.yml: pnpm/action-setup back on version: 9",
+    { [CI] = edit(ci, "package_json_file: adapters/js/package%.json", "version: 9") },
+    "pnpm-pin", "ci.yml: pnpm/action-setup does not read the version from adapters/js/package.json" },
+  { "security.yml: pnpm/action-setup with a version as well",
+    { [SEC] = edit(sec, "(\n(%s*)package_json_file: adapters/js/package%.json)", "%1\n%2version: 11") },
+    "pnpm-pin", "security.yml: pnpm/action-setup sets a pnpm version of its own" },
+  { "release-npm.yml: pnpm/action-setup reads the root package.json",
+    { [REL] = edit(rel, "package_json_file: adapters/js/package%.json", "package_json_file: package.json") },
+    "pnpm-pin", "release-npm.yml: pnpm/action-setup does not read the version" },
+  { "ci.yml: pnpm/action-setup as `uses:` under `- name:`, with a version",
+    { [CI] = edit(ci, "\n(%s*)%- (uses: pnpm/action%-setup@[^\n]*)\n(%s*)with:\n",
+        "\n%1- name: pnpm\n%1  %2\n%3with:\n%3  version: 9\n") },
+    "pnpm-pin", "ci.yml: pnpm/action-setup sets a pnpm version of its own" },
+  { "pnpm-workspace.yaml: missing", { [WS] = false }, "pnpm-pin", "pnpm-workspace.yaml is missing" },
+  { "pnpm-workspace.yaml: what a newer pnpm writes, undecided",
+    { [WS] = edit(ws, "esbuild: false", "esbuild: set this to true or false") },
+    "pnpm-pin", "allowBuilds esbuild is set this to true or false" },
+  { "pnpm-workspace.yaml: esbuild's build script runs", { [WS] = edit(ws, "esbuild: false", "esbuild: true") },
+    "pnpm-pin", "allowBuilds esbuild is true" },
+  { "pnpm-workspace.yaml: esbuild with a comment",
+    { [WS] = edit(ws, "esbuild: false", "esbuild: false # see above") } },
+  { "pnpm-workspace.yaml: no decisions", { [WS] = edit(ws, "\nallowBuilds:\n[^\n]*\n", "\n") },
+    "pnpm-pin", "has no allowBuilds decisions" },
+  { "pnpm-workspace.yaml: every build script allowed", { [WS] = ws .. "dangerouslyAllowAllBuilds: true\n" },
+    "pnpm-pin", "dangerouslyAllowAllBuilds" },
+
+  -- release-token: only the publish job holds the OIDC token, and it runs no
+  -- repository or dependency code (audit ci-release#1)
+  { "release-npm.yml: id-token for the whole workflow again",
+    { [REL] = edit(rel, "\npermissions:\n  contents: read\n",
+        "\npermissions:\n  contents: read\n  id-token: write\n") },
+    "release-token", "workflow-level permissions are not just `contents: read`" },
+  { "release-npm.yml: write-all for the whole workflow",
+    { [REL] = edit(rel, "\npermissions:\n  contents: read\n", "\npermissions: write-all\n") },
+    "release-token", "workflow-level permissions are not just `contents: read` (write-all)" },
+  { "release-npm.yml: the build job holds the token too",
+    { [REL] = edit(rel, "(\n  build:\n    runs%-on: [^\n]*\n)",
+        "%1    permissions:\n      contents: read\n      id-token: write\n") },
+    "release-token", "2 jobs hold the OIDC token (build, publish)" },
+  { "release-npm.yml: publish outside the npm environment",
+    { [REL] = edit(rel, "\n    environment: [^\n]*", "") },
+    "release-token", "job publish holds the OIDC token outside the npm environment" },
+  { "release-npm.yml: publish in the environment object form",
+    { [REL] = edit(rel, "\n    environment: [^\n]*",
+        "\n    environment:\n      name: npm\n      url: https://www.npmjs.com/package/@jev-edge/js") } },
+  { "release-npm.yml: publish checks out the repository",
+    { [REL] = edit(rel, "(\n(%s*)%- uses: actions/download%-artifact@)", "\n%2- uses: actions/checkout@v7%1") },
+    "release-token", "job publish holds the OIDC token and checks out the repository" },
+  { "release-npm.yml: publish installs the dependencies",
+    { [REL] = edit(rel, "(\n(%s*)%- name: npm for trusted publishing)", "\n%2- run: npm ci%1") },
+    "release-token", "installs or runs packages: - run: npm ci" },
+  { "release-npm.yml: publish runs pnpm",
+    { [REL] = edit(rel, "(\n(%s*)%- name: npm for trusted publishing)",
+        "\n%2- run: pnpm install --frozen-lockfile --ignore-scripts%1") },
+    "release-token", "installs or runs packages: - run: pnpm install" },
+  { "release-npm.yml: npm for publishing is a range",
+    { [REL] = edit(rel, "npm install %-g npm@[%d%.]+", 'npm install -g "npm@>=11.5.1"') },
+    "release-token", "publishes with npm@>=11.5.1, not an exact version" },
+  { "release-npm.yml: npm publish from the working directory",
+    { [REL] = edit(rel, 'npm publish "%./%$TARBALL"', "npm publish") },
+    "release-token", "npm publish is not given the packed tarball" },
+  { "release-npm.yml: npm publish runs lifecycle scripts",
+    { [REL] = edit(rel, "(npm publish [^\n]*) %-%-ignore%-scripts", "%1") },
+    "release-token", "npm publish runs lifecycle scripts" },
+  { "release-npm.yml: no npm publish",
+    { [REL] = edit(rel, "\n[^\n]*run: npm publish [^\n]*", "\n        run: echo") },
+    "release-token", "runs no npm publish" },
+  { "release-npm.yml: build runs dependency scripts",
+    { [REL] = edit(rel, "pnpm install %-%-frozen%-lockfile %-%-ignore%-scripts", "pnpm install --frozen-lockfile") },
+    "release-token", "job build: pnpm install runs dependency scripts" },
+
+  -- release-on-main: both jobs check that a tag's commit is on main (lead-github-ops#32)
+  { "release-npm.yml: build does not check main",
+    { [REL] = edit(rel, "\n        run: |\n          if ! git merge%-base[^\n]*\n[^\n]*\n[^\n]*\n          fi\n",
+        "\n        run: echo skipped\n") },
+    "release-on-main", "job build does not check that a tag's commit is on main" },
+  { "release-npm.yml: publish does not check main",
+    { [REL] = edit(rel, "compare/main%.%.%.%$GITHUB_SHA", "compare/$GITHUB_SHA...$GITHUB_SHA") },
+    "release-on-main", "job publish does not check that a tag's commit is on main" },
+  { "release-npm.yml: build checks a release branch instead of main",
+    { [REL] = edit(rel, '(%-%-is%-ancestor "%$GITHUB_SHA" origin/)main', "%1release/0.6") },
+    "release-on-main", "job build does not check that a tag's commit is on main" },
+  { "release-npm.yml: build's check never runs",
+    { [REL] = edit(rel, "(\n      %- name: A tag's commit is on main\n        if: )github%.ref_type == 'tag'"
+        .. "(\n        working%-directory: %.)", "%1false%2") },
+    "release-on-main", "job build: the check that a tag's commit is on main runs only if false" },
+  { "release-npm.yml: publish's check runs on dry runs only",
+    { [REL] = edit(rel, "(\n      %- name: A tag's commit is on main\n        if: )github%.ref_type == 'tag'"
+        .. "(\n        env:\n          GH_TOKEN)", "%1${{ inputs.dry_run }}%2") },
+    "release-on-main", "job publish: the check that a tag's commit is on main runs only if inputs.dry_run" },
+  { "release-npm.yml: build's check as ${{ }}",
+    { [REL] = edit(rel, "(\n      %- name: A tag's commit is on main\n        if: )github%.ref_type == 'tag'"
+        .. "(\n        working%-directory: %.)", "%1${{ github.ref_type == 'tag' }}%2") } },
+  { "release-npm.yml: shallow checkout",
+    { [REL] = edit(rel, "\n          fetch%-depth: 0[^\n]*", "") },
+    "release-on-main", "job build: checks main's history without fetching it" },
+  { "security.yml: package_json_file with a trailing comment",
+    { [SEC] = edit(sec, "(package_json_file: adapters/js/package%.json)", "%1 # the pin") } },
+
+  -- npm-exports: every export loads from require() as well (audit packaging#6)
+  { "package.json: ./core without default",
+    { [PKG] = edit(pkg, '(\n%s*"import": "%./dist/core/index%.js"),\n%s*"default": "[^"]*"', "%1") },
+    "npm-exports", 'exports ./core: "default" is nil' },
+  { "package.json: default names another file",
+    { [PKG] = edit(pkg, '"default": "%./dist/aws%.js"', '"default": "./dist/aws.cjs"') },
+    "npm-exports", 'exports ./aws: "default" is ./dist/aws.cjs, not the "import" file ./dist/aws.js' },
+  { "package.json: default before types",
+    { [PKG] = edit(pkg,
+        '(\n%s*)"types": "%./dist/deno%.d%.ts",(\n%s*"import": "%./dist/deno%.js"),\n%s*"default": "%./dist/deno%.js"',
+        '%1"default": "./dist/deno.js",%1"types": "./dist/deno.d.ts",%2') },
+    "npm-exports", 'exports ./deno: "default" is not the last condition' },
+  { "package.json: a new export CI does not load",
+    { [PKG] = edit(pkg, '(\n%s*)"%./package%.json": "%./package%.json"',
+        '%1"./node": {%1  "types": "./dist/node.d.ts",%1  "import": "./dist/node.js",'
+          .. '%1  "default": "./dist/node.js"%1},%1"./package.json": "./package.json"') },
+    "npm-exports", "ci.yml does not require() exports ./node" },
+  { "ci.yml: no require() smoke", { [CI] = edit(ci, "\n[^\n]*require%('@jev%-edge/js' %+ s%)[^\n]*", "") },
+    "npm-exports", "ci.yml does not require() exports ." },
+  { "ci.yml: require() smoke skips /frameworks",
+    { [CI] = edit(ci, "(%[''[^%]\n]*)'/frameworks', ([^%]\n]*%]%) require)", "%1%2") },
+    "npm-exports", "ci.yml does not require() exports ./frameworks" },
 
   -- rule-parity: a path watched for any body on one runtime only
   { "rules: json_only_paths emptied in the TS copy",

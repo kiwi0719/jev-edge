@@ -1,12 +1,20 @@
 name: release-npm
 
 # Publishes adapters/js as @jev-edge/js. A tag push `vX.Y.Z` publishes when
-# X.Y.Z is the version in adapters/js/package.json; a manual run is a dry run
-# unless `dry_run` is unticked, and an unticked one must be started on a `v*`
-# tag (on a branch it fails), so every real publish passes the same tag check.
+# X.Y.Z is the version in adapters/js/package.json and the tagged commit is
+# already on main; a manual run is a dry run unless `dry_run` is unticked, and
+# an unticked one must be started on a `v*` tag (on a branch it fails), so
+# every real publish passes the same tag checks.
+#
+# Two jobs. `build` runs the repository's code and its dependencies (install
+# without dependency scripts, typecheck, test, build, pack) and has no OIDC
+# token. `publish` has the token and runs neither: it downloads the tarball
+# `build` packed and publishes it with a pinned npm, in the `npm` environment
+# (v* tags only).
 # Authentication is npm trusted publishing: npm trusts this repository's
-# release-npm.yml through GitHub's OIDC token, so no npm token is stored
-# anywhere (configured on npmjs.com, package settings -> Trusted Publisher).
+# release-npm.yml in the `npm` environment through GitHub's OIDC token, so no
+# npm token is stored anywhere (configured on npmjs.com, package settings ->
+# Trusted Publisher).
 # A version already on npm is skipped with a notice when it was published from
 # this run's commit (a rerun); from any other commit the run fails.
 
@@ -20,18 +28,23 @@ on:
         type: boolean
         default: true
 
+# the publish job alone adds id-token: write
 permissions:
   contents: read
-  id-token: write # trusted publishing and provenance: GitHub's OIDC token
 
 concurrency:
   group: release-npm-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && '--dry-run' || '' }}
+
 jobs:
-  publish:
+  build:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    outputs:
+      tarball: ${{ steps.pack.outputs.tarball }}
     defaults:
       run:
         working-directory: adapters/js
@@ -46,16 +59,35 @@ jobs:
           exit 1
 
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # main's history, for the check below
+          persist-credentials: false
+
+      # A tag push runs the workflow file of the tagged commit, reviewed or
+      # not; only main is reviewed (its ruleset), so a release comes from a
+      # commit main has. A hotfix branch would need main's protection first.
+      # A tag whose own workflow file drops this check is stopped by the
+      # ruleset on v* tags (a repository setting), not here.
+      - name: A tag's commit is on main
+        if: github.ref_type == 'tag'
+        working-directory: .
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::$TAG is on $GITHUB_SHA, which main does not have; tag a commit already merged to main"
+            exit 1
+          fi
+
       - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
-          version: 9
+          # the version is package.json's "packageManager"
+          package_json_file: adapters/js/package.json
       - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: pnpm
           cache-dependency-path: adapters/js/pnpm-lock.yaml
-          # no registry-url: its .npmrc reads NODE_AUTH_TOKEN, and trusted
-          # publishing needs no token at all
 
       - name: Tag matches package.json version
         if: github.ref_type == 'tag'
@@ -69,7 +101,8 @@ jobs:
           fi
           echo "publishing @jev-edge/js $pkg"
 
-      - run: pnpm install --frozen-lockfile
+      # no dependency lifecycle scripts, whatever pnpm-workspace.yaml allows
+      - run: pnpm install --frozen-lockfile --ignore-scripts
       - run: pnpm typecheck
       - run: pnpm test
       - run: pnpm build
@@ -81,7 +114,7 @@ jobs:
             const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
             let bad = 0;
             for (const [sub, t] of Object.entries(pkg.exports)) {
-              for (const f of typeof t === "string" ? [t] : [t.import, t.types]) {
+              for (const f of typeof t === "string" ? [t] : [t.import, t.default, t.types]) {
                 if (!fs.existsSync(f)) { console.log(`::error::${sub}: ${f} missing`); bad++; }
               }
               if (typeof t !== "string") await import(sub === "." ? pkg.name : pkg.name + sub.slice(1));
@@ -89,13 +122,109 @@ jobs:
             process.exit(bad ? 1 : 0);
           '
 
+      # the package is ESM; require() loads it on Node >= 20.19 / 22.12
+      # through the exports' "default" condition (require(esm))
+      - name: Every export loads with require()
+        run: node -e "for (const s of ['', '/core', '/cloudflare', '/frameworks', '/aws', '/deno']) require('@jev-edge/js' + s)"
+
       - name: LICENSE is the repository's
         run: cmp LICENSE ../../LICENSE
 
-      - name: Pack listing
+      - name: Pack
+        id: pack
         run: |
-          pnpm pack --pack-destination "$RUNNER_TEMP"
-          tar -tzf "$RUNNER_TEMP"/jev-edge-js-*.tgz
+          mkdir -p "$RUNNER_TEMP/pkg"
+          pnpm pack --pack-destination "$RUNNER_TEMP/pkg"
+          cd "$RUNNER_TEMP/pkg"
+          set -- *.tgz
+          if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
+            echo "::error::expected one tarball, found: $*"
+            exit 1
+          fi
+          tar -tzf "$1"
+          echo "tarball=$1" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: npm-package
+          path: ${{ runner.temp }}/pkg/${{ steps.pack.outputs.tarball }}
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # A real publish deploys to `npm`, which only v* tags may use, and npm's
+    # Trusted Publisher names that environment, so a token minted anywhere
+    # else cannot publish. A dry run takes no environment, so it runs on a
+    # branch too.
+    environment: ${{ (github.event_name != 'workflow_dispatch' || !inputs.dry_run) && 'npm' || '' }}
+    permissions:
+      contents: read
+      id-token: write # trusted publishing and provenance: GitHub's OIDC token
+    env:
+      TARBALL: ${{ needs.build.outputs.tarball }}
+    # Nothing is checked out or installed from the lockfile here: no code
+    # from the repository or its dependencies runs next to the OIDC token.
+    steps:
+      - name: Non-dry publishes come from a tag
+        if: github.event_name == 'workflow_dispatch' && !inputs.dry_run && github.ref_type != 'tag'
+        env:
+          REF: ${{ github.ref_name }}
+        run: |
+          echo "::error::a manual publish runs on a v* tag, not on $REF; start it on the tag, or leave dry_run ticked"
+          exit 1
+
+      # the build job's check again, without a checkout, so the job holding
+      # the token does not rely on another job's result for it
+      - name: A tag's commit is on main
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if ! ahead="$(gh api "repos/$GITHUB_REPOSITORY/compare/main...$GITHUB_SHA" --jq .ahead_by)"; then
+            echo "::error::could not compare $GITHUB_SHA with main"
+            exit 1
+          fi
+          if [ "$ahead" != 0 ]; then
+            echo "::error::$TAG is on $GITHUB_SHA, $ahead commit(s) main does not have; tag a commit already merged to main"
+            exit 1
+          fi
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: npm-package
+          path: ${{ runner.temp }}/pkg
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          # nothing to cache: no dependency is installed here
+          package-manager-cache: false
+          # no registry-url: its .npmrc reads NODE_AUTH_TOKEN, and trusted
+          # publishing needs no token at all
+
+      - name: Tag matches the packed version
+        id: pkg
+        working-directory: ${{ runner.temp }}/pkg
+        env:
+          TAG: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          manifest="$(tar -xzOf "$TARBALL" package/package.json)"
+          name="$(node -p 'JSON.parse(process.argv[1]).name' "$manifest")"
+          v="$(node -p 'JSON.parse(process.argv[1]).version' "$manifest")"
+          if [ "$name" != "@jev-edge/js" ]; then
+            echo "::error::$TARBALL holds $name, not @jev-edge/js"
+            exit 1
+          fi
+          if [ "$REF_TYPE" = tag ] && [ "${TAG#v}" != "$v" ]; then
+            echo "::error::tag $TAG does not match the packed version $v"
+            exit 1
+          fi
+          echo "publishing @jev-edge/js $v"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
 
       # On a real publish, a version already on npm must come from this commit
       # (a rerun of the same tag). gitHead is set by a publish from a checkout;
@@ -103,9 +232,9 @@ jobs:
       - name: Already on npm?
         id: exists
         env:
-          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && '--dry-run' || '' }}
+          VERSION: ${{ steps.pkg.outputs.version }}
         run: |
-          v="$(node -p "require('./package.json').version")"
+          v="$VERSION"
           npm view "@jev-edge/js@$v" version >/dev/null 2>&1 || exit 0
           if [ -z "$DRY_RUN" ]; then
             src="$(npm view "@jev-edge/js@$v" gitHead 2>/dev/null || true)"
@@ -127,13 +256,13 @@ jobs:
           echo "::notice::@jev-edge/js@$v is already on npm; nothing to publish"
           echo "yes=true" >> "$GITHUB_OUTPUT"
 
-      # trusted publishing needs npm >= 11.5.1 (Node 22 ships npm 10)
+      # trusted publishing needs npm >= 11.5.1 (Node 22 ships npm 10); an
+      # exact version, so a rerun publishes with the same npm
       - name: npm for trusted publishing
         if: steps.exists.outputs.yes != 'true'
-        run: npm install -g "npm@>=11.5.1" && npm --version
+        run: npm install -g npm@11.20.0 --ignore-scripts && npm --version
 
       - name: Publish (trusted publishing, with provenance)
         if: steps.exists.outputs.yes != 'true'
-        env:
-          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && '--dry-run' || '' }}
-        run: npm publish --access public --provenance $DRY_RUN
+        working-directory: ${{ runner.temp }}/pkg
+        run: npm publish "./$TARBALL" --access public --provenance --ignore-scripts $DRY_RUN

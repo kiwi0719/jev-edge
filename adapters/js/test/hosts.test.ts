@@ -76,7 +76,7 @@ describe("nextMiddleware", () => {
     const hot = { "x-jev-mock-score": "0.95" };
     const based = await mw(nextReq(ATTACK, "/docs/v1/chat/completions", { pathname: "/v1/chat/completions", basePath: "/docs" }, hot));
     expect(based.status).toBe(403);
-    expect(based.headers.get("x-jev-source")).toBe("l2");
+    expect(based.headers.get("x-jev-verdict")).toBe("malicious"); // a block response names no source
     const localized = await mw(nextReq(ATTACK, "/docs/fr/v1/chat/completions?x=1", { pathname: "/v1/chat/completions", search: "?x=1", basePath: "/docs", locale: "fr" }, hot));
     expect(localized.status).toBe(403);
     // a benign body under the basePath is judged too, and continues

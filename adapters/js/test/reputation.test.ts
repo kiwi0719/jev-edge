@@ -219,7 +219,7 @@ describe("subject reputation in the JevState namespace: one object per subject",
       for (let i = 0; i < 3; i++) {
         const res = await handle(malicious(i), r, seen);
         expect(res.status).toBe(403);
-        expect(res.headers.get("x-jev-source")).toBe("l2");
+        expect(res.headers.get("x-jev-verdict")).toBe("malicious"); // a block response names no source
       }
       const said = err.mock.calls.map((c) => String(c[0])).filter((m) => m.includes("subject read failed"));
       expect(said).toHaveLength(1);

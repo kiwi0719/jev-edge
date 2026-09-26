@@ -218,12 +218,26 @@ def short_body(t: Target, vectors) -> bytes:
 
 
 def check_keepalive(t: Target, vectors) -> str | None:
+    # http.client quietly reconnects when a response closes the connection,
+    # so a status check alone passes a server that never keeps one open: look
+    # at the first response and require the same socket for the second.
     c = t.conn()
+    body = short_body(t, vectors)
     try:
-        for i in range(2):
-            s, _, _ = t.request("POST", "/v1/systemone", short_body(t, vectors), conn=c)
-            if s != 200:
-                return f"request {i + 1} on one connection: status {s}"
+        c.request("POST", t.map_path("/v1/systemone"), body=body, headers=t.headers())
+        r = c.getresponse()
+        r.read()
+        if r.status != 200:
+            return f"request 1 on one connection: status {r.status}"
+        if r.version < 11 or r.will_close:
+            return ("first response closes the connection (HTTP/1.0 or Connection: close); "
+                    "the gateway's keepalive pool cannot reuse it")
+        sock = c.sock
+        s, _, _ = t.request("POST", "/v1/systemone", body, conn=c)
+        if s != 200:
+            return f"request 2 on one connection: status {s}"
+        if c.sock is not sock:
+            return "the second request went out on a new connection"
     except (http.client.HTTPException, OSError) as e:
         return f"second request on one connection failed: {e!r}"
     finally:

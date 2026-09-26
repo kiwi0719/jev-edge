@@ -7,6 +7,7 @@ import {
   createRuntime, evaluate, withVerdictHeaders, copyRequest, healthResponse, failOpen, errorForward, type Options, type Runtime,
 } from "./runtime.js";
 import { headers as verdictHeaders, newVerdict, ERROR, SRC_ADAPTER, type Verdict } from "./core/verdict.js";
+import { contentEncoding } from "./core/rules.js";
 
 const HEADERS = ["x-jev-verdict", "x-jev-score", "x-jev-source", "x-jev-reason", "x-jev-request-id", "x-jev-subject"];
 
@@ -116,6 +117,8 @@ export interface NodeRequestLike {
   socket?: { remoteAddress?: string };
   /** set by express.json() / body-parser; used instead of the stream when present */
   body?: unknown;
+  /** Set by nodeMiddleware when it read the stream itself: the bytes as they came. */
+  rawBody?: Buffer;
   on(event: "data" | "end" | "error", cb: (arg?: any) => void): unknown;
   /** node:http IncomingMessage flags: when the stream is already finished (a
    *  previous middleware consumed it) there is nothing to read and waiting
@@ -144,6 +147,25 @@ function asBuffer(v: unknown): Buffer | undefined {
 const utf8 = new TextDecoder("utf-8");
 function text(b: Buffer): string {
   return utf8.decode(b);
+}
+
+const strictUtf8 = new TextDecoder("utf-8", { fatal: true });
+
+/**
+ * What later middleware gets as `req.body` for a stream this middleware
+ * read itself: the UTF-8 string when the body is plain UTF-8 text, else the
+ * bytes as they came, as express.raw() hands them. A compressed body (any
+ * Content-Encoding) or a binary one (an upload in a multipart body) decoded
+ * to a string with U+FFFD in place of what is not UTF-8 could not be
+ * inflated or saved again.
+ */
+function handedOn(b: Buffer, headers: NodeRequestLike["headers"]): string | Buffer {
+  if (contentEncoding(headers) !== "") return b;
+  try {
+    return strictUtf8.decode(b);
+  } catch {
+    return b;
+  }
 }
 
 function isEmptyObject(v: unknown): boolean {
@@ -243,7 +265,9 @@ function judgedUrl(req: NodeRequestLike): URL {
  * `req.originalUrl`, since that is what the rules' watch_paths name. If you use
  * express.json() first, the parsed body is re-serialised for evaluation; if
  * not, the stream is read here (whole, see readNodeBody) and re-exposed as
- * `req.body` (string) and `req.jev` (the verdict). X-Jev-* are set on
+ * `req.rawBody` (the bytes) and `req.body`: the string for plain UTF-8, the
+ * bytes for a compressed or binary body (handedOn). `req.jev` is the
+ * verdict. X-Jev-* are set on
  * `req.headers` for the handlers; client-supplied ones are removed first.
  * Any error fails open with x-jev-verdict: error, x-jev-source: adapter.
  */
@@ -266,9 +290,10 @@ export function nodeMiddleware(opts: Options) {
       }
       const method = req.method ?? "GET";
       const [body, , fromParser] = method === "GET" || method === "HEAD" ? [null, 0, false] : await readNodeBody(req);
+      const raw = asBuffer(body);
+      if (raw) req.rawBody = raw;
       if (body !== null && (req.body === undefined || (req._body !== true && isEmptyObject(req.body)))) {
-        const b = asBuffer(body);
-        req.body = b ? text(b) : body;
+        req.body = raw ? handedOn(raw, req.headers) : body;
       }
       // a parser already decoded it: the runtime must not try again
       if (fromParser) headers.delete("content-encoding");

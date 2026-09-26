@@ -218,6 +218,52 @@ describe("nodeMiddleware", () => {
     expect(res.statusCode).toBe(403);
   });
 
+  /** A request whose stream the middleware reads itself, in these chunks. */
+  function streamed(chunks: Buffer[], headers: Record<string, string> = {}) {
+    const req = nodeReq(null, headers);
+    req.method = "POST";
+    setTimeout(() => {
+      for (const c of chunks) req.emit("data", c);
+      req.emit("end");
+    }, 0);
+    return req;
+  }
+
+  it("hands later middleware a compressed body as the bytes it came as", async () => {
+    const { gzipSync, gunzipSync } = await import("node:zlib");
+    const gz = gzipSync(Buffer.from(BENIGN));
+    const req = streamed([gz.subarray(0, 7), gz.subarray(7)], { "content-encoding": "gzip" });
+    let nexted = false;
+    await nodeMiddleware(opts())(req as never, nodeRes(), () => { nexted = true; });
+    expect(nexted).toBe(true);
+    expect((req.headers as Record<string, string>)["x-jev-source"]).toBe("l2"); // judged, decoded
+    expect(Buffer.isBuffer(req.body)).toBe(true);
+    expect(Buffer.compare(req.body as Buffer, gz)).toBe(0);
+    expect(gunzipSync(req.body as Buffer).toString()).toBe(BENIGN);
+    expect(Buffer.compare(req.rawBody as Buffer, gz)).toBe(0);
+  });
+
+  it("hands on a body that is not UTF-8 byte for byte, and a UTF-8 one as its string", async () => {
+    const boundary = "xYz";
+    const binary = Buffer.concat([
+      Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="f"; filename="a.bin"\r\nContent-Type: application/octet-stream\r\n\r\n`),
+      Buffer.from([0xff, 0xfe, 0x00, 0xc3, 0x28, 0x80]),
+      Buffer.from(`\r\n--${boundary}--\r\n`),
+    ]);
+    const req = streamed([binary], { "content-type": `multipart/form-data; boundary=${boundary}` });
+    await nodeMiddleware(opts())(req as never, nodeRes(), () => {});
+    expect(Buffer.isBuffer(req.body)).toBe(true);
+    expect(Buffer.compare(req.body as Buffer, binary)).toBe(0);
+    expect(Buffer.compare(req.rawBody as Buffer, binary)).toBe(0);
+
+    const text = '{"messages":[{"role":"user","content":"Grüße, 你好, a summary please."}]}';
+    const utf8 = Buffer.from(text);
+    const r2 = streamed([utf8.subarray(0, 40), utf8.subarray(40)]); // a split inside a multi-byte character
+    await nodeMiddleware(opts())(r2 as never, nodeRes(), () => {});
+    expect(r2.body).toBe(text);
+    expect(Buffer.compare(r2.rawBody as Buffer, utf8)).toBe(0);
+  });
+
   it("judges a body a parser already inflated, despite its content-encoding header", async () => {
     const mw = nodeMiddleware(opts());
     const req = nodeReq(ATTACK, { "content-encoding": "gzip", "x-jev-mock-score": "0.95" }, "/v1/chat/completions", JSON.parse(ATTACK));

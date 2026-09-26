@@ -958,7 +958,7 @@ def test_bedrock_text_document_the_guardrail_cannot_read_leaves_the_rest_judged(
     with pytest.raises(Exception) as ei:
         run(guard(transport, unjudged="block", **kw).async_pre_call_hook({}, None, dict(data), "acompletion"))
     assert ei.value.status_code == 403 and seen["calls"] == 2
-    assert ei.value.detail["jev"]["verdict"] == "safe" and ei.value.detail["jev"]["unjudged"].endswith("csv not readable")
+    assert ei.value.jev_verdict["verdict"] == "safe" and ei.value.jev_verdict["unjudged"].endswith("csv not readable")
     # in a toolResult: the document is left out of it, its text blocks stay
     result = {"toolResult": {"toolUseId": "t", "status": "success", "content": [{"text": "fetched"}, doc]}}
     got = jg._body_dict({"messages": [{"role": "user", "content": [result, {"text": "go on"}]}]}, (), limit or jg.MAX_BODY_BYTES)
@@ -1008,7 +1008,7 @@ def test_bedrock_attack_beside_a_document_the_guardrail_cannot_read_is_blocked(s
     v = data["metadata"]["jev_verdict"]
     assert (v["verdict"], v["action"], v["status"]) == ("malicious", "block", 403)
     assert v["unjudged"] == "unjudgeable: call type allm_passthrough_route: bedrock document txt not readable"
-    assert ei.value.detail["jev"] == v
+    assert ei.value.jev_verdict == v
     # monitor mode: noted, not blocked
     transport, seen = fake_authz(status=403, verdict="malicious", score="0.95")
     out = run(guard(transport, enforce=False, **kw).async_pre_call_hook({}, None, bedrock(converse), "allm_passthrough_route"))
@@ -1043,7 +1043,7 @@ def test_bedrock_document_the_guardrail_cannot_read_with_the_judge_unavailable()
         assert (v["verdict"], v["action"]) == ("error", "pass") and v["unjudged"].endswith("txt not readable")
         with pytest.raises(Exception) as ei:
             run(guard(transport, unjudged="block").async_pre_call_hook({}, None, dict(data), "acompletion"))
-        assert ei.value.status_code == 403 and ei.value.detail["jev"]["verdict"] == "error"
+        assert ei.value.status_code == 403 and ei.value.jev_verdict["verdict"] == "error"
 
 
 @pytest.mark.parametrize("call_type,data", [

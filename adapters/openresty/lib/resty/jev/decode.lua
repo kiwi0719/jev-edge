@@ -14,6 +14,7 @@
 -- load this module too.
 
 local ffi = require "ffi"
+local trim = require("jev.core.normalize").trim
 
 local ffi_new, ffi_cast, ffi_string = ffi.new, ffi.cast, ffi.string
 local concat, min = table.concat, math.min
@@ -231,7 +232,7 @@ local function parse(encodings)
   if type(encodings) == "table" then encodings = concat(encodings, ",") end
   local list = {}
   for tok in tostring(encodings or ""):gmatch("[^,]+") do
-    tok = tok:match("^%s*(.-)%s*$"):lower()
+    tok = trim(tok):lower()
     if tok ~= "" and tok ~= "identity" then
       local enc = ALIASES[tok]
       if not enc then return nil, "unsupported encoding: " .. tok end

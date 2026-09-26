@@ -198,6 +198,25 @@ export function fold(s: string): string {
   return asciiLower(s).replace(/\u017F/g, "s").replace(/\u212A/g, "k");
 }
 
+// Lua's %s: space, \t, \n, \v, \f, \r (String.prototype.trim also strips
+// Unicode spaces, which Lua keeps).
+function luaSpace(c: number): boolean {
+  return c === 32 || (c >= 9 && c <= 13);
+}
+
+/**
+ * Port of trim() in core/normalize.lua: s without Lua's %s at either end.
+ * Linear: /^[ \t\n\v\f\r]+|[ \t\n\v\f\r]+$/g tries the second branch at
+ * every position of a whitespace run inside the value and scans the run to
+ * its end each time, which costs its length squared.
+ */
+export function trim(s: string): string {
+  let i = 0, j = s.length;
+  while (i < j && luaSpace(s.charCodeAt(i))) i++;
+  while (j > i && luaSpace(s.charCodeAt(j - 1))) j--;
+  return i === 0 && j === s.length ? s : s.slice(i, j);
+}
+
 // Port of first_bytes: marks in `first` the UTF-16 units a key that folds to
 // `name` can start with: the folded name's first, that letter's other case,
 // U+017F for s and U+212A for k.

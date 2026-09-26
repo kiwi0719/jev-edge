@@ -20,6 +20,22 @@ describe("subject extraction and hashing", function()
       { header = function() return "  " end }))
   end)
 
+  it("trims a header or cookie with a long whitespace run in linear time (lead-openresty-runtime#20)", function()
+    local run = string.rep(" ", 32 * 1024)
+    local view = { header = function() return "k" .. run .. "x" .. run end,
+                   cookie_header = "sid=k" .. run .. "x" .. run }
+    for _, c in ipairs({ { { enabled = true, from = "header", name = "x-api-key" }, {} },
+                         -- the credentials after the scheme, which one space now separates
+                         { { enabled = true, from = "header", name = "authorization" }, { "k x" } },
+                         { { enabled = true, from = "cookie", name = "sid" }, {} } }) do
+      local t0 = os.clock()
+      local out = subject.extract_all(c[1], view)
+      local ms = (os.clock() - t0) * 1000
+      assert.same(c[2], out, "longer than MAX_VALUE_BYTES once trimmed")
+      assert.is_true(ms < 50, ("%s took %.1f ms"):format(c[1].name, ms))
+    end
+  end)
+
   it("hashes with the salt and never exposes the raw value", function()
     local id = subject.hash_id({ from = "header", salt = "pepper" }, "key-1", hash)
     assert.equals("header:H(pepper\0key-1)", id)

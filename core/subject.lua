@@ -218,7 +218,7 @@ _M.KEY_PREFIX = "subj:"
 --- Cookie header yields (cookie_values).
 _M.MAX_IDS = 4
 
-local function trim(s) return (s:match("^%s*(.-)%s*$")) end
+local trim = require("jev.core.normalize").trim
 
 -- Python's http.cookies unquoting of a quoted value's inside: \ooo (octal
 -- 000-377) is that code point, UTF-8 encoded, and \x is x.

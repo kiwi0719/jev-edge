@@ -153,6 +153,24 @@ describe("subject: cookie candidates (g1-subject-id-evasion#1)", () => {
     expect(core.subject.extractAll(scfg, { cookie: () => "s-9" })).toEqual(["s-9"]);
   });
 
+  it("trims a header or cookie with a long whitespace run in linear time (lead-openresty-runtime#20)", () => {
+    const run = " ".repeat(32 * 1024);
+    const view = { header: () => "k" + run + "x" + run, cookieHeader: "sid=k" + run + "x" + run };
+    const cases: [core.subject.SubjectConfig, string[]][] = [
+      [{ enabled: true, from: "header", name: "x-api-key" }, []],
+      // the credentials after the scheme, which one space now separates
+      [{ enabled: true, from: "header", name: "authorization" }, ["k x"]],
+      [{ enabled: true, from: "cookie", name: "sid" }, []],
+    ];
+    for (const [c, want] of cases) {
+      const t0 = performance.now();
+      const out = core.subject.extractAll(c, view);
+      const ms = performance.now() - t0;
+      expect(out, "longer than MAX_VALUE_BYTES once trimmed").toEqual(want);
+      expect(ms, `${c.name} took ${ms.toFixed(1)} ms`).toBeLessThan(50);
+    }
+  });
+
   // The same table is in core/spec/subject_store_spec.lua.
   const AUTH: [string, string][] = [
     ["Bearer k", "bearer k"], ["bearer k", "bearer k"], ["BEARER k", "bearer k"],

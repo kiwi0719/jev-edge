@@ -164,7 +164,7 @@ local function ct_watched(ct, rule)
   local skip = rule.skip_content_types or _M.SKIP_CONTENT_TYPES
   local any = false
   for raw in ct:gmatch("[^,]+") do
-    local v = raw:match("^%s*(.-)%s*$")
+    local v = normalize.trim(raw)
     if v ~= "" then
       any = true
       local skipped = false

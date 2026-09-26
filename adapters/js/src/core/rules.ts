@@ -1,5 +1,5 @@
 // Port of core/rules.lua: L1, cheap and short-circuiting.
-import { extract, extractTools, extractUntrusted, jsonLike, isText, byteLength, head, tail, fieldKeys, deepKeys, scanStrings, scanTools, window, chunks as splitChunks, chunkOverlap, utf8Bytes, byteString, type JsonValue } from "./normalize.js";
+import { extract, extractTools, extractUntrusted, jsonLike, isText, byteLength, head, tail, fieldKeys, deepKeys, scanStrings, scanTools, window, chunks as splitChunks, chunkOverlap, utf8Bytes, byteString, trim, type JsonValue } from "./normalize.js";
 import { untrustedSpec, type UntrustedConfig } from "./defaults.js";
 import { repBlocked, type SubjectCtx, type ReputationConfig } from "./subject.js";
 
@@ -476,7 +476,7 @@ function ctWatched(ct: string, rule: Rule): boolean | "media" {
   const skip = rule.skip_content_types ?? SKIP_CONTENT_TYPES;
   let any = false;
   for (const raw of c.split(",")) {
-    const v = raw.replace(/^[ \t\n\v\f\r]+|[ \t\n\v\f\r]+$/g, "");
+    const v = trim(raw);
     if (v === "") continue;
     any = true;
     if (!skip.some((sk) => v.startsWith(sk))) return true;

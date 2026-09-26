@@ -160,6 +160,24 @@ local function fold(s)
 end
 _M.fold = fold
 
+--- s without the whitespace Lua's %s matches (space, \t, \n, \v, \f, \r)
+-- at either end. Linear: '^%s*(.-)%s*$' tries %s*$ again at every byte the
+-- lazy capture grows by, so a whitespace run inside the value costs its
+-- length squared (a Content-Type of 32 KB of spaces between two letters held
+-- a worker for over a second); '^%s*(.*%S)' does the same on a value of
+-- whitespace only.
+function _M.trim(s)
+  local i = s:find("%S")
+  if not i then return "" end
+  local j = #s
+  local b = s:byte(j)
+  while b == 32 or (b >= 9 and b <= 13) do
+    j = j - 1
+    b = s:byte(j)
+  end
+  return s:sub(i, j)
+end
+
 -- A folded key starts with the folded name's first byte, or with that
 -- letter's other case, or with the first byte of U+017F / U+212A.
 local FIRST = { s = 0xC5, k = 0xE2 }

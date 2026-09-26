@@ -530,3 +530,33 @@ describe("normalize.valid_utf8", function()
     for _, c in ipairs(cases) do assert.equals(c[2], N.valid_utf8(c[1]), c[1]) end
   end)
 end)
+
+-- The same table is in adapters/js/test/core.test.ts ("normalize.trim").
+describe("normalize.trim (lead-openresty-runtime#20)", function()
+  local CASES = {
+    { "", "" }, { " ", "" }, { " \t\n\v\f\r ", "" },
+    { "a", "a" }, { " a ", "a" }, { "\ta b\t", "a b" }, { "\v\fa\r\n", "a" },
+    { "application/json ; charset=utf-8 ", "application/json ; charset=utf-8" },
+    { "\194\160a\194\160", "\194\160a\194\160" },     -- U+00A0 is not Lua %s: kept
+    { "a" .. string.rep(" ", 10) .. "b", "a" .. string.rep(" ", 10) .. "b" },
+  }
+
+  it("strips what Lua's %s matches at either end, as the pattern did", function()
+    for _, c in ipairs(CASES) do
+      assert.equals(c[2], N.trim(c[1]), c[1])
+      assert.equals(c[1]:match("^%s*(.-)%s*$"), N.trim(c[1]), c[1])
+    end
+  end)
+
+  it("is linear in a whitespace run inside the value", function()
+    local run = string.rep(" ", 32 * 1024)
+    for _, c in ipairs({ { "application/json" .. run .. "x", "application/json" .. run .. "x" },
+                         { run .. "x" .. run, "x" }, { run, "" } }) do
+      local t0 = os.clock()
+      local v = N.trim(c[1])
+      local ms = (os.clock() - t0) * 1000
+      assert.is_true(ms < 10, ("%d bytes took %.1f ms"):format(#c[1], ms))
+      assert.equals(c[2], v)
+    end
+  end)
+end)

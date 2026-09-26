@@ -18,6 +18,7 @@
 // something the request path has to wait for.
 import type { Verdict } from "./verdict.js";
 import type { Store } from "./breaker.js";
+import { trim } from "./normalize.js"; // Lua %s, not Unicode trim
 
 export const FORMAT = 1;
 export const KEY_PREFIX = "subj:";
@@ -48,8 +49,6 @@ export interface RequestView {
 /** Most ids one request can name (idsOf), and most candidate values one Cookie header yields (cookieValues). */
 export const MAX_IDS = 4;
 
-const LUA_TRIM = /^[ \t\n\v\f\r]+|[ \t\n\v\f\r]+$/g; // Lua %s, not Unicode trim
-const trim = (s: string) => s.replace(LUA_TRIM, "");
 
 // Port of unescape in core/subject.lua: Python's http.cookies unquoting of a
 // quoted value's inside, \ooo (octal 000-377) is that code point and \x is x.

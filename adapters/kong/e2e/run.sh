@@ -90,6 +90,32 @@ for i in $(seq 1 20); do
   [ "$last" = "app verdict=safe score=0.10 source=l2" ] && break
 done
 check "a rotated vault key is picked up" "app verdict=safe score=0.10 source=l2" "$last"
+# Keys the schema used to refuse (subject.reputation, provider laya,
+# ssl_verify, questions_json): the config parses, and they work.
+check "kong.yml with them parses" "yes" \
+  "$(docker compose exec -T kong kong config parse /kong/kong.yml 2>&1 | grep -q 'parse successful' && echo yes || echo no)"
+code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' -H 'X-User: alice' -H 'X-Jev-Mock-Score: 0.97' -d "$ATTACK" $base/rep/chat/completions)
+check "subject.reputation: an injection is blocked" "403" "$code"
+code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' -H 'X-User: alice' -d "$LONG" $base/rep/chat/completions)
+check "subject.reputation: that subject is then refused" "403" "$code"
+check "subject.reputation: another subject is not" "app verdict=safe score=0.20 source=l2" \
+  "$(curl -s -H 'Content-Type: application/json' -H 'X-User: bob' -d "$LONG" $base/rep/chat/completions)"
+bad='_format_version: "3.0"
+services:
+  - name: s
+    url: http://app:8081
+    routes:
+      - name: r
+        paths: ["/r"]
+        plugins:
+          - name: jev-edge
+            config:
+              jev: { provider: mock, questions_json: '"'"'{"injection":{"instructions":""}}'"'"' }'
+check "a questions_json core refuses is refused" "yes" \
+  "$(printf '%s\n' "$bad" | docker compose exec -T kong sh -c 'cat > /tmp/bad.yml; kong config parse /tmp/bad.yml' 2>&1 | grep -q 'instructions must be a non-empty string' && echo yes || echo no)"
+check "provider laya judges" "app verdict=safe score=0.10 source=l2" "$(post /laya/chat/completions '' "$LONG")"
+check "provider laya blocks an injection" "403" \
+  "$(curl -s -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' -d "$ATTACK" $base/laya/chat/completions)"
 check "log_line writes the decision" "yes" "$(docker compose logs kong 2>/dev/null | grep -q 'jev-edge: {.*"verdict":"malicious"' && echo yes || echo no)"
 
 if [ $fail -ne 0 ]; then echo; echo "--- kong logs"; docker compose logs kong | tail -40; exit 1; fi

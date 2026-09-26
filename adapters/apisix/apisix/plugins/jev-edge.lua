@@ -61,7 +61,7 @@ local schema = {
     jev = {
       type = "object",
       properties = {
-        provider           = { type = "string", enum = { "jev", "openai-compat", "mock" }, default = "jev" },
+        provider           = { type = "string", enum = { "jev", "laya", "openai-compat", "mock" }, default = "jev" },
         endpoint           = { type = "string" },
         model              = { type = "string" },
         api_key            = { type = "string" },
@@ -71,6 +71,9 @@ local schema = {
         timeout_max_ms     = { type = "integer", minimum = 1 },
         timeout_adaptive   = { type = "boolean" },
         max_inflight       = { type = "integer", minimum = 1 },
+        ssl_verify         = { type = "boolean" },
+        -- per-template question wording: { <template> = { instructions, criteria, ... } }
+        questions          = { type = "object" },
         -- mock provider knobs, for tests
         mock_score         = { type = "number", minimum = 0, maximum = 1 },
         mock_header        = { type = "string" },
@@ -97,6 +100,16 @@ local schema = {
         hashed      = { type = "boolean" },
         history_ttl = { type = "number", minimum = 1 },
         max_entries = { type = "integer", minimum = 1 },
+        reputation  = {
+          type = "object",
+          properties = {
+            block_at   = { type = "number", minimum = 0 },
+            window_s   = { type = "number", exclusiveMinimum = 0 },
+            block_ttl  = { type = "number", exclusiveMinimum = 0 },
+            suspicious = { type = "number", minimum = 0 },
+            malicious  = { type = "number", minimum = 0 },
+          },
+        },
       },
     },
     sampling = {

@@ -5,12 +5,14 @@
 -- unset and core's defaults (core/defaults.lua) fill it, so the three
 -- adapters cannot drift on a default.
 --
--- One deviation: Kong's typedefs cannot express "a string or a table" in one
--- array, so rules come in two fields:
+-- Two deviations, where Kong's typedefs cannot express the value:
 --   rules       array of rule set ids under rules/ ("llm-endpoints", ...)
 --   rules_json  the full rules list as JSON, ids and inline rules mixed,
 --               exactly the APISIX / Lua-config `rules` value; when set it
---               replaces `rules`.
+--               replaces `rules` ("a string or a table" in one array).
+--   jev.questions_json
+--               jev.questions (per-template question wording, a map of maps)
+--               as a JSON object.
 
 require("resty.jev.loader")()
 
@@ -60,6 +62,17 @@ local function check_rule_ids(ids)
   return true
 end
 
+local function check_questions_json(s)
+  local qs, err = cjson.decode(s)
+  if type(qs) ~= "table" or qs[1] ~= nil then
+    return nil, "questions_json must be a JSON object" .. (err and (": " .. err) or "")
+  end
+  local merged = defaults.merge(defaults.config, { jev = { questions = qs } })
+  local ok, verr = defaults.validate(merged)
+  if not ok then return nil, verr end
+  return true
+end
+
 local unit = { 0, 1 }
 
 return {
@@ -72,7 +85,7 @@ return {
         { jev = {
           type = "record",
           fields = {
-            { provider           = { type = "string", one_of = { "jev", "openai-compat", "mock" } } },
+            { provider           = { type = "string", one_of = { "jev", "laya", "openai-compat", "mock" } } },
             { endpoint           = { type = "string" } },
             { model              = { type = "string" } },
             -- a {vault://env/...} reference works here too
@@ -83,6 +96,9 @@ return {
             { timeout_max_ms     = { type = "integer", gt = 0 } },
             { timeout_adaptive   = { type = "boolean" } },
             { max_inflight       = { type = "integer", gt = 0 } },
+            { ssl_verify         = { type = "boolean" } },
+            -- jev.questions as JSON: { "<template>": { "instructions": ..., ... } }
+            { questions_json     = { type = "string", custom_validator = check_questions_json } },
             -- mock provider knobs, for tests
             { mock_score         = { type = "number", between = unit } },
             { mock_header        = { type = "string" } },
@@ -106,6 +122,16 @@ return {
             { hashed      = { type = "boolean" } },
             { history_ttl = { type = "number", gt = 0 } },
             { max_entries = { type = "integer", gt = 0 } },
+            { reputation  = {
+              type = "record",
+              fields = {
+                { block_at   = { type = "number", between = { 0, 1e9 } } },
+                { window_s   = { type = "number", gt = 0 } },
+                { block_ttl  = { type = "number", gt = 0 } },
+                { suspicious = { type = "number", between = { 0, 1e9 } } },
+                { malicious  = { type = "number", between = { 0, 1e9 } } },
+              },
+            } },
           },
         } },
         { sampling = {
@@ -181,6 +207,11 @@ return {
       field_sources = { "config" },
       fn = function(entity)
         local conf = strip_nulls(entity.config)
+        -- as the handler hands it to core: questions_json is jev.questions
+        if type(conf.jev) == "table" and conf.jev.questions_json then
+          conf.jev.questions = cjson.decode(conf.jev.questions_json)
+          conf.jev.questions_json = nil
+        end
         local merged = defaults.merge(defaults.config, conf)
         local ok, err = defaults.validate(merged)
         if not ok then return nil, err end

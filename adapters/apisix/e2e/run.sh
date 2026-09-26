@@ -76,5 +76,17 @@ check "route B (same endpoint, another key) is still judged at L2" "app verdict=
 check "route B still blocks an injection" "403" \
   "$(curl -s -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' -d "$ATTACK" $base/qb/chat/completions)"
 
+# Keys the schema used to refuse (subject.reputation, provider laya,
+# ssl_verify, questions): the routes load, and the keys work
+code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' -H 'X-User: alice' -H 'X-Jev-Mock-Score: 0.95' -d "$ATTACK" $base/rep/chat/completions)
+check "subject.reputation: an injection is blocked" "403" "$code"
+code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' -H 'X-User: alice' -d "$LONG" $base/rep/chat/completions)
+check "subject.reputation: that subject is then refused" "403" "$code"
+check "subject.reputation: another subject is not" "app verdict=safe score=0.20 source=l2" \
+  "$(curl -s -H 'Content-Type: application/json' -H 'X-User: bob' -d "$LONG" $base/rep/chat/completions)"
+check "provider laya judges" "app verdict=safe score=0.10 source=l2" "$(post /laya/chat/completions '' "$LONG")"
+check "provider laya blocks an injection" "403" \
+  "$(curl -s -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' -d "$ATTACK" $base/laya/chat/completions)"
+
 if [ $fail -ne 0 ]; then echo; echo "--- apisix logs"; docker compose logs apisix | tail -40; exit 1; fi
 echo "apisix e2e: all checks passed"

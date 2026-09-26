@@ -98,6 +98,14 @@ local function config_from(conf)
     if type(specs) == "table" and #specs > 0 then c.rules = specs
     else kong.log.err("jev-edge: rules_json is not a JSON array, using rules") end
   end
+  -- jev.questions_json: jev.questions as JSON (a map of maps Kong's schema
+  -- cannot type); the schema has checked it
+  if c.jev and c.jev.questions_json then
+    local qs = cjson.decode(c.jev.questions_json)
+    if type(qs) == "table" then c.jev.questions = qs
+    else kong.log.err("jev-edge: jev.questions_json is not a JSON object, ignored") end
+    c.jev.questions_json = nil
+  end
   c.rules_json, c.log_line = nil, nil
   return defaults.merge(defaults.config, c)
 end

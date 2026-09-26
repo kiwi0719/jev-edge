@@ -114,9 +114,8 @@ routes:
         rules: [{ id: secmiss, extends: llm-endpoints, watch_paths: ["^/secmiss/"] }]
         policy: { mode: enforce }
         async: { enabled: false }
-  # A rule set that is not on this node's disk: not judged, and said so
-  # (verdict error), never passed as "no rules"; blocked in enforce with
-  # policy.unjudgeable = block.
+  # A rule set that is not on this node's disk: check_schema refuses the
+  # conf, so neither route loads (404), never passed as "no rules".
   - uri: /norule/*
     upstream:
       nodes:

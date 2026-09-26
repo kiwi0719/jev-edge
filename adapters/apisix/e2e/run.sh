@@ -95,17 +95,18 @@ check "an \$env:// api_key that does not resolve is not sent" "app verdict=safe 
 check "an unresolved reference is reported" "yes" \
   "$(docker compose logs apisix 2>/dev/null | grep -q 'jev.api_key reference \$env://JEV_E2E_NO_SUCH_KEY did not resolve' && echo yes || echo no)"
 
-# A rule set missing from the node: the route is not judged by the rules
-# that did load (the mock would say 0.95 and block), nor passed as "no
-# rules"; it fails open as an error naming the rule, or blocks when
-# policy.unjudgeable = block
-check "a missing rule set: verdict error, the rule named" \
-  "app verdict=error score=0.00 source=adapter reason=rules+failed+to+load%3A+no-such-rule" \
-  "$(curl -s -H 'X-E2e-Reason: 1' -H 'Content-Type: application/json' -d "$LONG" $base/norule/chat/completions)"
-check "a missing rule set with policy.unjudgeable = block: 403" "403" \
+# A rule set missing from the node: check_schema resolves the rules, so the
+# standalone loader refuses the route (404) and says why; it is never judged
+# by the rules that did load (the mock would say 0.95 and block) nor passed
+# as "no rules". The plugin's run-time answer for a rule that still fails to
+# load (verdict error naming it, or a block under unjudgeable = block) stays
+# as a second line the loader leaves no way to reach here.
+check "a missing rule set: refused at load, no route" "404" \
+  "$(curl -s -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' -d "$LONG" $base/norule/chat/completions)"
+check "a missing rule set with policy.unjudgeable = block: refused at load, no route" "404" \
   "$(curl -s -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' -d "$LONG" $base/norule-block/chat/completions)"
 check "a missing rule set is logged" "yes" \
-  "$(docker compose logs apisix 2>/dev/null | grep -q 'rules\[1\] (no-such-rule) failed to load' && echo yes || echo no)"
+  "$(docker compose logs apisix 2>&1 | grep -q "rule set 'no-such-rule' not found" && echo yes || echo no)"
 
 # Keys the schema used to refuse (subject.reputation, provider laya,
 # ssl_verify, questions): the routes load, and the keys work

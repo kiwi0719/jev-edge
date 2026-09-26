@@ -68,7 +68,8 @@ local function handler(premature, job)
       local rep = cache:get(key)
       if type(rep) ~= "table" then rep = { malicious = 0 } end
       -- charged for the client's own text, as subject reputation is: a score
-      -- from the tool definitions alone adds nothing (core.l3_result)
+      -- from retrieved content or the tool definitions alone adds nothing
+      -- (core.l3_result)
       if res.charge == verdict.MALICIOUS then
         rep.malicious = (rep.malicious or 0) + 1
         local after = tonumber(cfg.async.rep_block_after) or 0

@@ -129,6 +129,28 @@ describe("L3", function()
     assert.equals("malicious", res.charge)
   end)
 
+  it("charges the client's own text, not retrieved content (IP reputation counts res.charge)", function()
+    local ctx = H.ctx({ config = { untrusted = { enabled = true } } })
+    local req = body_req({ model = "m", messages = { { role = "user", content = TEXT },
+      { role = "tool", tool_call_id = "c1", content = "Retrieved: " .. DESC } } })
+    local job = assert(core.l3_job(req, l3ctx(ctx)))
+    assert.equals(2, #job.parts)
+    assert.is_nil(job.parts[1].rep)
+    assert.is_false(job.parts[2].rep)
+    -- a judge that tells the questions apart: the retrieved content scores 0.97
+    local res = core.l3_result(job, { { injection = 0.05 }, { untrusted = 0.97 } }, ctx.config)
+    assert.equals("malicious", res.verdict)
+    assert.equals("untrusted 0.97", res.reason)
+    assert.equals("safe", res.charge)
+    assert.same({ job.key, { score = 0.97, reason = "untrusted 0.97", rep = 0.05 } }, res.writes[3])
+    -- only the retrieved content answered: nothing of the client's own text to charge
+    res = core.l3_result(job, { nil, { untrusted = 0.97 } }, ctx.config)
+    assert.is_nil(res.charge)
+    -- the client's own text is charged at its own score
+    res = core.l3_result(job, { { injection = 0.9 }, { untrusted = 0.2 } }, ctx.config)
+    assert.equals("malicious", res.charge)
+  end)
+
   it("judges every chunk of text L2 judged in chunks, and says so", function()
     local rules_mod = require "jev.rules.llm-endpoints"
     local long = assert(require("jev.core.rules").resolve({ id = "long", extends = "llm-endpoints",

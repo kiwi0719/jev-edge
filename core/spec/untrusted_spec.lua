@@ -339,6 +339,53 @@ describe("untrusted content: pipeline", function()
     assert.truthy(j.prompts[3].questions.untrusted)
   end)
 
+  describe("subject reputation", function()
+    -- block_at 5: malicious adds 3, suspicious 1
+    local function rep_ctx(j, over)
+      local store = H.store()
+      local cfg = on({ policy = { mode = "enforce" },
+                       subject = { enabled = true, salt = "s", reputation = { block_at = 5 } } })
+      for k, v in pairs(over or {}) do cfg[k] = v end
+      return H.ctx({ judge = j, config = cfg, subject = { id = "u-r", store = store } }), store
+    end
+    local function points(store)
+      local n = 0
+      for k, v in pairs(store.dump()) do if k:find(":b:", 1, true) then n = n + v end end
+      return n
+    end
+
+    it("is not charged for retrieved content: its score decides the request, not the subject's standing", function()
+      local ctx, store = rep_ctx(recording({ injection = 0.05, untrusted = 0.92 }))
+      for _ = 1, 3 do
+        local v = core.evaluate(tool_req(USER, ATTACK), ctx)
+        assert.equals(V.MALICIOUS, v.verdict)
+        assert.equals(V.ACTION_BLOCK, v.action)
+      end
+      assert.equals(0, points(store))
+      -- the first request judged, the others were whole-request cache hits: they charge the same
+      assert.equals(2, #ctx.judge.prompts)
+    end)
+
+    it("is charged for the subject's own text at its own score", function()
+      local ctx, store = rep_ctx(recording({ injection = 0.95, untrusted = 0.1 }))
+      core.evaluate(tool_req(USER, ATTACK), ctx)
+      assert.equals(3, points(store))
+      ctx, store = rep_ctx(recording({ injection = 0.6, untrusted = 0.95 }))
+      local v = core.evaluate(tool_req(USER, ATTACK), ctx)
+      assert.equals("untrusted 0.95", v.reason)
+      assert.equals(1, points(store))
+    end)
+
+    it("charges nothing when only retrieved content was judged", function()
+      local ctx, store = rep_ctx(recording({ untrusted = 0.95 }),
+        { untrusted = { enabled = true, fields = { "documents[*].text" } } })
+      local v = core.evaluate(req_for({ messages = { { role = "user", content = "ok?" } },
+        documents = { { text = ATTACK } } }), ctx)
+      assert.equals(V.MALICIOUS, v.verdict)
+      assert.equals(0, points(store))
+    end)
+  end)
+
   it("cuts long retrieved content to max_judge_bytes and says so", function()
     local j = recording({ untrusted = 0.6 })
     local long = ("Quarterly figures, all regions, no changes. "):rep(1200)

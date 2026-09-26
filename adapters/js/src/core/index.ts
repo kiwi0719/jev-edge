@@ -54,9 +54,10 @@ function nowMs(ctx: Ctx): number {
 }
 
 // Port of rep_of in core/init.lua: what subject reputation charges for a
-// request judged in parts. undefined: the verdict's own label; a number: the
-// subject's own text scored lower than a part it is not charged for (the tool
-// definitions); false: none of its own text was judged.
+// request judged in parts, the max score over the subject's own parts; never
+// retrieved content or tool definitions, which come from elsewhere. undefined:
+// the verdict's own label; a number: the subject's own text scored lower than
+// a part it is not charged for; false: none of its own text was judged.
 type Rep = number | false | undefined;
 function repOf(best: number | undefined, own: number | undefined): Rep {
   if (own === undefined) return false;
@@ -123,7 +124,7 @@ interface Part {
   over?: { templates?: string[]; deployment?: string };
   /** put before the template name in the reason when this part's score decides */
   label?: string;
-  /** false: not the subject's own text, its score is not charged to it */
+  /** false: not the subject's own text (retrieved content, tool definitions), its score is not charged to it */
   rep?: false;
 }
 
@@ -327,17 +328,18 @@ export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
     if (chunks && chunks.length > 1) suffix = capped ? " (window)" : ` (${chunks.length} chunks${windowed ? ", window" : ""})`;
     else if (windowed || untrusted?.windowed || tools?.windowed) suffix = " (window)";
     if (untrusted && uspec) {
-      // asked without the deployment context, the way the question was measured
+      // asked without the deployment context, the way the question was
+      // measured. Not the subject's own text: not charged to it (repOf).
       parts.push({
         text: untrusted.text, templates: uspec.templates,
         context: { path: req.path ?? "", method: req.method ?? "", deployment: "" },
-        over: { templates: uspec.templates, deployment: "" },
+        over: { templates: uspec.templates, deployment: "" }, rep: false,
       });
     }
     if (tools) {
       // the client sent them: the same question and scope as its own text,
       // so the entry is the one any text like it gets. Their score decides
-      // the request; the subject's reputation is charged for its own text.
+      // the request; not charged either (repOf).
       parts.push({ text: tools.text, templates: rule!.templates, context, label: TOOLS_LABEL, rep: false });
     }
     return judgeParts(ctx, rule!, parts, suffix, fp, ckey, reason);

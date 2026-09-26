@@ -1182,6 +1182,15 @@ local function untrusted_key(text, config)
   return core.cache_key(fp_of(text), require("jev.rules.llm-endpoints"), cfg, normalize.djb2,
     { templates = cfg.untrusted.templates, deployment = "" })
 end
+-- the whole request's cache key for a request judged with retrieved content
+local function untrusted_whole_key(r, config)
+  local cfg = defaults.merge(defaults.config, config)
+  local ctx = { cache = H.store(), clock = function() return 1000 end, json_decode = H.body_decode,
+                re_find = H.re_find, config = cfg }
+  local _, text, _, _, _, _, u = rules_mod.evaluate(r, llm, ctx)
+  return core.cache_key(fp_of(text .. "\n<untrusted content>\n" .. u.text), llm, cfg, normalize.djb2,
+    { templates = { "injection", "+" .. table.concat(cfg.untrusted.templates, ",") } })
+end
 eval_case("untrusted: off by default, a tool result is judged with the rest of the text", {
   req = raw_req(U_TOOL), config = { policy = { mode = "enforce" } }, judge = U_SCORES })
 eval_case("untrusted: on, the tool result is judged on its own and the higher score wins", {
@@ -1220,6 +1229,26 @@ eval_case("untrusted: a rule's own untrusted table turns it on for that rule", {
   rules = { { id = "rag", extends = "llm-endpoints", watch_paths = { "^/rag/" }, untrusted = { enabled = true } },
             "llm-endpoints" },
   judge = U_SCORES })
+
+-- subject reputation charges the subject's own text (core-pipeline#7): the
+-- retrieved content's score decides the request, and is not charged
+local U_REP = { untrusted = { enabled = true }, policy = { mode = "enforce" }, subject = REP.subject }
+eval_case("untrusted: a malicious score on retrieved content does not count toward the subject's reputation", {
+  req = raw_req(U_TOOL), config = U_REP, subject = { id = "u-6" },
+  judge = { by_question = { injection = 0.05, untrusted = 0.92 } } })
+eval_case("untrusted: the subject's own malicious text counts", {
+  req = raw_req(U_TOOL), config = U_REP, subject = { id = "u-7" },
+  judge = { by_question = { injection = 0.95, untrusted = 0.1 } } })
+eval_case("untrusted: retrieved content judged alone charges nothing", {
+  req = raw_req(U_FIELD), subject = { id = "u-8" },
+  config = { untrusted = { enabled = true, fields = { "documents[*].text" } }, policy = { mode = "enforce" },
+             subject = REP.subject },
+  judge = { by_question = { injection = 0.1, untrusted = 0.95 } } })
+eval_case("untrusted: a whole-request cache hit charges what its entry says", {
+  req = raw_req(U_TOOL), config = U_REP, subject = { id = "u-9" },
+  cache = { [untrusted_whole_key(raw_req(U_TOOL), U_REP)] =
+    { score = 0.92, reason = "untrusted 0.92", rep = 0.05 } },
+  judge = { by_question = { injection = 0.95, untrusted = 0.95 } } })
 
 -- more retrieved-content shapes: every Responses *_call_output, mcp_call and
 -- file_search_call results

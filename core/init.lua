@@ -44,11 +44,16 @@ local function now_ms(ctx)
   return (ctx.clock and ctx.clock() or 0) * 1000
 end
 
--- What subject reputation charges for a request judged in parts: nil (the
+-- What reputation charges for a request judged in parts: the max score over
+-- the subject's own parts, the text it wrote. Retrieved content and tool
+-- definitions come from elsewhere (a web page, a mailbox, an MCP server the
+-- user may not control): their score decides the request, but charging it
+-- would let anyone who plants text there get users blocked. nil (the
 -- verdict's own label) when the subject's own text scored the request's
--- score, its own score when a part it is not charged for (the tool
--- definitions) scored higher, and false when none of its own text was judged.
--- The whole request's cache entry keeps it as `rep`, so a hit charges the same.
+-- score, its own score when a part it is not charged for scored higher, and
+-- false when none of its own text was judged. The whole request's cache
+-- entry keeps it as `rep`, so a hit charges the same; L3 charges IP
+-- reputation on the same label (l3_result).
 local function rep_of(best, own)
   if own == nil then return false end
   if own == best then return nil end
@@ -163,16 +168,16 @@ local function plan(req, cfg, hash, rule, text, windowed, chunks, capped, untrus
     suffix = " (window)"
   end
   if untrusted then
-    -- asked without the deployment context, the way the question was measured
+    -- asked without the deployment context, the way the question was
+    -- measured. Not the subject's own text: not charged to it (rep_of).
     parts[#parts + 1] = { text = untrusted.text, templates = uspec.templates,
       context = { path = req.path or "", method = req.method or "", deployment = "" },
-      over = { templates = uspec.templates, deployment = "" } }
+      over = { templates = uspec.templates, deployment = "" }, rep = false }
   end
   if tools then
     -- the client sent them: the same question and scope as its own text,
     -- so the entry is the one any text like it gets. An agent loads them
-    -- from servers the user may not control: their score decides the
-    -- request, but the subject's reputation is charged for its own text.
+    -- from servers the user may not control: not charged either (rep_of).
     parts[#parts + 1] = { text = tools.text, templates = rule.templates, context = p.context,
       label = TOOLS_LABEL, rep = false }
   end
@@ -192,7 +197,8 @@ end
 -- @param parts  list of { text, templates, context, over, label, rep } (over:
 --               cache_key's; label: put before the template name in the
 --               reason when this part's score decides; rep = false: not the
---               subject's own text, its score is not charged to it)
+--               subject's own text (retrieved content, tool definitions),
+--               its score is not charged to it)
 -- @param suffix appended to the reason when a part answered
 local function judge_parts(ctx, rule, parts, suffix, fp, ckey, reason)
   local cfg = ctx.config
@@ -460,7 +466,8 @@ end
 
 --- What L3's answers make of a job: the highest part score and its verdict
 -- and reason (as L2 would have given them), the label reputation charges
--- (that of the subject's own text; see rep_of), and the cache writes.
+-- (that of the subject's own text, never retrieved content or tool
+-- definitions; see rep_of), and the cache writes.
 -- @param job     from l3_job
 -- @param results results[k] is the judge's answers for job.parts[k], or nil
 --                when that call failed

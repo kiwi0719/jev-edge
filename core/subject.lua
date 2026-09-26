@@ -132,9 +132,10 @@ end
 -- Only judged verdicts count (L2, cache): an L1 block is the consequence, and
 -- counting it would extend the block by itself. Errors are swallowed.
 -- Reputation charges the subject for its own text only: a request whose
--- score came from the tool definitions (which an agent loads from a server
--- the user may not control) is charged at `charge`, the label its own text
--- earned, and with `charge == false` (none of its own text judged) not at all.
+-- score came from retrieved content or the tool definitions (which an agent
+-- loads from pages, mailboxes and servers the user may not control) is
+-- charged at `charge`, the label its own text earned, and with
+-- `charge == false` (none of its own text judged) not at all.
 -- @param charge optional: the label to charge instead of v.verdict, or false
 function _M.rep_record(ctx, v, charge)
   local r, at = rep_cfg(ctx)

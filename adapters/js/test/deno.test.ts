@@ -156,7 +156,9 @@ describe("denoHandler", () => {
     captureUpstream();
     const res = await denoHandler({ upstream: UPSTREAM, config: mockConfig() })(new Request("https://edge.example/_jev/health"), PEER);
     expect(res.status).toBe(200);
-    expect(((await res.json()) as { ok: boolean }).ok).toBe(true);
+    const j = (await res.json()) as Record<string, unknown>;
+    expect(j.ok).toBe(true);
+    expect(j.mode).toBeUndefined(); // the details only with health: "details"
   });
 
   it("puts the subject ring in Deno KV when kv is given", async () => {

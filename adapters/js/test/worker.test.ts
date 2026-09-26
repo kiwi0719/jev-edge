@@ -174,11 +174,35 @@ describe("handle", () => {
     expect(((await res.json()) as Record<string, string>).source).toBe("breaker");
   });
 
-  it("answers /_jev/health", async () => {
+  it("answers /_jev/health with ok, adapter and core only", async () => {
     const res = await handle(new Request("https://edge.example/_jev/health"), mockRt(), echo);
     const j = (await res.json()) as Record<string, unknown>;
-    expect(j.provider).toBe("mock");
-    expect(j.mode).toBe("enforce");
+    expect(Object.keys(j).sort()).toEqual(["adapter", "core", "ok"]);
+    expect(j.ok).toBe(true);
+  });
+
+  it("adds provider, model, mode and endpoint with health: \"details\"", async () => {
+    const rt = createRuntime({ config: { jev: { provider: "mock", model: "m1", timeout_ms: 400 }, policy: { mode: "enforce" } }, health: "details" });
+    const j = (await (await handle(new Request("https://edge.example/_jev/health"), rt, echo)).json()) as Record<string, unknown>;
+    expect(j).toMatchObject({ ok: true, provider: "mock", model: "m1", mode: "enforce", endpoint: null });
+  });
+
+  it("health: false leaves /_jev/health to the app", async () => {
+    const rt = createRuntime({ config: { jev: { provider: "mock", timeout_ms: 400 } }, health: false });
+    const j = (await (await handle(new Request("https://edge.example/_jev/health"), rt, echo)).json()) as Record<string, unknown>;
+    expect(j.source).toBe("l1"); // passed on, not answered
+  });
+
+  it("the thin Worker's health reply does not name its origin", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("origin")));
+    try {
+      const res = await thinWorker({ origin: "https://origin.internal.example" }).fetch(new Request("https://edge.example/_jev/health"), {});
+      const text = await res.text();
+      expect(text).not.toContain("origin.internal.example");
+      expect(JSON.parse(text)).toEqual({ ok: true, adapter: "cloudflare", core: expect.any(String) });
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it("rejects an invalid config at startup", () => {

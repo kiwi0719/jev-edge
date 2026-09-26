@@ -65,8 +65,9 @@ export interface Options {
   onVerdict?: (v: core.Verdict, req: Request) => void;
   /** Receives sampled decisions (normalized text, fingerprint, score, verdict) when config.sampling.enabled; storage is yours. */
   onSample?: (s: Sample, req: Request) => void;
-  /** Serve GET /_jev/health from the Worker (default true). */
-  health?: boolean;
+  /** Serve GET /_jev/health (default true): `{ ok, adapter, core }`. "details" adds provider, model, mode and
+   *  endpoint (the thin Worker's origin), which any caller can read; false leaves the path to the app. */
+  health?: boolean | "details";
   /** Set by the Cloudflare presets. Only then is `cf-ray` trusted as the request id; elsewhere it is a client header like any other. */
   platform?: "cloudflare";
 }
@@ -597,12 +598,22 @@ export function copyRequest(request: Request, headers: HeadersInit, body?: BodyI
   return new Request(request.url, init);
 }
 
+/**
+ * GET /_jev/health, on the traffic path and open to anyone: liveness and
+ * versions only. The provider, model, policy mode and endpoint (a thin
+ * Worker's origin URL, an internal judge address) tell a caller how to aim
+ * at the judge or where the origin is, so they come only with
+ * `health: "details"`.
+ */
 export function healthResponse(rt: Runtime): Response {
-  return Response.json({
-    ok: true, adapter: rt.opts.platform ?? "js", core: core.VERSION,
-    provider: rt.provider.name, model: rt.config.jev.model ?? null, mode: rt.config.policy.mode,
-    endpoint: rt.config.jev.endpoint ?? null,
-  });
+  const body: Record<string, unknown> = { ok: true, adapter: rt.opts.platform ?? "js", core: core.VERSION };
+  if (rt.opts.health === "details") {
+    Object.assign(body, {
+      provider: rt.provider.name, model: rt.config.jev.model ?? null, mode: rt.config.policy.mode,
+      endpoint: rt.config.jev.endpoint ?? null,
+    });
+  }
+  return Response.json(body);
 }
 
 /**

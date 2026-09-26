@@ -367,7 +367,10 @@ describe("nodeMiddleware", () => {
     const res = nodeRes();
     await mw(mounted("/v1", "/v1/_jev/health", null) as never, res, () => {});
     expect(res.ended).toBe(true);
-    expect(JSON.parse(res.body)).toMatchObject({ ok: true, provider: "mock" });
+    expect(JSON.parse(res.body)).toEqual({ ok: true, adapter: "js", core: expect.any(String) });
+    const detailed = nodeRes();
+    await nodeMiddleware({ ...opts(), health: "details" })(mounted("/v1", "/v1/_jev/health", null) as never, detailed, () => {});
+    expect(JSON.parse(detailed.body)).toMatchObject({ ok: true, provider: "mock", mode: "enforce" });
   });
 
   it("judges an absolute-form target on its path", async () => {

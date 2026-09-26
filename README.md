@@ -76,7 +76,7 @@ HTTP/1.1 403 Forbidden
 {"error":"request rejected"}
 ```
 
-The compose log shows one JSON line per judged request. `curl localhost:8090/_jev/health` reports the provider and timeout state, and `curl -X PUT localhost:8090/_jev/config -d '{"policy":{"mode":"monitor"}}'` flips to monitor mode without a reload. To judge with the real model, `export TYPESAFE_API_KEY=...` before `docker compose up`; the same config switches to the `jev` provider. Everything the demo runs is four short files in [demo/](demo/).
+The compose log shows one JSON line per judged request. The demo serves its admin endpoints on port 8090 (an installed gateway uses `127.0.0.1:9180`, below): `curl localhost:8090/_jev/health` reports the provider and timeout state, and `curl -X PUT localhost:8090/_jev/config -d '{"policy":{"mode":"monitor"}}'` flips to monitor mode without a reload. To judge with the real model, `export TYPESAFE_API_KEY=...` before `docker compose up`; the same config switches to the `jev` provider. Everything the demo runs is four short files in [demo/](demo/).
 
 ## How it works
 
@@ -94,7 +94,8 @@ How much reaches L2 is a property of your traffic: a few percent on a whole site
 
 - **Fail-open.** Jev slow or down → traffic flows and a log line fires. A circuit breaker stops the gateway waiting out the timeout on every request while the API is unhealthy.
 - **Cache.** Normalized body fingerprints are reused within a TTL; scrapers and replays are highly repetitive.
-- **Verdict headers.** `X-Jev-Verdict` and `X-Jev-Score` reach your upstream, so the application can make its own second decision.
+- **Reads what the backend reads.** The routes and aliases of OpenAI-compatible servers, Anthropic, Ollama, Gemini, Cohere, llama.cpp, TGI, Open WebUI and the AI SDK; tool-call arguments and tool definitions; compressed, oversized and malformed bodies. What it cannot read is reported as unjudgeable, never passed as "no text" ([what L1 reads](docs/design.md#body-size-and-what-l1-reads)).
+- **Verdict headers.** `X-Jev-Verdict` and `X-Jev-Score` reach your upstream, so the application can make its own second decision. A blocked client sees the verdict and a request id, never the score.
 - **Hot reload.** Flip `enforce` / `monitor`, thresholds or [retrieved-content judging](docs/design.md#retrieved-content) with one local PUT, no nginx reload.
 - **Pluggable judge.** A provider is two functions: `jev`, `laya`, `openai-compat` and `mock` ship.
 
@@ -125,7 +126,7 @@ git clone https://github.com/kiwi0719/jev-edge && cd jev-edge && sudo make insta
 1. Put your TypeSafe key in the environment nginx starts with and declare it: `env TYPESAFE_API_KEY;` at the top of `nginx.conf`.
 2. Point cosockets at a CA bundle, or every call to the provider fails TLS verification: `lua_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;` in `http {}`.
 3. Edit `/etc/nginx/jev-edge.conf.lua`. Write the `deployment_context`; see [the next section](docs/design.md#writing-the-deployment-context), it is the setting that decides your accuracy. Leave `policy.mode = "monitor"`.
-4. Add the three shared dicts and the `init` / `init_worker` blocks to `http {}`, then `access_by_lua_block` to the locations you want watched. The full example is [adapters/openresty/conf/example.nginx.conf](adapters/openresty/conf/example.nginx.conf); the minimum is:
+4. Add the shared dicts and the `init` / `init_worker` blocks to `http {}`, `access_by_lua_block` to the locations you want watched, and the admin endpoints on a listener of their own. The full example is [adapters/openresty/conf/example.nginx.conf](adapters/openresty/conf/example.nginx.conf); the minimum is:
 
 ```nginx
 lua_shared_dict jev_cache  64m;
@@ -137,9 +138,17 @@ env TYPESAFE_API_KEY;
 init_by_lua_block        { require("resty.jev.edge").init("/etc/nginx/jev-edge.conf.lua") }
 init_worker_by_lua_block { require("resty.jev.edge").init_worker() }
 
+# in the server that proxies your LLM traffic
 location /v1/ {
     access_by_lua_block { require("resty.jev.edge").access() }
     proxy_pass http://llm_backend;
+}
+
+# admin endpoints: a server of their own in http {}, on loopback
+server {
+    listen 127.0.0.1:9180;
+    location = /_jev/health { content_by_lua_block { require("resty.jev.edge").health() } }
+    location = /_jev/config { content_by_lua_block { require("resty.jev.edge").config_api() } }
 }
 ```
 
@@ -158,7 +167,7 @@ return {
 5. Reload nginx and check the provider from the box itself. This makes one real call and reports latency, the effective timeout and the breaker state:
 
 ```bash
-curl -s localhost:8090/_jev/health
+curl -s 127.0.0.1:9180/_jev/health
 ```
 
 6. Send a request:
@@ -181,7 +190,7 @@ It prints the score distribution, AUC, false-positive and miss rates per thresho
 8. Switch to `enforce` with one call, no reload:
 
 ```bash
-curl -X PUT localhost:8090/_jev/config -d '{"policy":{"mode":"enforce"}}'
+curl -X PUT 127.0.0.1:9180/_jev/config -d '{"policy":{"mode":"enforce"}}'
 ```
 
 Rollback is the same call with `"monitor"`, or `DELETE /_jev/config` to drop every runtime override.
@@ -189,7 +198,7 @@ Rollback is the same call with `"monitor"`, or `DELETE /_jev/config` to drop eve
 **Other gateways and hosts.**
 
 - **Apache APISIX**: the same engine as a plugin, per-route config with the same keys: [adapters/apisix](adapters/apisix/README.md).
-- **Kong Gateway**: the same engine as a plugin (Kong 3.x, DB-less or with a database), per-route or per-service config: [adapters/kong](adapters/kong/README.md).
+- **Kong Gateway**: the same engine as a plugin (Kong 3.x, DB-less, with a database or in hybrid mode), per-route or per-service config: [adapters/kong](adapters/kong/README.md).
 - **Envoy** uses the OpenResty process as its ext_authz service: [adapters/envoy](adapters/envoy/README.md). **HAProxy** does the same through a small SPOE agent: [adapters/haproxy](adapters/haproxy/README.md). **Traefik, Caddy and nginx `auth_request`** use one forward-auth endpoint: [adapters/forward-auth](adapters/forward-auth/README.md).
 - **Istio, Envoy Gateway, Azure API Management, Apigee**: configuration only, against the same `/_jev/authz` contract: [docs/recipes.md](docs/recipes.md).
 - **LiteLLM proxy**: a guardrail that asks jev-edge before every call: [adapters/litellm](adapters/litellm/README.md).

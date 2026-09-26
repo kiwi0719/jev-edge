@@ -16,15 +16,18 @@
 http {
     lua_shared_dict jev_metrics 4m;   # a few dozen keys; 1m is already plenty
 
-    server {
+    server {                          # the admin listener, never the traffic server
+        listen <monitoring-network-ip>:9180;
         location = /_jev/metrics {
-            allow 10.0.0.0/8;   # your Prometheus, nothing else
+            allow <prometheus-host>;  # your Prometheus, nothing else
             deny all;
             content_by_lua_block { require("resty.jev.edge").metrics() }
         }
     }
 }
 ```
+
+这就是 [example.nginx.conf](../adapters/openresty/conf/example.nginx.conf) 里的管理 server（那里绑定在 `127.0.0.1:9180`），只是换成你的 Prometheus 能访问到的地址。不要放在承载业务流量的 server 上：在负载均衡后面，`allow` 列表看到的是负载均衡的地址，而不是 Prometheus 的地址，除非配置了 `realip`；给它单独开一个监听端口，`allow` 列表才真正起作用。
 
 抓取方式和普通 target 没有区别。仪表盘和告警规则都以 `job` 和 `instance` 作为区分维度：
 
@@ -33,7 +36,7 @@ scrape_configs:
   - job_name: jev-edge
     metrics_path: /_jev/metrics
     static_configs:
-      - targets: ["gw1.internal:8080", "gw2.internal:8080"]
+      - targets: ["gw1.internal:9180", "gw2.internal:9180"]
 ```
 
 指标本身不用额外配置。告警会读取下面这些配置项：`jev.timeout_ms` / `jev.timeout_max_ms`（自适应超时的下限和上限）、`breaker.*`、`async.max_async`、`policy.unjudgeable`、`feedback.enabled` / `feedback.token`。
@@ -44,19 +47,23 @@ scrape_configs:
 
 | 指标 | 类型 | 标签 | 含义 |
 |---|---|---|---|
-| `jev_requests_total` | counter | `source`（l1、trust、cache、l2、breaker），`verdict`（safe、suspicious、malicious、error、skipped） | 每个经过评估的请求 |
+| `jev_requests_total` | counter | `source`（l1、trust、cache、l2、breaker、adapter），`verdict`（safe、suspicious、malicious、error、skipped） | 每个经过评估的请求 |
 | `jev_actions_total` | counter | `action`（pass、block） | 网关最终对请求做了什么 |
 | `jev_cache_hits_total` | counter | `kind`（fp） | 判定结果缓存的命中次数 |
 | `jev_l2_errors_total` | counter | `kind`（transport、timeout、unavailable、rejected、unusable、busy、other） | 以 `verdict=error` 收场的 L2 调用，按失败原因分类 |
-| `jev_l2_latency_ms` | histogram | `le`（25、50、100、200、300、500、1000、+Inf） | L2 调用耗时，失败的调用也算在内 |
+| `jev_l2_latency_ms` | histogram | `le`（25、50、100、200、300、500、1000、2000、3000、5000、10000、30000、+Inf） | L2 调用耗时，失败的调用也算在内；被 `max_inflight` 拒掉的（根本没发出调用）和每个部分都命中缓存的判定不算。有过一次调用之后每个桶都会输出，而且一个桶的值不会低于它下面那个桶（刚升级完时，新增的桶从旧的 `le="1000"` 起算） |
 | `jev_tokens_total` | counter | `direction`（input、output） | provider 消耗的 token 数 |
 | `jev_breaker_state` | gauge | | 0 表示关闭，1 表示打开，2 表示半开（见 `core/breaker.lua`） |
 | `jev_async_dropped_total` | counter | | 没能调度起来的异步（L3）任务 |
+| `jev_async_total` | counter | `result`（ok、failed、busy、no_scores、error） | 跑过的异步（L3）任务，按结果分类 |
 | `jev_l2_timeout_ms` | gauge | | 当前生效的 L2 自适应超时 |
 | `jev_l2_timeout_max_ms` | gauge | | 自适应超时的上限（`jev.timeout_max_ms`） |
-| `jev_unjudged_total` | counter | `reason`（body、binary、content-encoding） | 需要检查、但谁都读不了内容的请求 |
+| `jev_unjudged_total` | counter | `reason`（body、binary、content-encoding、invalid、json、partial、text、multipart、token） | 需要检查、但谁都读不了内容的请求 |
 | `jev_window_total` | counter | | 长文本按送审窗口切分后，L2 给出的窗口评分数 |
 | `jev_feedback_total` | counter | `label`（benign、attack、other），`result`（trusted、refused、revoked、invalid） | 通过 token 校验的 `POST /_jev/feedback` 调用 |
+| `jev_subject_blocks_total` | counter | | 因主体信誉被拦截的请求 |
+| `jev_authz_events_total` | counter | `event`（no_client_ip、cut_at_cap） | `/_jev/authz` 收到的、找不到可信客户端地址的请求（没有 `X-Forwarded-For`，或者跳数少于 `trusted_hops`），以及达到或超过 `max_body_bytes`、被当作截断处理的请求体 |
+| `jev_adapter_errors_total` | counter | `entry`（access、authz、forward_auth） | 因为判定过程抛异常而失败放行的请求；每一个也会计入 `jev_requests_total{source="adapter",verdict="error"}` |
 
 看这些指标时要注意几点：
 
@@ -91,7 +98,7 @@ providers:
 - **流量：** 按判定结果和来源拆分的请求数、网关动作、缓存命中率随时间的变化，以及窗口评分。
 - **L2：** 延迟的 p50/p95/p99 和均值、自适应超时与其上限的对比、熔断器状态时间线，以及按结果拆分的 L2 调用数。
 - **成本与异步：** 每秒 token 数和被丢弃的异步任务。
-- **覆盖情况：** 按原因拆分的无法判定请求，以及仪表盘时间范围内按标签和结果拆分的运维人员反馈。
+- **覆盖情况：** 按原因拆分的无法判定请求、仪表盘时间范围内按标签和结果拆分的运维人员反馈、主体信誉拦截、适配器错误（未经判定就放行的请求）、按结果拆分的异步重判、按类别拆分的 L2 错误，以及在 `max_inflight` 被拒的 L2 流量占比。
 
 ## 加载告警规则
 
@@ -124,7 +131,7 @@ provider 一直不可用时，熔断器会在打开（30 s）、半开（放一�
 
 处理步骤：
 
-1. 执行 `curl <gw>/_jev/health`，并在错误日志里 grep `L2 failed`。
+1. 在网关上执行 `curl 127.0.0.1:9180/_jev/health`（管理监听端口），并在错误日志里 grep `L2 failed`。
 2. 如果原因是 provider 故障，或者 key（`TYPESAFE_API_KEY`）被吊销、配错了，就把它修好。下一次半开探测成功后熔断器会自动关闭，不需要重启。
 3. 如果失败都是超时，参考 JevL2TimeoutAtCeiling。
 
@@ -150,6 +157,12 @@ provider 一直不可用时，熔断器会在打开（30 s）、半开（放一�
 - **`body`：** 请求体超过了规则的 `max_body_bytes`，而且头部和尾部都没有文本。要么调大这个限制，要么确认客户端是不是真的会发这么大的请求体。
 - **`content-encoding`：** 请求体经过压缩，而当前构建解不开。可能是缺少 zlib 或 libbrotlidec，也可能是数据损坏或者解压后太大。装上对应的库，或者让客户端别再压缩请求。
 - **`binary`：** LLM 路由上出现了非文本的请求体。检查规则的路径匹配是不是把上传接口也包进来了。
+- **`invalid`：** 声明为 JSON、却被解码器拒收，容错扫描器也找不到任何文本字段。多半是客户端有问题，或者 JSON 用的不是 UTF-8 编码。
+- **`json`：** JSON 请求体超出了遍历上限（20,000 个节点、1000 层），剩下的内容不够判定。通常是精心构造的请求体。
+- **`partial`：** 前面那层网关截断了请求体，而 `policy.partial = "unjudgeable"`。把网关的请求体上限调到 `max_body_bytes`，或者在网关上直接拒绝更大的请求体。
+- **`text`：** enforce 模式下设了 `policy.unjudgeable = "block"`，而文本超出了 `max_judge_chunks`。如果这类请求是正常的，就调大 `max_judge_chunks` 或 `max_judge_bytes`。
+- **`multipart`：** multipart 请求体里有超过 8 个不同的 boundary 参数。
+- **`token`：** 用 token id 写的提示词，L1 读不懂。正常的 SDK 发的是文本；在规则里设 `token_prompts = "block"` 可以拒绝它们。
 
 ### JevL2TimeoutAtCeiling（warning）
 
@@ -159,7 +172,7 @@ provider 本身正常、只是变慢了，就调大 `jev.timeout_max_ms`，改�
 
 如果 `timeout_max_ms == timeout_ms`，超时没有自适应的空间，会一直停在上限。这种实例请把这条告警静默掉。
 
-`jev_l2_timeout_max_ms` 就是为这条规则才和 `jev_l2_timeout_ms` 一起导出的。它的值是套用默认值之后的上限：没设置 `timeout_max_ms` 时为 2.5 × `timeout_ms`。
+`jev_l2_timeout_max_ms` 就是为这条规则才和 `jev_l2_timeout_ms` 一起导出的。它就是 `jev.timeout_max_ms`，默认 1000（见 `core/defaults.lua`）。把 `timeout_ms` 调到 1000 以上时，`timeout_max_ms` 也要一起调高，否则配置会被拒绝（`jev.timeout_max_ms must be >= jev.timeout_ms`），之前的配置继续生效，拒绝原因会记日志并显示为 `config_error`。2.5 × `timeout_ms` 这个兜底值只用于配置里根本没有 `timeout_max_ms` 这个键的情况。
 
 ### JevAsyncDropped（warning）
 
@@ -168,6 +181,24 @@ provider 本身正常、只是变慢了，就调大 `jev.timeout_max_ms`，改�
 这意味着可疑和出错的请求得不到二次检查，基于信誉的拦截也没法从这些请求中学习。
 
 如果 provider 还有余量，就调大 `async.max_async`。否则就排查是不是突然出现了一批 suspicious 或 error 判定结果，或者 provider 太慢、一直占着异步槽位（`async.timeout_ms`）。
+
+### JevL2Saturated（critical）
+
+5m 内，走到 L2 的请求里有超过 10% 被网关自己的 `jev.max_inflight` 上限拒掉（`jev_l2_errors_total{kind="busy"}`，原因 `max_inflight exceeded`）：根本没有发出调用，请求以 `verdict=error` 放行，而熔断器从不计这类拒绝，所以没有别的告警会响。
+
+如果 provider 还有余量（看它的限流和 L2 延迟面板），就调大 `jev.max_inflight`，或者给 provider 扩容。provider 变慢时每个槽位占用得更久：先看延迟分位数和 JevL2TimeoutAtCeiling，因为 provider 本身在超时的话，调高上限只会把 `busy` 变成 `timeout`。用 Laya profile 时，`max_inflight = 1` 是有意为之的；要等 `make conformance` 在新的 `CONCURRENCY` 下通过之后再调高。
+
+### JevAsyncFailing（warning）
+
+最近 10m 里跑过的异步（L3）重判任务，一半以上没有拿到答复，并且持续了 5m。suspicious 和出错的请求得不到第二次判定：不会有缓存下来的判定结果，信誉封禁也学不到东西。
+
+用 `sum by (result) (increase(jev_async_total[10m]))` 拆开看。`failed`：在错误日志里找 `L3 judge failed`（provider 出错，或者 L3 超时对这个 provider 来说太短）。`no_scores`：provider 有答复，但没给要求的分数（模型或模板不对）。`busy`：自定义判定器自己的上限。`error`：错误日志里的 `L3 error`，是 bug。
+
+### JevAdapterErrors（critical）
+
+最近 5m 里，有请求经某个入口（`access`、`authz`、`forward_auth`）未经判定就放行了，因为判定过程抛了异常：`verdict=error`，`source=adapter`。所有请求都这样失败时，上面那些按比例计算的告警根本看不到 L2 流量，这条告警就是为此而设的。
+
+在错误日志里找 `jev-edge: <entry> error, failing open`。如果是刚改过配置：先 `GET /_jev/config`（看 `config_error`），再用 `DELETE /_jev/config` 去掉覆盖，或者修好配置文件。否则就是 bug：请报告这行日志。
 
 ### JevL2Starved（critical）
 

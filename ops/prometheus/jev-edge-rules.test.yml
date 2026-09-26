@@ -81,6 +81,12 @@ tests:
                 content-encoding: a compressed body this build could not decode
                 (zlib/libbrotlidec missing, corrupt, too big). binary: a
                 non-text body on an LLM route; check the rule's path match.
+                invalid: declared JSON the decoder refused with nothing to scan.
+                json: JSON past the walk's bounds, too little left to judge.
+                partial: a body the gateway cut, with policy.partial =
+                "unjudgeable". text: text over max_judge_chunks under "block";
+                raise max_judge_chunks or max_judge_bytes. multipart: more than 8
+                boundaries. token: a prompt sent as token ids.
 
   # Adaptive timeout: gw1 pinned at its 1000 ms ceiling, gw2 adapting below it.
   - interval: 1m

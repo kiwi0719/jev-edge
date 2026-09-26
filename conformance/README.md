@@ -3,7 +3,7 @@
 The golden vectors in `core/golden/` pin down what core decides. These vectors pin down the **System One protocol as jev-edge speaks it**, so that any judge server can be checked against the requests the gateway actually sends. That covers TypeSafe's API as well as [laya-server](../adapters/laya-server/README.md) or anything else you point the `jev` or `laya` provider at. "Same format as Jev" is then something a test checks instead of something a vendor claims, and a server that drifts from the protocol later fails the test.
 
 ```
-make conformance ENDPOINT=<url> [API_KEY=...] [MODEL=laya] [STRICT=1] [MOCK=1] [BUDGET_MS=250]
+make conformance ENDPOINT=<url> [API_KEY=...] [MODEL=laya] [STRICT=1] [MOCK=1] [BUDGET_MS=500] [CONCURRENCY=1]
 make conformance-vectors    regenerate vectors.json and questions.json (after a template or provider change)
 make conformance-check      fail if the committed files are stale (part of `make check`)
 ```

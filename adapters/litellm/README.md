@@ -37,7 +37,7 @@ LiteLLM proxy is where a lot of LLM traffic actually flows, and it has a guardra
    | `JEV_EDGE_TIMEOUT` | `2.0` | seconds; exceeded = fail open |
    | `JEV_EDGE_PATH` | `/v1/chat/completions` | the path jev-edge's L1 sees; one its rules watch |
    | `JEV_EDGE_MAX_BODY_BYTES` | `1048576` | the largest body sent; keep it equal to jev-edge's `max_body_bytes` and at most `client_max_body_size` |
-   | `JEV_EDGE_EXTRA_FIELDS` | none | comma list of top-level keys also sent: those of jev-edge's `untrusted.fields` (`documents[*].text` sends `documents`) |
+   | `JEV_EDGE_EXTRA_FIELDS` | none | comma list of top-level keys also sent: those of jev-edge's `untrusted.fields` (`context[*].text` sends `context`) |
    | `JEV_EDGE_UNJUDGED` | `pass` | `pass` or `block`: what a request nobody could judge gets, and a request with a part nobody could judge ([below](#what-it-does-with-the-answer)); keep it equal to jev-edge's `policy.unjudgeable` |
    | `JEV_EDGE_TEST_ENDPOINT` | `judge` | `judge` or `refuse`: what a call from LiteLLM's `/guardrails/apply_guardrail` gets ([below](#the-test-endpoint)) |
 

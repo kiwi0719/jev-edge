@@ -41,7 +41,7 @@ golden-check:
 # Protocol conformance for judge servers (conformance/gen.lua): the System One
 # request as the gateway builds it, checked against a live server.
 #   make conformance ENDPOINT=http://127.0.0.1:8080/v1/systemone [API_KEY=...] [MODEL=laya]
-#                    [STRICT=1] [MOCK=1] [BUDGET_MS=250] [CONCURRENCY=64]
+#                    [STRICT=1] [MOCK=1] [BUDGET_MS=500] [CONCURRENCY=1]
 # CONCURRENCY is the gateways' jev.max_inflight, summed (1 in the Laya profile).
 # `conformance-vectors` regenerates the vectors after a template or provider
 # change; `conformance-check` fails when the committed ones are stale.

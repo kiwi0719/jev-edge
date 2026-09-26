@@ -21,6 +21,8 @@ monthly cost ≈ QPS × L2 share × 2.63M s/month × tokens per call × price pe
 
 打开 `untrusted` 之后（见[检索内容](design.zh-CN.md#检索内容)），带 tool 返回或 `untrusted.fields` 的请求会多一次调用：只把检索内容单独送审，问的是 `untrusted` 问题，不带部署上下文。这类请求要按两次调用来算；对话历史里重复出现的同一个 tool 返回，从第二轮起就会命中缓存。
 
+带工具定义（`tools`、`functions`、输出 schema；`llm-endpoints` 默认会判定它们，见[工具定义](design.zh-CN.md#工具定义)）的请求，还会为它们多调用一次，用规则的问题，单独缓存：每一轮都发同一套工具的 agent，在每个 `cache.fp_ttl` 里只为它付一次钱，所以要按“每套不同的工具、每个缓存周期多一次调用”来算，而不是每个请求都多一次。
+
 ## 算一笔账
 
 TypeSafe 在 2026-09-22 公布的输入价格是 **每十亿输入 token 42 美元**，没有列出输出价格；每次调用只有 39 个输出 token，不管单价多少都可以忽略。**做预算之前，先去 [typesafe.ai](https://typesafe.ai/) 确认当前价格**，这张表不会跟着价格变动更新。

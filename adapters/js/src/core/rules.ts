@@ -1,5 +1,5 @@
 // Port of core/rules.lua: L1, cheap and short-circuiting.
-import { extract, extractTools, extractUntrusted, jsonLike, isText, byteLength, head, tail, fieldKeys, deepKeys, scanStrings, scanTools, window, chunks as splitChunks, utf8Bytes, type JsonValue } from "./normalize.js";
+import { extract, extractTools, extractUntrusted, jsonLike, isText, byteLength, head, tail, fieldKeys, deepKeys, scanStrings, scanTools, window, chunks as splitChunks, chunkOverlap, utf8Bytes, type JsonValue } from "./normalize.js";
 import { untrustedSpec, type UntrustedConfig } from "./defaults.js";
 import { repBlocked, type SubjectCtx, type ReputationConfig } from "./subject.js";
 
@@ -570,18 +570,44 @@ async function judged(
   const budget = rule.max_judge_bytes ?? MAX_JUDGE_BYTES;
   const maxc = Math.floor(Number(rule.max_judge_chunks ?? 1)) || 1;
   if (maxc > 1 && byteLength(text) > budget) {
-    // port of the chunked branch of judged() in core/rules.lua
-    const [pieces, starts] = splitChunks(text, budget);
-    if (pieces.length <= maxc) return { text: pieces.join("\n"), hit: hit?.[0], windowed: partial, chunks: pieces, capped: false, untrusted, tools, bound, retrieved, ids };
-    const firstKept = pieces.length - (maxc - 1); // 0-based
-    const tb = utf8Bytes(text);
-    let older = new TextDecoder().decode(tb.subarray(0, starts[firstKept] - 1));
-    if (older.endsWith("\n")) older = older.slice(0, -1);
-    const olderLen = byteLength(older);
-    const inside = hit?.[1] !== undefined && hit?.[2] !== undefined && hit[2] <= olderLen;
-    const [win] = window(older, [older], budget, inside ? hit![1] : undefined, inside ? hit![2] : undefined);
-    const out = [win, ...pieces.slice(firstKept)];
-    return { text: out.join("\n"), hit: hit?.[0], windowed: true, chunks: out, capped: true, untrusted, tools, bound, retrieved, ids };
+    // port of the chunked branch of judged() in core/rules.lua: consecutive
+    // chunks share chunkOverlap bytes; text up to budget + (maxc - 1) x
+    // (budget - overlap) bytes is judged in full (cut hard when the newline
+    // cuts take more than maxc pieces), longer text is capped
+    const overlap = chunkOverlap(budget);
+    const capacity = budget + (maxc - 1) * (budget - overlap);
+    const textLen = byteLength(text);
+    let [pieces, starts] = splitChunks(text, budget, overlap);
+    if (pieces.length > maxc && textLen <= capacity) [pieces, starts] = splitChunks(text, budget, overlap, true);
+    let out = pieces;
+    let capped = false;
+    const spans: [number, number][] = [];
+    const from = hit?.[1], to = hit?.[2];
+    if (pieces.length <= maxc) {
+      for (let k = 0; k < pieces.length; k++) spans.push([starts[k], starts[k] + byteLength(pieces[k]) - 1]);
+    } else {
+      const firstKept = pieces.length - (maxc - 1); // 0-based
+      const tb = utf8Bytes(text);
+      let older = new TextDecoder().decode(tb.subarray(0, starts[firstKept] - 1));
+      if (older.endsWith("\n")) older = older.slice(0, -1);
+      const olderLen = byteLength(older);
+      const inside = from !== undefined && to !== undefined && to <= olderLen;
+      const [win] = window(older, [older], budget, inside ? from : undefined, inside ? to : undefined);
+      out = [win];
+      capped = true;
+      // the window holds the hit when it was inside what the window covers
+      if (inside) spans.push([from!, to!]);
+      for (let k = firstKept; k < pieces.length; k++) {
+        out.push(pieces[k]);
+        spans.push([starts[k], starts[k] + byteLength(pieces[k]) - 1]);
+      }
+    }
+    if (from !== undefined && to !== undefined && !spans.some(([a, z]) => a <= from && to <= z)) {
+      // backstop: a hit longer than the overlap straddles a cut; it and up
+      // to HIT_CONTEXT bytes each side are judged as a part of their own
+      out = [window(text, [], budget, from, to)[0], ...out];
+    }
+    return { text: out.join("\n"), hit: hit?.[0], windowed: capped || partial, chunks: out, capped, untrusted, tools, bound, retrieved, ids };
   }
   const [w, cut] = window(text, values, budget, hit?.[1], hit?.[2]);
   return { text: w, hit: hit?.[0], windowed: cut || partial, untrusted, tools, bound, retrieved, ids };

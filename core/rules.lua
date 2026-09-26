@@ -373,20 +373,49 @@ local function judged(req, rule, ctx, ct, size, ex)
   local budget = rule.max_judge_bytes or _M.MAX_JUDGE_BYTES
   local maxc = math.floor(tonumber(rule.max_judge_chunks) or 1)
   if maxc > 1 and #text > budget then
-    -- judged in chunks: all of the text when it fits in max_judge_chunks
-    -- pieces; otherwise the newest max_judge_chunks - 1 pieces whole and a
-    -- window over everything older (capped: some of the text is not judged)
-    local pieces, starts = normalize.chunks(text, budget)
-    if #pieces <= maxc then
-      return table.concat(pieces, "\n"), nil, hit, partial, pieces, false, untrusted, tools, bound, retrieved, ids
+    -- judged in chunks, consecutive ones sharing chunk_overlap bytes: all of
+    -- the text when it is no longer than budget + (maxc - 1) x (budget -
+    -- overlap) bytes, cut at newlines when that fits in maxc pieces and hard
+    -- otherwise; past that, the newest max_judge_chunks - 1 pieces whole and
+    -- a window over everything older (capped: some of the text is not judged)
+    local overlap = normalize.chunk_overlap(budget)
+    local capacity = budget + (maxc - 1) * (budget - overlap)
+    local pieces, starts = normalize.chunks(text, budget, overlap)
+    if #pieces > maxc and #text <= capacity then
+      pieces, starts = normalize.chunks(text, budget, overlap, true)
     end
-    local first_kept = #pieces - (maxc - 1) + 1
-    local older = text:sub(1, starts[first_kept] - 1):gsub("\n$", "")
-    local inside = from and to and to <= #older
-    local win = normalize.window(older, { older }, budget, inside and from or nil, inside and to or nil)
-    local out = { win }
-    for k = first_kept, #pieces do out[#out + 1] = pieces[k] end
-    return table.concat(out, "\n"), nil, hit, true, out, true, untrusted, tools, bound, retrieved, ids
+    local out, spans, capped = pieces, {}, false
+    if #pieces <= maxc then
+      for k = 1, #pieces do spans[k] = { starts[k], starts[k] + #pieces[k] - 1 } end
+    else
+      local first_kept = #pieces - (maxc - 1) + 1
+      local older = text:sub(1, starts[first_kept] - 1):gsub("\n$", "")
+      local inside = from and to and to <= #older
+      local win = normalize.window(older, { older }, budget, inside and from or nil, inside and to or nil)
+      out, capped = { win }, true
+      -- the window holds the hit when it was inside what the window covers
+      if inside then spans[1] = { from, to } end
+      for k = first_kept, #pieces do
+        out[#out + 1] = pieces[k]
+        spans[#spans + 1] = { starts[k], starts[k] + #pieces[k] - 1 }
+      end
+    end
+    if from and to then
+      -- backstop: a hit longer than the overlap can still straddle a cut;
+      -- it and up to HIT_CONTEXT bytes each side are judged as a part of
+      -- their own, the way window() keeps it
+      local whole = false
+      for _, sp in ipairs(spans) do
+        if sp[1] <= from and to <= sp[2] then whole = true break end
+      end
+      if not whole then
+        local around = normalize.window(text, {}, budget, from, to)
+        local with = { around }
+        for k = 1, #out do with[k + 1] = out[k] end
+        out = with
+      end
+    end
+    return table.concat(out, "\n"), nil, hit, capped or partial, out, capped, untrusted, tools, bound, retrieved, ids
   end
   local windowed
   text, windowed = normalize.window(text, values, budget, from, to)

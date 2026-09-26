@@ -1410,16 +1410,26 @@ export function tail(s: string, n: number): string {
 
 export const HIT_CONTEXT = 1024;
 
+/** Port of normalize.chunk_overlap: bytes two consecutive chunks share,
+ *  HIT_CONTEXT, at most a quarter of the budget, counted in each piece's budget. */
+export function chunkOverlap(budget: number): number {
+  return Math.max(0, Math.min(HIT_CONTEXT, Math.floor(budget / 4)));
+}
+
 /**
  * Port of normalize.chunks: consecutive pieces of at most `budget` UTF-8
  * bytes covering all of `text`; a cut prefers the last newline in the second
- * half of a piece (dropped) and never splits a code point. Returns the pieces
- * and each one's 1-based byte offset, as in Lua.
+ * half of a piece (dropped) and never splits a code point. With `overlap`,
+ * the piece after one that ends at e starts at e + 1 - overlap, moved
+ * forward to a character start. `hard`: no newline preference, and every
+ * piece but the last advances at least budget - overlap bytes. Returns the
+ * pieces and each one's 1-based byte offset, as in Lua.
  */
-export function chunks(text: string, budget: number): [string[], number[]] {
+export function chunks(text: string, budget: number, overlap = 0, hard = false): [string[], number[]] {
   const b = enc.encode(text);
   const n = b.length;
   const half = Math.floor(budget / 2);
+  const ov = Math.floor(Number(overlap) || 0);
   const pieces: string[] = [];
   const starts: number[] = [];
   let i = 1;
@@ -1431,11 +1441,13 @@ export function chunks(text: string, budget: number): [string[], number[]] {
     }
     let e = i + budget - 1;
     let next: number | undefined;
-    for (let j = e; j >= i + half + 1; j--) {
-      if (b[j - 1] === 10) {
-        e = j - 1;
-        next = j + 1;
-        break;
+    if (!hard) {
+      for (let j = e; j >= i + half + 1; j--) {
+        if (b[j - 1] === 10) {
+          e = j - 1;
+          next = j + 1;
+          break;
+        }
       }
     }
     if (next === undefined) {
@@ -1448,6 +1460,13 @@ export function chunks(text: string, budget: number): [string[], number[]] {
     }
     pieces.push(dec.decode(b.subarray(i - 1, e)));
     starts.push(i);
+    if (ov > 0) {
+      let nx = Math.max(i + 1, e + 1 - ov);
+      // a cut walked back to a character boundary does not eat the advance
+      if (hard) nx = Math.max(nx, Math.min(e + 1, i + budget - ov));
+      while (nx <= e && isCont(b, nx - 1)) nx++;
+      next = nx;
+    }
     i = next;
   }
   return [pieces, starts];

@@ -73,9 +73,10 @@ return {
   -- L2: the always_suspect hit, then the newest messages.
   max_judge_bytes = 32768,
   -- Text over max_judge_bytes in up to this many chunks, one judge call each
-  -- (in parallel). 1 = one window (hit + newest messages + head/tail), the
-  -- cheapest; raise it (4 covers 128 KiB) to judge long text in full, and
-  -- policy.unjudgeable then decides what still does not fit. See README.
+  -- (in parallel), consecutive chunks sharing 1 KiB. 1 = one window (hit +
+  -- newest messages + head/tail), the cheapest; raise it (4 covers 32 KiB +
+  -- 3 x 31 KiB = 125 KiB) to judge long text in full, and policy.unjudgeable
+  -- then decides what still does not fit. See README.
   max_judge_chunks = 1,
   -- Oldest first: the judging window keeps the last ones first. The paths
   -- are walked together, in document order: each message's content, tool

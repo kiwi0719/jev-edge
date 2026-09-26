@@ -1383,23 +1383,39 @@ end
 
 _M.HIT_CONTEXT = 1024
 
+--- Bytes two consecutive chunks share: HIT_CONTEXT, at most a quarter of
+-- the budget so that a small budget still makes progress. It is counted in
+-- each piece's budget, so a call never carries more than max_judge_bytes.
+function _M.chunk_overlap(budget)
+  return math.max(0, math.min(_M.HIT_CONTEXT, math.floor(budget / 4)))
+end
+
 --- Split `text` into consecutive pieces of at most `budget` bytes covering
 -- all of it, for judging in chunks (rule.max_judge_chunks). A cut prefers the
 -- last newline in the second half of a piece (the newline itself is dropped,
--- it joined two values) and never splits a UTF-8 sequence.
+-- it joined two values) and never splits a UTF-8 sequence. With `overlap`,
+-- the piece after one that ends at e starts at e + 1 - overlap (moved
+-- forward to a character start), so an instruction cut at a seam is still
+-- whole in one piece when it is no longer than the overlap. `hard`: no
+-- newline preference, and every piece but the last advances at least
+-- budget - overlap bytes, so text of up to budget + (n-1) x (budget -
+-- overlap) bytes always fits in n pieces.
 -- @return pieces, and the byte offset in `text` where each piece starts
-function _M.chunks(text, budget)
+function _M.chunks(text, budget, overlap, hard)
   local pieces, starts = {}, {}
   local i, n = 1, #text
   local half = math.floor(budget / 2)
+  overlap = math.floor(tonumber(overlap) or 0)
   while i <= n do
     if n - i + 1 <= budget then
       pieces[#pieces + 1], starts[#starts + 1] = text:sub(i), i
       break
     end
     local e, nexti = i + budget - 1, nil
-    for j = e, i + half + 1, -1 do
-      if text:byte(j) == 10 then e, nexti = j - 1, j + 1 break end
+    if not hard then
+      for j = e, i + half + 1, -1 do
+        if text:byte(j) == 10 then e, nexti = j - 1, j + 1 break end
+      end
     end
     if not nexti then
       -- back to a character boundary: at most 3 bytes, the longest run of
@@ -1412,6 +1428,13 @@ function _M.chunks(text, budget)
       nexti = e + 1
     end
     pieces[#pieces + 1], starts[#starts + 1] = text:sub(i, e), i
+    if overlap > 0 then
+      local nx = math.max(i + 1, e + 1 - overlap)
+      -- a cut walked back to a character boundary does not eat the advance
+      if hard then nx = math.max(nx, math.min(e + 1, i + budget - overlap)) end
+      while nx <= e and cont(text, nx) do nx = nx + 1 end
+      nexti = nx
+    end
     i = nexti
   end
   return pieces, starts

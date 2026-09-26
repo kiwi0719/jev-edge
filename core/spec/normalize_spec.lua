@@ -455,6 +455,58 @@ describe("normalize.chunks", function()
     local text = string.rep("\240\159\152\128", 40)   -- 40 x U+1F600, 4 bytes each
     for _, piece in ipairs((N.chunks(text, 63))) do assert.equals(0, #piece % 4) end
   end)
+
+  it("overlaps consecutive pieces by chunk_overlap bytes, each within the budget (g1-chunk-seams#3)", function()
+    assert.equals(16, N.chunk_overlap(64))
+    assert.equals(1024, N.chunk_overlap(32768))
+    assert.equals(0, N.chunk_overlap(3))
+    local text = string.rep("abcdefghij", 30)
+    local pieces, starts = N.chunks(text, 64, 16)
+    for k, p in ipairs(pieces) do
+      assert.is_true(#p <= 64)
+      assert.equals(text:sub(starts[k], starts[k] + #p - 1), p)
+      if k > 1 then
+        -- the last 16 bytes of the previous piece start this one
+        assert.equals(starts[k - 1] + #pieces[k - 1] - 16, starts[k])
+      end
+    end
+    assert.equals(#text, starts[#starts] + #pieces[#pieces] - 1)
+    -- a phrase up to overlap + 1 bytes long is whole in one piece wherever it falls
+    for at = 1, #text - 16 do
+      local whole = false
+      for k, p in ipairs(pieces) do
+        if starts[k] <= at and at + 16 <= starts[k] + #p - 1 then whole = true break end
+      end
+      assert.is_true(whole, "phrase at " .. at)
+    end
+    -- overlap starts at a character boundary
+    local emoji = string.rep("\240\159\152\128", 60)
+    for _, p in ipairs((N.chunks(emoji, 63, 15))) do assert.equals(0, #p % 4) end
+    for _, p in ipairs((N.chunks(emoji, 63, 15, true))) do assert.equals(0, #p % 4) end
+  end)
+
+  it("hard: text up to budget + (n-1) x (budget - overlap) bytes always fits in n pieces (g1-chunk-seams#4)", function()
+    local unit = { "a", "\n", "\195\169", "\226\130\172", "\240\159\152\128", " " }
+    for _, budget in ipairs({ 64, 100, 257 }) do
+      local ov = N.chunk_overlap(budget)
+      for n = 2, 4 do
+        local capacity = budget + (n - 1) * (budget - ov)
+        for seed = 1, 20 do
+          local parts, len, x = {}, 0, seed
+          while true do
+            x = (x * 1103515245 + 12345) % 2147483648
+            local u = unit[x % #unit + 1]
+            if len + #u > capacity then break end
+            parts[#parts + 1], len = u, len + #u
+          end
+          local text = table.concat(parts)
+          local pieces = N.chunks(text, budget, ov, true)
+          assert.is_true(#pieces <= n, ("budget %d n %d len %d: %d pieces"):format(budget, n, #text, #pieces))
+          for _, p in ipairs(pieces) do assert.is_true(#p <= budget) end
+        end
+      end
+    end
+  end)
 end)
 
 describe("normalize.valid_utf8", function()

@@ -556,6 +556,90 @@ rule("pnpm-pin", function(r)
   if n == 0 then fail(r, "pnpm-workspace.yaml has no allowBuilds decisions") end
 end)
 
+-- 15. Only the publish job of release-npm.yml holds the npm-publishing OIDC
+--     token, and it runs no code from the repository or its dependencies: no
+--     checkout, no install, a pinned npm publishing the tarball the build job
+--     packed, in the `npm` environment npm's Trusted Publisher names (audit
+--     ci-release#1: the token was granted to the whole workflow, so a
+--     dependency's install script or test-time code could publish).
+local function code_lines(ls)
+  local out = {}
+  for _, l in ipairs(ls) do
+    if not l:match("^%s*#") then out[#out + 1] = (l:gsub("%s+#.*$", "")) end
+  end
+  return out
+end
+
+rule("release-token", function(r)
+  local WF = ".github/workflows/release-npm.yml"
+  local src = read(WF)
+  if not src then return fail(r, WF .. " missing") end
+  local perms, inperms = {}, false
+  for _, l in ipairs(code_lines(yaml_lines(src))) do
+    if l:match("^permissions:") then
+      inperms = true
+      local inline = l:match("^permissions:%s*(%S.-)%s*$")
+      if inline then perms[#perms + 1] = inline end
+    elseif l:match("^%S") then
+      inperms = false
+    elseif inperms and l:match("%S") then
+      perms[#perms + 1] = l:match("^%s*(.-)%s*$")
+    end
+  end
+  if #perms ~= 1 or perms[1] ~= "contents: read" then
+    fail(r, WF .. ": workflow-level permissions are not just `contents: read` ("
+      .. table.concat(perms, ", ") .. "); the publish job adds id-token itself")
+  end
+  local jobs, body = workflow_jobs(src)
+  local holders = {}
+  for _, j in ipairs(jobs) do
+    local ls = code_lines(body[j])
+    local text = "\n" .. table.concat(ls, "\n") .. "\n"
+    if text:find("\n%s+id%-token:%s*write%s*\n") then
+      holders[#holders + 1] = j
+      local env = text:match("\n    environment:([^\n]*)\n") or ""
+      local envname = text:match("\n    environment:%s*\n%s+name:([^\n]*)\n") or env
+      if not (envname:match("^%s*npm%s*$") or envname:find("'npm'", 1, true)) then
+        fail(r, "job " .. j .. " holds the OIDC token outside the npm environment")
+      end
+      if text:find("actions/checkout", 1, true) then
+        fail(r, "job " .. j .. " holds the OIDC token and checks out the repository")
+      end
+      for _, l in ipairs(ls) do
+        if l:find("pnpm", 1, true) or l:match("%f[%w]npx%f[^%w]") or l:match("npm%s+ci%f[^%w]")
+           or l:match("npm%s+run%f[^%w]") or l:match("npm%s+exec%f[^%w]")
+           or ((l:match("npm%s+install%f[^%w]") or l:match("npm%s+i%s")) and not l:match("npm install %-g npm@")) then
+          fail(r, "job " .. j .. " holds the OIDC token and installs or runs packages: " .. l:match("^%s*(.-)$"))
+        end
+        local npmv = l:match("npm install %-g [\"']?npm@([^%s\"']*)")
+        if npmv and not npmv:match("^%d+%.%d+%.%d+$") then
+          fail(r, "job " .. j .. " publishes with npm@" .. npmv .. ", not an exact version")
+        end
+      end
+      local pub = text:match("\n[^\n]*npm publish([^\n]*)\n")
+      if not pub then
+        fail(r, "job " .. j .. " holds the OIDC token and runs no npm publish")
+      else
+        if not pub:match("^%s+[\"']?%./%S+") then
+          fail(r, "job " .. j .. ": npm publish is not given the packed tarball")
+        end
+        if not pub:find("--ignore-scripts", 1, true) then
+          fail(r, "job " .. j .. ": npm publish runs lifecycle scripts")
+        end
+      end
+    else
+      for _, l in ipairs(ls) do
+        if l:match("pnpm install") and not l:find("--ignore-scripts", 1, true) then
+          fail(r, "job " .. j .. ": pnpm install runs dependency scripts (--ignore-scripts)")
+        end
+      end
+    end
+  end
+  if #holders ~= 1 then
+    fail(r, WF .. ": " .. #holders .. " jobs hold the OIDC token (" .. table.concat(holders, ", ") .. "), not one")
+  end
+end)
+
 -- ---------------------------------------------------------------------------
 if #failures > 0 then
   io.stderr:write(("invariants: %d problem(s) across %d rules\n"):format(#failures, checked))

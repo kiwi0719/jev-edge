@@ -159,12 +159,31 @@ local _M = {
   schema   = schema,
 }
 
+-- A shipped rule set by id. The id names a module, so only a plain name is
+-- looked up (as the Kong schema allows): anything else is an error, never a
+-- require of a table or a path.
+local function load_rule(id)
+  if type(id) ~= "string" or not id:match("^[%w_%-]+$") then
+    return nil, "rule set id must be a name of letters, digits, '_' or '-', got " .. tostring(id)
+  end
+  local ok, r = pcall(require, "jev.rules." .. id)
+  if ok then return r end
+  -- the require error lists every searched path; the id is what matters
+  return nil, "rule set '" .. id .. "' not found (jev.rules." .. id .. ")"
+end
+
 function _M.check_schema(conf)
   local ok, err = core.schema.check(schema, conf)
   if not ok then return false, err end
   local merged = defaults.merge(defaults.config, conf)
   local vok, verr = defaults.validate(merged)
   if not vok then return false, verr end
+  -- the rules as a request would load them: a typo'd id, an unknown
+  -- template or a malformed pattern is refused here, where the Admin API
+  -- (or the standalone loader) reports it, instead of being dropped at run
+  -- time and turning judging off for the route
+  local _, rerr = rules_mod.resolve_all(merged.rules, load_rule)
+  if rerr then return false, rerr end
   return true
 end
 
@@ -222,11 +241,7 @@ end
 local function load_rules(specs)
   local out = {}
   for i, spec in ipairs(specs or {}) do
-    local rule, err = rules_mod.resolve(spec, function(id)
-      local ok, r = pcall(require, "jev.rules." .. id)
-      if ok then return r end
-      return nil, tostring(r)
-    end)
+    local rule, err = rules_mod.resolve(spec, load_rule)
     if rule then out[#out + 1] = rule
     else core.log.error("jev-edge: rules[", i, "] failed to load: ", tostring(err)) end
   end
@@ -334,11 +349,14 @@ end
 -- ---------------------------------------------------------------------------
 
 function _M.access(conf, ctx)
-  local rt = runtime_for(conf)
+  -- the client's own X-Jev-* go first, whatever happens next
   for _, h in ipairs(HEADER_NAMES) do core.request.set_header(ctx, h, nil) end
 
-  local v
+  local rt, v
   local ok, err = pcall(function()
+    -- inside the pcall: a conf that fails to build a runtime fails open,
+    -- as any other adapter error does, instead of a 500 for every request
+    rt = runtime_for(conf)
     local req = build_req(rt, ctx)
     local subj = subject_ctx(rt, req)
     ctx.jev_subject = subj and subj.id or nil

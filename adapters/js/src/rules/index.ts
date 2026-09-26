@@ -182,7 +182,11 @@ export function resolve(spec: RuleSpec): Rule {
   // and the same defaults apply to both forms.
   if (typeof spec === "string") spec = { extends: spec } as RuleSpec & object;
   if (typeof spec !== "object" || spec === null) throw new Error("rule spec must be a string or a table");
-  const base: Partial<Rule> = spec.extends ? load(spec.extends) : {};
+  const ext: unknown = spec.extends;
+  if (ext !== undefined && (typeof ext !== "string" || ext === "")) {
+    throw new Error("rule extends must be the id of a rule set (a non-empty string)");
+  }
+  const base: Partial<Rule> = ext !== undefined ? load(ext) : {};
   const { extends: _ext, ...over } = spec;
   const out = { ...base, ...over } as Rule;
   if (out.id === undefined) throw new Error("rule needs an id");

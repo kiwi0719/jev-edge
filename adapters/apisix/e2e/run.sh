@@ -40,6 +40,12 @@ check "block response carries the request id" "1" "$(grep -ci '^x-jev-request-id
 check "client-supplied X-Jev-* is stripped" "app verdict=skipped score=0.00 source=l1" "$(curl -s -H 'X-Jev-Verdict: safe' -H 'X-Jev-Score: 0.00' $base/healthz)"
 check "provider failure fails open" "app verdict=error score=0.00 source=l2" "$(post /v1/chat/completions fail "$ATTACK")"
 check "GET on a watched path passes at L1" "app verdict=skipped score=0.00 source=l1" "$(curl -s $base/v1/models)"
+check "an inline rule passes check_schema and judges" "app verdict=safe score=0.20 source=l2" "$(post /ok/ask '' "$LONG")"
+check "a typo'd rule set id is refused at load: no route" "404" \
+  "$(curl -s -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' -d "$LONG" $base/typo/v1/chat/completions)"
+check "an inline rule whose extends is not an id is refused at load: no route" "404" \
+  "$(curl -s -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' -d "$LONG" $base/badext/ask)"
+check "the loader said why" "1" "$(docker compose logs apisix 2>&1 | grep -c "rule set 'llm-endpoint' not found" | awk '{print ($1 > 0)}')"
 
 if [ $fail -ne 0 ]; then echo; echo "--- apisix logs"; docker compose logs apisix | tail -40; exit 1; fi
 echo "apisix e2e: all checks passed"

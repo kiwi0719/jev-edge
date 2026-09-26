@@ -732,7 +732,12 @@ function _M.resolve(spec, load)
   if type(spec) == "string" then spec = { extends = spec } end
   if type(spec) ~= "table" then return nil, "rule spec must be a string or a table" end
   local base = {}
-  if spec.extends then
+  if spec.extends ~= nil then
+    -- a loader builds a module name from it ('jev.rules.' .. id): a table
+    -- or JSON null there raises instead of reporting
+    if type(spec.extends) ~= "string" or spec.extends == "" then
+      return nil, "rule extends must be the id of a rule set (a non-empty string)"
+    end
     local b, err = load(spec.extends)
     if type(b) ~= "table" then return nil, err or ("rule set " .. tostring(spec.extends) .. " not found") end
     base = b

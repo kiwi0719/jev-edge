@@ -389,7 +389,16 @@ describe("rules.resolve", () => {
     it("wants a string id and deployment context", () => {
       expect(tryR({ deployment_context: "Billing." }).deployment_context).toBe("Billing.");
       for (const bad of [1, ["x"], null]) expect(() => tryR({ deployment_context: bad })).toThrow(/deployment_context/);
-      for (const bad of ["", 1, null]) expect(() => tryR({ id: bad })).toThrow("rule id must be a non-empty string");
+      for (const bad of ["", 1, null, {}]) expect(() => tryR({ id: bad })).toThrow("rule id must be a non-empty string");
+    });
+
+    // kong-apisix#4 (twin of core/spec/rules_resolve_spec.lua)
+    it("wants extends to be a rule set id", () => {
+      for (const bad of [{ a: 1 }, {}, 1, true, "", null]) {
+        expect(() => resolve({ id: "x", extends: bad, watch_paths: ["^/x/"] } as never), JSON.stringify(bad))
+          .toThrow("rule extends must be the id of a rule set (a non-empty string)");
+      }
+      expect(() => resolve({ id: "x", extends: "llm-endpoint" })).toThrow(/unknown rule set: llm-endpoint/);
     });
   });
 

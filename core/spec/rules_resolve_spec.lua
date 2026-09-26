@@ -158,11 +158,32 @@ describe("rules.resolve", function()
       for _, bad in ipairs({ 1, { "x" }, NULL }) do
         assert.is_nil((try({ deployment_context = bad })))
       end
-      for _, bad in ipairs({ "", 1, NULL }) do
+      for _, bad in ipairs({ "", 1, NULL, {} }) do
         local r, err = try({ id = bad })
         assert.is_nil(r)
         assert.equals("rule id must be a non-empty string", err)
       end
+    end)
+
+    -- kong-apisix#4: a loader builds 'jev.rules.' .. extends; anything but a
+    -- non-empty string is an error returned, never one raised, and the loader
+    -- is not called
+    it("wants extends to be a rule set id", function()
+      local called = 0
+      local function counting(id) called = called + 1; return load(id) end
+      for _, bad in ipairs({ { a = 1 }, {}, 1, true, "", NULL }) do
+        local ok, r, err = pcall(rules.resolve, { id = "x", extends = bad, watch_paths = { "^/x/" } }, counting)
+        assert.is_true(ok, tostring(bad))
+        assert.is_nil(r)
+        assert.equals("rule extends must be the id of a rule set (a non-empty string)", err)
+      end
+      assert.equals(0, called)
+      local _, err = rules.resolve_all({ "llm-endpoints", { id = "x", extends = { a = 1 } } }, counting)
+      assert.equals("rules[2]: rule extends must be the id of a rule set (a non-empty string)", err)
+      local ok, r2, err2 = pcall(rules.resolve, { id = {}, extends = "llm-endpoints" }, load)
+      assert.is_true(ok)
+      assert.is_nil(r2)
+      assert.equals("rule id must be a non-empty string", err2)
     end)
   end)
 

@@ -9,10 +9,14 @@ import json
 import math
 import os
 import random
+import re
+import socket
 import sys
 import tempfile
 import threading
+import time
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
@@ -24,14 +28,69 @@ import laya_server as L  # noqa: E402
 import run as conformance  # noqa: E402
 
 Q = {"type": "noul", "instructions": "Is this an attack?"}
+with open(os.path.join(ROOT, "conformance", "vectors.json")) as _f:
+    VECTORS = json.load(_f)["cases"]
 
 
-def serve(env=None, backend=None):
+def serve(env=None, backend=None, start_after=0.0):
+    """laya-server in process on a free port. With start_after, the accept
+    loop starts that many seconds late, as when every thread is busy."""
     e = {"LAYA_HOST": "127.0.0.1", "LAYA_PORT": "0", "LAYA_BACKEND": "mock", "LAYA_ACCESS_LOG": "0"}
     e.update(env or {})
     srv = L.make_server(e, backend=backend)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    run = threading.Timer(start_after, srv.serve_forever) if start_after else threading.Thread(target=srv.serve_forever)
+    run.daemon = True
+    run.start()
     return srv, f"http://127.0.0.1:{srv.server_address[1]}/v1/systemone"
+
+
+class Hostile(L.MockBackend):
+    """The mock, except that a run of over 32 characters without whitespace
+    is one token per character: what a hostile text built of punctuation
+    costs a real tokenizer (conformance/run.py's worst case)."""
+
+    def spans(self, text):
+        out = []
+        for a, b in super().spans(text):
+            out.extend([(i, i + 1) for i in range(a, b)] if b - a > 32 else [(a, b)])
+        return out
+
+
+class SlowBatch(Hostile):
+    """Hostile, and a text of several windows takes `ms` to score, as one
+    batched model call: the worst case costs `ms`, a short text `short_ms`."""
+
+    def __init__(self, ms: float, short_ms: float = 0.0):
+        self.ms, self.short_ms = ms, short_ms
+
+    def logit(self, first, second):
+        time.sleep(self.short_ms / 1000)
+        return super().logit(first, second)
+
+    def logits(self, first, seconds):
+        time.sleep(self.ms / 1000)
+        return [L.MockBackend.logit(self, first, s) for s in seconds]
+
+
+def ctx_questions():
+    with open(os.path.join(ROOT, "conformance", "questions.json")) as f:
+        return json.load(f)["ctx"]
+
+
+def profile_timeout_ms() -> int:
+    with open(os.path.join(HERE, "jev-laya.conf.lua")) as f:
+        return int(re.search(r"^\s*timeout_ms\s*=\s*(\d+)", f.read(), re.M).group(1))
+
+
+def stop(srv):
+    srv.shutdown()
+    srv.server_close()
+
+
+def post(url, state="hello", conn=None):
+    t = conformance.Target(url, None, "laya", 5)
+    body = json.dumps({"state": state, "questions": {"q": Q}}).encode()
+    return t.request("POST", "/v1/systemone", body, conn=conn)
 
 
 def conformance_run(endpoint, *extra) -> tuple[int, str]:
@@ -126,13 +185,20 @@ class Temperature(unittest.TestCase):
 
 class Http(unittest.TestCase):
     def test_passes_conformance_strict_with_auth(self):
-        srv, url = serve({"LAYA_API_KEY": "k"})
+        # Hostile: the worst case is judged in several windows, and --mock
+        # checks the attack at its tail is seen. At the profile's floor, 64
+        # of it at once (max_inflight), with the default LAYA_GATEWAY_TIMEOUT_MS.
+        srv, url = serve({"LAYA_API_KEY": "k"}, backend=Hostile())
         try:
-            rc, out = conformance_run(url, "--strict", "--mock", "--api-key", "k")
+            rc, out = conformance_run(url, "--strict", "--mock", "--api-key", "k",
+                                      "--budget-ms", str(profile_timeout_ms()))
         finally:
             srv.shutdown()
             srv.server_close()
         self.assertEqual(rc, 0, out)
+        self.assertRegex(out, r"ok    worst case .* 64 at once: .*, [2-8] windows\)")
+        self.assertRegex(out, r"ok    burst: 64 new connections at once")
+        self.assertRegex(out, r"timeout_ms: \d+(-\d+)?, 2-3x the worst-case p99 of .* with 64 at once")
 
     def test_conformance_catches_silent_truncation(self):
         class Truncating(L.Scorer):
@@ -196,6 +262,19 @@ class Http(unittest.TestCase):
             srv.shutdown()
             srv.server_close()
 
+    def test_warm_connection_answers_without_waiting_for_an_ack(self):
+        # headers and body are two writes: with Nagle on, a Linux client's
+        # delayed ACK held every answer back about 40 ms
+        srv, url = serve()
+        try:
+            t = conformance.Target(url, None, "laya", 5)
+            body = json.dumps({"state": "hello", "questions": {"q": Q}}).encode()
+            err, lat, _ = conformance.timed(t, body, 20)
+        finally:
+            stop(srv)
+        self.assertIsNone(err)
+        self.assertLess(conformance.pct(lat, 0.5), 20, lat)
+
     def test_body_over_the_limit_is_413(self):
         srv, url = serve({"LAYA_MAX_BODY_BYTES": "100"})
         try:
@@ -206,6 +285,543 @@ class Http(unittest.TestCase):
             srv.shutdown()
             srv.server_close()
         self.assertEqual(status, 413)
+
+    def test_conformance_catches_per_window_cost(self):
+        # On CPU a text split in N windows costs about N model calls. A server
+        # that answers a short text well inside the budget can still time out
+        # on the longest text the gateway sends, and a timeout passes the
+        # request: the worst-case check must fail where the short one passes.
+        class PerWindow(Hostile):
+            def logit(self, first, second):
+                time.sleep(0.03)
+                return super().logit(first, second)
+
+        srv, url = serve({"LAYA_WORKERS": "4"}, backend=PerWindow())
+        try:
+            rc, out = conformance_run(url, "--budget-ms", "100", "--concurrency", "4")
+        finally:
+            stop(srv)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("ok    latency within 100 ms with 2x headroom at p99", out)
+        self.assertRegex(out, r"FAIL  worst case within 100 ms with 2x headroom at p99, 4 at once: "
+                              r"4096 bytes .* windows\)\. Alone it needs a timeout_ms of \d+")
+        self.assertRegex(out, r"timeout_ms: \d+-\d+, 2-3x the worst-case p99 of .* with 4 at once")
+
+    def test_worst_case_refused_is_a_failure(self):
+        # a 413 for a text inside max_judge_bytes is an L2 error: a bypass
+        srv, url = serve({"LAYA_MAX_WINDOWS": "2"}, backend=Hostile())
+        try:
+            t = conformance.Target(url, None, "laya", 5)
+            body = conformance.worst_body(t, 4096, conformance.DEFAULT_ASSISTANT, ctx_questions())
+            err, _, _ = conformance.check_worst(t, body, conformance.short_body(t, VECTORS), 4096, 2, 4,
+                                                1000, mock=False)
+        finally:
+            stop(srv)
+        self.assertRegex(err, r"^status 413 for 4096 bytes .*LAYA_MAX_WINDOWS")
+
+    def test_worst_text_is_fixed_ascii_of_the_asked_size(self):
+        a, b = conformance.worst_text(4096), conformance.worst_text(4096)
+        self.assertEqual(a, b)
+        self.assertEqual(len(a.encode()), 4096)
+        self.assertTrue(a.endswith(" ATTACK"))
+        self.assertNotIn(" ", a[:-7])
+
+    def test_worst_case_is_timed_at_the_gateways_concurrency(self):
+        # Fast enough one at a time, but one worker: of 4 worst-case texts at
+        # once (the gateway at max_inflight), 3 cannot be scored within the
+        # 250 ms the server has at a 500 ms timeout, behind the first, and
+        # get 503, which the gateway treats as an L2 error. The check fails
+        # and says how many at once the server holds.
+        srv, url = serve({"LAYA_WORKERS": "1"}, backend=SlowBatch(150))
+        try:
+            rc, out = conformance_run(url, "--budget-ms", "500", "--concurrency", "4")
+        finally:
+            stop(srv)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("ok    burst: 4 new connections at once", out)  # short texts: fast
+        self.assertRegex(out, r"FAIL  worst case within 500 ms with 2x headroom at p99, 4 at once: "
+                              r"4096 bytes .* wording: \d+ of 8 not answered 200 \(503: \d+\)")
+        self.assertIn("set max_inflight (summed over the gateways that call this server) to at most 1", out)
+        self.assertNotIn("a 503 took", out)  # refused at once, while the gateway reads
+        self.assertRegex(out, r"timeout_ms: \d+-\d+ for the worst case one at a time .* With 4 at once, "
+                              r"1 per round were answered in time at timeout_ms 500: set max_inflight "
+                              r"to at most 1")
+
+
+class Verdicts(unittest.TestCase):
+    """conformance/run.py's timing verdicts from given latencies: a check
+    passes only with the headroom the run recommends, and a 503 must come
+    while the gateway still reads."""
+
+    t = conformance.Target("http://127.0.0.1:9/v1/systemone", None, "laya", 1)
+
+    def worst(self, alone, rounds, budget=500.0):
+        with mock.patch.object(conformance, "timed", return_value=(None, sorted(alone), b'{"answers": '
+                               b'{"injection": {"noul": 0.9}}, "usage": {"windows": 6}}')), \
+             mock.patch.object(conformance, "at_once", return_value=rounds):
+            return conformance.check_worst(self.t, b"", b"", 4096, len(alone), len(rounds[0]), budget,
+                                           mock=True)
+
+    def test_latency_passes_only_with_headroom(self):
+        for p99, ok in ((40.0, True), (50.0, True), (60.0, False), (99.0, False)):
+            with mock.patch.object(conformance, "timed", return_value=(None, [10.0, p99], b"")):
+                err, _, got = conformance.check_latency(self.t, VECTORS, 2, 100)
+            self.assertEqual(got, p99)
+            if ok:
+                self.assertIsNone(err, p99)
+            else:
+                self.assertRegex(err, rf"^p99 {p99:.1f} ms needs a timeout_ms of {math.ceil(2 * p99)} at 2x "
+                                      r"headroom, over the 100 ms budget \(the gateway reads for 60% of it\)")
+
+    def test_worst_case_under_budget_but_without_headroom_fails(self):
+        # every one answered 200 inside the 500 ms budget, yet the p99 of 300 ms
+        # is all the gateway's read wait: the tail past it would time out
+        err, _, w = self.worst([100.0] * 4, [[(200, 300.0)] * 4] * 2)
+        self.assertRegex(err, r"^p99 300\.0 ms needs a timeout_ms of 600 at 2x headroom")
+        self.assertIn("Raise timeout_ms to 600-900", err)
+        self.assertEqual(w.together, 300.0)
+        self.assertEqual(conformance.timeout_line(w, 5.0)[:48], "timeout_ms: 600-900, 2-3x the worst-case p99 of ")
+
+    def test_worst_case_with_headroom_passes(self):
+        err, info, w = self.worst([100.0] * 4, [[(200, 240.0)] * 4] * 2)
+        self.assertIsNone(err, info)
+        self.assertEqual((w.alone, w.together, w.fit), (100.0, 240.0, 4))
+
+    def test_a_503_after_the_gateway_stopped_reading_is_flagged(self):
+        # at 500 ms the gateway reads for 300: a 503 at 400 ms reaches no one
+        late = [(200, 150.0), (200, 240.0), (503, 400.0), (503, 400.0)]
+        err, _, w = self.worst([100.0] * 4, [late, late])
+        self.assertIn("a 503 took 400 ms, after the gateway stopped reading at 300 ms", err)
+        self.assertIn("LAYA_GATEWAY_TIMEOUT_MS at most the gateway's timeout_ms, 500 here", err)
+        self.assertEqual(w.fit, 2)
+        prompt = [(200, 150.0), (200, 240.0), (503, 60.0), (503, 60.0)]
+        err, _, _ = self.worst([100.0] * 4, [prompt, prompt])
+        self.assertNotIn("a 503 took", err)
+        self.assertIn("to at most 2", err)
+
+    def test_too_slow_alone_says_so_first(self):
+        # max_inflight advice would be wrong here: one at a time already misses
+        err, _, w = self.worst([400.0] * 4, [[(200, 900.0)] * 4] * 2)
+        self.assertIn("Alone it needs a timeout_ms of 800 at 2x headroom", err)
+        err, _, w = self.worst([400.0] * 4, [[(503, 50.0)] * 4] * 2)
+        line = conformance.timeout_line(w, 0.0)
+        self.assertIn("timeout_ms: 800-1200 for the worst case one at a time", line)
+        self.assertIn("Run again with --budget-ms 800 or more", line)
+        self.assertNotIn("max_inflight to at most", line)
+
+
+class Load(unittest.TestCase):
+    """lead-laya-python#31: the gateway opens up to jev.max_inflight (64)
+    connections at once. socketserver's listen backlog of 5 dropped most of
+    a burst; each dropped connection was an L2 timeout, which passes the
+    request, and enough of them opened the breaker for every tenant."""
+
+    def burst(self, env):
+        # the accept loop starts 0.3 s late, as when the server is busy: the
+        # burst must wait in the listen queue, not be dropped from it
+        srv, url = serve(env, start_after=0.3)
+        try:
+            t = conformance.Target(url, None, "laya", 5)
+            return conformance.check_burst(t, VECTORS, 64, 2000)
+        finally:
+            stop(srv)
+
+    def test_listen_backlog_holds_a_burst(self):
+        err, info = self.burst({})
+        self.assertIsNone(err, info)
+
+    def test_a_small_backlog_fails_the_burst_check(self):
+        err, _ = self.burst({"LAYA_BACKLOG": "1"})
+        self.assertRegex(err or "", r"not answered 200 \(connect")
+        self.assertIn("(laya-server: LAYA_BACKLOG)", err)
+        self.assertNotIn("A 503", err)
+
+    def test_backlog_is_configurable(self):
+        srv, _ = serve({"LAYA_BACKLOG": "200"})
+        try:
+            self.assertEqual(srv.request_queue_size, 200)
+        finally:
+            stop(srv)
+        srv, _ = serve()
+        try:
+            self.assertEqual(srv.request_queue_size, 1024)
+        finally:
+            stop(srv)
+
+    def test_busy_workers_answer_503_while_the_gateway_reads(self):
+        started, release = threading.Event(), threading.Event()
+
+        class Held(L.MockBackend):
+            def logit(self, first, second):
+                started.set()
+                release.wait(5)
+                return super().logit(first, second)
+
+        # nothing scored yet, so no estimate: the second request waits
+        # for the first as long as it can, half the gateway's timeout
+        srv, url = serve({"LAYA_WORKERS": "1"}, backend=Held())
+        first = []
+        th = threading.Thread(target=lambda: first.append(post(url, "ATTACK")))
+        try:
+            th.start()
+            self.assertTrue(started.wait(5))
+            status, data, ms = post(url)
+            release.set()
+            th.join(5)
+        finally:
+            release.set()
+            stop(srv)
+        self.assertEqual(status, 503)
+        self.assertEqual(json.loads(data)["error"]["code"], "overloaded")
+        self.assertNotIn("answers", json.loads(data))
+        # answered while the gateway at the profile's floor still reads
+        self.assertLess(ms, conformance.READ_SHARE * profile_timeout_ms())
+        self.assertEqual(first[0][0], 200)
+
+    def test_answer_time_is_derived_from_the_profile(self):
+        # LAYA_GATEWAY_TIMEOUT_MS is the profile's floor by default. The
+        # gateway reads for 60% of it; the server answers or refuses within
+        # half of it, the headroom conformance passes a server at
+        floor = profile_timeout_ms()
+        self.assertEqual(L.GATEWAY_TIMEOUT_MS_DEFAULT, floor)
+        self.assertEqual(L.READ_SHARE, conformance.READ_SHARE)
+        self.assertEqual(L.ANSWER_SHARE, 1 / conformance.HEADROOM[0])
+        self.assertLess(L.ANSWER_SHARE, L.READ_SHARE)
+        for env, want in (({}, floor / 2), ({"LAYA_GATEWAY_TIMEOUT_MS": "300"}, 150)):
+            srv, _ = serve(env)
+            try:
+                self.assertEqual(srv.RequestHandlerClass.workers.answer_ms, want)
+            finally:
+                stop(srv)
+
+    def test_connection_past_the_cap_gets_503_and_is_closed(self):
+        srv, url = serve({"LAYA_MAX_CONNECTIONS": "1"})
+        t = conformance.Target(url, None, "laya", 5)
+        held = t.conn()
+        try:
+            self.assertEqual(post(url, conn=held)[0], 200)  # keepalive: holds the one slot
+            c = t.conn()
+            c.request("POST", "/v1/systemone", body=json.dumps({"state": "x", "questions": {"q": Q}}),
+                      headers=t.headers())
+            r = c.getresponse()
+            data = r.read()
+            c.close()
+            self.assertEqual(r.status, 503)
+            self.assertEqual(r.getheader("Connection"), "close")
+            self.assertEqual(json.loads(data)["error"]["code"], "overloaded")
+            self.assertEqual(t.request("GET", "/healthz", None)[0], 200)  # busy is not unhealthy
+        finally:
+            held.close()
+        try:
+            deadline = time.monotonic() + 5
+            while srv.connections and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(post(url)[0], 200)
+        finally:
+            stop(srv)
+
+    def test_workers_default(self):
+        py = L.PythonBackend.__new__(L.PythonBackend)
+        py.spans, py.count, py.logit, py.pair_overhead = L.MockBackend().spans, len, lambda f, s: 0.0, 0
+        for env, backend, want in (({}, None, L.cpu_budget()[0]),
+                                   ({}, py, 1),                      # may not be thread-safe
+                                   ({"LAYA_WORKERS": "3"}, py, 3)):
+            srv, _ = serve(env, backend=backend)
+            try:
+                self.assertEqual(srv.RequestHandlerClass.workers.n, want)
+            finally:
+                stop(srv)
+
+
+class Pool(unittest.TestCase):
+    """A request waits for a worker as long as it can still be answered in
+    time, by its own estimated scoring time and that of the work ahead of
+    it. A fixed 50 ms wait refused most of a burst of short texts the
+    server would have answered while the gateway reads."""
+
+    def test_size_is_about_the_tokens(self):
+        # without the tokenizer, which holds the GIL: a short prompt, prose
+        # of 4096 bytes, and the worst case of 4096 bytes (one token per
+        # byte) come out in that order, each in a size class of its own
+        t = conformance.Target("http://127.0.0.1:9/v1/systemone", None, "laya", 1)
+        q = {"injection": ctx_questions()["injection"]}
+        prose = ("Please summarise the attached invoice and tell me how refunds work. " * 70)[:4096]
+        worst = json.loads(conformance.worst_body(t, 4096, conformance.DEFAULT_ASSISTANT, q))["state"]
+        sizes = [L.cost_units({"assistant": conformance.DEFAULT_ASSISTANT, "user_message": "hello"}, q),
+                 L.cost_units({"assistant": conformance.DEFAULT_ASSISTANT, "user_message": prose}, q),
+                 L.cost_units(worst, q)]
+        self.assertEqual(sizes, sorted(sizes))
+        self.assertEqual(len({L.CostModel.size_class(n) for n in sizes}), 3, sizes)
+        self.assertGreater(sizes[2], 4096 * 0.8)
+        self.assertLess(sizes[1], sizes[2] / 2)
+
+    def test_cost_is_learned_per_size_class(self):
+        c = L.CostModel()
+        self.assertEqual(c.estimate(100), 0.0)  # nothing scored yet
+        c.observe(100, 5.0)     # a short text: 0.05 ms per unit
+        c.observe(6000, 420.0)  # the worst case: 0.07 ms per unit
+        self.assertAlmostEqual(c.estimate(120), 6.0)
+        self.assertAlmostEqual(c.estimate(5000), 350.0)
+        self.assertAlmostEqual(c.estimate(500), 25.0)   # a class not seen: the nearest one's rate
+        self.assertAlmostEqual(c.estimate(1000), 70.0)  # halfway: the dearer one's
+        c.observe(100, 15.0)  # a slower scoring moves its class's rate half way
+        self.assertAlmostEqual(c.estimate(100), 10.0)
+        c.observe(100, 5.0)   # a faster one a tenth of the way
+        self.assertAlmostEqual(c.estimate(100), 9.5)
+
+    def test_queue_takes_what_fits_in_order_and_refuses_the_rest_at_once(self):
+        cost = L.CostModel()
+        cost.observe(100, 400.0)  # 4 ms per unit: 400 ms for 100 units, 40 ms for 10
+        w = L.Workers(1, 1000, cost)
+        order = []
+
+        def queued(name, units):
+            with w.slot(units):
+                order.append(name)
+
+        held = w.slot(100)
+        held.__enter__()  # scoring, about 400 ms
+        a = threading.Thread(target=queued, args=("a", 100))
+        a.start()  # 400 ms of waiting and 400 of scoring fit in 1000: it waits
+        deadline = time.monotonic() + 5
+        while not w._queue and time.monotonic() < deadline:
+            time.sleep(0.001)
+        t0 = time.perf_counter()
+        with self.assertRaises(L.Refused) as cm:
+            with w.slot(100):  # 800 ms of waiting and 400 of scoring do not
+                pass
+        self.assertLess((time.perf_counter() - t0) * 1000, 50)  # refused at once, not after a wait
+        self.assertEqual((cm.exception.status, cm.exception.code), (503, "overloaded"))
+        self.assertIn("LAYA_GATEWAY_TIMEOUT_MS", cm.exception.message)
+        b = threading.Thread(target=queued, args=("b", 10))
+        b.start()  # 800 ms of waiting and 40 of scoring fit: it waits behind a
+        while len(w._queue) < 2 and time.monotonic() < deadline:
+            time.sleep(0.001)
+        held.__exit__(None, None, None)
+        a.join(5)
+        b.join(5)
+        self.assertEqual(order, ["a", "b"])
+        self.assertEqual(w._free, 1)
+
+    def test_a_short_burst_is_served_and_a_long_text_behind_it_refused_at_once(self):
+        # one worker, 10 ms per short text, 400 ms for the worst case; at a
+        # 1000 ms gateway timeout the server answers within 500 ms
+        srv, url = serve({"LAYA_WORKERS": "1", "LAYA_GATEWAY_TIMEOUT_MS": "1000"},
+                         backend=SlowBatch(400, short_ms=10))
+        pool = srv.RequestHandlerClass.workers
+        t = conformance.Target(url, None, "laya", 5)
+        short = conformance.short_body(t, VECTORS)
+        worst = conformance.worst_body(t, 4096, conformance.DEFAULT_ASSISTANT, ctx_questions())
+        try:
+            conformance.timed(t, short, 3)  # the server learns what each costs
+            conformance.timed(t, worst, 2)
+            # 16 short texts at once: about 200 ms of scoring, all answered in time
+            rounds = conformance.at_once(t, short, short, 16, 2)
+            for r in rounds:
+                self.assertEqual([s for s, _ in r], [200] * 16, r)
+                self.assertLess(max(ms for _, ms in r), conformance.READ_SHARE * 1000)
+            # a worst-case text sent behind 12 or more short ones cannot be
+            # scored in time: 503 at once, not after a wait
+            got = {}
+
+            def send(name, body):
+                got[name] = t.request("POST", "/v1/systemone", body)
+
+            ths = [threading.Thread(target=send, args=(i, short)) for i in range(16)]
+            with contextlib.redirect_stderr(io.StringIO()):
+                for th in ths:
+                    th.start()
+                deadline = time.monotonic() + 5
+                while len(pool._queue) < 12 and time.monotonic() < deadline:
+                    time.sleep(0.001)
+                send("worst", worst)
+                for th in ths:
+                    th.join(5)
+        finally:
+            stop(srv)
+        self.assertEqual(sorted(got[i][0] for i in range(16)), [200] * 16)
+        status, data, ms = got["worst"]
+        self.assertEqual(status, 503, data)
+        self.assertEqual(json.loads(data)["error"]["code"], "overloaded")
+        self.assertLess(ms, 60)
+
+    def test_burst_503s_are_blamed_on_the_workers_not_the_backlog(self):
+        srv, url = serve({"LAYA_WORKERS": "1"}, backend=SlowBatch(0, short_ms=40))
+        try:
+            t = conformance.Target(url, None, "laya", 5)
+            conformance.timed(t, conformance.short_body(t, VECTORS), 2)
+            with contextlib.redirect_stderr(io.StringIO()):
+                err, _ = conformance.check_burst(t, VECTORS, 16, 500)  # 640 ms of work for 250
+        finally:
+            stop(srv)
+        self.assertRegex(err or "", r"not answered 200 \(503: \d+\)\. A 503 means the server could not score "
+                                    r"that many at once in time: add capacity \(laya-server: LAYA_WORKERS")
+        self.assertNotIn("LAYA_BACKLOG", err)
+
+
+class ClientGone(unittest.TestCase):
+    """A client that stalls or hangs up in the middle of its body is the
+    client's doing: an access-log line, never a backend-fault warning."""
+
+    def run_client(self, send):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            srv, url = serve({"LAYA_IDLE_TIMEOUT_S": "0.2", "LAYA_ACCESS_LOG": "1"})
+            try:
+                t = conformance.Target(url, None, "laya", 5)
+                body = json.dumps({"state": "hello", "questions": {"q": Q}}).encode()
+                s = conformance.raw_socket(t)
+                try:
+                    s.sendall(conformance.partial_request(t, body))
+                    send(s)
+                finally:
+                    s.close()
+                status = post(url)[0]
+            finally:
+                stop(srv)
+        return status, err.getvalue()
+
+    def test_stall_mid_body(self):
+        def stall(s):
+            s.settimeout(3)
+            self.assertEqual(s.recv(100), b"")  # closed by the server after its idle timeout
+        status, log = self.run_client(stall)
+        self.assertEqual(status, 200)
+        self.assertNotIn("backend error", log)
+        self.assertNotIn("Traceback", log)
+        self.assertRegex(log, r"client gone mid-request: \w+ after the headers, reading a \d+-byte body")
+
+    def test_hang_up_mid_body(self):
+        def hang_up(s):
+            s.shutdown(socket.SHUT_WR)
+            s.settimeout(3)
+            s.recv(100)
+        status, log = self.run_client(hang_up)
+        self.assertEqual(status, 200)
+        self.assertNotIn("backend error", log)
+        self.assertRegex(log, r"client gone mid-request: hung up after \d+ of \d+ body bytes")
+
+
+class Cpus(unittest.TestCase):
+    """Pool sizes come from the CPUs this process may use, not the host's
+    count: a container limited to 2 CPUs on a 64-core host got 64 workers,
+    each with onnxruntime's pool of one thread per host core."""
+
+    def tree(self, files: dict) -> str:
+        d = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, d)
+        for path, text in files.items():
+            os.makedirs(os.path.dirname(os.path.join(d, path)), exist_ok=True)
+            with open(os.path.join(d, path), "w") as f:
+                f.write(text)
+        return d
+
+    def quota(self, files):
+        d = self.tree(files)
+        return L.cgroup_cpus(os.path.join(d, "sys"), os.path.join(d, "proc"))
+
+    def test_cgroup_v2_container(self):
+        self.assertEqual(self.quota({"proc": "0::/\n", "sys/cpu.max": "150000 100000\n"}), 1.5)
+        self.assertIsNone(self.quota({"proc": "0::/\n", "sys/cpu.max": "max 100000\n"}))
+
+    def test_cgroup_v2_nested_takes_the_lowest(self):
+        self.assertEqual(self.quota({"proc": "0::/a/b\n", "sys/a/b/cpu.max": "max 100000\n",
+                                     "sys/a/cpu.max": "200000 100000\n", "sys/cpu.max": "800000 100000\n"}), 2.0)
+
+    def test_cgroup_v1_container_sees_its_group_at_the_mount(self):
+        # without a cgroup namespace the path names the host's group
+        self.assertEqual(self.quota({"proc": "12:memory:/docker/x\n4:cpu,cpuacct:/docker/x\n",
+                                     "sys/cpu,cpuacct/cpu.cfs_quota_us": "300000\n",
+                                     "sys/cpu,cpuacct/cpu.cfs_period_us": "100000\n"}), 3.0)
+        self.assertIsNone(self.quota({"proc": "4:cpu,cpuacct:/\n",
+                                      "sys/cpu,cpuacct/cpu.cfs_quota_us": "-1\n",
+                                      "sys/cpu,cpuacct/cpu.cfs_period_us": "100000\n"}))
+
+    def test_no_cgroups(self):
+        self.assertIsNone(L.cgroup_cpus("/nonexistent", "/nonexistent/cgroup"))
+
+    def test_budget_is_affinity_capped_by_the_quota_rounded_down(self):
+        d = self.tree({"proc": "0::/\n", "sys/cpu.max": "250000 100000\n"})
+        args = (os.path.join(d, "sys"), os.path.join(d, "proc"))
+        with mock.patch.object(os, "sched_getaffinity", create=True, return_value=set(range(8))):
+            self.assertEqual(L.cpu_budget(*args), (2, "cgroup CPU quota 2.5, of 8 CPUs this process may run on"))
+        with mock.patch.object(os, "sched_getaffinity", create=True, return_value={0, 1}):
+            self.assertEqual(L.cpu_budget(*args), (2, "CPUs this process may run on"))
+        d = self.tree({"proc": "0::/\n", "sys/cpu.max": "50000 100000\n"})
+        with mock.patch.object(os, "sched_getaffinity", create=True, return_value=set(range(8))):
+            self.assertEqual(L.cpu_budget(os.path.join(d, "sys"), os.path.join(d, "proc"))[0], 1)
+
+    def test_pool_sizes(self):
+        for kind, env, cpus, want in (
+                ("onnx", {}, 1, (1, 1)), ("onnx", {}, 2, (2, 1)), ("onnx", {}, 4, (2, 2)),
+                ("onnx", {}, 8, (2, 4)), ("onnx", {}, 10, (2, 4)), ("onnx", {}, 64, (16, 4)),
+                ("onnx", {"LAYA_WORKERS": "4"}, 8, (4, 2)),
+                ("onnx", {"LAYA_WORKERS": "16"}, 8, (16, 1)),     # oversubscribed: warned at start
+                ("onnx", {"LAYA_ORT_THREADS": "1"}, 8, (8, 1)),
+                ("onnx", {"LAYA_ORT_THREADS": "0"}, 8, (1, 0)),   # onnxruntime's choice: the host's cores
+                ("onnx", {"LAYA_WORKERS": "3", "LAYA_ORT_THREADS": "5"}, 8, (3, 5)),
+                ("mock", {}, 6, (6, 0)), ("python", {}, 6, (1, 0)), ("python", {"LAYA_WORKERS": "2"}, 6, (2, 0))):
+            self.assertEqual(L.pool_sizes(kind, env, cpus), want, (kind, env, cpus))
+            w, t = want
+            if kind == "onnx" and not env:
+                self.assertLessEqual(w * t, cpus)
+        with self.assertRaises(ValueError):
+            L.pool_sizes("onnx", {"LAYA_ORT_THREADS": "-1"}, 4)
+
+    def onnx_server(self, env, cpus=8):
+        got = {}
+
+        def fake_load(e, threads=None):
+            got["threads"] = threads
+            return L.MockBackend()
+
+        e = {"LAYA_HOST": "127.0.0.1", "LAYA_PORT": "0", "LAYA_BACKEND": "onnx", **env}
+        with mock.patch.object(L, "load_backend", fake_load):
+            srv = L.make_server(e, cpus=(cpus, "test CPUs"))
+        self.addCleanup(srv.server_close)
+        return srv, got["threads"]
+
+    def test_server_sizes_onnx_from_the_cpus(self):
+        srv, threads = self.onnx_server({})
+        self.assertEqual((srv.RequestHandlerClass.workers.n, threads), (2, 4))
+        lines = L.startup_lines(srv)
+        self.assertRegex(lines[0], r": 2 workers, 4 onnxruntime threads on 8 CPUs \(test CPUs\), "
+                                   r"answering within 250 ms of a 500 ms gateway timeout")
+        self.assertFalse(any("slow each other down" in x or "LAYA_ORT_THREADS=0" in x for x in lines), lines)
+
+    def test_startup_warns_when_the_pool_outgrows_the_cpus(self):
+        srv, _ = self.onnx_server({"LAYA_WORKERS": "8", "LAYA_ORT_THREADS": "2"})
+        self.assertTrue(any("LAYA_WORKERS x LAYA_ORT_THREADS = 16, over the 8 CPUs" in x
+                            for x in L.startup_lines(srv)))
+        srv, threads = self.onnx_server({"LAYA_ORT_THREADS": "0"})
+        self.assertEqual(threads, 0)
+        self.assertTrue(any("LAYA_ORT_THREADS=0 lets onnxruntime size its pool from the host's cores" in x
+                            for x in L.startup_lines(srv)))
+
+
+class OrtOptions(unittest.TestCase):
+    def test_providers(self):
+        have = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        self.assertEqual(L.ort_providers(None, have), ["CPUExecutionProvider"])
+        self.assertEqual(L.ort_providers(" CUDAExecutionProvider,CPUExecutionProvider ", have), have)
+        # a provider missing from the build stops the server rather than
+        # falling back to CPU under a timeout sized for a GPU
+        with self.assertRaises(SystemExit) as cm:
+            L.ort_providers("CUDAExecutionProvider", ["CPUExecutionProvider"])
+        self.assertIn("CUDAExecutionProvider", str(cm.exception))
+
+    def test_env_reaches_the_backend(self):
+        with mock.patch.object(L, "OnnxBackend") as onnx:
+            L.load_backend({"LAYA_BACKEND": "onnx", "LAYA_ORT_PROVIDERS": "CUDAExecutionProvider",
+                            "LAYA_ORT_THREADS": "2"})
+        onnx.assert_called_once_with("/model", 1, providers="CUDAExecutionProvider", threads=2)
+
+    def test_threads_default_to_the_cpu_budget(self):
+        # fit_temperature.py loads the backend without a server
+        with mock.patch.object(L, "OnnxBackend") as onnx, \
+             mock.patch.object(L, "cpu_budget", return_value=(8, "test")):
+            L.load_backend({"LAYA_BACKEND": "onnx"})
+        onnx.assert_called_once_with("/model", 1, providers=None, threads=4)
 
 
 if __name__ == "__main__":

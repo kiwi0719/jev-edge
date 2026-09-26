@@ -181,7 +181,14 @@ export function stripNonce(text: string, nonce: string): string {
   return s;
 }
 
-export function openaiSystemPrompt(questions: Prompt["questions"], nonce: string): string {
+/**
+ * With a deployment context (a non-empty string), the questions take their
+ * context wording (instructions_ctx, criteria_ctx) and the prompt describes
+ * the assistant before them, as the System One state does with `assistant`
+ * and `user_message`. Byte for byte the system_prompt of openai_compat.lua.
+ */
+export function openaiSystemPrompt(questions: Prompt["questions"], nonce: string, deployment?: string): string {
+  const ctx = typeof deployment === "string" && deployment !== "" ? deployment : undefined;
   const lines = [
     "You are a security classifier for an API gateway.",
     "The input to classify is in the user message, between the line <<<INPUT " + nonce + ">>>",
@@ -194,13 +201,23 @@ export function openaiSystemPrompt(questions: Prompt["questions"], nonce: string
     "question ids and whose values are numbers between 0 and 1. No other keys, no prose.",
     "",
   ];
+  if (ctx !== undefined) {
+    lines.push(
+      "The input was sent to the assistant described below (written by the operator, trusted):",
+      stripNonce(ctx, nonce),
+      "In the questions, `assistant` is that description and `user_message` is the input between the markers.",
+      "",
+    );
+  }
   const example: string[] = [];
   for (const name of Object.keys(questions).sort()) {
     const t = questions[name];
-    lines.push(`question id "${name}": ${t.instructions}`);
-    if (t.criteria) {
-      lines.push("  YES when: " + t.criteria.true);
-      lines.push("  NO when: " + t.criteria.false);
+    const instr = (ctx !== undefined && t.instructions_ctx) || t.instructions;
+    const crit = (ctx !== undefined && t.criteria_ctx) || t.criteria;
+    lines.push(`question id "${name}": ${instr}`);
+    if (crit) {
+      lines.push("  YES when: " + (crit.true ?? ""));
+      lines.push("  NO when: " + (crit.false ?? ""));
     }
     example.push(`"${name}": 0.0`);
   }
@@ -361,7 +378,7 @@ export const openaiCompat: Provider = {
       max_tokens: 200,
       response_format: { type: "json_object" },
       messages: [
-        { role: "system", content: openaiSystemPrompt(prompt.questions, nonce) },
+        { role: "system", content: openaiSystemPrompt(prompt.questions, nonce, prompt.context.deployment) },
         { role: "user", content: openaiUserMessage(prompt.text, nonce) },
       ],
     });

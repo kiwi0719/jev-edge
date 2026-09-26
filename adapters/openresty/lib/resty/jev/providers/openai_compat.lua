@@ -64,7 +64,12 @@ local function strip_nonce(text, nonce)
 end
 _M.strip_nonce = strip_nonce
 
-local function system_prompt(questions, nonce)
+-- With a deployment context (a non-empty string), the questions take their
+-- context wording (instructions_ctx, criteria_ctx) and the prompt describes
+-- the assistant before them, as the System One state does with `assistant`
+-- and `user_message`.
+local function system_prompt(questions, nonce, deployment)
+  if type(deployment) ~= "string" or deployment == "" then deployment = nil end
   local lines = {
     "You are a security classifier for an API gateway.",
     "The input to classify is in the user message, between the line <<<INPUT " .. nonce .. ">>>",
@@ -77,13 +82,23 @@ local function system_prompt(questions, nonce)
     "question ids and whose values are numbers between 0 and 1. No other keys, no prose.",
     "",
   }
+  if deployment then
+    lines[#lines + 1] = "The input was sent to the assistant described below (written by the operator, trusted):"
+    lines[#lines + 1] = strip_nonce(deployment, nonce)
+    lines[#lines + 1] = "In the questions, `assistant` is that description and `user_message` is the input"
+      .. " between the markers."
+    lines[#lines + 1] = ""
+  end
   local example = {}
   for _, name in ipairs(sorted_names(questions)) do
     local t = questions[name]
-    lines[#lines + 1] = "question id \"" .. name .. "\": " .. t.instructions
-    if t.criteria then
-      lines[#lines + 1] = "  YES when: " .. (t.criteria[true] or "")
-      lines[#lines + 1] = "  NO when: " .. (t.criteria[false] or "")
+    local instr = (deployment and t.instructions_ctx) or t.instructions
+    local crit = (deployment and t.criteria_ctx) or t.criteria
+    lines[#lines + 1] = "question id \"" .. name .. "\": " .. instr
+    if crit then
+      -- templates key criteria by boolean; a JSON-shaped table by string
+      lines[#lines + 1] = "  YES when: " .. (crit[true] or crit["true"] or "")
+      lines[#lines + 1] = "  NO when: " .. (crit[false] or crit["false"] or "")
     end
     example[#example + 1] = '"' .. name .. '": 0.0'
   end
@@ -107,6 +122,7 @@ function _M.build_request(prompt, cfg, nonce)
   local wanted = {}
   for name in pairs(prompt.questions) do wanted[name] = true end
   nonce = nonce or new_nonce()
+  local deployment = prompt.context and prompt.context.deployment
   local endpoint = (cfg.endpoint or "http://127.0.0.1:11434/v1"):gsub("/+$", "")
   local body = cjson.encode({
     model = cfg.model or "gpt-4o-mini",
@@ -114,7 +130,7 @@ function _M.build_request(prompt, cfg, nonce)
     max_tokens = 200,
     response_format = { type = "json_object" },
     messages = {
-      { role = "system", content = system_prompt(prompt.questions, nonce) },
+      { role = "system", content = system_prompt(prompt.questions, nonce, deployment) },
       { role = "user",   content = user_message(prompt.text, nonce) },
     },
   })

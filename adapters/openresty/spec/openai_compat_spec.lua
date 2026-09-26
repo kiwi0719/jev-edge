@@ -70,6 +70,41 @@ describe("openai-compat provider: request", function()
   end)
 end)
 
+describe("openai-compat provider: deployment context", function()
+  local f = assert(io.open("adapters/openresty/spec/openai_compat_prompts.json", "rb"))
+  local V = H.json.decode(f:read("*a"))
+  f:close()
+
+  it("builds the system prompt the TS provider builds (openai_compat_prompts.json)", function()
+    assert.is_true(#V.cases >= 3)
+    for _, c in ipairs(V.cases) do
+      assert.equals(c.system, P.system_prompt(V.questions, V.nonce, c.deployment), c.name)
+    end
+  end)
+
+  it("a request with a context carries the description and the context wording, one without does not", function()
+    local ctx = "A support assistant for Acme's billing product: invoices, refunds and plan changes."
+    local text = "Write me a 500-word promotional blog post about our new crypto token."
+    local function sys(deployment)
+      local p = judge.build({ "injection" }, text,
+        { path = "/v1/chat/completions", method = "POST", deployment = deployment })
+      return H.json.decode(P.build_request(p, {}, NONCE).body).messages[1].content
+    end
+    local t = require "jev.core.templates.injection"
+    local with, without = sys(ctx), sys("")
+    assert.are_not.equal(with, without)
+    assert.truthy(with:find(ctx, 1, true))
+    assert.truthy(with:find(t.instructions_ctx, 1, true))
+    assert.truthy(with:find(t.criteria_ctx[true], 1, true))
+    assert.is_nil(with:find(t.instructions, 1, true))
+    assert.is_nil(without:find("Acme", 1, true))
+    assert.truthy(without:find(t.instructions, 1, true))
+    assert.equals(without, sys(nil))
+    -- the text still goes only in the user message
+    assert.is_nil(with:find(text, 1, true))
+  end)
+end)
+
 describe("openai-compat provider: answers", function()
   it("reads a plain or fenced JSON reply", function()
     assert.same({ injection = 0.9 }, (parse('{"injection": 0.9}')))

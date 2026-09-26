@@ -46,9 +46,27 @@ describe("judge", function()
     assert.equals(J.UNAVAILABLE, J.status_kind(500))
     assert.equals(J.UNAVAILABLE, J.status_kind(503))
     assert.equals(J.UNAVAILABLE, J.status_kind(429))
-    for _, st in ipairs({ 400, 401, 403, 404, 408, 413, 422, 302 }) do
-      assert.equals(J.REJECTED, J.status_kind(st), st)
+    -- the key, the endpoint or model, the route: configuration no text
+    -- provokes, so they count and a misconfigured provider opens the breaker
+    for _, st in ipairs({ 401, 404, 405 }) do
+      assert.equals(J.UNAVAILABLE, J.status_kind(st), st)
+      assert.is_true(J.counts("laya http " .. st, J.status_kind(st)), st)
     end
+    -- what a content filter, a WAF or a strict parser answers to the text
+    for _, st in ipairs({ 400, 403, 408, 413, 422, 302 }) do
+      assert.equals(J.REJECTED, J.status_kind(st), st)
+      assert.is_false(J.counts("laya http " .. st, J.status_kind(st)), st)
+    end
+  end)
+
+  it("names an L2 error's kind from a fixed set", function()
+    for _, k in ipairs({ J.TRANSPORT, J.TIMEOUT, J.UNAVAILABLE, J.REJECTED, J.UNUSABLE }) do
+      assert.equals(k, J.error_kind("x", k))
+    end
+    assert.equals("busy", J.error_kind(J.BUSY))
+    assert.equals("busy", J.error_kind(J.BUSY, J.TRANSPORT))
+    assert.equals("other", J.error_kind("some error"))
+    assert.equals("other", J.error_kind("some error", "made-up"))
   end)
 
   it("counts only transport, timeout and unavailable against the provider", function()

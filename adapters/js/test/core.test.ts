@@ -630,8 +630,34 @@ describe("which judge errors count against the breaker", () => {
       const breaker = new Breaker(memoryStore(), () => 1000, { min_samples: 1, fail_ratio: 0.5 });
       const v = await core.evaluate(request(0), ctxFor(breaker, () => r));
       expect(v.reason).toBe(r[1]);
+      expect(v.error_kind).toBe(r[2] ?? "other");
       expect(await breaker.state()).toBe(OPEN);
     }
+  });
+
+  it("401, 404 and 405 are the gateway's configuration: they count and trip it", async () => {
+    for (const st of [401, 404, 405]) {
+      expect(J.statusKind(st), String(st)).toBe(J.UNAVAILABLE);
+      const breaker = new Breaker(memoryStore(), () => 1000, { min_samples: 1, fail_ratio: 0.5 });
+      const v = await core.evaluate(request(0), ctxFor(breaker, () => [null, `laya http ${st}`, J.statusKind(st)]));
+      expect(v.reason).toBe(`laya http ${st}`);
+      expect(v.error_kind).toBe("unavailable");
+      expect(await breaker.state()).toBe(OPEN);
+    }
+    for (const st of [400, 403, 408, 413, 422, 302]) expect(J.statusKind(st), String(st)).toBe(J.REJECTED);
+    for (const st of [500, 503, 429]) expect(J.statusKind(st), String(st)).toBe(J.UNAVAILABLE);
+    for (const st of [200, 204]) expect(J.statusKind(st), String(st)).toBe(J.UNUSABLE);
+  });
+
+  it("an L2 error verdict names its kind from a fixed set", async () => {
+    for (const k of [J.TRANSPORT, J.TIMEOUT, J.UNAVAILABLE, J.REJECTED, J.UNUSABLE] as const) expect(J.errorKind("x", k)).toBe(k);
+    expect(J.errorKind(J.BUSY)).toBe("busy");
+    expect(J.errorKind(J.BUSY, J.TRANSPORT)).toBe("busy");
+    expect(J.errorKind("some error")).toBe("other");
+    expect(J.errorKind("some error", "made-up" as never)).toBe("other");
+    const breaker = new Breaker(memoryStore(), () => 1000);
+    expect((await core.evaluate(request(0), ctxFor(breaker, () => [null, J.BUSY]))).error_kind).toBe("busy");
+    expect((await core.evaluate(request(0), ctxFor(breaker, () => [{ injection: 0.1 }, null]))).error_kind).toBe("");
   });
 
   it("a half-open probe with a non-counting error hands the probe on", async () => {

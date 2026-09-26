@@ -252,7 +252,9 @@ async function judgeParts(
     // no part left to judge
     await settle(ctx);
     const [action, label, async] = policy.onError();
-    return finish(ctx, verdict.newVerdict({ action, verdict: label, async, source: verdict.SRC_L2, reason: leftOut!, fingerprint: fp }));
+    return finish(ctx, verdict.newVerdict({
+      action, verdict: label, async, source: verdict.SRC_L2, reason: leftOut!, fingerprint: fp, error_kind: judge.KIND_OTHER,
+    }));
   }
 
   const t0 = nowMs(ctx);
@@ -266,6 +268,7 @@ async function judgeParts(
   const elapsed = nowMs(ctx) - t0;
 
   let err: string | undefined;
+  let ekind: judge.VerdictErrorKind | undefined;
   let failed = false, answered = false;
   for (let k = 0; k < pending.length; k++) {
     const p = pending[k];
@@ -277,7 +280,7 @@ async function judgeParts(
     if (a) [s, t, n] = judge.reduce(a);
     if (!a || n === 0) {
       if (a) [e, kind] = ["no scores in answer", judge.UNUSABLE];
-      err ??= judge.reason(e, kind);
+      if (err === undefined) [err, ekind] = [judge.reason(e, kind), judge.errorKind(e, kind)];
       if (judge.counts(e, kind)) failed = true;
     } else {
       answered = true;
@@ -307,7 +310,7 @@ async function judgeParts(
     log(ctx, "warn", "jev-edge: L2 failed on a chunk: " + err);
     const [action, label, async] = policy.onError();
     return finish(ctx, verdict.newVerdict({
-      action, verdict: label, async, source: verdict.SRC_L2, reason: err, fingerprint: fp, l2_ms: elapsed,
+      action, verdict: label, async, source: verdict.SRC_L2, reason: err, fingerprint: fp, l2_ms: elapsed, error_kind: ekind,
     }));
   }
   const score = best ?? 0;
@@ -468,7 +471,9 @@ export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
     log(ctx, "error", "jev-edge: " + perr);
     await settle(ctx);
     const [action, label, async] = policy.onError();
-    return finish(ctx, verdict.newVerdict({ action, verdict: label, async, source: verdict.SRC_L2, reason: perr, fingerprint: fp }));
+    return finish(ctx, verdict.newVerdict({
+      action, verdict: label, async, source: verdict.SRC_L2, reason: perr, fingerprint: fp, error_kind: judge.KIND_OTHER,
+    }));
   }
 
   const t0 = nowMs(ctx);
@@ -482,7 +487,7 @@ export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
     const [action, label, async] = policy.onError();
     return finish(ctx, verdict.newVerdict({
       action, verdict: label, async, source: verdict.SRC_L2,
-      reason: why, fingerprint: fp, l2_ms: elapsed,
+      reason: why, error_kind: judge.errorKind(jerr, jkind), fingerprint: fp, l2_ms: elapsed,
     }));
   }
 
@@ -497,7 +502,7 @@ export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
     const [action, label, async] = policy.onError();
     return finish(ctx, verdict.newVerdict({
       action, verdict: label, async, source: verdict.SRC_L2,
-      reason: why, fingerprint: fp, l2_ms: elapsed,
+      reason: why, error_kind: judge.UNUSABLE, fingerprint: fp, l2_ms: elapsed,
     }));
   }
   await settle(ctx, false, true);

@@ -1188,6 +1188,8 @@ verdict_case("reason truncated after encoding, never inside an escape", { reason
 verdict_case("reason unicode percent-encoded", { reason = "über" })
 verdict_case("score header rounds to two decimals", { score = 0.345 })
 verdict_case("score header rounds half", { score = 0.125 })
+verdict_case("an L2 error keeps its kind", { verdict = "error", source = "l2", reason = "timeout",
+  error_kind = "timeout" })
 
 -- ---------------------------------------------------------------------------
 -- evaluate: the whole pipeline with every IO scripted

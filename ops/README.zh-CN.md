@@ -47,6 +47,7 @@ scrape_configs:
 | `jev_requests_total` | counter | `source`（l1、trust、cache、l2、breaker），`verdict`（safe、suspicious、malicious、error、skipped） | 每个经过评估的请求 |
 | `jev_actions_total` | counter | `action`（pass、block） | 网关最终对请求做了什么 |
 | `jev_cache_hits_total` | counter | `kind`（fp） | 判定结果缓存的命中次数 |
+| `jev_l2_errors_total` | counter | `kind`（transport、timeout、unavailable、rejected、unusable、busy、other） | 以 `verdict=error` 收场的 L2 调用，按失败原因分类 |
 | `jev_l2_latency_ms` | histogram | `le`（25、50、100、200、300、500、1000、+Inf） | L2 调用耗时，失败的调用也算在内 |
 | `jev_tokens_total` | counter | `direction`（input、output） | provider 消耗的 token 数 |
 | `jev_breaker_state` | gauge | | 0 表示关闭，1 表示打开，2 表示半开（见 `core/breaker.lua`） |
@@ -133,12 +134,12 @@ provider 一直不可用时，熔断器会在打开（30 s）、半开（放一�
 
 处理步骤：
 
-1. 在错误日志里找 `jev-edge: L2 failed: <reason>`，看具体原因。
-2. 如果是超时，把 L2 延迟分位数和超时面板对照着看。provider 本身正常、只是变慢了，就调大 `jev.timeout_max_ms`。
-3. 如果是 401/403，轮换 key。
-4. 如果是 5xx，那是 provider 那边出了故障。
+1. 先用 `sum by (kind) (rate(jev_l2_errors_total[5m]))` 按类别拆开，再到错误日志里找 `jev-edge: L2 failed: <reason>` 看具体原因。
+2. `timeout`：把 L2 延迟分位数和超时面板对照着看。provider 本身正常、只是变慢了，就调大 `jev.timeout_max_ms`。
+3. `unavailable`：5xx 或 429 是 provider 那边出了故障；401 说明 key 错了或被吊销；404、405 说明 endpoint 或模型名写错了。
+4. `rejected`（其余 4xx）或 `unusable`（返回 2xx 却没有分数）：比例接近 100% 就说明 provider 拒绝了每一次调用，常见原因是模型不接受某个参数、key 权限不够，或者前面有 WAF 拦着（参考 JevL2NoVerdicts）。
 
-错误率达到 `breaker.fail_ratio` 后，接着就会触发 JevBreakerOpen。
+只有 `transport`、`timeout` 和 `unavailable` 计入熔断，达到 `breaker.fail_ratio` 后接着就会触发 JevBreakerOpen。`rejected` 和 `unusable` 永远不会让熔断打开：送审文本本身就能引出这类失败（内容过滤返回的 400、WAF 返回的 403、模型拒答），不能让客户端借此把 L2 关掉。`busy` 表示网关自己的 `jev.max_inflight` 满了。
 
 ### JevUnjudgeableRatioHigh（warning）
 
@@ -173,6 +174,18 @@ provider 本身正常、只是变慢了，就调大 `jev.timeout_max_ms`，改�
 10m 内一直有请求走到 L2 阶段（`source=breaker`），但没有任何一次 L2 调用给出判定结果。这条告警和 JevBreakerOpen 是一对，区别在于它依据的是流量：即使抓取熔断器状态 gauge 时恰好处在半开状态，它照样会触发。
 
 处理方法和 JevBreakerOpen 相同。判定结果缓存会继续为已经判定过的文本提供结果，新文本在 L2 恢复前都不经判定直接放行。
+
+### JevL2NoVerdicts（critical）
+
+10m 内每一次 L2 调用都以 `verdict=error` 收场，没有一次给出判定结果，不管熔断器处于什么状态。provider 如果因为熔断不计入的原因拒绝每一次调用（模型参数不对返回 400、WAF 返回 403、响应里没有分数），熔断器就一直关着，JevBreakerOpen 和 JevL2Starved 都不会响，可实际上 L1 之后已经什么都没在判定了。
+
+处理步骤：
+
+1. 用 `sum by (kind) (rate(jev_l2_errors_total[5m]))` 按类别拆开，再到错误日志里找 `jev-edge: L2 failed: <reason>`。
+2. `rejected`：provider 拒绝了调用。检查模型参数、key 的权限，以及 provider 前面有没有别的东西拦着。
+3. `unusable`：provider 有响应，但格式不是判定器要的。检查模型名和模板。
+4. `busy`：`jev.max_inflight` 满了，调大它或者扩容。
+5. `unavailable`、`transport` 或 `timeout`：按 JevBreakerOpen 处理。
 
 ## CI
 

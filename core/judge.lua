@@ -23,16 +23,43 @@ _M.BUSY = "max_inflight exceeded"
 -- off for every tenant. So only the first three kinds count (counts()).
 _M.TRANSPORT   = "transport"    -- no HTTP answer: connect, DNS, TLS, reset
 _M.TIMEOUT     = "timeout"
-_M.UNAVAILABLE = "unavailable"  -- HTTP 5xx or 429
+_M.UNAVAILABLE = "unavailable"  -- HTTP 5xx, 429, 401, 404 or 405
 _M.REJECTED    = "rejected"     -- any other non-2xx status: this call was refused
 _M.UNUSABLE    = "unusable"     -- 2xx, but no answer core can use
+
+-- 401 (the key), 404 (the endpoint or the model) and 405 (the route): the
+-- gateway's configuration, which no judged text can provoke. They count, so
+-- a provider misconfigured for good opens the breaker and its alerts fire,
+-- where as REJECTED every request would pass as an L2 error for ever. A 400,
+-- 403, 413 or 422 stays REJECTED: a content filter, a WAF or a strict parser
+-- answers those to the text.
+local CONFIG_STATUS = { [401] = true, [404] = true, [405] = true }
 
 --- The kind of a failed call the provider answered with this HTTP status.
 function _M.status_kind(status)
   status = tonumber(status) or 0
-  if status >= 500 or status == 429 then return _M.UNAVAILABLE end
+  if status >= 500 or status == 429 or CONFIG_STATUS[status] then return _M.UNAVAILABLE end
   if status >= 200 and status < 300 then return _M.UNUSABLE end
   return _M.REJECTED
+end
+
+-- The kinds an L2 error verdict names (verdict.error_kind): the five above,
+-- "busy" for BUSY (the gateway's own cap, no call made) and "other" for a
+-- judge that gives no kind or one core does not know, or a prompt that could
+-- not be built. A fixed set: it labels a metric, and a provider must not be
+-- able to mint label values.
+_M.KIND_BUSY  = "busy"
+_M.KIND_OTHER = "other"
+local KINDS = {
+  [_M.TRANSPORT] = true, [_M.TIMEOUT] = true, [_M.UNAVAILABLE] = true,
+  [_M.REJECTED] = true, [_M.UNUSABLE] = true,
+}
+
+--- The error kind an L2 error verdict carries for a failed call.
+function _M.error_kind(err, kind)
+  if err == _M.BUSY then return _M.KIND_BUSY end
+  if KINDS[kind] then return kind end
+  return _M.KIND_OTHER
 end
 
 --- Does a failed call count against the provider (a breaker failure)?

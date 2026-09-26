@@ -17,6 +17,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "",
           "l2_ms": 0,
           "reason": "path not watched",
@@ -69,6 +70,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "",
           "l2_ms": 0,
           "reason": "text too short",
@@ -121,6 +123,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "",
           "l2_ms": 0,
           "reason": "ip reputation",
@@ -181,6 +184,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "",
           "l2_ms": 0,
           "reason": "ip reputation",
@@ -262,6 +266,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "cf223bdc",
           "l2_ms": 0,
           "reason": "injection 0.10",
@@ -340,6 +345,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "cf223bdc",
           "l2_ms": 0,
           "reason": "injection 0.10",
@@ -410,6 +416,7 @@
         "verdict": {
           "action": "pass",
           "async": true,
+          "error_kind": "",
           "fingerprint": "cf223bdc",
           "l2_ms": 0,
           "reason": "injection 0.55",
@@ -480,6 +487,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -550,6 +558,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -624,6 +633,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "cf223bdc",
           "l2_ms": 0,
           "reason": "abuse 0.80",
@@ -695,6 +705,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "cf223bdc",
           "l2_ms": 0,
           "reason": "abuse 0.30",
@@ -766,6 +777,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "cf223bdc",
           "l2_ms": 0,
           "reason": "injection 1.00",
@@ -828,6 +840,7 @@
         "verdict": {
           "action": "pass",
           "async": true,
+          "error_kind": "other",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "timeout",
@@ -892,6 +905,7 @@
         "verdict": {
           "action": "pass",
           "async": true,
+          "error_kind": "unusable",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "unusable: no scores in answer",
@@ -956,6 +970,7 @@
         "verdict": {
           "action": "pass",
           "async": true,
+          "error_kind": "unusable",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "unusable: no scores in answer",
@@ -1026,6 +1041,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -1108,6 +1124,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -1190,6 +1207,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -1272,6 +1290,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -1336,6 +1355,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "injection 0.05",
@@ -1418,6 +1438,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -1497,6 +1518,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -1569,6 +1591,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "injection 0.05",
@@ -1637,6 +1660,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "cf223bdc",
           "l2_ms": 0,
           "reason": "injection 0.80",
@@ -1694,6 +1718,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "cf223bdc",
           "l2_ms": 0,
           "reason": "injection 0.55",
@@ -1751,6 +1776,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "cf223bdc",
           "l2_ms": 0,
           "reason": "injection 0.80",
@@ -1830,6 +1856,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "cf223bdc",
           "l2_ms": 0,
           "reason": "injection 0.10",
@@ -1891,6 +1918,7 @@
         "verdict": {
           "action": "pass",
           "async": true,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "breaker open",
@@ -1967,6 +1995,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "injection 0.90",
@@ -2035,6 +2064,7 @@
         "verdict": {
           "action": "pass",
           "async": true,
+          "error_kind": "transport",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "connection refused",
@@ -2102,6 +2132,7 @@
         "verdict": {
           "action": "pass",
           "async": true,
+          "error_kind": "timeout",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "timeout",
@@ -2169,6 +2200,7 @@
         "verdict": {
           "action": "pass",
           "async": true,
+          "error_kind": "unavailable",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "laya http 503",
@@ -2236,6 +2268,7 @@
         "verdict": {
           "action": "pass",
           "async": true,
+          "error_kind": "unavailable",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "openai-compat http 429",
@@ -2303,6 +2336,7 @@
         "verdict": {
           "action": "pass",
           "async": true,
+          "error_kind": "rejected",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "rejected: openai-compat http 400",
@@ -2374,6 +2408,7 @@
         "verdict": {
           "action": "pass",
           "async": true,
+          "error_kind": "unusable",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "unusable: openai-compat: no content",
@@ -2445,6 +2480,7 @@
         "verdict": {
           "action": "pass",
           "async": true,
+          "error_kind": "unusable",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "unusable: no scores in answer",
@@ -2511,6 +2547,7 @@
         "verdict": {
           "action": "pass",
           "async": true,
+          "error_kind": "busy",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "max_inflight exceeded",
@@ -2577,6 +2614,7 @@
         "verdict": {
           "action": "pass",
           "async": true,
+          "error_kind": "other",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "provider error",
@@ -2651,6 +2689,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "injection 0.90",
@@ -2719,6 +2758,7 @@
         "verdict": {
           "action": "pass",
           "async": true,
+          "error_kind": "unavailable",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "laya http 502",
@@ -2786,6 +2826,7 @@
         "verdict": {
           "action": "pass",
           "async": true,
+          "error_kind": "unusable",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "unusable: openai-compat: no content",
@@ -2853,6 +2894,7 @@
         "verdict": {
           "action": "pass",
           "async": true,
+          "error_kind": "rejected",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "rejected: laya http 400",
@@ -2920,6 +2962,7 @@
         "verdict": {
           "action": "pass",
           "async": true,
+          "error_kind": "unusable",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "unusable: no scores in answer",
@@ -2988,6 +3031,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "cf223bdc",
           "l2_ms": 0,
           "reason": "injection 0.45",
@@ -3064,6 +3108,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "cf223bdc",
           "l2_ms": 0,
           "reason": "injection 0.10",
@@ -3138,6 +3183,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "cf223bdc",
           "l2_ms": 0,
           "reason": "injection 0.10",
@@ -3208,6 +3254,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "cf223bdc",
           "l2_ms": 0,
           "reason": "injection 0.10",
@@ -3278,6 +3325,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "6b60cd5e",
           "l2_ms": 0,
           "reason": "injection 0.10",
@@ -3348,6 +3396,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -3422,6 +3471,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -3496,6 +3546,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -3570,6 +3621,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -3644,6 +3696,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "2ba24c09",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -3718,6 +3771,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "2ba24c09",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -3792,6 +3846,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -3866,6 +3921,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "2ba24c09",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -3940,6 +3996,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -4014,6 +4071,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -4088,6 +4146,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -4162,6 +4221,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -4236,6 +4296,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -4310,6 +4371,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -4384,6 +4446,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "2ba24c09",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -4458,6 +4521,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "2ba24c09",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -4532,6 +4596,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "166bb30c",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -4606,6 +4671,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "603293f7",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -4680,6 +4746,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "6db0361a",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -4754,6 +4821,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -4828,6 +4896,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "cf223bdc",
           "l2_ms": 0,
           "reason": "injection 0.10",
@@ -4880,6 +4949,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "",
           "l2_ms": 0,
           "reason": "path not watched",
@@ -4932,6 +5002,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "",
           "l2_ms": 0,
           "reason": "path not watched",
@@ -5006,6 +5077,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "injection 0.90",
@@ -5080,6 +5152,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "injection 0.90",
@@ -5154,6 +5227,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "injection 0.90",
@@ -5210,6 +5284,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "",
           "l2_ms": 0,
           "reason": "path not watched: body not JSON",
@@ -5284,6 +5359,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -5367,6 +5443,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -5447,6 +5524,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -5509,6 +5587,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "",
           "l2_ms": 0,
           "reason": "method not watched",
@@ -5589,6 +5668,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -5651,6 +5731,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "",
           "l2_ms": 0,
           "reason": "method not watched",
@@ -5731,6 +5812,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "cf223bdc",
           "l2_ms": 0,
           "reason": "injection 0.10",
@@ -5809,6 +5891,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -5867,6 +5950,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "",
           "l2_ms": 0,
           "reason": "path not watched",
@@ -5943,6 +6027,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -6001,6 +6086,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "",
           "l2_ms": 0,
           "reason": "path not watched",
@@ -6077,6 +6163,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -6135,6 +6222,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "",
           "l2_ms": 0,
           "reason": "path not watched",
@@ -6211,6 +6299,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -6270,6 +6359,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "",
           "l2_ms": 0,
           "reason": "path not watched",
@@ -6347,6 +6437,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -6405,6 +6496,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "",
           "l2_ms": 0,
           "reason": "path not watched",
@@ -6481,6 +6573,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -6557,6 +6650,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -6633,6 +6727,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -6691,6 +6786,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "",
           "l2_ms": 0,
           "reason": "path not watched",
@@ -6759,6 +6855,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "fingerprint trusted by alice",
@@ -6831,6 +6928,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "fingerprint trusted",
@@ -6918,6 +7016,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -6998,6 +7097,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -7064,6 +7164,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "fingerprint trusted",
@@ -7129,6 +7230,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "fingerprint trusted",
@@ -7220,6 +7322,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "cf223bdc",
           "l2_ms": 0,
           "reason": "injection 0.10",
@@ -7300,6 +7403,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "cf223bdc",
           "l2_ms": 0,
           "reason": "injection 0.10",
@@ -7393,6 +7497,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -7482,6 +7587,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "cf223bdc",
           "l2_ms": 0,
           "reason": "injection 0.10",
@@ -7536,6 +7642,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "",
           "l2_ms": 0,
           "reason": "path not watched",
@@ -7611,6 +7718,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "",
           "l2_ms": 0,
           "reason": "ip reputation",
@@ -7694,6 +7802,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "cf223bdc",
           "l2_ms": 0,
           "reason": "injection 0.80",
@@ -7779,6 +7888,7 @@
         "verdict": {
           "action": "pass",
           "async": true,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "breaker open",
@@ -7864,6 +7974,7 @@
         "verdict": {
           "action": "pass",
           "async": true,
+          "error_kind": "other",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "timeout",
@@ -7960,6 +8071,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -8053,6 +8165,7 @@
         "verdict": {
           "action": "pass",
           "async": true,
+          "error_kind": "",
           "fingerprint": "cf223bdc",
           "l2_ms": 0,
           "reason": "injection 0.55",
@@ -8141,6 +8254,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "cf223bdc",
           "l2_ms": 0,
           "reason": "injection 0.10",
@@ -8238,6 +8352,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -8338,6 +8453,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -8411,6 +8527,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "",
           "l2_ms": 0,
           "reason": "subject reputation",
@@ -8487,6 +8604,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "",
           "l2_ms": 0,
           "reason": "subject reputation",
@@ -8578,6 +8696,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "cf223bdc",
           "l2_ms": 0,
           "reason": "injection 0.10",
@@ -8672,6 +8791,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "cf223bdc",
           "l2_ms": 0,
           "reason": "injection 0.10",
@@ -8746,6 +8866,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -8813,6 +8934,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "",
           "l2_ms": 0,
           "reason": "path not watched",
@@ -8889,6 +9011,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "",
           "l2_ms": 0,
           "reason": "subject reputation",
@@ -9000,6 +9123,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -9109,6 +9233,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "8bc2cafa",
           "l2_ms": 0,
           "reason": "injection 0.30 (3 chunks)",
@@ -9198,6 +9323,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "8bc2cafa",
           "l2_ms": 0,
           "reason": "injection 0.95 (3 chunks)",
@@ -9296,6 +9422,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "8bc2cafa",
           "l2_ms": 0,
           "reason": "injection 0.20 (3 chunks)",
@@ -9397,6 +9524,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "7646af02",
           "l2_ms": 0,
           "reason": "injection 0.20 (window)",
@@ -9454,6 +9582,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "7646af02",
           "l2_ms": 0,
           "reason": "unjudgeable: text over max_judge_chunks",
@@ -9526,6 +9655,7 @@
         "verdict": {
           "action": "pass",
           "async": true,
+          "error_kind": "other",
           "fingerprint": "8bc2cafa",
           "l2_ms": 0,
           "reason": "timeout",
@@ -9603,6 +9733,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "8bc2cafa",
           "l2_ms": 0,
           "reason": "injection 0.95 (3 chunks)",
@@ -9683,6 +9814,7 @@
         "verdict": {
           "action": "pass",
           "async": true,
+          "error_kind": "unavailable",
           "fingerprint": "8bc2cafa",
           "l2_ms": 0,
           "reason": "laya http 500",
@@ -9755,6 +9887,7 @@
         "verdict": {
           "action": "pass",
           "async": true,
+          "error_kind": "unusable",
           "fingerprint": "8bc2cafa",
           "l2_ms": 0,
           "reason": "unusable: laya: malformed response",
@@ -9821,6 +9954,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "7646af02",
           "l2_ms": 0,
           "reason": "unjudgeable: text over max_judge_chunks",
@@ -9929,6 +10063,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "1f7b40b1",
           "l2_ms": 0,
           "reason": "injection 0.20 (4 chunks)",
@@ -10025,6 +10160,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "fb02b84c",
           "l2_ms": 0,
           "reason": "injection 0.20 (3 chunks)",
@@ -10121,6 +10257,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "dc444891",
           "l2_ms": 0,
           "reason": "injection 0.20 (window)",
@@ -10196,6 +10333,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "c3a93532",
           "l2_ms": 0,
           "reason": "injection 0.20",
@@ -10286,6 +10424,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "a8a268bf",
           "l2_ms": 0,
           "reason": "untrusted 0.90",
@@ -10379,6 +10518,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "a8a268bf",
           "l2_ms": 0,
           "reason": "injection 0.80",
@@ -10469,6 +10609,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "a8a268bf",
           "l2_ms": 0,
           "reason": "untrusted 0.90",
@@ -10562,6 +10703,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "b28247cb",
           "l2_ms": 0,
           "reason": "untrusted 0.90",
@@ -10655,6 +10797,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "990eac0b",
           "l2_ms": 0,
           "reason": "untrusted 0.90",
@@ -10733,6 +10876,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "15bf157e",
           "l2_ms": 0,
           "reason": "injection 0.20",
@@ -10808,6 +10952,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "c3a93532",
           "l2_ms": 0,
           "reason": "injection 0.20",
@@ -10895,6 +11040,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "43ee97ab",
           "l2_ms": 0,
           "reason": "untrusted 0.70",
@@ -10981,6 +11127,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "a8a268bf",
           "l2_ms": 0,
           "reason": "untrusted 0.85",
@@ -11061,6 +11208,7 @@
         "verdict": {
           "action": "pass",
           "async": true,
+          "error_kind": "unusable",
           "fingerprint": "a8a268bf",
           "l2_ms": 0,
           "reason": "unusable: no scores in answer",
@@ -11144,6 +11292,7 @@
         "verdict": {
           "action": "pass",
           "async": true,
+          "error_kind": "unusable",
           "fingerprint": "a8a268bf",
           "l2_ms": 0,
           "reason": "unusable: no scores in answer",
@@ -11219,6 +11368,7 @@
         "verdict": {
           "action": "pass",
           "async": true,
+          "error_kind": "rejected",
           "fingerprint": "a8a268bf",
           "l2_ms": 0,
           "reason": "rejected: laya http 400",
@@ -11296,6 +11446,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "54029043",
           "l2_ms": 0,
           "reason": "injection 0.20",
@@ -11371,6 +11522,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "a8a268bf",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -11433,6 +11585,7 @@
         "verdict": {
           "action": "pass",
           "async": true,
+          "error_kind": "other",
           "fingerprint": "43ee97ab",
           "l2_ms": 0,
           "reason": "no templates registered for: nope",
@@ -11531,6 +11684,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "a8a268bf",
           "l2_ms": 0,
           "reason": "untrusted 0.90",
@@ -11635,6 +11789,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "a8a268bf",
           "l2_ms": 0,
           "reason": "untrusted 0.92",
@@ -11749,6 +11904,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "c208a661",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -11862,6 +12018,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "a8a268bf",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -11958,6 +12115,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "54029043",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -12053,6 +12211,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "injection 0.95 (window)",
@@ -12152,6 +12311,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "c3a93532",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -12252,6 +12412,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "43ee97ab",
           "l2_ms": 0,
           "reason": "untrusted 0.95",
@@ -12337,6 +12498,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "c208a661",
           "l2_ms": 0,
           "reason": "untrusted 0.92",
@@ -12423,6 +12585,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "a8a268bf",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -12530,6 +12693,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "a3e180cf",
           "l2_ms": 0,
           "reason": "untrusted 0.90",
@@ -12623,6 +12787,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "95a331c6",
           "l2_ms": 0,
           "reason": "untrusted 0.90",
@@ -12716,6 +12881,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "990eac0b",
           "l2_ms": 0,
           "reason": "untrusted 0.90",
@@ -12809,6 +12975,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "990eac0b",
           "l2_ms": 0,
           "reason": "untrusted 0.90",
@@ -12887,6 +13054,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "15bf157e",
           "l2_ms": 0,
           "reason": "injection 0.20",
@@ -12977,6 +13145,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "7d4d7651",
           "l2_ms": 0,
           "reason": "untrusted 0.90",
@@ -13055,6 +13224,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "9a6c0e21",
           "l2_ms": 0,
           "reason": "injection 0.20",
@@ -13145,6 +13315,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "2a5666dd",
           "l2_ms": 0,
           "reason": "untrusted 0.90",
@@ -13223,6 +13394,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "58b0b347",
           "l2_ms": 0,
           "reason": "injection 0.20",
@@ -13313,6 +13485,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "52305dbf",
           "l2_ms": 0,
           "reason": "untrusted 0.70",
@@ -13391,6 +13564,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "9caaea83",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -13447,6 +13621,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "",
           "l2_ms": 0,
           "reason": "unjudgeable: invalid json",
@@ -13503,6 +13678,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "",
           "l2_ms": 0,
           "reason": "unjudgeable: invalid json",
@@ -13578,6 +13754,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "4356e612",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -13652,6 +13829,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "cf223bdc",
           "l2_ms": 0,
           "reason": "injection 0.10",
@@ -13730,6 +13908,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "db385f4c",
           "l2_ms": 0,
           "reason": "tools+injection 0.95",
@@ -13818,6 +13997,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "433c9523",
           "l2_ms": 0,
           "reason": "injection 0.30",
@@ -13896,6 +14076,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "433c9523",
           "l2_ms": 0,
           "reason": "tools+injection 0.90",
@@ -13982,6 +14163,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "433c9523",
           "l2_ms": 0,
           "reason": "injection 0.80",
@@ -14064,6 +14246,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "e1349761",
           "l2_ms": 0,
           "reason": "injection 0.20",
@@ -14121,6 +14304,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "433c9523",
           "l2_ms": 0,
           "reason": "tools+injection 0.20",
@@ -14194,6 +14378,7 @@
         "verdict": {
           "action": "pass",
           "async": true,
+          "error_kind": "unavailable",
           "fingerprint": "db385f4c",
           "l2_ms": 0,
           "reason": "laya http 503",
@@ -14265,6 +14450,7 @@
         "verdict": {
           "action": "pass",
           "async": true,
+          "error_kind": "unusable",
           "fingerprint": "db385f4c",
           "l2_ms": 0,
           "reason": "unusable: laya: malformed response",
@@ -14325,6 +14511,7 @@
         "verdict": {
           "action": "pass",
           "async": true,
+          "error_kind": "",
           "fingerprint": "db385f4c",
           "l2_ms": 0,
           "reason": "breaker open",
@@ -14400,6 +14587,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "9871e49a",
           "l2_ms": 0,
           "reason": "tools+injection 0.95",
@@ -14493,6 +14681,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "db385f4c",
           "l2_ms": 0,
           "reason": "tools+injection 0.95",
@@ -14597,6 +14786,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "433c9523",
           "l2_ms": 0,
           "reason": "tools+injection 0.95",
@@ -14675,6 +14865,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "433c9523",
           "l2_ms": 0,
           "reason": "tools+injection 0.95",
@@ -14764,6 +14955,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "8bc2cafa",
           "l2_ms": 0,
           "reason": "injection 0.30 (3 chunks)",
@@ -14840,6 +15032,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "8bc2cafa",
           "l2_ms": 0,
           "reason": "injection 0.10 (3 chunks)",
@@ -14925,6 +15118,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "7646af02",
           "l2_ms": 0,
           "reason": "injection 0.20 (window)",
@@ -15010,6 +15204,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "433c9523",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -15095,6 +15290,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "9871e49a",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -15170,6 +15366,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -15267,6 +15464,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "b6a58326",
           "l2_ms": 0,
           "reason": "untrusted 0.90",
@@ -15350,6 +15548,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "2b98815f",
           "l2_ms": 0,
           "reason": "tools+injection 0.90 (window)",
@@ -15442,6 +15641,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "2615d9e3",
           "l2_ms": 0,
           "reason": "injection 0.30 (window)",
@@ -15494,6 +15694,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "",
           "l2_ms": 0,
           "reason": "text too short",
@@ -15568,6 +15769,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "0002b5c5",
           "l2_ms": 0,
           "reason": "injection 0.10",
@@ -15620,6 +15822,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "",
           "l2_ms": 0,
           "reason": "unjudgeable: body too large",
@@ -15675,6 +15878,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "",
           "l2_ms": 0,
           "reason": "unjudgeable: body too large",
@@ -15731,6 +15935,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "",
           "l2_ms": 0,
           "reason": "unjudgeable: body too large",
@@ -15805,6 +16010,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "5199f56f",
           "l2_ms": 0,
           "reason": "injection 0.90 (window)",
@@ -15862,6 +16068,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "",
           "l2_ms": 0,
           "reason": "unjudgeable: partial body",
@@ -15920,6 +16127,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "",
           "l2_ms": 0,
           "reason": "unjudgeable: partial body",
@@ -15979,6 +16187,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "",
           "l2_ms": 0,
           "reason": "unjudgeable: partial body",
@@ -16056,6 +16265,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "injection 0.10",
@@ -16132,6 +16342,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "injection 0.10 (window)",
@@ -16190,6 +16401,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "",
           "l2_ms": 0,
           "reason": "content-type not watched",
@@ -16249,6 +16461,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "",
           "l2_ms": 0,
           "reason": "unjudgeable: token ids",
@@ -16305,6 +16518,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "",
           "l2_ms": 0,
           "reason": "unjudgeable: token ids",
@@ -16362,6 +16576,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "",
           "l2_ms": 0,
           "reason": "unjudgeable: token ids",
@@ -16422,6 +16637,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "",
           "l2_ms": 0,
           "reason": "unjudgeable: token ids",
@@ -16478,6 +16694,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "",
           "l2_ms": 0,
           "reason": "unjudgeable: token ids",
@@ -16557,6 +16774,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "injection 0.95",
@@ -16613,6 +16831,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "",
           "l2_ms": 0,
           "reason": "unjudgeable: token ids",
@@ -16691,6 +16910,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "3017ad18",
           "l2_ms": 0,
           "reason": "injection 0.90 (window)",
@@ -16761,6 +16981,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "cf223bdc",
           "l2_ms": 0,
           "reason": "injection 0.10",

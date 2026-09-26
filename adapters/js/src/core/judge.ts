@@ -37,16 +37,39 @@ export const BUSY = "max_inflight exceeded";
  */
 export const TRANSPORT = "transport"; // no HTTP answer: connect, DNS, TLS, reset
 export const TIMEOUT = "timeout";
-export const UNAVAILABLE = "unavailable"; // HTTP 5xx or 429
+export const UNAVAILABLE = "unavailable"; // HTTP 5xx, 429, 401, 404 or 405
 export const REJECTED = "rejected"; // any other non-2xx status: this call was refused
 export const UNUSABLE = "unusable"; // 2xx, but no answer core can use
 export type ErrorKind = typeof TRANSPORT | typeof TIMEOUT | typeof UNAVAILABLE | typeof REJECTED | typeof UNUSABLE;
 
+/** 401 (the key), 404 (the endpoint or the model) and 405 (the route): the
+ *  gateway's configuration, which no judged text can provoke. They count, so
+ *  a provider misconfigured for good opens the breaker and its alerts fire.
+ *  A 400, 403, 413 or 422 stays REJECTED: a content filter, a WAF or a strict
+ *  parser answers those to the text. Same set as core/judge.lua. */
+const CONFIG_STATUS = new Set([401, 404, 405]);
+
 /** The kind of a failed call the provider answered with this HTTP status. */
 export function statusKind(status: number): ErrorKind {
-  if (status >= 500 || status === 429) return UNAVAILABLE;
+  if (status >= 500 || status === 429 || CONFIG_STATUS.has(status)) return UNAVAILABLE;
   if (status >= 200 && status < 300) return UNUSABLE;
   return REJECTED;
+}
+
+/** The kinds an L2 error verdict names (Verdict.error_kind): the five above,
+ *  "busy" for BUSY and "other" for a judge that gives no kind or an unknown
+ *  one, or a prompt that could not be built. A fixed set (it labels a
+ *  metric). Same strings as core/judge.lua. */
+export const KIND_BUSY = "busy";
+export const KIND_OTHER = "other";
+export type VerdictErrorKind = ErrorKind | typeof KIND_BUSY | typeof KIND_OTHER;
+const KINDS = new Set<string>([TRANSPORT, TIMEOUT, UNAVAILABLE, REJECTED, UNUSABLE]);
+
+/** Port of judge.error_kind: the error kind an L2 error verdict carries. */
+export function errorKind(err: unknown, kind?: ErrorKind | null): VerdictErrorKind {
+  if (err === BUSY) return KIND_BUSY;
+  if (typeof kind === "string" && KINDS.has(kind)) return kind;
+  return KIND_OTHER;
 }
 
 /** Does a failed call count against the provider (a breaker failure)? A

@@ -175,11 +175,16 @@ tests:
                 10 minutes. Failed calls pass (verdict=error) and are queued for
                 async re-judging, so protection is degraded, not traffic.
               runbook: >-
-                Read the error log for "jev-edge: L2 failed: <reason>". Timeouts:
+                Break it down: sum by (kind) (rate(jev_l2_errors_total[5m])), and
+                read the error log for "jev-edge: L2 failed: <reason>". timeout:
                 compare jev_l2_latency_ms quantiles with jev_l2_timeout_ms and
                 raise jev.timeout_max_ms if the provider is slow but healthy.
-                401/403: rotate the key. 5xx: provider incident. Past fail_ratio
-                the breaker opens (JevBreakerOpen).
+                unavailable: 5xx or 429 is a provider incident, 401 a bad key,
+                404/405 a wrong endpoint or model; these count, and past
+                fail_ratio the breaker opens (JevBreakerOpen). rejected (another
+                4xx) and unusable (no scores) never open it, as the judged text
+                can provoke them: near 100% usually means a model parameter, the
+                key's permissions or a WAF (JevL2NoVerdicts).
 
   # Async drops: gw1 drops a job once at minute 5; no drops afterwards.
   - interval: 1m
@@ -210,4 +215,58 @@ tests:
                 or a slow provider holding async slots (async.timeout_ms).
       - eval_time: 25m
         alertname: JevAsyncDropped
+        exp_alerts: []
+
+  # No verdicts: gw1's provider refuses every call (rejected, the breaker
+  # stays closed and nothing reaches source=breaker); gw2 fails most calls
+  # but still gets some verdicts; gw3 has no L2 traffic at all.
+  - interval: 1m
+    input_series:
+      - series: 'jev_requests_total{job="jev",instance="gw1",source="l2",verdict="error"}'
+        values: '0+20x30'
+      - series: 'jev_l2_errors_total{job="jev",instance="gw1",kind="rejected"}'
+        values: '0+20x30'
+      - series: 'jev_requests_total{job="jev",instance="gw2",source="l2",verdict="error"}'
+        values: '0+20x30'
+      - series: 'jev_requests_total{job="jev",instance="gw2",source="l2",verdict="safe"}'
+        values: '0+1x30'
+      - series: 'jev_requests_total{job="jev",instance="gw3",source="l1",verdict="skipped"}'
+        values: '0+50x30'
+    promql_expr_test:
+      - expr: sum by (kind) (rate(jev_l2_errors_total[5m]))
+        eval_time: 20m
+        exp_samples:
+          - labels: '{kind="rejected"}'
+            value: 0.3333333333333333
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: JevL2NoVerdicts
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: JevL2NoVerdicts
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: jev
+              instance: gw1
+            exp_annotations:
+              summary: "jev-edge L2 calls all fail on gw1"
+              description: >-
+                For 10 minutes every L2 call on gw1 has failed
+                and none has given a verdict. Those requests pass with
+                verdict=error: only L1, the verdict cache and trusted fingerprints
+                are protecting traffic, and the breaker may still be closed.
+              runbook: >-
+                Break it down: sum by (kind) (rate(jev_l2_errors_total[5m])), and
+                read "jev-edge: L2 failed: <reason>" in the error log. rejected:
+                the provider refuses every call (a parameter the model does not
+                take, the key's permissions, a WAF). unusable: it answers, but
+                not in the judge's format (a wrong model or template). busy:
+                jev.max_inflight is full. unavailable, transport or timeout: see
+                JevBreakerOpen.
+      - eval_time: 20m
+        alertname: JevL2Starved
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: JevBreakerOpen
         exp_alerts: []

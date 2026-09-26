@@ -14,6 +14,13 @@ local function incr(key, by)
   if d then d:incr(key, by or 1, 0) end
 end
 
+-- What an L2 error verdict ran into (verdict.error_kind, judge.error_kind):
+-- a fixed set, anything else counted as "other".
+local L2_ERROR_KINDS = {
+  transport = true, timeout = true, unavailable = true, rejected = true,
+  unusable = true, busy = true, other = true,
+}
+
 function _M.record(v)
   incr("req:" .. v.source .. ":" .. v.verdict)
   incr("action:" .. v.action)
@@ -23,6 +30,11 @@ function _M.record(v)
   if unj then incr("unjudged:" .. unj) end
   if v.reason:find("(window)", 1, true) then incr("window") end
   if v.reason == "subject reputation" then incr("subject_blocks") end
+  if v.source == "l2" and v.verdict == "error" then
+    local kind = v.error_kind
+    if not L2_ERROR_KINDS[kind] then kind = "other" end
+    incr("l2_err:" .. kind)
+  end
   if v.source == "l2" then
     incr("l2_count")
     incr("l2_sum_ms", math.floor(v.l2_ms))
@@ -106,6 +118,7 @@ function _M.render()
   line("# TYPE jev_l2_timeout_max_ms gauge")
   line("# TYPE jev_feedback_total counter")
   line("# TYPE jev_authz_events_total counter")
+  line("# TYPE jev_l2_errors_total counter")
   for _, key in ipairs(d:get_keys(0)) do
     local val = d:get(key)
     local src, verdict = key:match("^req:([^:]+):(.+)$")
@@ -137,6 +150,8 @@ function _M.render()
       line("jev_subject_blocks_total " .. val)
     elseif key == "l2_timeout_max_ms" then
       line("jev_l2_timeout_max_ms " .. val)
+    elseif key:match("^l2_err:") then
+      line(string.format('jev_l2_errors_total{kind="%s"} %d', key:sub(8), val))
     elseif key:match("^authz:") then
       line(string.format('jev_authz_events_total{event="%s"} %d', key:sub(7), val))
     elseif key:match("^feedback:") then

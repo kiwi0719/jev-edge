@@ -19,7 +19,9 @@
 --                 err == judge.BUSY: the adapter's own in-flight cap refused
 --                 the call; not a provider failure, not fed to the breaker
 --                 kind: judge.TRANSPORT | TIMEOUT | UNAVAILABLE (breaker
---                 failures) or REJECTED | UNUSABLE (not); none = counted
+--                 failures) or REJECTED | UNUSABLE (not); none = counted.
+--                 An L2 error verdict names it as error_kind
+--                 (judge.error_kind)
 --   breaker     object from core/breaker.lua (optional)
 --   subject     optional { id = string, history = table|nil, record = fn(entry) }
 --                 Per-subject trajectory (core/subject.lua). Absent, or absent
@@ -306,7 +308,7 @@ local function judge_parts(ctx, rule, parts, suffix, fp, ckey, reason)
     settle(ctx)
     local action, label, async = policy.on_error()
     return finish(ctx, verdict.new({ action = action, verdict = label, async = async,
-      source = verdict.SRC_L2, reason = left_out, fingerprint = fp }))
+      source = verdict.SRC_L2, reason = left_out, fingerprint = fp, error_kind = judge.KIND_OTHER }))
   end
 
   local t0 = now_ms(ctx)
@@ -323,7 +325,7 @@ local function judge_parts(ctx, rule, parts, suffix, fp, ckey, reason)
   end
   local elapsed = now_ms(ctx) - t0
 
-  local err, failed, answered
+  local err, ekind, failed, answered
   for k, p in ipairs(pending) do
     local r = results[k] or {}
     local a, e, kind = r[1], r[2], r[3]
@@ -331,7 +333,7 @@ local function judge_parts(ctx, rule, parts, suffix, fp, ckey, reason)
     if a then s, t, n = judge.reduce(a) end
     if not a or n == 0 then
       if a then e, kind = "no scores in answer", judge.UNUSABLE end
-      err = err or judge.reason(e, kind)
+      if not err then err, ekind = judge.reason(e, kind), judge.error_kind(e, kind) end
       if judge.counts(e, kind) then failed = true end
     else
       answered = true
@@ -357,7 +359,7 @@ local function judge_parts(ctx, rule, parts, suffix, fp, ckey, reason)
     log(ctx, "warn", "jev-edge: L2 failed on a chunk: " .. err)
     local action, label, async = policy.on_error()
     return finish(ctx, verdict.new({ action = action, verdict = label, async = async,
-      source = verdict.SRC_L2, reason = err, fingerprint = fp, l2_ms = elapsed }))
+      source = verdict.SRC_L2, reason = err, fingerprint = fp, l2_ms = elapsed, error_kind = ekind }))
   end
 
   local action, label, async = policy.decide(best, cfg.policy)
@@ -482,7 +484,7 @@ function _M.evaluate(req, ctx)
     settle(ctx)
     local action, label, async = policy.on_error()
     return finish(ctx, verdict.new({ action = action, verdict = label, async = async,
-      source = verdict.SRC_L2, reason = perr, fingerprint = fp }))
+      source = verdict.SRC_L2, reason = perr, fingerprint = fp, error_kind = judge.KIND_OTHER }))
   end
 
   local t0 = now_ms(ctx)
@@ -495,7 +497,7 @@ function _M.evaluate(req, ctx)
     log(ctx, "warn", "jev-edge: L2 failed: " .. why)
     local action, label, async = policy.on_error()
     return finish(ctx, verdict.new({ action = action, verdict = label, async = async,
-      source = verdict.SRC_L2, reason = why,
+      source = verdict.SRC_L2, reason = why, error_kind = judge.error_kind(jerr, jkind),
       fingerprint = fp, l2_ms = elapsed }))
   end
 
@@ -509,7 +511,7 @@ function _M.evaluate(req, ctx)
     log(ctx, "warn", "jev-edge: L2 answer has no scores")
     local action, label, async = policy.on_error()
     return finish(ctx, verdict.new({ action = action, verdict = label, async = async,
-      source = verdict.SRC_L2, reason = why,
+      source = verdict.SRC_L2, reason = why, error_kind = judge.UNUSABLE,
       fingerprint = fp, l2_ms = elapsed }))
   end
   if ctx.breaker then ctx.breaker:success() end

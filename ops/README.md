@@ -47,6 +47,7 @@ All of these come from `adapters/openresty/lib/resty/jev/metrics.lua`:
 | `jev_requests_total` | counter | `source` (l1, trust, cache, l2, breaker), `verdict` (safe, suspicious, malicious, error, skipped) | every evaluated request |
 | `jev_actions_total` | counter | `action` (pass, block) | what the gateway did with it |
 | `jev_cache_hits_total` | counter | `kind` (fp) | verdict-cache hits |
+| `jev_l2_errors_total` | counter | `kind` (transport, timeout, unavailable, rejected, unusable, busy, other) | L2 calls that ended in `verdict=error`, by what they ran into |
 | `jev_l2_latency_ms` | histogram | `le` (25, 50, 100, 200, 300, 500, 1000, +Inf) | L2 call time, including failed calls |
 | `jev_tokens_total` | counter | `direction` (input, output) | provider tokens |
 | `jev_breaker_state` | gauge | | 0 closed, 1 open, 2 half-open (`core/breaker.lua`) |
@@ -133,12 +134,12 @@ More than 10% of L2 calls have returned `verdict=error` for 10m. That covers tim
 
 What to do:
 
-1. Read the reason in `jev-edge: L2 failed: <reason>` in the error log.
-2. For timeouts, compare the L2 latency quantiles with the timeout panel. If the provider is healthy but slower, raise `jev.timeout_max_ms`.
-3. For 401/403, rotate the key.
-4. For 5xx, it is a provider incident.
+1. Break the errors down with `sum by (kind) (rate(jev_l2_errors_total[5m]))` and read the reason in `jev-edge: L2 failed: <reason>` in the error log.
+2. `timeout`: compare the L2 latency quantiles with the timeout panel. If the provider is healthy but slower, raise `jev.timeout_max_ms`.
+3. `unavailable`: a 5xx or 429 is a provider incident, a 401 a bad or revoked key, a 404 or 405 a wrong endpoint or model name.
+4. `rejected` (any other 4xx) or `unusable` (a 2xx with no scores in it): if it is near 100%, the provider refuses every call. That usually means a parameter the model does not take, the key's permissions, or a WAF in front of it (see JevL2NoVerdicts).
 
-If the error rate reaches `breaker.fail_ratio`, JevBreakerOpen follows.
+Only `transport`, `timeout` and `unavailable` count toward the breaker. If they reach `breaker.fail_ratio`, JevBreakerOpen follows. `rejected` and `unusable` never open it, because the judged text can provoke them (a content filter's 400, a WAF's 403, a refusal) and a client must not be able to switch L2 off. `busy` is the gateway's own `jev.max_inflight` being full.
 
 ### JevUnjudgeableRatioHigh (warning)
 
@@ -173,6 +174,18 @@ Raise `async.max_async` if the provider has headroom. Otherwise look for a burst
 For 10m, requests have reached the L2 stage (`source=breaker`) and no L2 call has produced a verdict. This is the traffic-based twin of JevBreakerOpen: it still fires when the breaker-state gauge happens to be sampled while half-open.
 
 Handle it the same way as JevBreakerOpen. The verdict cache keeps serving texts it has already judged. New texts pass unjudged until L2 recovers.
+
+### JevL2NoVerdicts (critical)
+
+For 10m, every L2 call has ended in `verdict=error` and none has given a verdict, whatever the breaker says. A provider that refuses every call for a reason the breaker does not count (a 400 for a model parameter, a WAF's 403, answers with no scores) leaves the breaker closed, so JevBreakerOpen and JevL2Starved stay quiet while nothing past L1 is judged.
+
+What to do:
+
+1. Break it down with `sum by (kind) (rate(jev_l2_errors_total[5m]))` and read `jev-edge: L2 failed: <reason>` in the error log.
+2. `rejected`: the provider refuses the call. Check the model's parameters, the key's permissions and anything in front of the provider.
+3. `unusable`: the provider answers, but not in the judge's format. Check the model name and the templates.
+4. `busy`: `jev.max_inflight` is full; raise it or add capacity.
+5. `unavailable`, `transport` or `timeout`: handle it as JevBreakerOpen.
 
 ## CI
 

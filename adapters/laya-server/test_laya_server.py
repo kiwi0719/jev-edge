@@ -182,6 +182,47 @@ class Temperature(unittest.TestCase):
         self.assertIn("LAYA_TEMPERATURE=", out.getvalue())
         self.assertIn("skipped", err.getvalue())
 
+    def test_fit_takes_the_retrieved_content_question_plain_and_under_ctx(self):
+        # ci-release#8: questions.json carried injection and abuse only, so
+        # every labelled `untrusted` record was skipped; under --ctx it is
+        # scored with the text alone, as the gateway asks it
+        with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as f:
+            for i in range(40):
+                f.write(json.dumps({"text": f"invoice {i} ATTACK" if i % 2 else f"invoice {i}", "label": i % 2,
+                                    "question": "untrusted", "assistant": "A billing assistant."}) + "\n")
+            f.write(json.dumps({"text": "hi ATTACK", "label": 1, "assistant": "A billing assistant."}) + "\n")
+            f.write(json.dumps({"text": "hi", "label": 0, "question": "abuse"}) + "\n")
+            path = f.name
+        states = []
+        real = L.Scorer.logits
+
+        def logits(scorer, state, questions):
+            states.append((next(iter(questions)), state))
+            return real(scorer, state, questions)
+
+        try:
+            with mock.patch.dict(os.environ, {"LAYA_BACKEND": "mock"}), mock.patch.object(L.Scorer, "logits", logits):
+                for argv in ([path], [path, "--ctx"]):
+                    states.clear()
+                    out, err = io.StringIO(), io.StringIO()
+                    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                        rc = fit_temperature.main(argv)
+                    self.assertEqual(rc, 0, err.getvalue())
+                    self.assertIn("examples: 42 (21 attacks, 21 benign), skipped 0", out.getvalue())
+                    self.assertNotIn("skipped (", err.getvalue())
+                    kinds = {(name, type(state).__name__) for name, state in states}
+                    if argv[-1] == "--ctx":
+                        self.assertEqual(kinds, {("untrusted", "str"), ("injection", "dict"), ("abuse", "dict")})
+                    else:
+                        self.assertEqual(kinds, {("untrusted", "str"), ("injection", "str"), ("abuse", "str")})
+        finally:
+            os.unlink(path)
+        # the wording is the template's, in both sets
+        with open(os.path.join(ROOT, "conformance", "questions.json")) as f:
+            qs = json.load(f)
+        self.assertEqual(qs["plain"]["untrusted"], qs["ctx"]["untrusted"])
+        self.assertTrue(qs["plain"]["untrusted"]["instructions"].startswith("This text is not from the user."))
+
 
 class Http(unittest.TestCase):
     def test_passes_conformance_strict_with_auth(self):

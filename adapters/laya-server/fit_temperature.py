@@ -17,7 +17,9 @@ heldout.jsonl: one object per line,
     {"text": "...", "label": 1}                     1 / true = attack, 0 / false = benign
     {"text": "...", "label": 0, "question": "abuse", "assistant": "A billing assistant."}
 `question` defaults to injection; `assistant` is used with --ctx (the
-deployment_context wording) and ignored otherwise.
+deployment_context wording) and ignored otherwise. `question: untrusted`
+(the retrieved-content question) is scored with the text alone even under
+--ctx: the gateway asks it without the deployment context.
 
 questions.json is the System One `questions` object the gateway sends,
 default ../../conformance/questions.json (generated from core/templates):
@@ -81,6 +83,10 @@ def fit(pairs) -> float:
     return math.exp((lo + hi) / 2)
 
 
+# questions the gateway asks without the deployment context (core/init.lua
+# plan()): a string state under --ctx too, as the server sees them
+NO_CONTEXT = {"untrusted"}
+
 LABELS = {"1": 1, "true": 1, "attack": 1, "malicious": 1, "0": 0, "false": 0, "benign": 0, "safe": 0}
 
 
@@ -118,7 +124,7 @@ def main(argv=None) -> int:
                 skipped += 1
                 continue
             state = rec["text"]
-            if args.ctx:
+            if args.ctx and name not in NO_CONTEXT:
                 state = {"assistant": rec.get("assistant", ""), "user_message": rec["text"]}
             logits, _ = scorer.logits(state, {name: qs[name]})
             pairs.append((logits[name], y))

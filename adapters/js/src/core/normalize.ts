@@ -1964,9 +1964,12 @@ function hitPart(tb: Uint8Array, spans: readonly (readonly [number, number])[], 
   const ranges: [number, number][] = [];
   for (let i = first; i <= lastIdx; i++) {
     const [from, to] = merged[i];
-    // forward to a character start: the context never grows past its share
+    // forward to a character start: the context never grows past its share;
+    // a match that starts inside a character (a pattern that begins with a
+    // byte wildcard) takes that whole character, as one span does
     let a = Math.max(1, from - ctxb);
     while (a < from && isCont(tb, a - 1)) a++;
+    while (a > 1 && isCont(tb, a - 1)) a--;
     const b = Math.min(n, to + ctxb);
     const last = ranges[ranges.length - 1];
     if (last && a <= last[1] + 1) last[1] = b;

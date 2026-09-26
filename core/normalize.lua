@@ -1893,9 +1893,12 @@ local function hit_part(text, spans, half)
   local ranges = {}
   for i = first, #merged do
     local from, to = merged[i][1], merged[i][2]
-    -- forward to a character start: the context never grows past its share
+    -- forward to a character start: the context never grows past its share;
+    -- a match that starts inside a character (a pattern that begins with a
+    -- byte wildcard) takes that whole character, as one span does
     local a = math.max(1, from - ctxb)
     while a < from and cont(text, a) do a = a + 1 end
+    while a > 1 and cont(text, a) do a = a - 1 end
     local b = math.min(#text, to + ctxb)
     local last = ranges[#ranges]
     if last and a <= last[2] + 1 then

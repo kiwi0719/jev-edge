@@ -145,7 +145,11 @@ function scopeEndpoint(e: unknown): string {
     auth = at >= 0 ? auth.slice(0, at + 1) + asciiLower(auth.slice(at + 1)) : asciiLower(auth);
     s = asciiLower(m[1]) + auth + m[3];
   }
-  return s.replace(/\/+$/, "");
+  // trailing slashes dropped by a walk back, linear (a /\/+$/ search is
+  // quadratic on a long run of slashes)
+  let end = s.length;
+  while (end > 0 && s.charCodeAt(end - 1) === 47) end--;
+  return s.slice(0, end);
 }
 
 const byteOrder = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);

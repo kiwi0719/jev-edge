@@ -120,7 +120,11 @@ local function scope_endpoint(e)
     if user then auth = user .. host:lower() else auth = auth:lower() end
     e = scheme:lower() .. auth .. rest
   end
-  return (e:gsub("/+$", ""))
+  -- trailing slashes dropped by a walk back, linear (gsub("/+$") tries the
+  -- run again from each slash)
+  local j = #e
+  while j > 0 and e:byte(j) == 47 do j = j - 1 end
+  return e:sub(1, j)
 end
 
 -- A value of jev.questions in a canonical spelling: a table as its keys

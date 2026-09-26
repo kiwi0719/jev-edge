@@ -819,8 +819,10 @@ describe("normalize.extract: JSON the Lua decoder refuses", () => {
   });
 
   it("scans undeclared JSON it cannot decode, as Ollama reads it whatever the header says", () => {
-    expect(ex(BODY + "} ]", "")).toEqual([ATTACK, "scan"]);
-    expect(ex(BODY + ',"x":' + "[".repeat(1001) + "]".repeat(1001) + "}", "text/plain")).toEqual([ATTACK, "scan"]);
+    // then the whole body, when it is text: a backend may read it as text
+    expect(ex(BODY + "} ]", "")).toEqual([ATTACK + "\n" + BODY + "} ]", "scan"]);
+    const deep = BODY + ',"x":' + "[".repeat(1001) + "]".repeat(1001) + "}";
+    expect(ex(deep, "text/plain")).toEqual([ATTACK + "\n" + deep, "scan"]);
     // with nothing to scan it is text, as before
     expect(ex("[INST] " + ATTACK, "")).toEqual(["[INST] " + ATTACK, "text"]);
     // under a form type (curl -d) or multipart, that reading follows the scan
@@ -829,6 +831,14 @@ describe("normalize.extract: JSON the Lua decoder refuses", () => {
     expect(ex(mp, "multipart/form-data; boundary=B")).toEqual([ATTACK + "\nfield", "scan"]);
     // and with nothing to scan it is read that way alone, as before
     expect(ex("[1] ]&q=a+b", "application/x-www-form-urlencoded")).toEqual(["a b", "form"]);
+  });
+
+  it("reads what follows the JSON value when a backend may read the body as text (r5 scan branch)", () => {
+    const tail = '{"prompt":"hello there friend, how are you?"}\n' + ATTACK;
+    for (const ct of ["text/plain", ""]) expect(ex(tail, ct), ct).toEqual(["hello there friend, how are you?\n" + tail, "scan"]);
+    // declared JSON is read as JSON; binary bytes are not text
+    expect(ex(tail)).toEqual(["hello there friend, how are you?", "scan"]);
+    expect(ex('{"prompt":"hello there friend, how are you?"}\n\0\x01\x02', "text/plain")).toEqual(["hello there friend, how are you?", "scan"]);
   });
 
   it("does not take json in a Content-Type parameter for declared JSON", () => {

@@ -1166,13 +1166,20 @@ export function extract(
     // reads it, declared JSON or not: the text fields' string values and the
     // objects under a "**" path's key. Under a form or multipart type the
     // values that reading gives follow, since a backend of that kind reads
-    // the body so. Declared JSON with nothing to scan is unjudgeable, never
-    // "no text"; any other body with nothing to scan is read as before.
+    // the body so. Under any other type (text/plain, none) the whole body
+    // follows too, when it is text: a backend that reads it as text (a raw
+    // prompt route, req.text()) reads all of it, the bytes after the JSON
+    // value included. Declared JSON with nothing to scan is unjudgeable,
+    // never "no text"; any other body with nothing to scan is read as before.
     const seen: { tokenIds?: boolean } = {};
     const out = scanStrings(body, fieldKeys(fields), [], deepKeys(fields), seen);
     if (out.length > 0) {
-      if (form && !declaredJson) formValues(body, out);
-      else if (multipart && !declaredJson && multipartValues(body, rawCt, out)) return ["", "boundaries", []];
+      if (!declaredJson) {
+        if (form) formValues(body, out);
+        else if (multipart) {
+          if (multipartValues(body, rawCt, out)) return ["", "boundaries", []];
+        } else if (isText(body)) out.push(body);
+      }
       return [out.join("\n"), "scan", out, undefined, undefined, seen.tokenIds === true];
     }
     if (declaredJson) return ["", "invalid", [], undefined, undefined, seen.tokenIds === true];

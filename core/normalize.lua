@@ -1113,15 +1113,22 @@ function _M.extract(body, content_type, fields, json_decode)
     -- reads it, declared JSON or not: the text fields' string values and the
     -- objects under a "**" path's key. Under a form or multipart type the
     -- values that reading gives follow, since a backend of that kind reads
-    -- the body so. Declared JSON with nothing to scan is unjudgeable, never
-    -- "no text"; any other body with nothing to scan is read as before.
+    -- the body so. Under any other type (text/plain, none) the whole body
+    -- follows too, when it is text: a backend that reads it as text (a raw
+    -- prompt route, req.text()) reads all of it, the bytes after the JSON
+    -- value included. Declared JSON with nothing to scan is unjudgeable,
+    -- never "no text"; any other body with nothing to scan is read as before.
     local seen = {}
     local out = _M.scan_strings(body, _M.field_keys(fields), {}, _M.deep_keys(fields), seen)
     if #out > 0 then
-      if form and not declared_json then
-        form_values(body, out)
-      elseif multipart and not declared_json and multipart_values(body, raw_ct, out) then
-        return "", "boundaries", {}
+      if not declared_json then
+        if form then
+          form_values(body, out)
+        elseif multipart then
+          if multipart_values(body, raw_ct, out) then return "", "boundaries", {} end
+        elseif _M.is_text(body) then
+          out[#out + 1] = body
+        end
       end
       return table.concat(out, "\n"), "scan", out, nil, nil, seen.token_ids == true
     end

@@ -326,9 +326,10 @@ describe("normalize.extract: JSON the decoder refuses", function()
   end)
 
   it("scans undeclared JSON it cannot decode, as Ollama reads it whatever the header says", function()
-    assert.same({ ATTACK, "scan" }, { ex(BODY .. "} ]", "") })
-    assert.same({ ATTACK, "scan" }, { ex(BODY .. ',"x":' .. string.rep("[", 1001) .. string.rep("]", 1001) .. "}",
-      "text/plain") })
+    -- then the whole body, when it is text: a backend may read it as text
+    assert.same({ ATTACK .. "\n" .. BODY .. "} ]", "scan" }, { ex(BODY .. "} ]", "") })
+    local deep = BODY .. ',"x":' .. string.rep("[", 1001) .. string.rep("]", 1001) .. "}"
+    assert.same({ ATTACK .. "\n" .. deep, "scan" }, { ex(deep, "text/plain") })
     -- with nothing to scan it is text, as before
     assert.same({ "[INST] " .. ATTACK, "text" }, { ex("[INST] " .. ATTACK, "") })
     -- under a form type (curl -d) or multipart, that reading follows the scan
@@ -337,6 +338,19 @@ describe("normalize.extract: JSON the decoder refuses", function()
     assert.same({ ATTACK .. "\nfield", "scan" }, { ex(mp, "multipart/form-data; boundary=B") })
     -- and with nothing to scan it is read that way alone, as before
     assert.same({ "a b", "form" }, { ex("[1] ]&q=a+b", "application/x-www-form-urlencoded") })
+  end)
+
+  it("reads what follows the JSON value when a backend may read the body as text (r5 scan branch)", function()
+    local tail = '{"prompt":"hello there friend, how are you?"}\n' .. ATTACK
+    for _, ct in ipairs({ "text/plain", "" }) do
+      local text, kind = ex(tail, ct)
+      assert.equals("scan", kind)
+      assert.equals("hello there friend, how are you?\n" .. tail, text)
+    end
+    -- declared JSON is read as JSON; binary bytes are not text
+    assert.same({ "hello there friend, how are you?", "scan" }, { ex(tail) })
+    assert.same({ "hello there friend, how are you?", "scan" },
+      { ex('{"prompt":"hello there friend, how are you?"}\n\0\1\2', "text/plain") })
   end)
 
   it("does not take json in a Content-Type parameter for declared JSON", function()

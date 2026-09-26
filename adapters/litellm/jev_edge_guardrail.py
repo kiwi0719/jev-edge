@@ -109,12 +109,32 @@ TEXT_KEYS = ("query", "text", "prompt", "input", "messages")
 # `content`, which jev-edge would read in-line too) is sent.
 MEDIA_PARTS = frozenset({"image_url", "input_image", "image", "input_audio", "audio", "file", "input_file"})
 # Keys whose values are media payloads wherever they appear (`bytes`: a
-# Bedrock Converse image, document or video source).
+# Bedrock Converse image, document or video source), except in tool-call
+# arguments (TOOL_ARGUMENTS).
 MEDIA_KEYS = frozenset({"image_url", "input_audio", "file_data", "inline_data", "inlineData", "bytes"})
 # Strings under these keys name structure, not text: a body with nothing else
 # is not worth a round trip.
 STRUCTURAL_KEYS = frozenset({"role", "type", "id", "call_id", "tool_call_id", "tool_use_id", "name",
                              "media_type", "status", "model", "cache_control"})
+# Tool-call arguments, sent whole like the tool definitions: jev-edge reads
+# every key and string below the ones it knows (messages[*].tool_calls[*]
+# .function.arguments.**, messages[*].content[*].input.**, ...), so a key
+# the media filter drops elsewhere (`bytes`, `image_url`) is model-visible
+# text here. Paths from a top-level key, keys folded as jev-edge folds them,
+# "*" for each item of an array. Bedrock Converse's toolUse.input and
+# Gemini's functionCall.args are tool-call arguments too.
+TOOL_ARGUMENTS = frozenset({
+    ("messages", "*", "tool_calls", "*", "function", "arguments"),
+    ("messages", "*", "tool_calls", "*", "custom", "input"),
+    ("messages", "*", "function_call", "arguments"),
+    ("messages", "*", "content", "*", "input"),
+    ("messages", "*", "content", "*", "tooluse", "input"),
+    ("input", "*", "arguments"),
+    ("input", "*", "input"),
+    ("contents", "*", "parts", "*", "functioncall", "args"),
+    ("contents", "parts", "*", "functioncall", "args"),
+})
+_TOOL_ARGUMENT_PREFIXES = frozenset(p[:i] for p in TOOL_ARGUMENTS for i in range(1, len(p)))
 # Containers nested deeper than this below a top-level key are dropped:
 # jev-edge's decoder (cjson) refuses JSON nested more than 1000 levels, and
 # the body's own top-level object is the first of them. Below that, jev-edge
@@ -232,17 +252,25 @@ def _litellm_scans_batch_files() -> bool:
 _DROP = object()
 
 
-def _clean(node: Any, media: bool = True) -> Any:
-    """A JSON-safe copy of `node` to MAX_DEPTH, without media payloads (with
+def _fold(key: str) -> str:
+    """A key as jev-edge matches it, the way Go's encoding/json does: case
+    folded, U+017F (long s) as s (U+212A, the Kelvin sign, lower-cases to k)."""
+    return key.lower().replace("\u017f", "s")
+
+
+def _clean(node: Any, media: bool = True, key: Optional[str] = None) -> Any:
+    """A JSON-safe copy of `node`, the value of top-level key `key`, to
+    MAX_DEPTH, without media payloads outside tool-call arguments (with
     `media` false, everything JSON can carry is kept). Built with a stack of
     its own, so a client's nesting cannot exhaust Python's recursion limit;
     every container is placed when its parent is copied, so keys and items
     keep their order."""
     stack: list = []
 
-    def start(v: Any, depth: int) -> Any:
+    def start(v: Any, depth: int, media: bool, path: Optional[tuple]) -> Any:
         """A scalar as it is sent, an empty container queued to be filled,
-        or _DROP."""
+        or _DROP. `path` is where `v` is while it can still lead to tool-call
+        arguments, None once it cannot."""
         if isinstance(v, str) or v is None or isinstance(v, (bool, int)):
             return v
         if isinstance(v, float):
@@ -260,15 +288,26 @@ def _clean(node: Any, media: bool = True) -> Any:
             out = []
         else:
             return _DROP
-        stack.append((v, out, depth))
+        stack.append((v, out, depth, media, path))
         return out
 
-    root = start(node, 1)
+    def below(media: bool, path: Optional[tuple], seg: str) -> tuple:
+        """`media` and `path` for a child at `seg` ("*" for an array item)."""
+        if path is None:
+            return media, None
+        path = path + (seg,)
+        if path in TOOL_ARGUMENTS:
+            return False, None
+        return media, (path if path in _TOOL_ARGUMENT_PREFIXES else None)
+
+    top = (_fold(key),) if media and key is not None else None
+    root = start(node, 1, media, top if top in _TOOL_ARGUMENT_PREFIXES else None)
     while stack:
-        src, out, depth = stack.pop()
+        src, out, depth, media, path = stack.pop()
         if isinstance(out, list):
+            cmedia, cpath = below(media, path, "*")
             for v in src:
-                c = start(v, depth + 1)
+                c = start(v, depth + 1, cmedia, cpath)
                 if c is not _DROP:
                     out.append(c)
             continue
@@ -280,9 +319,11 @@ def _clean(node: Any, media: bool = True) -> Any:
             keep = ("type", "text", "content")
         for k, v in src.items():
             k = str(k)
-            if media and (k in MEDIA_KEYS or (keep is not None and k not in keep)):
+            cmedia, cpath = below(media, path, _fold(k)) if path is not None else (media, None)
+            # tool-call arguments are read whatever the part they are in
+            if cmedia and (k in MEDIA_KEYS or (keep is not None and k not in keep)):
                 continue
-            c = start(v, depth + 1)
+            c = start(v, depth + 1, cmedia, cpath)
             if c is not _DROP:
                 out[k] = c
     return root
@@ -429,7 +470,7 @@ def _body_dict(data: dict, extra_fields: tuple = ()) -> Optional[dict]:
     if system and convo is None:
         # no conversation under `messages` (the Responses API): the system
         # prompt goes first, before the input
-        body["messages"] = _clean(system)
+        body["messages"] = _clean(system, key="messages")
     taken = DEFINITION_KEYS + SYSTEM_KEYS + TEXT_KEYS
     for key in tuple(k for k in extra_fields if k not in taken) + TEXT_KEYS:
         value = data.get(key)
@@ -439,7 +480,7 @@ def _body_dict(data: dict, extra_fields: tuple = ()) -> Optional[dict]:
             value = system + convo
         if value is None or _is_definition(key, value):
             continue
-        c = _clean(value)
+        c = _clean(value, key=key)
         if c is not _DROP:
             body[key] = c
     return body if _has_text(body) else None

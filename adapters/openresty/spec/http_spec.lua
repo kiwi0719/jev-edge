@@ -203,3 +203,79 @@ describe("http.slots", function()
     s.give(false)
   end)
 end)
+
+-- The adaptive L2 timeout learns from core's L2 calls only. With the
+-- estimate pinned at the ceiling, /_jev/health's call (asking for the
+-- ceiling) and an L3 job came out equal to it and were counted as L2
+-- samples (lead-openresty-runtime#19).
+describe("http judge: adaptive samples", function()
+  local saved_ngx, http, reply, t
+  setup(function()
+    saved_ngx = _G.ngx
+    t = 1000
+    -- every clock read moves 50 ms, so a call takes a measurable time
+    _G.ngx = { now = function() t = t + 0.05; return t end, update_time = function() end,
+               log = function() end, WARN = 5 }
+    package.loaded["resty.http"] = { new = function()
+      return { set_timeouts = function() end, request_uri = function() return reply() end }
+    end }
+    package.loaded["resty.jev.http"] = nil
+    http = require "resty.jev.http"
+  end)
+  teardown(function()
+    _G.ngx = saved_ngx
+    package.loaded["resty.http"] = nil
+    package.loaded["resty.jev.http"] = nil
+  end)
+
+  local ok_reply = function() return { status = 200, body = '{"answers":{"injection":{"noul":0.1}}}' } end
+  local timeout_reply = function() return nil, "timeout" end
+  local cfg = { provider = "jev", endpoint = "http://judge/v1", timeout_ms = 100, timeout_max_ms = 500,
+                timeout_warmup = 1 }
+  local prompt = J.build({ "injection" }, "some judged text", { path = "/v1/chat/completions", method = "POST" })
+
+  -- a judge whose estimate is pinned at the ceiling (500)
+  local function pinned()
+    local store = H.store()
+    store:set("adapt:n", 50); store:set("adapt:mean", 2000); store:set("adapt:var", 0)
+    local j = assert(http.new(cfg, store))
+    assert.equals(500, j.adaptive:current())
+    return j, store
+  end
+  local function n(store) return store:get("adapt:n") end
+
+  it("a /_jev/health call (sample = false) at the pinned ceiling is not a sample", function()
+    local j, store = pinned()
+    reply = ok_reply
+    assert.truthy(j.call(prompt, 500, { sample = false }))
+    reply = timeout_reply
+    assert.is_nil(j.call(prompt, 500, { sample = false }))
+    assert.equals(50, n(store))
+  end)
+
+  it("an L3 call (lane l3) is not a sample, whatever its timeout", function()
+    local j, store = pinned()
+    reply = ok_reply
+    assert.truthy(j.call(prompt, 500, { lane = "l3" }))
+    assert.truthy(j.call(prompt, 100, { lane = "l3" }))
+    assert.equals(1, #j.call_many({ prompt }, 500, { lane = "l3" }))
+    assert.equals(50, n(store))
+  end)
+
+  it("a call asking for more than timeout_ms is not a sample, even with no opts", function()
+    local j, store = pinned()
+    reply = ok_reply
+    assert.truthy(j.call(prompt, 500))
+    assert.equals(50, n(store))
+  end)
+
+  it("core's L2 call (timeout_ms) is a sample, success or timeout", function()
+    local j, store = pinned()
+    reply = ok_reply
+    assert.truthy(j.call(prompt, 100))
+    assert.equals(51, n(store))
+    reply = timeout_reply
+    assert.is_nil(j.call(prompt, 100))
+    assert.equals(52, n(store))
+  end)
+end)

@@ -109,14 +109,21 @@ function _M.new(cfg, inflight, metrics)
   local l2 = inflight and _M.slots(inflight, "inflight:l2", lease)
 
   -- core passes cfg.jev.timeout_ms and the adaptive estimate (floor..ceiling)
-  -- overrides it. A caller asking for MORE than the estimate (L3 with the
-  -- ceiling, /_jev/health) gets what it asked for, and such a call does not
-  -- feed the adaptive estimate: it is not an L2 sample.
-  local function do_call(prompt, requested)
+  -- overrides it; a caller asking for more than the estimate (L3 with its
+  -- own timeout, /_jev/health with the ceiling) gets what it asked for.
+  -- Only core's L2 calls feed the estimate, told apart by the caller, not by
+  -- the timeout: with the estimate pinned at the ceiling, /_jev/health's
+  -- call (the ceiling) came out equal to it and counted as an L2 sample, and
+  -- so did an L3 job whose timeout was the ceiling. Not a sample: a call
+  -- with opts.sample = false (/_jev/health) or opts.lane = "l3" (async.lua),
+  -- and, as a guard, one asking for more than timeout_ms.
+  local floor_ms = tonumber(cfg.timeout_ms)
+  local function do_call(prompt, requested, opts)
     local est = adaptive:current()
     local req_ms = tonumber(requested)
     local timeout_ms = (req_ms and req_ms > est) and req_ms or est
-    local is_l2 = timeout_ms == est
+    local is_l2 = not (opts and (opts.sample == false or opts.lane == "l3"))
+      and not (req_ms and floor_ms and req_ms > floor_ms)
 
     if provider.local_only then
       local t0 = now_ms()
@@ -173,12 +180,15 @@ function _M.new(cfg, inflight, metrics)
     return answers
   end
 
-  --- @param opts optional { lane = "l3" }: an L3 re-judge (resty.jev.async),
-  -- which takes no L2 slot. L3 jobs are capped by async.max_async on their
-  -- own counter, and they run while the L2 calls that overflowed still hold
-  -- their slots: under the L2 cap every re-judge of a "max_inflight
-  -- exceeded" request was refused the same way. At saturation the provider
-  -- sees up to max_inflight + max_async calls.
+  --- @param opts optional:
+  --   lane = "l3": an L3 re-judge (resty.jev.async), which takes no L2 slot
+  --     and is not an adaptive-timeout sample. L3 jobs are capped by
+  --     async.max_async on their own counter, and they run while the L2
+  --     calls that overflowed still hold their slots: under the L2 cap every
+  --     re-judge of a "max_inflight exceeded" request was refused the same
+  --     way. At saturation the provider sees up to max_inflight + max_async
+  --     calls.
+  --   sample = false: not an adaptive-timeout sample (/_jev/health).
   function self.call(prompt, requested_timeout, opts)
     -- Concurrency cap applies to every provider, mock included, so the limit
     -- is exercised by the soak test. The slot is given back after a return
@@ -190,7 +200,7 @@ function _M.new(cfg, inflight, metrics)
       slot = l2.take(tonumber(cfg.max_inflight) or 64)
       if slot == nil then return nil, judge.BUSY end
     end
-    local ok, answers, err, kind = pcall(do_call, prompt, requested_timeout)
+    local ok, answers, err, kind = pcall(do_call, prompt, requested_timeout, opts)
     if slot then l2.give(slot) end
     if not ok then return nil, "judge error: " .. tostring(answers) end
     return answers, err, kind

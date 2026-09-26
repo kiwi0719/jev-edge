@@ -31,8 +31,9 @@ local function done(job)
 end
 
 -- resty.jev.http takes no L2 in-flight slot for these calls: L3 has its own
--- cap (max_async), and the L2 slots are the ones that just overflowed.
-local LANE = { lane = "l3" }
+-- cap (max_async), and the L2 slots are the ones that just overflowed. Nor
+-- are they adaptive-timeout samples: they run on the L3 timeout.
+local LANE = { lane = "l3", sample = false }
 
 -- One answer (or nil) per part, in order; several parts at once when the
 -- judge can (resty.jev.http's call_many, one light thread each). The second

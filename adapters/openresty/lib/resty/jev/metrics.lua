@@ -5,7 +5,10 @@
 local _M = {}
 
 local DICT = "jev_metrics"
-local BUCKETS = { 25, 50, 100, 200, 300, 500, 1000 }
+-- L2 latency buckets (ms). They reach past jev.timeout_max_ms, which an
+-- operator may raise well above a second: a call slower than the top bucket
+-- lands only in +Inf, and histogram_quantile() then answers the top bucket.
+local BUCKETS = { 25, 50, 100, 200, 300, 500, 1000, 2000, 3000, 5000, 10000, 30000 }
 
 local function dict() return ngx.shared[DICT] end
 
@@ -176,13 +179,21 @@ end
 -- then _sum and _count. record() creates a bucket key only for a call that
 -- fell in it, so a bucket below the fastest call has no key; it is 0, not
 -- absent (a histogram missing buckets is dropped or misread).
+--
+-- Buckets are cumulative, so each is at least the one below it. A bucket
+-- added by an upgrade starts at 0 in a dict that survived a HUP reload with
+-- the old buckets filled; it is emitted as the bucket below it until calls
+-- catch it up (the calls before the upgrade that fell between the two are
+-- not known, so this is a floor), never as a count that goes down with le.
 local function histogram_lines(d, out)
   local count = d:get("l2_count")
   if not count then return end
+  local floor = 0
   for _, b in ipairs(BUCKETS) do
-    out[#out + 1] = string.format('jev_l2_latency_ms_bucket{le="%d"} %d', b, d:get("l2_le:" .. b) or 0)
+    floor = math.max(floor, d:get("l2_le:" .. b) or 0)
+    out[#out + 1] = string.format('jev_l2_latency_ms_bucket{le="%d"} %d', b, floor)
   end
-  out[#out + 1] = string.format('jev_l2_latency_ms_bucket{le="+Inf"} %d', d:get("l2_le:inf") or count)
+  out[#out + 1] = string.format('jev_l2_latency_ms_bucket{le="+Inf"} %d', math.max(floor, d:get("l2_le:inf") or count))
   out[#out + 1] = "jev_l2_latency_ms_sum " .. (d:get("l2_sum_ms") or 0)
   out[#out + 1] = "jev_l2_latency_ms_count " .. count
 end

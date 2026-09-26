@@ -834,6 +834,6 @@ location = /check {
 Content-Type: application/json
 --- response_body_like eval
 ["source=l2", "source=l2", "source=l1",
- '^jev_l2_latency_ms_bucket\{le="25"\}\njev_l2_latency_ms_bucket\{le="50"\}\njev_l2_latency_ms_bucket\{le="100"\}\njev_l2_latency_ms_bucket\{le="200"\}\njev_l2_latency_ms_bucket\{le="300"\}\njev_l2_latency_ms_bucket\{le="500"\}\njev_l2_latency_ms_bucket\{le="1000"\}\njev_l2_latency_ms_bucket\{le="\+Inf"\}\njev_l2_latency_ms_sum\njev_l2_latency_ms_count\n$']
+ '^jev_l2_latency_ms_bucket\{le="25"\}\njev_l2_latency_ms_bucket\{le="50"\}\njev_l2_latency_ms_bucket\{le="100"\}\njev_l2_latency_ms_bucket\{le="200"\}\njev_l2_latency_ms_bucket\{le="300"\}\njev_l2_latency_ms_bucket\{le="500"\}\njev_l2_latency_ms_bucket\{le="1000"\}\njev_l2_latency_ms_bucket\{le="2000"\}\njev_l2_latency_ms_bucket\{le="3000"\}\njev_l2_latency_ms_bucket\{le="5000"\}\njev_l2_latency_ms_bucket\{le="10000"\}\njev_l2_latency_ms_bucket\{le="30000"\}\njev_l2_latency_ms_bucket\{le="\+Inf"\}\njev_l2_latency_ms_sum\njev_l2_latency_ms_count\n$']
 --- no_error_log
 [error]

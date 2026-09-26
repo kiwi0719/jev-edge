@@ -544,7 +544,7 @@
       "type": "timeseries",
       "id": 12,
       "title": "L2 latency quantiles",
-      "description": "histogram_quantile over jev_l2_latency_ms_bucket (buckets 25..1000 ms, +Inf), plus the mean from _sum/_count.",
+      "description": "histogram_quantile over jev_l2_latency_ms_bucket (buckets 25..30000 ms, +Inf), plus the mean from _sum/_count.",
       "datasource": {
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"

@@ -197,7 +197,8 @@ tools-fp:
 
 # the generated tables, then everything from the "<!-- notes" line of the old report on
 tools-fp-report:
-	{ lua bench/tools/report.lua; sed -n '/^<!-- notes/,$$p' bench/tools/report.md 2>/dev/null; } > bench/tools/report.md.tmp
+	lua bench/tools/report.lua > bench/tools/report.md.tmp
+	if [ -f bench/tools/report.md ]; then sed -n '/^<!-- notes/,$$p' bench/tools/report.md >> bench/tools/report.md.tmp; fi
 	mv bench/tools/report.md.tmp bench/tools/report.md
 
 # openai-compat provider against an Ollama container on the jev-net network:

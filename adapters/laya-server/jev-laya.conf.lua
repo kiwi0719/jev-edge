@@ -34,9 +34,11 @@ return {
     -- one request may add to your latency, lower max_judge_bytes (below) or
     -- max_inflight and measure again, add CPUs, or run the model on a GPU
     -- (LAYA_ORT_PROVIDERS), which runs the windows of a batch in parallel.
-    -- laya-server's queue wait (LAYA_QUEUE_MS, 50 ms) is sized for this
-    -- floor: a 503 must come while the gateway still reads. The ceiling is
-    -- what one request may add when the server as a whole slows down.
+    -- Give laya-server the same floor (LAYA_GATEWAY_TIMEOUT_MS, default
+    -- 500): a request waits for a worker only while it can still be
+    -- answered in half of it, and a 503 comes while the gateway still reads.
+    -- The ceiling is what one request may add when the server as a whole
+    -- slows down.
     timeout_ms       = 500,
     timeout_max_ms   = 800,
     timeout_headroom = 1.5,

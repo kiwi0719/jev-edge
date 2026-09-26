@@ -527,8 +527,8 @@ def check_worst(t: Target, body: bytes, warm: bytes, nbytes: int, samples: int, 
     late = max((ms for s, ms in flat if s == 503 and ms > read_ms), default=None)
     if late is not None:
         problems.append(f"a 503 took {late:.0f} ms, after the gateway stopped reading at {read_ms:.0f} ms, "
-                        f"so it logs a timeout instead: shorten the server's queue wait (laya-server: "
-                        f"LAYA_QUEUE_MS)")
+                        f"so it logs a timeout instead: the server must refuse sooner (laya-server: "
+                        f"LAYA_GATEWAY_TIMEOUT_MS at most the gateway's timeout_ms, {budget_ms:.0f} here)")
     if problems:
         return f"{'; '.join(problems)} ({info}). {w.advice()}", info, w
     return None, info, w

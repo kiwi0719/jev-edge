@@ -25,10 +25,10 @@ Guarantees the gateway relies on, checked by conformance/ (make conformance):
     is judged with U+FFFD in its place, never refused;
   * load past what the server can take is answered, never dropped: the
     listen backlog is LAYA_BACKLOG, not socketserver's 5; at most
-    LAYA_WORKERS requests are scored at once; a request that waits longer
-    than LAYA_QUEUE_MS for a worker, and a connection past
-    LAYA_MAX_CONNECTIONS, get a 503 `overloaded` while the gateway still
-    reads (QUEUE_MS_DEFAULT);
+    LAYA_WORKERS requests are scored at once, the others wait their turn
+    for as long as they can still be answered in time (Workers); a request
+    that cannot, and a connection past LAYA_MAX_CONNECTIONS, get a 503
+    `overloaded` while the gateway still reads;
   * a client that hangs up or stalls in the middle of its request gets an
     access-log line at most, never a backend-fault warning;
   * errors are JSON with a non-200 status (400, 401, 404, 405, 411, 413,
@@ -68,11 +68,11 @@ Configuration (environment):
                      (CPUs / LAYA_WORKERS; neither set: CPUs / 2, at most 4)
   LAYA_WORKERS       requests scored at once
                      (onnx: CPUs / LAYA_ORT_THREADS; mock: CPUs; python: 1)
-  LAYA_QUEUE_MS      wait for a free worker before 503: at most the
-                     gateway's read wait (60% of jev.timeout_ms) minus the
-                     worst-case p99; 10% of the profile's timeout_ms, for a
-                     server that just passes conformance (QUEUE_MS_DEFAULT)
-                                                                  (50)
+  LAYA_GATEWAY_TIMEOUT_MS the jev.timeout_ms of the gateways calling this
+                     server (the lowest, if they differ). A request waits
+                     for a worker only while it can still be answered
+                     within half of it; otherwise it gets 503 (Workers)
+                                                   (500, the Laya profile's)
   LAYA_BACKLOG       listen backlog: at least the sum of jev.max_inflight of
                      the gateways calling this server; the kernel caps it at
                      its somaxconn                                (1024)
@@ -89,7 +89,9 @@ within them (pool_sizes), and the server says at start what it chose.
 
 from __future__ import annotations
 
+import collections
 import contextlib
+import heapq
 import hmac
 import importlib
 import json
@@ -507,6 +509,29 @@ class Scorer:
         return {name: {"noul": round(sigmoid(x / self.t), 6)} for name, x in logits.items()}, usage
 
 
+_SYMBOL = re.compile(r"[^\w\s]")
+
+
+def _approx_tokens(s: str) -> int:
+    return len(s.encode("utf-8", "replace")) // 4 + len(_SYMBOL.findall(s))
+
+
+def cost_units(state, questions: dict) -> int:
+    """About the tokens a request makes the model read, without the
+    tokenizer: one per 4 bytes, plus one per punctuation mark or symbol, of
+    the text and of each question's wording. A short prompt comes to a few
+    hundred, the worst case (conformance/run.py) to several thousand, and a
+    prose text of the same size to about a third of that, like their real
+    token counts. The tokenizer would give the exact count, and with it the
+    windows, but it holds the GIL: tokenized before queueing, 64 worst-case
+    texts at once took over 100 ms one after the other, and their 503s came
+    after the gateway had stopped reading. This takes microseconds.
+    CostModel learns the ms per unit from the scorings themselves."""
+    assistant, text = split_state(state)
+    t = _approx_tokens(text)
+    return sum(t + _approx_tokens(question_segment(q, assistant)) for q in questions.values())
+
+
 # ---------------------------------------------------------------------------
 # request validation
 # ---------------------------------------------------------------------------
@@ -547,49 +572,167 @@ def validate(req) -> None:
 
 
 
-# LAYA_QUEUE_MS by default. The gateway waits for the answer 60% of its L2
-# timeout (resty/jev/http.lua: connect 30%, send 10%, read 60%): 300 ms at
-# the Laya profile's floor, timeout_ms = 500 (jev-laya.conf.lua). Past it the
-# gateway has given up: a 503 sent later reaches no one, the gateway logs a
-# timeout instead, and a request scored later spends a worker on an answer
-# no one reads. conformance passes a server whose worst case, at the
-# gateway's max_inflight, fits half of timeout_ms (2x headroom). A request
-# that gets a worker at the end of its wait and is then scored in that
-# worst case is answered in time only if the wait is at most 60% - 50% =
-# 10% of timeout_ms: 50 ms. For another timeout_ms, or a server faster than
-# that, LAYA_QUEUE_MS = 0.6 x timeout_ms - the worst-case p99.
-QUEUE_MS_DEFAULT = 50
+# The gateway waits for the answer 60% of its L2 timeout (resty/jev/http.lua:
+# connect 30%, send 10%, read 60%): 300 ms at the Laya profile's floor,
+# timeout_ms = 500 (jev-laya.conf.lua). Past it the gateway has given up: a
+# 503 sent later reaches no one, the gateway logs a timeout instead, and a
+# request scored later spends a worker on an answer no one reads.
+READ_SHARE = 0.6
+# LAYA_GATEWAY_TIMEOUT_MS by default: the profile's timeout_ms.
+GATEWAY_TIMEOUT_MS_DEFAULT = 500
+# Workers answers within this share of it: the 2x headroom conformance
+# passes a server at (conformance/run.py). The last 10% before the gateway
+# stops reading is room for a scoring that takes longer than its estimate,
+# and for the network.
+ANSWER_SHARE = 0.5
+
+
+class CostModel:
+    """What a request costs to score, in ms, from its size in cost_units:
+    ms per unit, learned for each size class (requests within a factor of 2
+    of each other) from the scorings this server ran, under its own load.
+
+    Per class, because the time per unit is not the same at every size: a
+    short prompt is one window with room to spare, the worst case several
+    full ones, and within a window the model's time grows faster than the
+    tokens. A class not seen yet takes the rate of the nearest one seen, so
+    a size larger than any seen is priced low until it has been scored
+    once. 0 until the first scoring.
+
+    A scoring slower than its class's rate moves the rate half way to it,
+    a faster one a tenth of the way: when the server slows down (a full
+    pool, a noisy neighbour) an estimate that lags sends answers after the
+    gateway stops reading, while one that lags on the way back only
+    refuses a little early."""
+
+    SLOWER, FASTER = 0.5, 0.1  # weight of the newest scoring against the class's rate
+
+    def __init__(self):
+        self.rate = {}  # size class -> ms per unit
+
+    @staticmethod
+    def size_class(units: float) -> int:
+        return int(units).bit_length()  # class k: [2^(k-1), 2^k)
+
+    def observe(self, units: float, ms: float) -> None:
+        if units <= 0:
+            return
+        k, r = self.size_class(units), ms / units
+        old = self.rate.get(k)
+        w = self.SLOWER if old is None or r > old else self.FASTER
+        self.rate[k] = r if old is None else old + (r - old) * w
+
+    def estimate(self, units: float) -> float:
+        if not self.rate or units <= 0:
+            return 0.0
+        k = self.size_class(units)
+        near = min(self.rate, key=lambda j: (abs(j - k), -j))  # a tie goes to the larger, dearer class
+        return self.rate[near] * units
+
+
+class _Turn:
+    """One request's turn at the pool."""
+
+    __slots__ = ("est", "end", "ready")
+
+    def __init__(self, est: float):
+        self.est = est                  # its expected scoring time, ms
+        self.end = 0.0                  # when that ends, once it has a worker (perf_counter)
+        self.ready = threading.Event()  # set when it has a worker
 
 
 class Workers:
-    """The scoring pool: at most `n` requests are scored at once.
+    """The scoring pool: at most `n` requests are scored at once, and the
+    others wait their turn, first come first served, for as long as they
+    can still be answered in time.
 
-    A request that finds every worker busy waits up to `wait_ms` for one,
-    then gets 503 `overloaded`, soon enough for the gateway to read it
-    (QUEUE_MS_DEFAULT). Scoring it later would only spend a worker on an
-    answer no one reads, and push the requests behind it past their own
-    timeouts.
+    In time is within `answer_ms` of the request's arrival (ANSWER_SHARE of
+    LAYA_GATEWAY_TIMEOUT_MS: 250 ms at the profile's floor). On arrival a
+    request's own scoring time is estimated from its size (cost_units,
+    CostModel), and so is its wait: the requests being scored and queued
+    ahead of it, each taking its estimate. When the wait and its own time
+    do not fit, it gets 503 `overloaded` at once. When they fit, it waits
+    for a worker up to answer_ms minus its own time, and gets the 503 then
+    if none came. A short text needs a few ms of scoring, so a burst of
+    them is served from the queue; the longest text needs most of the
+    budget, so behind others it is refused at once. Every 503 comes before
+    the gateway stops reading and, as far as the estimates hold, no worker
+    is spent on an answer that would come after it. A request that finds a
+    worker free is scored at once, whatever its estimate: no one is waiting
+    for that worker.
     """
 
-    def __init__(self, n: int, wait_ms: float):
+    def __init__(self, n: int, answer_ms: float, cost: CostModel | None = None):
         if n < 1:
             raise ValueError("LAYA_WORKERS must be >= 1")
-        if wait_ms < 0:
-            raise ValueError("LAYA_QUEUE_MS must be >= 0")
-        self.n, self.wait_ms = n, wait_ms
-        self.sem = threading.BoundedSemaphore(n)
+        if answer_ms <= 0:
+            raise ValueError("LAYA_GATEWAY_TIMEOUT_MS must be > 0")
+        self.n, self.answer_ms = n, answer_ms
+        self.cost = cost or CostModel()
+        self._lock = threading.Lock()
+        self._free = n
+        self._running: set = set()
+        self._queue: collections.deque = collections.deque()  # waiting turns, oldest first
+
+    def _start(self, turn: _Turn, now: float) -> None:
+        # under the lock: `turn` takes a worker
+        turn.end = now + turn.est / 1000
+        self._running.add(turn)
+        turn.ready.set()
+
+    def _wait_ms(self, now: float) -> float:
+        # under the lock, every worker busy: how long a request queued now
+        # waits, when the ones scoring and queued take their estimates
+        free_at = [max(0.0, (t.end - now) * 1000) for t in self._running]
+        heapq.heapify(free_at)
+        for t in self._queue:
+            heapq.heapreplace(free_at, free_at[0] + t.est)
+        return free_at[0]
 
     @contextlib.contextmanager
-    def slot(self):
-        """Holds a worker for the block; yields the ms spent waiting for it."""
+    def slot(self, units: float = 0, since: float | None = None):
+        """Holds a worker for the block; yields the ms spent waiting for it.
+        units: the request's size (cost_units); since: when it arrived, by
+        perf_counter (default now)."""
+        now = time.perf_counter()
+        left = self.answer_ms - (now - (now if since is None else since)) * 1000
+        with self._lock:
+            turn = _Turn(self.cost.estimate(units))
+            if self._free:
+                self._free -= 1
+                self._start(turn, now)
+            else:
+                wait = self._wait_ms(now)
+                if wait + turn.est > left:
+                    raise Refused(503, "overloaded",
+                                  f"all {self.n} workers busy: about {wait:.0f} ms of waiting and "
+                                  f"{turn.est:.0f} ms of scoring, over the {left:.0f} ms left to answer in "
+                                  "(LAYA_WORKERS, LAYA_GATEWAY_TIMEOUT_MS)")
+                self._queue.append(turn)
+        if not turn.ready.wait(max(0.0, left - turn.est) / 1000):
+            with self._lock:
+                if not turn.ready.is_set():
+                    self._queue.remove(turn)
+                    raise Refused(503, "overloaded",
+                                  f"all {self.n} workers still busy after "
+                                  f"{(time.perf_counter() - now) * 1000:.0f} ms, too late for {turn.est:.0f} ms "
+                                  f"of scoring in the {left:.0f} ms left to answer in "
+                                  "(LAYA_WORKERS, LAYA_GATEWAY_TIMEOUT_MS)")
         t0 = time.perf_counter()
-        if not self.sem.acquire(timeout=self.wait_ms / 1000):
-            raise Refused(503, "overloaded", f"all {self.n} workers busy for {self.wait_ms:g} ms "
-                                             "(LAYA_WORKERS, LAYA_QUEUE_MS)")
+        scored = False
         try:
-            yield (time.perf_counter() - t0) * 1000
+            yield (t0 - now) * 1000
+            scored = True
         finally:
-            self.sem.release()
+            ms = (time.perf_counter() - t0) * 1000
+            with self._lock:
+                self._running.discard(turn)
+                if scored:
+                    self.cost.observe(units, ms)
+                if self._queue:
+                    self._start(self._queue.popleft(), time.perf_counter())
+                else:
+                    self._free += 1
 
 
 class ClientGone(ConnectionError):
@@ -717,6 +860,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.close_connection = True
                 raise Refused(413, "body_too_large", f"body over {self.max_body} bytes")
             raw = self._read(n)
+            received = time.perf_counter()  # the gateway's read wait runs from here on
             try:
                 try:
                     req = json.loads(raw)
@@ -727,7 +871,7 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 raise Refused(400, "invalid_json", "body is not valid JSON") from None
             validate(req)
-            with self.workers.slot() as waited:
+            with self.workers.slot(cost_units(req["state"], req["questions"]), since=received) as waited:
                 t0 = time.perf_counter()
                 answers, usage = self.scorer.score(req["state"], req["questions"])
                 usage["ms"] = round((time.perf_counter() - t0) * 1000, 2)
@@ -810,6 +954,7 @@ def make_server(env=os.environ, backend=None, cpus: tuple[int, str] | None = Non
         kind = ("onnx" if isinstance(backend, OnnxBackend) else
                 "python" if isinstance(backend, PythonBackend) else "mock")
     workers, threads = pool_sizes(kind, env, cpus[0])
+    gateway_timeout_ms = float(env.get("LAYA_GATEWAY_TIMEOUT_MS") or GATEWAY_TIMEOUT_MS_DEFAULT)
     backend = backend or load_backend(env, threads=threads)
     scorer = Scorer(
         backend,
@@ -820,7 +965,7 @@ def make_server(env=os.environ, backend=None, cpus: tuple[int, str] | None = Non
     )
     attrs = {
         "scorer": scorer,
-        "workers": Workers(workers, float(env.get("LAYA_QUEUE_MS") or QUEUE_MS_DEFAULT)),
+        "workers": Workers(workers, ANSWER_SHARE * gateway_timeout_ms),
         "model_name": env.get("LAYA_MODEL_NAME", "laya"),
         "api_key": env.get("LAYA_API_KEY") or None,
         "max_body": int(env.get("LAYA_MAX_BODY_BYTES", "262144")),
@@ -832,6 +977,7 @@ def make_server(env=os.environ, backend=None, cpus: tuple[int, str] | None = Non
                  backlog=int(env.get("LAYA_BACKLOG", "1024")),
                  max_connections=int(env.get("LAYA_MAX_CONNECTIONS", "1024")))
     srv.cpus, srv.cpu_source, srv.ort_threads = cpus[0], cpus[1], threads if kind == "onnx" else None
+    srv.gateway_timeout_ms = gateway_timeout_ms
     return srv
 
 
@@ -849,7 +995,8 @@ def startup_lines(srv: Server) -> list[str]:
     threads = "" if t is None else ", " + (count(t, "onnxruntime thread") if t else "onnxruntime's own threads")
     pool = count(h.workers.n, "worker") + threads
     out = [f"laya-server on {host}:{port}{PATH}: {pool} on {count(srv.cpus, 'CPU')} ({srv.cpu_source}), "
-           f"queue wait {h.workers.wait_ms:g} ms, backlog {srv.request_queue_size}, "
+           f"answering within {h.workers.answer_ms:g} ms of a {srv.gateway_timeout_ms:g} ms gateway timeout, "
+           f"backlog {srv.request_queue_size}, "
            f"at most {srv.max_connections} connections"
            + (f", providers {','.join(providers)}" if providers else "")]
     if t == 0:

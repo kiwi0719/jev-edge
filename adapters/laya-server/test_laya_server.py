@@ -58,14 +58,18 @@ class Hostile(L.MockBackend):
 
 class SlowBatch(Hostile):
     """Hostile, and a text of several windows takes `ms` to score, as one
-    batched model call: the worst case costs `ms`, a short text nothing."""
+    batched model call: the worst case costs `ms`, a short text `short_ms`."""
 
-    def __init__(self, ms: float):
-        self.ms = ms
+    def __init__(self, ms: float, short_ms: float = 0.0):
+        self.ms, self.short_ms = ms, short_ms
+
+    def logit(self, first, second):
+        time.sleep(self.short_ms / 1000)
+        return super().logit(first, second)
 
     def logits(self, first, seconds):
         time.sleep(self.ms / 1000)
-        return [self.logit(first, s) for s in seconds]
+        return [L.MockBackend.logit(self, first, s) for s in seconds]
 
 
 def ctx_questions():
@@ -183,7 +187,7 @@ class Http(unittest.TestCase):
     def test_passes_conformance_strict_with_auth(self):
         # Hostile: the worst case is judged in several windows, and --mock
         # checks the attack at its tail is seen. At the profile's floor, 64
-        # of it at once (max_inflight), with the default queue wait.
+        # of it at once (max_inflight), with the default LAYA_GATEWAY_TIMEOUT_MS.
         srv, url = serve({"LAYA_API_KEY": "k"}, backend=Hostile())
         try:
             rc, out = conformance_run(url, "--strict", "--mock", "--api-key", "k",
@@ -324,10 +328,11 @@ class Http(unittest.TestCase):
 
     def test_worst_case_is_timed_at_the_gateways_concurrency(self):
         # Fast enough one at a time, but one worker: of 4 worst-case texts at
-        # once (the gateway at max_inflight), 3 wait past the queue wait and
+        # once (the gateway at max_inflight), 3 cannot be scored within the
+        # 250 ms the server has at a 500 ms timeout, behind the first, and
         # get 503, which the gateway treats as an L2 error. The check fails
         # and says how many at once the server holds.
-        srv, url = serve({"LAYA_WORKERS": "1"}, backend=SlowBatch(120))
+        srv, url = serve({"LAYA_WORKERS": "1"}, backend=SlowBatch(150))
         try:
             rc, out = conformance_run(url, "--budget-ms", "500", "--concurrency", "4")
         finally:
@@ -337,7 +342,7 @@ class Http(unittest.TestCase):
         self.assertRegex(out, r"FAIL  worst case within 500 ms with 2x headroom at p99, 4 at once: "
                               r"4096 bytes .* wording: \d+ of 8 not answered 200 \(503: \d+\)")
         self.assertIn("set max_inflight (summed over the gateways that call this server) to at most 1", out)
-        self.assertNotIn("a 503 took", out)  # the default queue wait answers while the gateway reads
+        self.assertNotIn("a 503 took", out)  # refused at once, while the gateway reads
         self.assertRegex(out, r"timeout_ms: \d+-\d+ for the worst case one at a time .* With 4 at once, "
                               r"1 per round were answered in time at timeout_ms 500: set max_inflight "
                               r"to at most 1")
@@ -387,7 +392,7 @@ class Verdicts(unittest.TestCase):
         late = [(200, 150.0), (200, 240.0), (503, 400.0), (503, 400.0)]
         err, _, w = self.worst([100.0] * 4, [late, late])
         self.assertIn("a 503 took 400 ms, after the gateway stopped reading at 300 ms", err)
-        self.assertIn("LAYA_QUEUE_MS", err)
+        self.assertIn("LAYA_GATEWAY_TIMEOUT_MS at most the gateway's timeout_ms, 500 here", err)
         self.assertEqual(w.fit, 2)
         prompt = [(200, 150.0), (200, 240.0), (503, 60.0), (503, 60.0)]
         err, _, _ = self.worst([100.0] * 4, [prompt, prompt])
@@ -441,7 +446,7 @@ class Load(unittest.TestCase):
         finally:
             stop(srv)
 
-    def test_busy_workers_answer_503_after_the_queue_wait(self):
+    def test_busy_workers_answer_503_while_the_gateway_reads(self):
         started, release = threading.Event(), threading.Event()
 
         class Held(L.MockBackend):
@@ -450,7 +455,9 @@ class Load(unittest.TestCase):
                 release.wait(5)
                 return super().logit(first, second)
 
-        srv, url = serve({"LAYA_WORKERS": "1"}, backend=Held())  # the default queue wait
+        # nothing scored yet, so no estimate: the second request waits
+        # for the first as long as it can, half the gateway's timeout
+        srv, url = serve({"LAYA_WORKERS": "1"}, backend=Held())
         first = []
         th = threading.Thread(target=lambda: first.append(post(url, "ATTACK")))
         try:
@@ -469,18 +476,21 @@ class Load(unittest.TestCase):
         self.assertLess(ms, conformance.READ_SHARE * profile_timeout_ms())
         self.assertEqual(first[0][0], 200)
 
-    def test_default_queue_wait_is_derived_from_the_profile(self):
-        # the gateway reads for 60% of timeout_ms, and conformance passes a
-        # worst case of up to half of it: what is left is the queue wait
+    def test_answer_time_is_derived_from_the_profile(self):
+        # LAYA_GATEWAY_TIMEOUT_MS is the profile's floor by default. The
+        # gateway reads for 60% of it; the server answers or refuses within
+        # half of it, the headroom conformance passes a server at
         floor = profile_timeout_ms()
-        want = (conformance.READ_SHARE - 1 / conformance.HEADROOM[0]) * floor
-        self.assertAlmostEqual(L.QUEUE_MS_DEFAULT, want)
-        self.assertLessEqual(L.QUEUE_MS_DEFAULT, floor / 5)
-        srv, _ = serve()
-        try:
-            self.assertEqual(srv.RequestHandlerClass.workers.wait_ms, L.QUEUE_MS_DEFAULT)
-        finally:
-            stop(srv)
+        self.assertEqual(L.GATEWAY_TIMEOUT_MS_DEFAULT, floor)
+        self.assertEqual(L.READ_SHARE, conformance.READ_SHARE)
+        self.assertEqual(L.ANSWER_SHARE, 1 / conformance.HEADROOM[0])
+        self.assertLess(L.ANSWER_SHARE, L.READ_SHARE)
+        for env, want in (({}, floor / 2), ({"LAYA_GATEWAY_TIMEOUT_MS": "300"}, 150)):
+            srv, _ = serve(env)
+            try:
+                self.assertEqual(srv.RequestHandlerClass.workers.answer_ms, want)
+            finally:
+                stop(srv)
 
     def test_connection_past_the_cap_gets_503_and_is_closed(self):
         srv, url = serve({"LAYA_MAX_CONNECTIONS": "1"})
@@ -519,6 +529,119 @@ class Load(unittest.TestCase):
                 self.assertEqual(srv.RequestHandlerClass.workers.n, want)
             finally:
                 stop(srv)
+
+
+class Pool(unittest.TestCase):
+    """A request waits for a worker as long as it can still be answered in
+    time, by its own estimated scoring time and that of the work ahead of
+    it. A fixed 50 ms wait refused most of a burst of short texts the
+    server would have answered while the gateway reads."""
+
+    def test_size_is_about_the_tokens(self):
+        # without the tokenizer, which holds the GIL: a short prompt, prose
+        # of 4096 bytes, and the worst case of 4096 bytes (one token per
+        # byte) come out in that order, each in a size class of its own
+        t = conformance.Target("http://127.0.0.1:9/v1/systemone", None, "laya", 1)
+        q = {"injection": ctx_questions()["injection"]}
+        prose = ("Please summarise the attached invoice and tell me how refunds work. " * 70)[:4096]
+        worst = json.loads(conformance.worst_body(t, 4096, conformance.DEFAULT_ASSISTANT, q))["state"]
+        sizes = [L.cost_units({"assistant": conformance.DEFAULT_ASSISTANT, "user_message": "hello"}, q),
+                 L.cost_units({"assistant": conformance.DEFAULT_ASSISTANT, "user_message": prose}, q),
+                 L.cost_units(worst, q)]
+        self.assertEqual(sizes, sorted(sizes))
+        self.assertEqual(len({L.CostModel.size_class(n) for n in sizes}), 3, sizes)
+        self.assertGreater(sizes[2], 4096 * 0.8)
+        self.assertLess(sizes[1], sizes[2] / 2)
+
+    def test_cost_is_learned_per_size_class(self):
+        c = L.CostModel()
+        self.assertEqual(c.estimate(100), 0.0)  # nothing scored yet
+        c.observe(100, 5.0)     # a short text: 0.05 ms per unit
+        c.observe(6000, 420.0)  # the worst case: 0.07 ms per unit
+        self.assertAlmostEqual(c.estimate(120), 6.0)
+        self.assertAlmostEqual(c.estimate(5000), 350.0)
+        self.assertAlmostEqual(c.estimate(500), 25.0)   # a class not seen: the nearest one's rate
+        self.assertAlmostEqual(c.estimate(1000), 70.0)  # halfway: the dearer one's
+        c.observe(100, 15.0)  # a slower scoring moves its class's rate half way
+        self.assertAlmostEqual(c.estimate(100), 10.0)
+        c.observe(100, 5.0)   # a faster one a tenth of the way
+        self.assertAlmostEqual(c.estimate(100), 9.5)
+
+    def test_queue_takes_what_fits_in_order_and_refuses_the_rest_at_once(self):
+        cost = L.CostModel()
+        cost.observe(100, 400.0)  # 4 ms per unit: 400 ms for 100 units, 40 ms for 10
+        w = L.Workers(1, 1000, cost)
+        order = []
+
+        def queued(name, units):
+            with w.slot(units):
+                order.append(name)
+
+        held = w.slot(100)
+        held.__enter__()  # scoring, about 400 ms
+        a = threading.Thread(target=queued, args=("a", 100))
+        a.start()  # 400 ms of waiting and 400 of scoring fit in 1000: it waits
+        deadline = time.monotonic() + 5
+        while not w._queue and time.monotonic() < deadline:
+            time.sleep(0.001)
+        t0 = time.perf_counter()
+        with self.assertRaises(L.Refused) as cm:
+            with w.slot(100):  # 800 ms of waiting and 400 of scoring do not
+                pass
+        self.assertLess((time.perf_counter() - t0) * 1000, 50)  # refused at once, not after a wait
+        self.assertEqual((cm.exception.status, cm.exception.code), (503, "overloaded"))
+        self.assertIn("LAYA_GATEWAY_TIMEOUT_MS", cm.exception.message)
+        b = threading.Thread(target=queued, args=("b", 10))
+        b.start()  # 800 ms of waiting and 40 of scoring fit: it waits behind a
+        while len(w._queue) < 2 and time.monotonic() < deadline:
+            time.sleep(0.001)
+        held.__exit__(None, None, None)
+        a.join(5)
+        b.join(5)
+        self.assertEqual(order, ["a", "b"])
+        self.assertEqual(w._free, 1)
+
+    def test_a_short_burst_is_served_and_a_long_text_behind_it_refused_at_once(self):
+        # one worker, 10 ms per short text, 400 ms for the worst case; at a
+        # 1000 ms gateway timeout the server answers within 500 ms
+        srv, url = serve({"LAYA_WORKERS": "1", "LAYA_GATEWAY_TIMEOUT_MS": "1000"},
+                         backend=SlowBatch(400, short_ms=10))
+        pool = srv.RequestHandlerClass.workers
+        t = conformance.Target(url, None, "laya", 5)
+        short = conformance.short_body(t, VECTORS)
+        worst = conformance.worst_body(t, 4096, conformance.DEFAULT_ASSISTANT, ctx_questions())
+        try:
+            conformance.timed(t, short, 3)  # the server learns what each costs
+            conformance.timed(t, worst, 2)
+            # 16 short texts at once: about 200 ms of scoring, all answered in time
+            rounds = conformance.at_once(t, short, short, 16, 2)
+            for r in rounds:
+                self.assertEqual([s for s, _ in r], [200] * 16, r)
+                self.assertLess(max(ms for _, ms in r), conformance.READ_SHARE * 1000)
+            # a worst-case text sent behind 12 or more short ones cannot be
+            # scored in time: 503 at once, not after a wait
+            got = {}
+
+            def send(name, body):
+                got[name] = t.request("POST", "/v1/systemone", body)
+
+            ths = [threading.Thread(target=send, args=(i, short)) for i in range(16)]
+            with contextlib.redirect_stderr(io.StringIO()):
+                for th in ths:
+                    th.start()
+                deadline = time.monotonic() + 5
+                while len(pool._queue) < 12 and time.monotonic() < deadline:
+                    time.sleep(0.001)
+                send("worst", worst)
+                for th in ths:
+                    th.join(5)
+        finally:
+            stop(srv)
+        self.assertEqual(sorted(got[i][0] for i in range(16)), [200] * 16)
+        status, data, ms = got["worst"]
+        self.assertEqual(status, 503, data)
+        self.assertEqual(json.loads(data)["error"]["code"], "overloaded")
+        self.assertLess(ms, 60)
 
 
 class ClientGone(unittest.TestCase):
@@ -647,7 +770,8 @@ class Cpus(unittest.TestCase):
         srv, threads = self.onnx_server({})
         self.assertEqual((srv.RequestHandlerClass.workers.n, threads), (2, 4))
         lines = L.startup_lines(srv)
-        self.assertRegex(lines[0], r": 2 workers, 4 onnxruntime threads on 8 CPUs \(test CPUs\), queue wait 50 ms")
+        self.assertRegex(lines[0], r": 2 workers, 4 onnxruntime threads on 8 CPUs \(test CPUs\), "
+                                   r"answering within 250 ms of a 500 ms gateway timeout")
         self.assertFalse(any("slow each other down" in x or "LAYA_ORT_THREADS=0" in x for x in lines), lines)
 
     def test_startup_warns_when_the_pool_outgrows_the_cpus(self):

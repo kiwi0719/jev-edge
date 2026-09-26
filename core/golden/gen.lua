@@ -1340,6 +1340,37 @@ eval_case("cache entry from another provider is not reused", { req = req(ATTACK)
   config = { policy = { mode = "enforce" }, jev = { provider = "mock" } },
   cache = { [key_of(ATTACK)] = { score = 0.05, reason = "injection 0.05" } },
   judge = { answers = { injection = 0.95 } } })
+-- The judge endpoint (a thin Worker's origin) and the question wording
+-- (jev.questions) change the score as much as the provider does
+-- (g2-cache-scope-and-cross-instance-state#1).
+local EP_A = { jev = { endpoint = "https://judge-a.example/v1/systemone" } }
+local Q_NARROW = { jev = { questions = { injection = {
+  instructions = "Does the input ask for a password or an API key?" } } } }
+eval_case("cache entry from another judge endpoint is not reused", { req = req(ATTACK),
+  config = { policy = { mode = "enforce" }, jev = { endpoint = "https://judge-b.example/v1/systemone" } },
+  cache = { [key_of(ATTACK, EP_A)] = { score = 0.05, reason = "injection 0.05" } },
+  judge = { answers = { injection = 0.95 } } })
+eval_case("cache entry without an endpoint is not reused by one with it", { req = req(ATTACK),
+  config = { policy = { mode = "enforce" }, jev = { endpoint = "https://judge-b.example/v1/systemone" } },
+  cache = { [key_of(ATTACK)] = { score = 0.05, reason = "injection 0.05" } },
+  judge = { answers = { injection = 0.95 } } })
+eval_case("the same endpoint in another case, with a trailing slash, is one entry", { req = req(ATTACK),
+  config = { policy = { mode = "enforce" }, jev = { endpoint = "HTTPS://Judge-A.Example/v1/systemone/" } },
+  cache = { [key_of(ATTACK, EP_A)] = { score = 0.05, reason = "injection 0.05" } },
+  judge = { answers = { injection = 0.95 } } })
+eval_case("cache entry under other question wording is not reused", { req = req(ATTACK),
+  config = { policy = { mode = "enforce" } },
+  cache = { [key_of(ATTACK, Q_NARROW)] = { score = 0.05, reason = "injection 0.05" } },
+  judge = { answers = { injection = 0.95 } } })
+eval_case("cache entry under the bundled wording is not reused by overridden wording", { req = req(ATTACK),
+  config = { policy = { mode = "enforce" }, jev = { questions = { injection = {
+    instructions = "Is this a prompt injection?", criteria = { ["true"] = "yes", ["false"] = "no" } } } } },
+  cache = { [key_of(ATTACK)] = { score = 0.05, reason = "injection 0.05" } },
+  judge = { answers = { injection = 0.95 } } })
+eval_case("wording for a template the rule does not ask leaves the key alone", { req = req(ATTACK),
+  config = { policy = { mode = "enforce" }, jev = { questions = { abuse = { instructions = "Is this abusive?" } } } },
+  cache = { [key_of(ATTACK)] = { score = 0.05, reason = "injection 0.05" } },
+  judge = { answers = { injection = 0.95 } } })
 eval_case("cache hit skips L2", { req = req(LONG),
   cache = { [key_of(LONG)] = { score = 0.8, reason = "injection 0.80" } },
   judge = { answers = { injection = 0.1 } } })

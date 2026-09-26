@@ -118,10 +118,61 @@ async function settle(ctx: Ctx, failed = false, answered = false): Promise<void>
   else if (b.release) await b.release();
 }
 
+// Lua's string.lower: ASCII letters only.
+const asciiLower = (s: string): string => s.replace(/[A-Z]+/g, (c) => c.toLowerCase());
+
+// Port of scope_endpoint in core/init.lua: scheme and host lowercased,
+// trailing slashes dropped, the rest byte for byte.
+function scopeEndpoint(e: unknown): string {
+  let s = String(e);
+  const m = /^([A-Za-z][A-Za-z0-9+.-]*:\/\/)([^/?#]*)([\s\S]*)$/.exec(s);
+  if (m) {
+    let auth = m[2];
+    const at = auth.lastIndexOf("@");
+    auth = at >= 0 ? auth.slice(0, at + 1) + asciiLower(auth.slice(at + 1)) : asciiLower(auth);
+    s = asciiLower(m[1]) + auth + m[3];
+  }
+  return s.replace(/\/+$/, "");
+}
+
+const byteOrder = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
+
+// Port of canon in core/init.lua: a jev.questions value in one spelling, a
+// table's keys sorted (a list's keys are 1, 2, ... as in Lua).
+function canon(v: unknown): string {
+  if (typeof v !== "object" || v === null) return String(v);
+  const entries: [string, unknown][] = Array.isArray(v)
+    ? v.map((x, i) => [String(i + 1), x] as [string, unknown])
+    : Object.entries(v as Record<string, unknown>);
+  entries.sort((a, b) => byteOrder(a[0], b[0]));
+  return "{" + entries.map(([k, x]) => k + "=" + canon(x)).join(",") + "}";
+}
+
+// Port of scope_questions in core/init.lua: the wording a provider reads for
+// these templates, hashed; undefined when none is overridden.
+const WORDING = ["instructions", "criteria", "instructions_ctx", "criteria_ctx"] as const;
+function scopeQuestions(qs: unknown, templates: string[], hash: (s: string) => string): string | undefined {
+  if (typeof qs !== "object" || qs === null) return undefined;
+  // a whole request's entry names its parts ("injection,abuse", "+untrusted")
+  const names = [...new Set(templates.flatMap((t) => String(t).match(/[^,+]+/g) ?? []))].sort(byteOrder);
+  const lines: string[] = [];
+  for (const n of names) {
+    const q = (qs as Record<string, unknown>)[n];
+    if (typeof q !== "object" || q === null) continue;
+    for (const k of WORDING) {
+      const v = (q as Record<string, unknown>)[k];
+      if (v !== undefined && v !== null) lines.push(`${n}.${k}=${canon(v)}`);
+    }
+  }
+  return lines.length ? String(hash(lines.join("\n"))) : undefined;
+}
+
 /** Port of core.cache_key: the verdict-cache key for a fingerprint judged under
  *  `rule`. A score is only valid for the prompt that produced it, so the key is
- *  scoped to the rule's templates and deployment context and to the provider
- *  and model; trust stays keyed by fingerprint alone. */
+ *  scoped to the rule's templates and deployment context, to the provider and
+ *  model, and, when set, to the judge endpoint (a thin Worker's origin) and
+ *  the question wording (jev.questions); trust stays keyed by fingerprint
+ *  alone. */
 export function cacheKey(
   fp: string, rule: Rule | undefined, cfg: Config, hash: (s: string) => string,
   over?: { templates?: string[]; deployment?: string },
@@ -129,14 +180,17 @@ export function cacheKey(
   const jev = cfg?.jev ?? {};
   const templates = over?.templates ?? rule?.templates ?? [];
   const deployment = over?.deployment ?? rule?.deployment_context ?? jev.deployment_context ?? "";
-  const scope = [
+  const fields = [
     String(rule?.id ?? ""),
     templates.join(","),
     String(deployment),
     String(jev.provider ?? ""),
     String(jev.model ?? ""),
-  ].join("\n");
-  return "fp:" + String(hash(scope)).slice(0, 16) + ":" + fp;
+  ];
+  if (typeof jev.endpoint === "string" && jev.endpoint !== "") fields.push("endpoint=" + scopeEndpoint(jev.endpoint));
+  const q = scopeQuestions(jev.questions, templates, hash);
+  if (q !== undefined) fields.push("questions=" + q);
+  return "fp:" + String(hash(fields.join("\n"))).slice(0, 16) + ":" + fp;
 }
 
 // Port of UNTRUSTED_SEP and TOOLS_SEP in core/init.lua: what the request's

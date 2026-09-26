@@ -92,12 +92,69 @@ local function settle(ctx, failed, answered)
   elseif b.release then b:release() end
 end
 
+-- The judge endpoint as the cache scope names it: scheme and host
+-- lowercased (they are case-insensitive), trailing slashes dropped; the rest
+-- byte for byte.
+local function scope_endpoint(e)
+  e = tostring(e)
+  local scheme, auth, rest = e:match("^(%a[%w+.%-]*://)([^/?#]*)(.*)$")
+  if scheme then
+    local user, host = auth:match("^(.*@)([^@]*)$")
+    if user then auth = user .. host:lower() else auth = auth:lower() end
+    e = scheme:lower() .. auth .. rest
+  end
+  return (e:gsub("/+$", ""))
+end
+
+-- A value of jev.questions in a canonical spelling: a table as its keys
+-- sorted, each key=value, nested the same way (a list's keys are 1, 2, ...).
+local function canon(v)
+  if type(v) ~= "table" then return tostring(v) end
+  local keys = {}
+  for k in pairs(v) do keys[#keys + 1] = tostring(k) end
+  table.sort(keys)
+  local byname = {}
+  for k, x in pairs(v) do byname[tostring(k)] = x end
+  local out = {}
+  for i, k in ipairs(keys) do out[i] = k .. "=" .. canon(byname[k]) end
+  return "{" .. table.concat(out, ",") .. "}"
+end
+
+-- The question wording a provider reads for these templates
+-- (providers/jev.lua: only these fields); nil when none is overridden.
+local WORDING = { "instructions", "criteria", "instructions_ctx", "criteria_ctx" }
+local function scope_questions(qs, templates, hash)
+  if type(qs) ~= "table" then return nil end
+  -- a whole request's entry names its parts ("injection,abuse", "+untrusted")
+  local names, seen = {}, {}
+  for _, t in ipairs(templates) do
+    for n in tostring(t):gmatch("[^,+]+") do
+      if not seen[n] then seen[n] = true; names[#names + 1] = n end
+    end
+  end
+  table.sort(names)
+  local lines = {}
+  for _, n in ipairs(names) do
+    local q = qs[n]
+    if type(q) == "table" then
+      for _, k in ipairs(WORDING) do
+        if q[k] ~= nil then lines[#lines + 1] = n .. "." .. k .. "=" .. canon(q[k]) end
+      end
+    end
+  end
+  if #lines == 0 then return nil end
+  return tostring(hash(table.concat(lines, "\n")))
+end
+
 --- Verdict-cache key for a fingerprint judged under `rule`.
 -- A score is only valid for the prompt that produced it: the same text judged
--- with another rule's templates or deployment context, or by another
--- provider or model, may score differently, so each gets its own entry
--- (a lenient tenant's SAFE must not be replayed on a strict one). Trust
--- stays keyed by fingerprint alone: an operator vouches for the text.
+-- with another rule's templates or deployment context, by another provider,
+-- model or endpoint (a thin Worker's origin is its endpoint), or with other
+-- question wording (jev.questions), may score differently, so each gets its
+-- own entry (a lenient tenant's SAFE must not be replayed on a strict one).
+-- The endpoint and the wording join the scope only when set, so the keys of
+-- a config without them stay as they were. Trust stays keyed by fingerprint
+-- alone: an operator vouches for the text.
 -- @param fp   fingerprint (non-empty)
 -- @param rule the rule L1 matched
 -- @param cfg  merged config
@@ -109,14 +166,19 @@ function _M.cache_key(fp, rule, cfg, hash, over)
   local templates = over and over.templates or (rule and rule.templates) or {}
   local deployment = over and over.deployment
   if deployment == nil then deployment = rule and rule.deployment_context or jev.deployment_context or "" end
-  local scope = table.concat({
+  local fields = {
     tostring(rule and rule.id or ""),
     table.concat(templates, ","),
     tostring(deployment),
     tostring(jev.provider or ""),
     tostring(jev.model or ""),
-  }, "\n")
-  return "fp:" .. tostring(hash(scope)):sub(1, 16) .. ":" .. fp
+  }
+  if type(jev.endpoint) == "string" and jev.endpoint ~= "" then
+    fields[#fields + 1] = "endpoint=" .. scope_endpoint(jev.endpoint)
+  end
+  local q = scope_questions(jev.questions, templates, hash)
+  if q then fields[#fields + 1] = "questions=" .. q end
+  return "fp:" .. tostring(hash(table.concat(fields, "\n"))):sub(1, 16) .. ":" .. fp
 end
 
 -- Joins the whole text, the retrieved content and the tool definitions into

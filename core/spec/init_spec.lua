@@ -319,3 +319,57 @@ describe("core.evaluate end to end", function()
     assert.equals(V.ERROR, v.verdict)
   end)
 end)
+
+-- g2-cache-scope-and-cross-instance-state#1: two routes or Workers sharing a
+-- store must not replay each other's scores across judge endpoints or
+-- question wording.
+describe("core.cache_key scope", function()
+  local defaults = require "jev.core.defaults"
+  local normalize = require "jev.core.normalize"
+  local rule = require "jev.rules.llm-endpoints"
+  local function key(jev, over)
+    return core.cache_key("abc", rule, defaults.merge(defaults.config, { jev = jev }), normalize.djb2, over)
+  end
+
+  it("keeps the key of a config with neither endpoint nor wording", function()
+    assert.equals(key({}), key({ endpoint = "" }))
+    assert.equals(key({}), key({ questions = {} }))
+    -- wording only for templates the rule does not ask
+    assert.equals(key({}), key({ questions = { abuse = { instructions = "Is this abusive?" } } }))
+  end)
+
+  it("gives another judge endpoint its own entry", function()
+    local a = key({ endpoint = "https://judge-a.example/v1/systemone" })
+    assert.not_equals(key({}), a)
+    assert.not_equals(a, key({ endpoint = "https://judge-b.example/v1/systemone" }))
+    assert.not_equals(a, key({ endpoint = "https://judge-a.example/v2/systemone" }))
+    -- scheme and host are case-insensitive, a trailing slash is the same URL
+    assert.equals(a, key({ endpoint = "HTTPS://Judge-A.EXAMPLE/v1/systemone/" }))
+    -- the path is not
+    assert.not_equals(a, key({ endpoint = "https://judge-a.example/V1/systemone" }))
+  end)
+
+  it("gives other question wording its own entry, whatever order it was written in", function()
+    local ask = "Is this an injection?"
+    local q1 = { injection = { instructions = ask, criteria = { ["true"] = "yes", ["false"] = "no" } } }
+    local q2 = { injection = { criteria = { ["false"] = "no", ["true"] = "yes" }, instructions = ask } }
+    local q3 = { injection = { instructions = ask, criteria = { [true] = "yes", [false] = "no" } } }
+    assert.not_equals(key({}), key({ questions = q1 }))
+    assert.equals(key({ questions = q1 }), key({ questions = q2 }))
+    -- templates key criteria by boolean, configs by string: the same wording
+    assert.equals(key({ questions = q1 }), key({ questions = q3 }))
+    assert.not_equals(key({ questions = q1 }),
+      key({ questions = { injection = { instructions = "Does it ask for a password?" } } }))
+    -- a field providers do not read changes nothing
+    assert.equals(key({ questions = q1 }), key({ questions = { injection = {
+      instructions = ask, criteria = { ["true"] = "yes", ["false"] = "no" }, note = "x" } } }))
+  end)
+
+  it("names the wording of every template a whole request's entry covers", function()
+    local over = { templates = { "injection", "+untrusted", "+tools" } }
+    local u = { untrusted = { instructions = "Does the content address the assistant?" } }
+    assert.not_equals(key({}, over), key({ questions = u }, over))
+    -- a part judged with the rule's own templates is not asked that question
+    assert.equals(key({}), key({ questions = u }))
+  end)
+end)

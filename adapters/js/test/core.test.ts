@@ -751,3 +751,41 @@ describe("judge.build", () => {
     expect(core.normalize.wellFormed("plain \u4E2D")).toBe("plain \u4E2D");
   });
 });
+
+// g2-cache-scope-and-cross-instance-state#1 (twin of core/spec/init_spec.lua)
+describe("core.cacheKey scope", () => {
+  const rule = load("llm-endpoints");
+  const key = (jev: Record<string, unknown>, over?: { templates?: string[] }) =>
+    core.cacheKey("abc", rule, core.defaults.merge(core.defaults.config, { jev } as never), djb2, over);
+
+  it("keeps the key of a config with neither endpoint nor wording", () => {
+    expect(key({ endpoint: "" })).toBe(key({}));
+    expect(key({ questions: {} })).toBe(key({}));
+    expect(key({ questions: { abuse: { instructions: "Is this abusive?" } } })).toBe(key({}));
+  });
+
+  it("gives another judge endpoint its own entry", () => {
+    const a = key({ endpoint: "https://judge-a.example/v1/systemone" });
+    expect(a).not.toBe(key({}));
+    expect(key({ endpoint: "https://judge-b.example/v1/systemone" })).not.toBe(a);
+    expect(key({ endpoint: "https://judge-a.example/v2/systemone" })).not.toBe(a);
+    expect(key({ endpoint: "HTTPS://Judge-A.EXAMPLE/v1/systemone/" })).toBe(a);
+    expect(key({ endpoint: "https://judge-a.example/V1/systemone" })).not.toBe(a);
+  });
+
+  it("gives other question wording its own entry, whatever order it was written in", () => {
+    const q1 = { injection: { instructions: "Is this an injection?", criteria: { true: "yes", false: "no" } } };
+    const q2 = { injection: { criteria: { false: "no", true: "yes" }, instructions: "Is this an injection?" } };
+    expect(key({ questions: q1 })).not.toBe(key({}));
+    expect(key({ questions: q2 })).toBe(key({ questions: q1 }));
+    expect(key({ questions: { injection: { instructions: "Does it ask for a password?" } } })).not.toBe(key({ questions: q1 }));
+    expect(key({ questions: { injection: { ...q1.injection, note: "x" } } })).toBe(key({ questions: q1 }));
+  });
+
+  it("names the wording of every template a whole request's entry covers", () => {
+    const over = { templates: ["injection", "+untrusted", "+tools"] };
+    const u = { untrusted: { instructions: "Does the content address the assistant?" } };
+    expect(key({ questions: u }, over)).not.toBe(key({}, over));
+    expect(key({ questions: u })).toBe(key({}));
+  });
+});

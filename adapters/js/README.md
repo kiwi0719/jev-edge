@@ -36,7 +36,7 @@ export default thinWorker({ config: { policy: { mode: "enforce" } } });
 JEV_ORIGIN = "https://gateway.example.com"   # the jev-edge you already run
 ```
 
-Per request the Worker runs L1 (watch paths, method, content type, body size, `always_suspect` patterns, reputation) and checks its fingerprint cache. Only requests that would reach L2 are sent to the origin's `/_jev/authz/<path>` with the body and `X-Forwarded-For`, exactly as Envoy sends them. A 403 from the origin is a block at the edge; `X-Jev-Verdict: error` from the origin fails open. Set `upstream` when the app is not behind the same host as the gateway; bind `JEV_CACHE` (KV) to share the cache across isolates. [wrangler.thin.toml](wrangler.thin.toml), [examples/thin.ts](examples/thin.ts).
+Per request the Worker runs L1 (watch paths, method, content type, body size, `always_suspect` patterns, reputation) and checks its fingerprint cache. Only requests that would reach L2 are sent to the origin's `/_jev/authz/<path>` with the body and `X-Forwarded-For`, exactly as Envoy sends them. A block from the origin, any 4xx carrying `X-Jev-Verdict` (so a `policy.block_status` of 429 or 451 too), is a block at the edge whatever the Worker's own thresholds, and is cached as one; a 4xx without `X-Jev-Verdict` is not jev-edge's answer and fails open. So does a 200 the origin did not judge (`X-Jev-Verdict: skipped` while its breaker is open, `error`, or no `X-Jev-*` at all), which is never cached at the edge and does not count against the Worker's breaker. Set `upstream` when the app is not behind the same host as the gateway; bind `JEV_CACHE` (KV) to share the cache across isolates. [wrangler.thin.toml](wrangler.thin.toml), [examples/thin.ts](examples/thin.ts).
 
 ### Full Worker
 
@@ -114,7 +114,7 @@ app.use("/v1/*", honoMiddleware({ config: { … } }));
 app.post("/v1/chat/completions", (c) => c.json({ verdict: c.get("jev") }));
 ```
 
-`c.req.raw` is replaced with the request carrying the verdict's `X-Jev-*` (client-supplied ones removed), and the same headers are set on the response.
+`c.req.raw` is replaced with the request carrying the verdict's `X-Jev-*` (client-supplied ones removed), on a middleware error too, where they say `error` / `adapter`. A body an earlier middleware already read with `c.req.json()` or `c.req.text()` is judged from Hono's cached copy. The response gets `X-Jev-Request-Id` only: the verdict, score, reason, source and subject stay with the handlers and the log.
 
 ## AWS Lambda@Edge
 

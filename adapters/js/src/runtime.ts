@@ -15,12 +15,13 @@ import { shouldSample, buildSample, type Sample } from "./sampling.js";
 import * as subjectMod from "./core/subject.js";
 import { load as loadProvider, type Provider, type ProviderRequestInfo } from "./providers/index.js";
 import {
-  kvStore, memoryStore, durableStore, durableBreaker, durableAdaptive, isStateTarget, stateStub,
-  type KVLike, type StateTarget,
+  kvStore, memoryStore, durableStore, durableBreaker, durableAdaptive, durableRequest, durableSubjectStore, isStateTarget,
+  isNamespace, isNamed, stateStub,
+  type KVLike, type StateTarget, type SubjectSession,
 } from "./cf/stores.js";
-import { Adaptive, type AdaptiveLike } from "./cf/adaptive.js";
+import { Adaptive, tuning, type AdaptiveLike } from "./cf/adaptive.js";
 import type { Store, BreakerLike } from "./core/breaker.js";
-import { bestEffortStore, bestEffortBreaker, bestEffortAdaptive } from "./besteffort.js";
+import { bestEffortStore, bestEffortBreaker, bestEffortAdaptive, bestEffortRead } from "./besteffort.js";
 
 type DeepPartial<T> = { [K in keyof T]?: T[K] extends object ? DeepPartial<T[K]> : T[K] };
 
@@ -31,14 +32,16 @@ export interface Options {
   rules?: RuleSpec[];
   /** Overrides config.jev.provider with an instance. */
   provider?: Provider;
-  /** KV namespace for the fingerprint / reputation cache. Memory (per isolate) if absent. The JevState
-   *  Durable Object (namespace, `{ namespace, name }` or stub, as for `state`) is taken too, as
+  /** KV namespace for the fingerprint / reputation cache. Memory (per isolate, the 20000 most recently used
+   *  entries) if absent. The JevState Durable Object (namespace, `{ namespace, name }` or stub, as for `state`) is taken too, as
    *  durableStore: one object for every lookup, and entries kept until overwritten. */
   cache?: KVLike | StateTarget | Store;
   /** Breaker + adaptive timeout state: the JevState Durable Object namespace (env.JEV_STATE), the namespace
    *  and an object name (`{ namespace: env.JEV_STATE, name: "staging" }`), a stub, or any Store. Memory (per
-   *  isolate) if absent. With the Durable Object the breaker and adaptive read-modify-write run inside it,
-   *  one fetch per operation.
+   *  isolate) if absent. With the Durable Object the breaker and adaptive read-modify-write run inside it:
+   *  a judged request makes one fetch before the judge (allow and timeout) and one after (the samples and
+   *  the breaker's record, through waitUntil when the host has it). A failed read before the judge is the
+   *  breaker closed and the timeout floor, never a fail-open (besteffort.ts).
    *  Pass the namespace: the runtime makes a stub per operation (`idFromName("jev-edge")`, or the name
    *  given), so it can be kept at module scope. workerd binds a stub to the request that created it; a
    *  runtime kept across requests with a stub logs that once per stub and isolate, and from then on keeps
@@ -47,9 +50,15 @@ export interface Options {
    *  with a `namespace` key and no `get` for `{ namespace, name }`, so a Store must have no `fetch` and not
    *  both idFromName and get. */
   state?: StateTarget | Store;
-  /** Store for per-subject trajectories: KV, the JevState Durable Object (namespace, `{ namespace, name }`
-   *  or stub, as for `state`; its incr is atomic) or any Store. Memory (per isolate) if absent. Only used
-   *  with config.subject.enabled. */
+  /** Store for per-subject trajectories and reputation: KV, the JevState Durable Object or any Store. Memory
+   *  (per isolate, the 50000 most recently used entries) if absent; the Cloudflare presets pass their Durable
+   *  Object when config.subject.reputation is on. Only used with config.subject.enabled. The JevState
+   *  namespace (or `{ namespace, name }`) keeps each subject in an object of its own (durableSubjectStore:
+   *  `jev-subject:<id>`, atomic and consistent everywhere), and a judged request makes one hop to it before
+   *  the judge (trajectory and reputation read together) and one or two after (the points, and the
+   *  trajectory entry through waitUntil when the host has it); a failed read there judges without them. A
+   *  stub keeps every subject in that one object. KV loses concurrent increments, so reputation counted
+   *  there is best effort (logged once). */
   subjectStore?: KVLike | StateTarget | Store;
   /** Header carrying the client IP, set by a proxy you trust to overwrite it.
    *  Default: cf-connecting-ip on Cloudflare (a preset, or a request with the
@@ -61,8 +70,9 @@ export interface Options {
   onVerdict?: (v: core.Verdict, req: Request) => void;
   /** Receives sampled decisions (normalized text, fingerprint, score, verdict) when config.sampling.enabled; storage is yours. */
   onSample?: (s: Sample, req: Request) => void;
-  /** Serve GET /_jev/health from the Worker (default true). */
-  health?: boolean;
+  /** Serve GET /_jev/health (default true): `{ ok, adapter, core }`. "details" adds provider, model, mode and
+   *  endpoint (the thin Worker's origin), which any caller can read; false leaves the path to the app. */
+  health?: boolean | "details";
   /** Set by the Cloudflare presets. Only then is `cf-ray` trusted as the request id; elsewhere it is a client header like any other. */
   platform?: "cloudflare";
 }
@@ -76,6 +86,16 @@ export interface Runtime {
   subjectStore: Store;
   breaker: BreakerLike;
   adaptive: AdaptiveLike;
+  /** With `state` a JevState: the breaker and adaptive one judged request
+   *  uses, one hop to the object before the judge and one after it (the
+   *  second through waitUntil when the host has it). Absent otherwise, and a
+   *  request uses `breaker` and `adaptive`. */
+  perRequest?: (rctx?: RequestCtx) => { breaker: BreakerLike; adaptive: AdaptiveLike };
+  /** With `subjectStore` the JevState namespace: one subject's trajectory and
+   *  the reputation keys a judged request reads, in one hop to its object
+   *  (durableSubjectStore); null when that read failed, logged once per
+   *  outage. Absent otherwise, and a request reads `subjectStore` per key. */
+  subjectSession?: (id: string) => Promise<SubjectSession | null>;
   opts: Options;
 }
 
@@ -94,11 +114,41 @@ function isKV(x: unknown): x is KVLike {
  * and would pass for KV; a namespace has `get` and would pass for a Store,
  * and fail on every request.
  */
-function storeOption(x: KVLike | StateTarget | Store | undefined, clock: () => number): Store {
+function storeOption(x: KVLike | StateTarget | Store | undefined, clock: () => number, maxEntries: number): Store {
   if (isStateTarget(x)) return durableStore(x);
   if (isKV(x)) return kvStore(x);
-  return (x as Store | undefined) ?? memoryStore(clock);
+  return (x as Store | undefined) ?? memoryStore(clock, { maxEntries });
 }
+
+/** Caps of the default memory stores (least recently used out past them):
+ *  one cache entry per judged text, and a subject's ring takes max_entries
+ *  + 1 keys. `state` has none, so breaker and adaptive keys stay. */
+const MEMORY_CACHE_ENTRIES = 20000;
+const MEMORY_SUBJECT_ENTRIES = 50000;
+
+const warnedKv = new WeakSet<object>();
+
+/**
+ * Subject reputation counts with the store's incr. KV has none: kvStore's
+ * incr is a get and a put, a put takes seconds to land and KV takes about one
+ * write a second per key, so concurrent increments for one subject are mostly
+ * lost (19 of 20 in a live test) and block_at may never be reached. Warned
+ * once per KV binding in each isolate, not refused: such a config keeps
+ * working as it did, best effort.
+ */
+function warnKvReputation(config: core.Config, store: unknown): void {
+  const s = config.subject;
+  if (!s?.enabled || !(Number(s.reputation?.block_at) > 0)) return;
+  if (isStateTarget(store) || !isKV(store) || warnedKv.has(store)) return;
+  warnedKv.add(store);
+  console.warn(
+    "jev-edge: subject.reputation with a KV subjectStore is best effort, not enforcement: KV has no atomic " +
+    "increment (a get and a put, about one write a second per key), so concurrent increments for one subject " +
+    "are lost and block_at may never be reached. Pass subjectStore: env.JEV_STATE (the JevState Durable " +
+    "Object), whose increment is atomic.",
+  );
+}
+
 export function createRuntime(opts: Options): Runtime {
   const config = core.defaults.merge(core.defaults.config, opts.config ?? {});
   const [ok, err] = core.defaults.validate(config);
@@ -106,34 +156,81 @@ export function createRuntime(opts: Options): Runtime {
   const rules = ((opts.rules ?? config.rules) as RuleSpec[]).map(resolveRule);
   const provider = opts.provider ?? loadProvider(config.jev.provider ?? "jev");
   const clock = () => Date.now() / 1000;
-  const cache = storeOption(opts.cache, clock);
-  const subjectStore = storeOption(opts.subjectStore, clock);
+  const cache = storeOption(opts.cache, clock, MEMORY_CACHE_ENTRIES);
+  // reads that fail (besteffort.ts) are logged once per outage, per runtime
+  const failing = new Set<string>();
+  // the JevState namespace: an object per subject, not the one every
+  // isolate's breaker already queues on
+  const subjects = isNamespace(opts.subjectStore) || isNamed(opts.subjectStore) ? durableSubjectStore(opts.subjectStore) : undefined;
+  const subjectStore = subjects ?? storeOption(opts.subjectStore, clock, MEMORY_SUBJECT_ENTRIES);
+  warnKvReputation(config, opts.subjectStore);
+  let subjectSession: Runtime["subjectSession"];
+  if (subjects) {
+    const scfg = config.subject;
+    subjectSession = (id) =>
+      bestEffortRead<SubjectSession | null>(
+        failing, "subject read",
+        () => subjects.session(id, { max: scfg.max_entries, ttl: scfg.history_ttl ?? 3600, keys: reputationKeys(config, id, clock()) }),
+        null, "no subject history and reputation read per key",
+      );
+  }
   let state: Store;
   let breaker: BreakerLike;
   let adaptive: AdaptiveLike;
+  const floor = tuning(config.jev).floor;
+  let perRequest: Runtime["perRequest"];
   if (isStateTarget(opts.state)) {
-    // One hop per operation: the Durable Object runs the same Breaker and
-    // Adaptive classes against its own storage, so the read-modify-write is
-    // atomic there instead of three or four round trips from here. The stub
-    // is made per call from a namespace (and name); a stub given as is is
-    // guarded against use past its request (cf/stores.ts), one guard for all
-    // three.
+    // The Durable Object runs the same Breaker and Adaptive classes against
+    // its own storage, so each read-modify-write is atomic there instead of
+    // three or four round trips from here: one hop per operation, and two
+    // per judged request (durableRequest). The stub is made per call from a
+    // namespace (and name); a stub given as is is guarded against use past
+    // its request (cf/stores.ts), one guard for all of them.
     const stub = stateStub(opts.state);
     state = durableStore(stub);
     breaker = durableBreaker(stub, config.breaker);
     adaptive = durableAdaptive(stub, config.jev);
+    const session = durableRequest(stub, config.breaker, config.jev);
+    perRequest = (rctx) => {
+      const s = session();
+      const defer = rctx?.waitUntil
+        ? (p: Promise<void>): boolean => {
+            try {
+              rctx.waitUntil!(p);
+              return true;
+            } catch {
+              return false; // a host that refuses it: awaited instead
+            }
+          }
+        : undefined;
+      return { breaker: bestEffortBreaker(s.breaker, { failing, defer }), adaptive: bestEffortAdaptive(s.adaptive, { failing, floor }) };
+    };
   } else {
     state = (opts.state as Store | undefined) ?? memoryStore(clock);
     breaker = new core.breaker.Breaker(state, clock, config.breaker);
     adaptive = new Adaptive(state, config.jev);
   }
   return {
-    config, rules, provider, state, opts,
+    config, rules, provider, state, opts, perRequest, subjectSession,
     cache: bestEffortStore(cache, "cache"),
     subjectStore: bestEffortStore(subjectStore, "subject store"),
-    breaker: bestEffortBreaker(breaker),
-    adaptive: bestEffortAdaptive(adaptive),
+    breaker: bestEffortBreaker(breaker, { failing }),
+    adaptive: bestEffortAdaptive(adaptive, { failing, floor }),
   };
+}
+
+/**
+ * The reputation keys a judged request reads (core/subject.ts): the block
+ * (repBlocked, at L1) and the previous window's points (repRecord). Loaded
+ * with the trajectory, so neither costs a hop of its own; a key named here
+ * that core does not read, or one it reads that is not here, only costs or
+ * saves a read.
+ */
+function reputationKeys(config: core.Config, id: string, now: number): string[] {
+  const r = config.subject?.reputation;
+  if (!r || !(Number(r.block_at) > 0)) return [];
+  const k = subjectMod.REP_PREFIX + id;
+  return [k + ":until", k + ":b:" + (Math.floor(now / (r.window_s ?? 600)) - 1)];
 }
 
 const HEADER_NAMES = ["X-Jev-Verdict", "X-Jev-Score", "X-Jev-Source", "X-Jev-Reason", "X-Jev-Request-Id"];
@@ -300,6 +397,8 @@ async function readReq(request: Request, rt: Runtime): Promise<[core.Req, Provid
             body = utf8.decode(d[0]);
             req.body_size = d[0].byteLength;
           }
+        } else {
+          warnDecoder(d[1], rt);
         }
       }
     } else if (whole) {
@@ -316,8 +415,27 @@ async function readReq(request: Request, rt: Runtime): Promise<[core.Req, Provid
   return [req, { method: request.method, path, headers: request.headers, body, clientIp }];
 }
 
+const decodersMissing = new Set<string>();
+
+/**
+ * A coding this runtime has no decoder for (decode.ts: br without node:zlib;
+ * gzip and deflate where DecompressionStream is missing or a stub, as on
+ * Next's edge runtime, and node:zlib too) makes every body sent in it
+ * unjudgeable, and the verdict's reason names only the coding. Said once per
+ * coding and isolate.
+ */
+function warnDecoder(reason: string, rt: Runtime): void {
+  if (!reason.includes("not available") || decodersMissing.has(reason) || decodersMissing.size >= 8) return;
+  decodersMissing.add(reason);
+  console.warn(
+    "jev-edge: " + reason + " on this runtime: request bodies sent with that Content-Encoding are unjudgeable, " +
+    "and policy.unjudgeable (" + (rt.config.policy.unjudgeable ?? "pass") + ") decides them. gzip and deflate need " +
+    "DecompressionStream or node:zlib, br needs node:zlib (Next.js: the Node runtime; Workers: nodejs_compat).",
+  );
+}
+
 /** Subject context for this request, or undefined: hashed id, one history read, a sink that writes without being awaited. */
-async function subjectCtx(rt: Runtime, request: Request, clientIp: string, rctx?: RequestCtx): Promise<subjectMod.SubjectCtx | undefined> {
+async function subjectCtx(rt: Runtime, request: Request, clientIp: string, candidate: boolean, rctx?: RequestCtx): Promise<subjectMod.SubjectCtx | undefined> {
   const scfg = rt.config.subject;
   if (!scfg?.enabled) return undefined;
   const raw = subjectMod.extract(scfg, {
@@ -327,6 +445,32 @@ async function subjectCtx(rt: Runtime, request: Request, clientIp: string, rctx?
   });
   const id = await subjectMod.hashId(scfg, raw, subjectMod.sha256Hex);
   if (!id) return undefined;
+  // On Workers the isolate may be torn down right after the response;
+  // waitUntil keeps the write alive. Elsewhere it is plain fire-and-forget.
+  const keep = (p: Promise<unknown>) => {
+    if (rctx?.waitUntil) {
+      try {
+        rctx.waitUntil(p);
+      } catch {
+        /* a host that refuses the promise still gets the fire-and-forget write */
+      }
+    }
+  };
+  if (rt.subjectSession) {
+    // The subject's own object: one hop for the trajectory and the reputation
+    // keys, and only for a request some rule would judge (any other passes L1
+    // on its path or method, and core records nothing for it).
+    const s = candidate ? await rt.subjectSession(id) : null;
+    return {
+      id,
+      history: s?.history ?? null,
+      store: s ? bestEffortStore(s.store, "subject store") : rt.subjectStore,
+      record: (e) => {
+        const write = s ? s.append(e) : subjectMod.appendHistory(rt.subjectStore, id, e, scfg.max_entries, scfg.history_ttl ?? 3600);
+        keep(write.catch(() => {}));
+      },
+    };
+  }
   const store = rt.subjectStore;
   return {
     id,
@@ -336,16 +480,7 @@ async function subjectCtx(rt: Runtime, request: Request, clientIp: string, rctx?
     // reputation counters (subject.reputation); atomic where the store has incr
     store,
     record: (e) => {
-      const p = subjectMod.appendHistory(store, id, e, scfg.max_entries, scfg.history_ttl ?? 3600).catch(() => {});
-      // On Workers the isolate may be torn down right after the response;
-      // waitUntil keeps the write alive. Elsewhere it is plain fire-and-forget.
-      if (rctx?.waitUntil) {
-        try {
-          rctx.waitUntil(p);
-        } catch {
-          /* a host that refuses the promise still gets the fire-and-forget write */
-        }
-      }
+      keep(subjectMod.appendHistory(store, id, e, scfg.max_entries, scfg.history_ttl ?? 3600).catch(() => {}));
     },
   };
 }
@@ -436,22 +571,23 @@ export async function evaluate(request: Request, rt: Runtime, rctx?: RequestCtx)
 
 async function evaluateInner(request: Request, rt: Runtime, requestId: string, rctx?: RequestCtx): Promise<Evaluation> {
   const [req, info] = await readReq(request, rt);
-  const subject = await subjectCtx(rt, request, info.clientIp, rctx);
+  const subject = await subjectCtx(rt, request, info.clientIp, isCandidate(rt, info.path, info.method), rctx);
   if (subject?.id) info.subjectId = subject.id;
+  const { breaker, adaptive } = rt.perRequest?.(rctx) ?? rt;
   const judgeOnce = async (prompt: core.Prompt): Promise<core.JudgeResult> => {
-    const timeoutMs = await rt.adaptive.current();
+    const timeoutMs = await adaptive.current();
     const t0 = Date.now();
     const r = await rt.provider.call(prompt, rt.config.jev, timeoutMs, info);
     const elapsed = Date.now() - t0;
-    if (r[0]) await rt.adaptive.success(elapsed);
-    else if (String(r[1]).includes("timeout")) await rt.adaptive.timeout(timeoutMs);
+    if (r[0]) await adaptive.success(elapsed);
+    else if (String(r[1]).includes("timeout")) await adaptive.timeout(timeoutMs);
     return r;
   };
   const ctx: core.Ctx = {
     config: rt.config,
     rules: rt.rules,
     cache: rt.cache,
-    breaker: rt.breaker,
+    breaker,
     subject,
     clock: () => Date.now() / 1000,
     // sha256, not djb2: the fingerprint keys the verdict cache and the trust
@@ -517,15 +653,86 @@ export function withVerdictHeaders(request: Request, verdict: core.Verdict, requ
   for (const [k, v] of Object.entries(core.verdict.headers(verdict))) headers.set(k, v);
   headers.set("X-Jev-Request-Id", requestId);
   if (subjectId) headers.set("X-Jev-Subject", subjectId);
+  // new Request(request) throws on a body something already read; the
+  // headers must still be stripped and set, so that copy goes without it
+  if (request.bodyUsed) return copyRequest(request, headers);
   return new Request(request, { headers });
 }
 
+/**
+ * `request`'s URL and method with these headers and, when given (and the
+ * method takes one), this body: for a request whose own body something
+ * already read, which `new Request(request)` refuses. The platform's `cf`
+ * object goes along where there is one (workerd takes it in the init), so
+ * the copy is still a Cloudflare request to clientIpOf and requestIdFor.
+ */
+export function copyRequest(request: Request, headers: HeadersInit, body?: BodyInit): Request {
+  const init: RequestInit = { method: request.method, headers };
+  if (body !== undefined && request.method !== "GET" && request.method !== "HEAD") init.body = body;
+  if ("cf" in request) (init as { cf?: unknown }).cf = (request as { cf?: unknown }).cf;
+  return new Request(request.url, init);
+}
+
+/**
+ * GET /_jev/health, on the traffic path and open to anyone: liveness and
+ * versions only. The provider, model, policy mode and endpoint (a thin
+ * Worker's origin URL, an internal judge address) tell a caller how to aim
+ * at the judge or where the origin is, so they come only with
+ * `health: "details"`.
+ */
 export function healthResponse(rt: Runtime): Response {
-  return Response.json({
-    ok: true, adapter: rt.opts.platform ?? "js", core: core.VERSION,
-    provider: rt.provider.name, model: rt.config.jev.model ?? null, mode: rt.config.policy.mode,
-    endpoint: rt.config.jev.endpoint ?? null,
-  });
+  const body: Record<string, unknown> = { ok: true, adapter: rt.opts.platform ?? "js", core: core.VERSION };
+  if (rt.opts.health === "details") {
+    Object.assign(body, {
+      provider: rt.provider.name, model: rt.config.jev.model ?? null, mode: rt.config.policy.mode,
+      endpoint: rt.config.jev.endpoint ?? null,
+    });
+  }
+  return Response.json(body);
+}
+
+/**
+ * The request to forward when the adapter failed: X-Jev-Verdict: error /
+ * X-Jev-Source: adapter, every client-supplied X-Jev-* gone. Never throws:
+ * when even that copy cannot be made, the request itself, its X-Jev-*
+ * deleted where its headers allow it.
+ */
+export function errorForward(request: Request): Request {
+  let rid: string;
+  try {
+    rid = crypto.randomUUID();
+  } catch {
+    rid = String(Date.now());
+  }
+  try {
+    return withVerdictHeaders(request, errorVerdict(), rid);
+  } catch {
+    /* the last resort below */
+  }
+  try {
+    for (const h of [...HEADER_NAMES, SUBJECT_HEADER]) request.headers.delete(h);
+  } catch {
+    /* immutable headers: forwarded as they came */
+  }
+  return request;
+}
+
+const buildFailures = new Set<string>();
+
+/**
+ * A host whose runtime cannot be built (a config createRuntime refuses, a
+ * preset missing its origin) fails open like any other adapter error:
+ * `next` gets the request with X-Jev-Verdict: error / X-Jev-Source: adapter.
+ * Each distinct error is logged once per isolate, not per request; a failed
+ * build is never cached, so the next request tries again.
+ */
+export function failOpen(request: Request, next: (req: Request) => Promise<Response>, err: unknown): Promise<Response> {
+  const key = err instanceof Error ? err.message : String(err);
+  if (!buildFailures.has(key) && buildFailures.size < 32) {
+    buildFailures.add(key);
+    console.error("jev-edge: cannot build the runtime, failing open (logged once): " + describe(err));
+  }
+  return next(errorForward(request));
 }
 
 /**
@@ -544,17 +751,7 @@ export async function handle(request: Request, rt: Runtime, next: (req: Request)
     forwarded = withVerdictHeaders(request, verdict, requestId, subjectId);
   } catch (e) {
     console.error("jev-edge: handle error, failing open: " + describe(e));
-    let rid = "";
-    try {
-      rid = crypto.randomUUID();
-    } catch {
-      rid = String(Date.now());
-    }
-    try {
-      forwarded = withVerdictHeaders(request, errorVerdict(), rid);
-    } catch {
-      forwarded = request;
-    }
+    forwarded = errorForward(request);
   }
   return next(forwarded);
 }

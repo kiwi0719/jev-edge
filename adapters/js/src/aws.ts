@@ -35,6 +35,17 @@ export interface CfResponse {
 
 const HEADER_NAMES = ["x-jev-verdict", "x-jev-score", "x-jev-source", "x-jev-reason", "x-jev-request-id", "x-jev-subject"];
 
+let warnedNoBody = false;
+
+/**
+ * The request to judge. Without "Include Body" on the trigger CloudFront
+ * sends no body but keeps Content-Length, and a request whose size says
+ * there is a body and whose text is empty reaches L1 as "no text". The
+ * judged request then drops Content-Length and Transfer-Encoding, so core
+ * gives it the header-only treatment ("no body", IP reputation still
+ * applies), and the first one in each execution environment is warned
+ * about. The request CloudFront forwards is untouched.
+ */
 function toRequest(cf: CfRequest): Request {
   const headers = new Headers();
   for (const [name, values] of Object.entries(cf.headers ?? {})) {
@@ -53,7 +64,19 @@ function toRequest(cf: CfRequest): Request {
     // runtime scans it as the head of a larger body instead of parsing it.
     truncated = cf.body.bodyTruncated === true || cf.body.inputTruncated === true;
   }
-  const request = new Request(url, { method: cf.method, headers, body: cf.method === "GET" || cf.method === "HEAD" ? undefined : body });
+  const bodyless = cf.method === "GET" || cf.method === "HEAD";
+  if (!bodyless && body === undefined) {
+    if (!warnedNoBody && Number(headers.get("content-length")) > 0) {
+      warnedNoBody = true;
+      console.warn(
+        "jev-edge: a " + cf.method + " with Content-Length " + headers.get("content-length") + " arrived without its body: " +
+        "Include Body is off on this trigger, so bodies are not judged (logged once)",
+      );
+    }
+    headers.delete("content-length");
+    headers.delete("transfer-encoding");
+  }
+  const request = new Request(url, { method: cf.method, headers, body: bodyless ? undefined : body });
   return truncated ? markTruncated(request) : request;
 }
 

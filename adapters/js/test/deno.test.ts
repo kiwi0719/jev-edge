@@ -156,7 +156,9 @@ describe("denoHandler", () => {
     captureUpstream();
     const res = await denoHandler({ upstream: UPSTREAM, config: mockConfig() })(new Request("https://edge.example/_jev/health"), PEER);
     expect(res.status).toBe(200);
-    expect(((await res.json()) as { ok: boolean }).ok).toBe(true);
+    const j = (await res.json()) as Record<string, unknown>;
+    expect(j.ok).toBe(true);
+    expect(j.mode).toBeUndefined(); // the details only with health: "details"
   });
 
   it("puts the subject ring in Deno KV when kv is given", async () => {
@@ -206,6 +208,30 @@ describe("denoHandler", () => {
 
   it("requires an upstream", () => {
     expect(() => denoHandler({ upstream: "" })).toThrow(/upstream/);
+  });
+
+  it("fails open to the upstream when the runtime cannot be built", async () => {
+    const seen = captureUpstream();
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const h = denoHandler({ upstream: UPSTREAM, config: mockConfig({ policy: { mode: "bogus" } }) });
+      for (let i = 0; i < 2; i++) {
+        const res = await h(chat(ATTACK, { "x-jev-verdict": "safe", "x-jev-subject": "header:x" }), PEER);
+        expect(res.status).toBe(200);
+      }
+      expect(seen).toHaveLength(2);
+      expect(seen[0].url).toBe(UPSTREAM + "/v1/chat/completions");
+      expect(seen[0].headers.get("x-jev-verdict")).toBe("error");
+      expect(seen[0].headers.get("x-jev-source")).toBe("adapter");
+      expect(seen[0].headers.get("x-jev-subject")).toBeNull();
+      expect(seen[0].redirect).toBe("manual");
+      expect(await seen[0].text()).toBe(ATTACK);
+      const msgs = error.mock.calls.map((c) => String(c[0]));
+      expect(msgs).toHaveLength(1); // once, not per request
+      expect(msgs[0]).toMatch(/cannot build the runtime, failing open.*mode/);
+    } finally {
+      error.mockRestore();
+    }
   });
 });
 

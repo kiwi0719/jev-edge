@@ -65,6 +65,19 @@ describe("handle", () => {
     expect(j.source).toBe("l1");
   });
 
+  it("strips client-supplied X-Jev-* from a request whose body was already read", async () => {
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const req = chat(ATTACK, { "x-jev-verdict": "safe", "x-jev-source": "l2", "x-jev-subject": "header:deadbeef" });
+      await req.text();
+      const seen = async (r: Request) => Response.json({ verdict: r.headers.get("x-jev-verdict"), source: r.headers.get("x-jev-source"), subject: r.headers.get("x-jev-subject") });
+      const j = (await (await handle(req, mockRt(), seen)).json()) as Record<string, string | null>;
+      expect(j).toEqual({ verdict: "error", source: "adapter", subject: null });
+    } finally {
+      err.mockRestore();
+    }
+  });
+
   it("only trusts cf-ray for the request id on Cloudflare", async () => {
     const rid = async (req: Request) => Response.json({ rid: req.headers.get("x-jev-request-id") });
     const plain = (await (await handle(chat(BENIGN, { "cf-ray": "forged-ray" }), mockRt(), rid)).json()) as { rid: string };
@@ -161,11 +174,35 @@ describe("handle", () => {
     expect(((await res.json()) as Record<string, string>).source).toBe("breaker");
   });
 
-  it("answers /_jev/health", async () => {
+  it("answers /_jev/health with ok, adapter and core only", async () => {
     const res = await handle(new Request("https://edge.example/_jev/health"), mockRt(), echo);
     const j = (await res.json()) as Record<string, unknown>;
-    expect(j.provider).toBe("mock");
-    expect(j.mode).toBe("enforce");
+    expect(Object.keys(j).sort()).toEqual(["adapter", "core", "ok"]);
+    expect(j.ok).toBe(true);
+  });
+
+  it("adds provider, model, mode and endpoint with health: \"details\"", async () => {
+    const rt = createRuntime({ config: { jev: { provider: "mock", model: "m1", timeout_ms: 400 }, policy: { mode: "enforce" } }, health: "details" });
+    const j = (await (await handle(new Request("https://edge.example/_jev/health"), rt, echo)).json()) as Record<string, unknown>;
+    expect(j).toMatchObject({ ok: true, provider: "mock", model: "m1", mode: "enforce", endpoint: null });
+  });
+
+  it("health: false leaves /_jev/health to the app", async () => {
+    const rt = createRuntime({ config: { jev: { provider: "mock", timeout_ms: 400 } }, health: false });
+    const j = (await (await handle(new Request("https://edge.example/_jev/health"), rt, echo)).json()) as Record<string, unknown>;
+    expect(j.source).toBe("l1"); // passed on, not answered
+  });
+
+  it("the thin Worker's health reply does not name its origin", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("origin")));
+    try {
+      const res = await thinWorker({ origin: "https://origin.internal.example" }).fetch(new Request("https://edge.example/_jev/health"), {});
+      const text = await res.text();
+      expect(text).not.toContain("origin.internal.example");
+      expect(JSON.parse(text)).toEqual({ ok: true, adapter: "cloudflare", core: expect.any(String) });
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it("rejects an invalid config at startup", () => {
@@ -223,11 +260,73 @@ describe("backend provider (thin Worker)", () => {
   });
 
   it("turns a 403 from the origin into a block at the edge", async () => {
-    stubAuthz(() => new Response('{"error":"request rejected"}', { status: 403, headers: { "X-Jev-Reason": "injection+0.95", "X-Jev-Score": "0.95" } }));
+    stubAuthz(() => new Response('{"error":"request rejected"}', { status: 403, headers: { "X-Jev-Verdict": "malicious", "X-Jev-Reason": "injection+0.95", "X-Jev-Score": "0.95" } }));
     const w = thinWorker({ origin: "https://origin.example", config: { policy: { mode: "enforce" } } });
     const res = await w.fetch(chat(ATTACK), {});
     expect(res.status).toBe(403);
-    expect(res.headers.get("x-jev-score")).toBe("0.95");
+    expect(res.headers.get("x-jev-verdict")).toBe("malicious");
+  });
+
+  it("answers 404 to the origin's /_jev/* endpoints, however the path is spelled, and fetches nothing", async () => {
+    const fetched: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: string | Request) => { fetched.push(String(input instanceof Request ? input.url : input)); return new Response("origin"); }));
+    const w = thinWorker({ origin: "https://origin.example", config: { policy: { mode: "enforce" } } });
+    const paths = ["/_jev/authz/v1/chat/completions", "/%5Fjev/authz/x", "/%5fJEV/authz/x", "//_jev/config", "/_jev/samples", "/_JEV/authz", "/_jev", "/x/%2e%2e/_jev/authz", "//_jev/health", "/_jev/health/"];
+    for (const path of paths) {
+      for (const method of ["POST", "GET"]) {
+        const req = new Request("https://edge.example" + path, { method, headers: { "x-forwarded-for": "203.0.113.7" }, body: method === "POST" ? BENIGN : undefined });
+        const res = await w.fetch(req, {});
+        expect({ path, method, status: res.status }).toEqual({ path, method, status: 404 });
+        expect(await res.json()).toEqual({ error: "not found" });
+      }
+    }
+    expect(fetched).toEqual([]);
+    const health = await w.fetch(new Request("https://edge.example/_jev/health"), {});
+    expect(health.status).toBe(200);
+    expect(await health.json()).toMatchObject({ ok: true });
+    expect(fetched).toEqual([]); // answered by the Worker, not the origin
+    // a path that only starts with the letters is an ordinary one
+    await w.fetch(new Request("https://edge.example/_jevx/y"), {});
+    expect(fetched).toEqual(["https://origin.example/_jevx/y"]);
+  });
+
+  it("blocks what the origin blocked below the Worker's threshold, and blocks the replay from its cache", async () => {
+    let authz = 0;
+    // the origin calibrated to block at 0.5; the Worker keeps the default 0.7
+    stubAuthz(() => {
+      authz++;
+      return new Response('{"error":"request rejected"}', { status: 403, headers: { "X-Jev-Verdict": "malicious", "X-Jev-Score": "0.60", "X-Jev-Reason": "injection+0.60" } });
+    });
+    const w = thinWorker({ origin: "https://origin.example", config: { policy: { mode: "enforce" } } });
+    const env = {};
+    expect((await w.fetch(chat(ATTACK), env)).status).toBe(403);
+    const replay = await w.fetch(chat(ATTACK), env);
+    expect(replay.status).toBe(403);
+    expect(replay.headers.get("x-jev-source")).toBe("cache");
+    expect(authz).toBe(1);
+  });
+
+  it("takes the origin's block_status: any 4xx that carries X-Jev-Verdict", async () => {
+    for (const status of [429, 451, 400]) {
+      stubAuthz(() => new Response('{"error":"request rejected"}', { status, headers: { "X-Jev-Verdict": "malicious", "X-Jev-Score": "0.95", "X-Jev-Reason": "injection+0.95" } }));
+      const w = thinWorker({ origin: "https://origin.example", config: { policy: { mode: "enforce" } } });
+      const res = await w.fetch(chat(ATTACK), {});
+      expect(res.status, String(status)).toBe(403);
+      expect(res.headers.get("x-jev-verdict")).toBe("malicious");
+    }
+  });
+
+  it("fails open on a 4xx from the origin without X-Jev-Verdict: not jev-edge's answer", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      stubAuthz(() => new Response("forbidden", { status: 403 }));
+      const w = thinWorker({ origin: "https://origin.example", config: { policy: { mode: "enforce" } } });
+      const res = await w.fetch(chat(ATTACK), {});
+      expect(res.status).toBe(200);
+      expect(((await res.json()) as Record<string, unknown>).verdict).toBe("error");
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("fails open when the origin reports an error", async () => {
@@ -235,6 +334,46 @@ describe("backend provider (thin Worker)", () => {
     const w = thinWorker({ origin: "https://origin.example" });
     const res = await w.fetch(chat(ATTACK), {});
     expect(((await res.json()) as Record<string, unknown>).verdict).toBe("error");
+  });
+
+  it("fails open, uncached, when the origin did not judge: its breaker open, or no X-Jev-* at all", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      let authz = 0;
+      let answer: () => Response = () => new Response(null, { status: 200, headers: { "X-Jev-Verdict": "skipped", "X-Jev-Score": "0.00", "X-Jev-Source": "breaker", "X-Jev-Reason": "breaker+open" } });
+      stubAuthz(() => { authz++; return answer(); });
+      const w = thinWorker({ origin: "https://origin.example", config: { policy: { mode: "enforce" } } });
+      const env = {};
+      for (let i = 0; i < 2; i++) {
+        const j = (await (await w.fetch(chat(ATTACK), env)).json()) as Record<string, unknown>;
+        expect(j.upstream).toBe(true);
+        expect(j.verdict).toBe("error"); // never "safe"
+      }
+      expect(authz).toBe(2); // nothing cached: the second one asked the origin again
+      // the origin recovered: the next request is judged there and blocked
+      answer = () => new Response('{"error":"request rejected"}', { status: 403, headers: { "X-Jev-Verdict": "malicious", "X-Jev-Score": "0.95", "X-Jev-Reason": "injection+0.95" } });
+      expect((await w.fetch(chat(ATTACK), env)).status).toBe(403);
+      // a catch-all that answers 200 with no X-Jev-*
+      answer = () => new Response("<html>app</html>", { status: 200 });
+      const j = (await (await w.fetch(chat(BENIGN), env)).json()) as Record<string, unknown>;
+      expect(j.verdict).toBe("error");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("an origin that did not judge does not count against the Worker's breaker", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      let authz = 0;
+      stubAuthz(() => { authz++; return new Response(null, { status: 200, headers: { "X-Jev-Verdict": "skipped", "X-Jev-Score": "0.00", "X-Jev-Reason": "breaker+open" } }); });
+      const rt = createRuntime({ config: { jev: { provider: "backend", endpoint: "https://origin.example" }, policy: { mode: "enforce" }, breaker: { min_samples: 1 } } });
+      for (let i = 0; i < 3; i++) await handle(chat(ATTACK.replace("print", "print " + i)), rt, echo);
+      expect(authz).toBe(3);
+      expect(await rt.breaker.state()).toBe(0);
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("reads the origin from env.JEV_ORIGIN", async () => {
@@ -274,6 +413,121 @@ describe("fullWorker and pagesMiddleware", () => {
       warn.mockRestore();
     }
     expect(fetched).toEqual([]);
+  });
+
+  it("the Worker presets fail open when the runtime cannot be built", async () => {
+    const fetched: Request[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: Request) => { fetched.push(input); return Response.json({ upstream: true }); }));
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const bogus = { config: { policy: { mode: "bogus" as never } } };
+    const forged = { "x-jev-verdict": "safe", "x-jev-source": "l2", "x-jev-subject": "header:x" };
+    const expectError = (r: Request) => {
+      expect(r.headers.get("x-jev-verdict")).toBe("error");
+      expect(r.headers.get("x-jev-source")).toBe("adapter");
+      expect(r.headers.get("x-jev-subject")).toBeNull();
+    };
+    try {
+      const full = fullWorker({ upstream: "https://app.internal", ...bogus });
+      expect((await full.fetch(chat(ATTACK, forged), {})).status).toBe(200);
+      expect(fetched[0].url).toBe("https://app.internal/v1/chat/completions");
+      expectError(fetched[0]);
+      expect(await fetched[0].text()).toBe(ATTACK);
+
+      const thin = thinWorker({ origin: "https://origin.example", ...bogus });
+      expect((await thin.fetch(chat(ATTACK, forged), {})).status).toBe(200);
+      expect(fetched[1].url).toBe("https://origin.example/v1/chat/completions");
+      expectError(fetched[1]);
+      // the origin's /_jev/* stay off limits on this path too
+      expect((await thin.fetch(chat(ATTACK, {}, "/_jev/authz/v1/chat/completions"), {})).status).toBe(404);
+      expect(fetched).toHaveLength(2);
+
+      // no origin at all: the upstream when there is one, else the request's own URL
+      expect((await thinWorker({ upstream: "https://app.internal" }).fetch(chat(ATTACK, forged), {})).status).toBe(200);
+      expect(fetched[2].url).toBe("https://app.internal/v1/chat/completions");
+      expectError(fetched[2]);
+      expect((await thinWorker().fetch(chat(ATTACK, forged), {})).status).toBe(200);
+      expect(fetched[3].url).toBe("https://edge.example/v1/chat/completions");
+      expectError(fetched[3]);
+
+      let nexted: Request | undefined;
+      const pages = pagesMiddleware(bogus);
+      const res = await pages({ request: chat(ATTACK, forged), env: {}, next: async (req) => { nexted = req; return new Response("app"); } });
+      expect(await res.text()).toBe("app");
+      expectError(nexted!);
+
+      const msgs = error.mock.calls.map((c) => String(c[0]));
+      expect(msgs.every((m) => m.includes("cannot build the runtime, failing open"))).toBe(true);
+      expect(msgs.filter((m) => m.includes("origin (or env.JEV_ORIGIN) is required"))).toHaveLength(1); // logged once
+    } finally {
+      error.mockRestore();
+    }
+  });
+
+  it("the Worker presets forward where a resolver function's options say, resolved once per env", async () => {
+    const seen: { url: string; verdict: string | null }[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: string | Request, init?: RequestInit) => {
+      const req = input instanceof Request ? input : new Request(input, init);
+      seen.push({ url: req.url, verdict: req.headers.get("x-jev-verdict") });
+      if (new URL(req.url).pathname.startsWith("/_jev/authz")) {
+        return new Response(null, { status: 200, headers: { "X-Jev-Verdict": "safe", "X-Jev-Score": "0.10", "X-Jev-Reason": "injection+0.10" } });
+      }
+      return Response.json({ upstream: true });
+    }));
+    type Env = { APP: string; GATEWAY: string; JEV_ORIGIN?: string };
+    let calls = 0;
+    const full = fullWorker((env: Env) => {
+      calls++;
+      return { upstream: env.APP, provider: providers.mock, config: { jev: { mock_score: 0.1, timeout_ms: 400 } } };
+    });
+    const env: Env = { APP: "https://app.internal", GATEWAY: "https://gateway.internal" };
+    for (let i = 0; i < 3; i++) expect((await full.fetch(chat(BENIGN), env)).status).toBe(200);
+    expect(calls).toBe(1);
+    expect(seen.map((s) => s.url)).toEqual(Array(3).fill("https://app.internal/v1/chat/completions"));
+    expect(seen.every((s) => s.verdict === "safe")).toBe(true);
+
+    // the function's origin, not env.JEV_ORIGIN, judges; its upstream gets the request
+    seen.length = 0;
+    const thin = thinWorker((e: Env) => ({ origin: e.GATEWAY, upstream: e.APP }));
+    expect((await thin.fetch(chat(BENIGN), { ...env, JEV_ORIGIN: "https://stale.example" })).status).toBe(200);
+    expect(seen.map((s) => s.url)).toEqual(["https://gateway.internal/_jev/authz/v1/chat/completions", "https://app.internal/v1/chat/completions"]);
+    expect(seen[1].verdict).toBe("safe");
+    // upstream defaults to the origin the function returned
+    seen.length = 0;
+    expect((await thinWorker((e: Env) => ({ origin: e.GATEWAY })).fetch(chat(BENIGN), env)).status).toBe(200);
+    expect(seen.map((s) => s.url)).toEqual(["https://gateway.internal/_jev/authz/v1/chat/completions", "https://gateway.internal/v1/chat/completions"]);
+    // an address set on the function itself, as the only working form was, still counts
+    seen.length = 0;
+    const legacy = Object.assign(() => ({ provider: providers.mock, config: { jev: { mock_score: 0.1, timeout_ms: 400 } } }), { upstream: "https://old.internal" });
+    expect((await fullWorker(legacy).fetch(chat(BENIGN), env)).status).toBe(200);
+    expect(seen.map((s) => s.url)).toEqual(["https://old.internal/v1/chat/completions"]);
+  });
+
+  it("the Worker presets fail open on an address they cannot use, and name it once", async () => {
+    const fetched: Request[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: Request) => { fetched.push(input); return Response.json({ upstream: true }); }));
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      // a missing origin: "the Worker presets fail open when the runtime cannot be built"
+      const noOrigin = thinWorker((e: { APP?: string }) => ({ origin: "gateway.internal", upstream: e.APP }));
+      const badUpstream = fullWorker(() => ({ upstream: "app.internal", provider: providers.mock }));
+      const noUpstream = fullWorker(() => ({ provider: providers.mock }) as unknown as { upstream: string });
+      for (let i = 0; i < 2; i++) {
+        expect((await noOrigin.fetch(chat(ATTACK), { APP: "https://app.internal" })).status).toBe(200);
+        expect((await badUpstream.fetch(chat(ATTACK), {})).status).toBe(200);
+        expect((await noUpstream.fetch(chat(ATTACK), {})).status).toBe(200);
+      }
+      // unjudged, to the one usable address or the request's own URL
+      expect(fetched.map((r) => r.url)).toEqual(Array(2).fill([
+        "https://app.internal/v1/chat/completions", "https://edge.example/v1/chat/completions", "https://edge.example/v1/chat/completions",
+      ]).flat());
+      expect(fetched.every((r) => r.headers.get("x-jev-verdict") === "error" && r.headers.get("x-jev-source") === "adapter")).toBe(true);
+      const msgs = error.mock.calls.map((c) => String(c[0]));
+      expect(msgs.filter((m) => m.includes('thinWorker: origin (or env.JEV_ORIGIN) must be an absolute http(s) URL, got "gateway.internal"'))).toHaveLength(1);
+      expect(msgs.filter((m) => m.includes('fullWorker: upstream must be an absolute http(s) URL, got "app.internal"'))).toHaveLength(1);
+      expect(msgs.filter((m) => m.includes("fullWorker: upstream is required"))).toHaveLength(1);
+    } finally {
+      error.mockRestore();
+    }
   });
 
   it("fullWorker picks up the API key from env", async () => {
@@ -483,21 +737,26 @@ describe("stores", () => {
     }
   });
 
-  it("any other error from a stub still fails open, with no fallback", async () => {
+  it("any other error from a stub is the stub's: no isolate fallback, and the judge still decides", async () => {
     const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
-      const broken = { fetch: async (): Promise<Response> => { throw new Error("network connection lost"); } };
+      let calls = 0;
+      const broken = { fetch: async (): Promise<Response> => { calls++; throw new Error("network connection lost"); } };
       const rt = createRuntime({ config: ENFORCE95, state: broken });
       for (let i = 0; i < 2; i++) {
-        const j = (await (await handle(chat(attack(i)), rt, echo)).json()) as Record<string, string>;
-        expect(j.verdict).toBe("error");
-        expect(j.source).toBe("adapter");
+        const res = await handle(chat(attack(i)), rt, echo);
+        expect(res.status).toBe(403);
+        expect(res.headers.get("x-jev-source")).toBe("l2");
       }
+      expect(calls).toBe(4); // /pre and /post of each request still went to the stub
       const msgs = err.mock.calls.map((c) => String(c[0]));
-      expect(msgs).toHaveLength(2);
-      expect(msgs.every((m) => m.includes("failing open") && m.includes("network connection lost"))).toBe(true);
+      expect(msgs).toHaveLength(1); // the breaker read, once for the outage
+      expect(msgs[0]).toMatch(/breaker read failed, judging with the breaker closed: network connection lost/);
+      expect(warn.mock.calls.map((c) => String(c[0])).filter((m) => m.includes("breaker success failed"))).toHaveLength(2);
     } finally {
       err.mockRestore();
+      warn.mockRestore();
     }
   });
 
@@ -505,6 +764,7 @@ describe("stores", () => {
     // workerd marks an exception that crossed from the object with remote: true;
     // its own cross-request refusal, raised in the caller, carries no such flag
     const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
       const inner = {
         fetch: async (): Promise<Response> => {
@@ -515,13 +775,15 @@ describe("stores", () => {
       await expect(store.get("a")).rejects.toThrow(/thrown by the object/);
       await expect(store.get("a")).rejects.toThrow(/thrown by the object/); // still the object's, no fallback
       const rt = createRuntime({ config: ENFORCE95, state: inner });
-      const j = (await (await handle(chat(attack(0)), rt, echo)).json()) as Record<string, string>;
-      expect(j.verdict).toBe("error");
-      expect(j.source).toBe("adapter");
+      const res = await handle(chat(attack(0)), rt, echo);
+      expect(res.status).toBe(403); // the breaker read closed, the judge decided
+      expect(res.headers.get("x-jev-source")).toBe("l2");
       const msgs = err.mock.calls.map((c) => String(c[0]));
       expect(msgs.some((m) => m.includes("used in a later one"))).toBe(false);
+      expect(msgs.some((m) => m.includes("breaker read failed") && m.includes("thrown by the object"))).toBe(true);
     } finally {
       err.mockRestore();
+      warn.mockRestore();
     }
   });
 
@@ -649,10 +911,55 @@ describe("stores", () => {
     await Promise.all(kept);
     const id = first.subjectId!;
     expect(id).toMatch(/^ip:/);
-    // the ring's counter went through the object's atomic /incr
-    expect(objects.get("jev-edge")!.mem.get("subj:" + id + ":n")).toMatchObject({ v: 2 });
+    // the ring's counter went through the atomic incr of the subject's own object, not jev-edge's
+    expect(objects.get("jev-subject:" + id)!.mem.get("subj:" + id + ":n")).toMatchObject({ v: 2 });
+    expect([...objects.get("jev-edge")!.mem.keys()].some((k) => k.startsWith("subj:"))).toBe(false);
     expect(await ringLoad(rt.subjectStore, id, 20)).toHaveLength(2);
     expect([...objects.get("cache")!.mem.keys()].some((k) => k.startsWith("fp:"))).toBe(true);
+  });
+
+  it("a preset with JEV_STATE bound counts subject reputation in the Durable Object, for every isolate", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ upstream: true })));
+    try {
+      const { ns, objects } = namespaces();
+      const opts = {
+        provider: providers.mock,
+        config: { ...ENFORCE95, jev: { ...ENFORCE95.jev, mock_header: "x-jev-mock-score" }, subject: { ...SUBJECTS.subject, reputation: { block_at: 5 } } },
+      };
+      // two Workers, as two isolates: each has its own runtime and memory
+      const one = fullWorker({ upstream: "https://app.internal", ...opts });
+      const two = fullWorker({ upstream: "https://app.internal", ...opts });
+      const env = { JEV_STATE: ns };
+      expect((await one.fetch(chat(attack(0)), env)).status).toBe(403);
+      expect((await two.fetch(chat(attack(1)), env)).status).toBe(403);
+      // 3 + 3 points from one subject across the two: blocked in both
+      const blocked = await one.fetch(chat(BENIGN, { "x-jev-mock-score": "0.1" }), env);
+      expect(blocked.status).toBe(403);
+      expect(blocked.headers.get("x-jev-reason")).toBe("subject+reputation");
+      // in the subject's own object, not the global one
+      const subjects = [...objects.keys()].filter((n) => n.startsWith("jev-subject:ip:"));
+      expect(subjects).toHaveLength(1);
+      expect([...objects.get(subjects[0])!.mem.keys()].some((k) => k.startsWith("srep:ip:"))).toBe(true);
+      expect([...objects.get("jev-edge")!.mem.keys()].some((k) => k.startsWith("srep:"))).toBe(false);
+      // options that name a subjectStore keep it
+      const fresh = namespaces();
+      const mem = memoryStore();
+      const counted: string[] = [];
+      const own = { ...mem, incr: (k: string, by: number, ttl: number) => { counted.push(k); return mem.incr!(k, by, ttl); } };
+      const three = fullWorker({ upstream: "https://app.internal", ...opts, subjectStore: own });
+      expect((await three.fetch(chat(attack(2)), { JEV_STATE: fresh.ns })).status).toBe(403);
+      expect(counted.some((k) => k.startsWith("srep:ip:"))).toBe(true);
+      expect([...(fresh.objects.get("jev-edge")?.mem.keys() ?? [])].some((k) => k.startsWith("srep:"))).toBe(false);
+      expect([...fresh.objects.keys()].some((n) => n.startsWith("jev-subject"))).toBe(false);
+      // without reputation the subject store stays the runtime's default
+      const plain = namespaces();
+      const four = fullWorker({ upstream: "https://app.internal", provider: providers.mock, config: { ...ENFORCE95, subject: SUBJECTS.subject } });
+      expect((await four.fetch(chat(attack(3)), { JEV_STATE: plain.ns })).status).toBe(403);
+      expect([...(plain.objects.get("jev-edge")?.mem.keys() ?? [])].some((k) => k.startsWith("subj:"))).toBe(false);
+      expect([...plain.objects.keys()].some((n) => n.startsWith("jev-subject"))).toBe(false);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it("a stub as cache or subjectStore goes through fetch, not taken for KV by the put it answers", async () => {
@@ -812,17 +1119,40 @@ describe("writes after the verdict are best effort", () => {
     }
   });
 
-  it("Durable Object: breaker success and adaptive sample answering 503 keep the block", async () => {
+  it("Durable Object: the record after the judge (/post) answering 503 keeps the block", async () => {
+    const c = watchConsole();
+    try {
+      const rt = createRuntime({ config: ENFORCE, state: failingDO((path) => path === "/post") });
+      const res = await handle(chat(ATTACK), rt, echo);
+      expect(res.status).toBe(403);
+      expect(c.warned().some((m) => m.includes("breaker success failed") && m.includes("http 503"))).toBe(true);
+      expect(c.errored()).toEqual([]);
+    } finally {
+      c.restore();
+    }
+  });
+
+  /** A JevState build from before /pre and /post: those answer 404, the rest as `inner`. */
+  function olderBuild(inner: { fetch(i: string | Request, init?: RequestInit): Promise<Response> }) {
+    return {
+      fetch: async (i: string | Request, init?: RequestInit) => {
+        const p = new URL(new Request(i, init).url).pathname;
+        return p === "/pre" || p === "/post" ? new Response("not found", { status: 404 }) : inner.fetch(i, init);
+      },
+    };
+  }
+
+  it("Durable Object per operation (an older JevState): breaker success and adaptive sample answering 503 keep the block", async () => {
     const c = watchConsole();
     try {
       for (const failing of ["/breaker", "/adaptive"]) {
-        const stub = failingDO((path, op) => path === failing && (op === "success" || op === "failure"));
+        const stub = olderBuild(failingDO((path, op) => path === failing && (op === "success" || op === "failure")));
         const rt = createRuntime({ config: ENFORCE, state: stub });
         const res = await handle(chat(ATTACK), rt, echo);
         expect({ failing, status: res.status }).toEqual({ failing, status: 403 });
       }
-      expect(c.warned().some((m) => m.includes("breaker success failed") && m.includes("http 503"))).toBe(true);
-      expect(c.warned().some((m) => m.includes("adaptive timeout sample failed"))).toBe(true);
+      expect(c.warned().some((m) => m.includes("jev-state /breaker: http 503"))).toBe(true);
+      expect(c.warned().some((m) => m.includes("jev-state /adaptive: http 503"))).toBe(true);
       expect(c.errored()).toEqual([]);
     } finally {
       c.restore();
@@ -835,7 +1165,7 @@ describe("writes after the verdict are best effort", () => {
   it("Durable Object: a failed breaker failure() keeps the judge's error verdict (source l2, not adapter)", async () => {
     const c = watchConsole();
     try {
-      const rt = createRuntime({ config: TIMES_OUT, state: failingDO((path, op) => path === "/breaker" && op === "failure") });
+      const rt = createRuntime({ config: TIMES_OUT, state: failingDO((path) => path === "/post") });
       const j = (await (await handle(chat(ATTACK), rt, echo)).json()) as Record<string, string>;
       expect(j.verdict).toBe("error");
       expect(j.source).toBe("l2");
@@ -880,5 +1210,151 @@ describe("writes after the verdict are best effort", () => {
     } finally {
       c.restore();
     }
+  });
+});
+
+// Before the judge: the breaker's allow() and the adaptive timeout. A state
+// store that fails them (a Durable Object overloaded or restarting) must not
+// fail the request open while the judge is healthy; the breaker reads closed
+// and the timeout is its floor. Never counted as a breaker failure.
+describe("reads before the judge are best effort", () => {
+  const ENFORCE95 = { jev: { provider: "mock", mock_score: 0.95, mock_delay_ms: 2, timeout_ms: 400 }, policy: { mode: "enforce" as const } };
+  const attack = (i: number) => ATTACK.replace("prompt.", "prompt, read " + i + ".");
+
+  /** The breaker's counters in the object's storage, whatever window they fell in. */
+  const window = (mem: Map<string, unknown>) => [...mem.entries()].find(([k]) => k.startsWith("brk:w:"))?.[1];
+
+  function jevState() {
+    const mem = new Map<string, unknown>();
+    const d = new JevState({ storage: { get: async (k) => mem.get(k), put: async (k, v) => { mem.set(k, v); }, delete: async (k) => mem.delete(k) } });
+    const paths: string[] = [];
+    const stub = { fetch: (i: string | Request, init?: RequestInit) => { const r = new Request(i, init); paths.push(new URL(r.url).pathname); return d.fetch(r); } };
+    return { stub, paths, mem };
+  }
+
+  it("a Durable Object that throws on every call still gets the judge's verdict, logged once", async () => {
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const overloaded = { fetch: async (): Promise<Response> => { throw new Error("Durable Object is overloaded"); } };
+      const rt = createRuntime({ config: ENFORCE95, state: overloaded });
+      for (let i = 0; i < 3; i++) {
+        const res = await handle(chat(attack(i)), rt, echo);
+        expect(res.status).toBe(403);
+        expect(res.headers.get("x-jev-verdict")).toBe("malicious");
+        expect(res.headers.get("x-jev-source")).toBe("l2");
+      }
+      const errors = err.mock.calls.map((c) => String(c[0]));
+      expect(errors.filter((m) => m.includes("breaker read failed"))).toHaveLength(1);
+      expect(errors.some((m) => m.includes("failing open"))).toBe(false);
+      expect(errors.every((m) => m.includes("overloaded"))).toBe(true);
+    } finally {
+      err.mockRestore();
+      warn.mockRestore();
+    }
+  });
+
+  it("the in-process breaker and adaptive over a Store whose reads throw: the verdict stands, no breaker failure", async () => {
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const sets: string[] = [];
+      const state = { get: async () => { throw new Error("store read refused"); }, set: async (k: string) => { sets.push(k); } };
+      const rt = createRuntime({ config: ENFORCE95, state });
+      const res = await handle(chat(attack(0)), rt, echo);
+      expect(res.status).toBe(403);
+      expect(res.headers.get("x-jev-source")).toBe("l2");
+      expect(await rt.breaker.state()).toBe(0); // closed
+      expect(await rt.adaptive.current()).toBe(400); // the floor
+      expect(err.mock.calls.map((c) => String(c[0])).some((m) => m.includes("adaptive timeout read failed") || m.includes("breaker read failed"))).toBe(true);
+    } finally {
+      err.mockRestore();
+      warn.mockRestore();
+    }
+  });
+
+  it("logs again after the reads recovered and failed anew", async () => {
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const { stub } = jevState();
+      let down = true;
+      const flaky = { fetch: async (i: string | Request, init?: RequestInit) => { if (down) throw new Error("overloaded"); return stub.fetch(i, init); } };
+      const rt = createRuntime({ config: ENFORCE95, state: flaky });
+      await handle(chat(attack(0)), rt, echo);
+      await handle(chat(attack(1)), rt, echo);
+      down = false;
+      await handle(chat(attack(2)), rt, echo);
+      down = true;
+      await handle(chat(attack(3)), rt, echo);
+      expect(err.mock.calls.map((c) => String(c[0])).filter((m) => m.includes("breaker read failed"))).toHaveLength(2);
+    } finally {
+      err.mockRestore();
+      warn.mockRestore();
+    }
+  });
+
+  it("one hop before the judge and one after: /pre and /post", async () => {
+    const { stub, paths, mem } = jevState();
+    const rt = createRuntime({ config: ENFORCE95, state: stub });
+    const res = await handle(chat(attack(0)), rt, echo);
+    expect(res.status).toBe(403);
+    expect(paths).toEqual(["/pre", "/post"]);
+    expect(mem.get("adapt")).toMatchObject({ v: { n: 1 } });
+    expect(window(mem)).toMatchObject({ v: { ok: 1, fail: 0 } });
+  });
+
+  it("the record after the judge goes to waitUntil, off the request path", async () => {
+    const { stub, paths, mem } = jevState();
+    const rt = createRuntime({ config: ENFORCE95, state: stub });
+    const kept: Promise<unknown>[] = [];
+    const { evaluate } = await import("../src/runtime");
+    const ev = await evaluate(chat(attack(0)), rt, { waitUntil: (p) => { kept.push(p); } });
+    expect(ev.verdict).toMatchObject({ verdict: "malicious", source: "l2" });
+    expect(kept).toHaveLength(1);
+    await Promise.all(kept);
+    expect(paths).toEqual(["/pre", "/post"]);
+    expect(mem.get("adapt")).toMatchObject({ v: { n: 1 } });
+  });
+
+  it("a judge timeout: the adaptive sample and the breaker failure in the one /post", async () => {
+    const { stub, paths, mem } = jevState();
+    const config = { ...ENFORCE95, jev: { ...ENFORCE95.jev, mock_delay_ms: 50, timeout_ms: 10, timeout_max_ms: 20 } };
+    const rt = createRuntime({ config, state: stub });
+    const j = (await (await handle(chat(attack(0)), rt, echo)).json()) as Record<string, string>;
+    expect(j).toMatchObject({ verdict: "error", source: "l2" });
+    expect(paths).toEqual(["/pre", "/post"]);
+    expect(mem.get("adapt")).toMatchObject({ v: { n: 1, mean: 12 } }); // fired * 1.2
+    expect(window(mem)).toMatchObject({ v: { ok: 0, fail: 1 } });
+  });
+
+  it("an open breaker: /pre says no, nothing is judged or recorded", async () => {
+    const { stub, paths } = jevState();
+    const rt = createRuntime({ config: ENFORCE95, state: stub });
+    await rt.breaker.trip();
+    paths.length = 0;
+    const res = await handle(chat(attack(0)), rt, echo);
+    expect(((await res.json()) as Record<string, string>).source).toBe("breaker");
+    expect(paths).toEqual(["/pre"]);
+  });
+
+  it("a JevState of an older build (no /pre, /post): the per-operation endpoints", async () => {
+    const { stub, paths, mem } = jevState();
+    const old = { fetch: async (i: string | Request, init?: RequestInit) => {
+      const r = new Request(i, init);
+      const p = new URL(r.url).pathname;
+      if (p === "/pre" || p === "/post") { paths.push(p); return new Response("not found", { status: 404 }); }
+      return stub.fetch(r);
+    } };
+    const rt = createRuntime({ config: ENFORCE95, state: old });
+    for (let i = 0; i < 2; i++) {
+      const res = await handle(chat(attack(i)), rt, echo);
+      expect(res.status).toBe(403);
+      expect(res.headers.get("x-jev-source")).toBe("l2");
+    }
+    // one 404 teaches the runtime; the second request goes per operation from the start
+    expect(paths.filter((p) => p === "/pre")).toHaveLength(1);
+    expect(paths.filter((p) => p !== "/pre" && p !== "/post")).toEqual(["/breaker", "/adaptive", "/adaptive", "/breaker", "/breaker", "/adaptive", "/adaptive", "/breaker"]);
+    expect(mem.get("adapt")).toMatchObject({ v: { n: 2 } });
   });
 });

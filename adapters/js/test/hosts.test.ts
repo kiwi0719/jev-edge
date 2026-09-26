@@ -64,6 +64,62 @@ describe("nextMiddleware", () => {
     }
   });
 
+  /** A NextRequest-like request: `url` keeps next.config's basePath (and the
+   *  locale), `nextUrl.pathname` is the path Next routes on, without them. */
+  function nextReq(body: string, url: string, nextUrl: { pathname: string; search?: string; basePath?: string; locale?: string }, headers: Record<string, string> = {}) {
+    return Object.assign(chat(body, headers, url), { nextUrl: { search: "", basePath: "", ...nextUrl } });
+  }
+
+  it("judges the path Next routes on under a basePath, and a locale", async () => {
+    const mw = nextMiddleware(opts(), NextResponse);
+    const hot = { "x-jev-mock-score": "0.95" };
+    const based = await mw(nextReq(ATTACK, "/docs/v1/chat/completions", { pathname: "/v1/chat/completions", basePath: "/docs" }, hot));
+    expect(based.status).toBe(403);
+    expect(based.headers.get("x-jev-source")).toBe("l2");
+    const localized = await mw(nextReq(ATTACK, "/docs/fr/v1/chat/completions?x=1", { pathname: "/v1/chat/completions", search: "?x=1", basePath: "/docs", locale: "fr" }, hot));
+    expect(localized.status).toBe(403);
+    // a benign body under the basePath is judged too, and continues
+    const ok = await mw(nextReq(BENIGN, "/docs/v1/chat/completions", { pathname: "/v1/chat/completions", basePath: "/docs" }));
+    expect(((await ok.json()) as Record<string, unknown>).verdict).toBe("safe");
+  });
+
+  it("without nextUrl the request URL is judged as before", async () => {
+    const mw = nextMiddleware(opts(), NextResponse);
+    const res = await mw(chat(ATTACK, { "x-jev-mock-score": "0.95" }, "/docs/v1/chat/completions"));
+    expect(((await res.json()) as Record<string, unknown>).verdict).toBe("skipped"); // not a watched path
+  });
+
+  it("serves /_jev/health under a basePath", async () => {
+    const mw = nextMiddleware(opts(), NextResponse);
+    const req = Object.assign(new Request("https://app.example/docs/_jev/health"), { nextUrl: { pathname: "/_jev/health", search: "", basePath: "/docs" } });
+    const res = await mw(req);
+    expect(await res.json()).toMatchObject({ ok: true });
+  });
+
+  it("a //-path from nextUrl stays a path, never a host", async () => {
+    const mw = nextMiddleware(opts(), NextResponse);
+    const res = await mw(nextReq(ATTACK, "/docs//v1/chat/completions", { pathname: "//v1/chat/completions", basePath: "/docs" }, { "x-jev-mock-score": "0.95" }));
+    expect(res.status).toBe(403);
+  });
+
+  it("fails open with the client's X-Jev-* replaced when the runtime cannot be built", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      let seen: Headers | undefined;
+      const mw = nextMiddleware({ config: { policy: { mode: "bogus" as never } } }, {
+        next: (init?: { request?: { headers?: Headers } }) => { seen = init?.request?.headers; return Response.json({ next: true }); },
+      });
+      const res = await mw(chat(ATTACK, { "x-jev-verdict": "safe", "x-jev-subject": "header:x" }));
+      expect(await res.json()).toEqual({ next: true });
+      expect(seen?.get("x-jev-verdict")).toBe("error");
+      expect(seen?.get("x-jev-source")).toBe("adapter");
+      expect(seen?.get("x-jev-subject")).toBeNull();
+      expect(error.mock.calls.some((c) => String(c[0]).includes("cannot build the runtime, failing open"))).toBe(true);
+    } finally {
+      error.mockRestore();
+    }
+  });
+
   it("hands the subject write to the event's waitUntil", async () => {
     const { memoryStore } = await import("../src/cf/stores");
     const { ringLoad } = await import("../src/core/subject");
@@ -159,6 +215,83 @@ describe("nodeMiddleware", () => {
     }, 0);
     const res = nodeRes();
     await mw(req as never, res, () => {});
+    expect(res.statusCode).toBe(403);
+  });
+
+  /** A request whose stream the middleware reads itself, in these chunks. */
+  function streamed(chunks: Buffer[], headers: Record<string, string> = {}) {
+    const req = nodeReq(null, headers);
+    req.method = "POST";
+    setTimeout(() => {
+      for (const c of chunks) req.emit("data", c);
+      req.emit("end");
+    }, 0);
+    return req;
+  }
+
+  it("hands later middleware a compressed body as the bytes it came as", async () => {
+    const { gzipSync, gunzipSync } = await import("node:zlib");
+    const gz = gzipSync(Buffer.from(BENIGN));
+    const req = streamed([gz.subarray(0, 7), gz.subarray(7)], { "content-encoding": "gzip" });
+    let nexted = false;
+    await nodeMiddleware(opts())(req as never, nodeRes(), () => { nexted = true; });
+    expect(nexted).toBe(true);
+    expect((req.headers as Record<string, string>)["x-jev-source"]).toBe("l2"); // judged, decoded
+    expect(Buffer.isBuffer(req.body)).toBe(true);
+    expect(Buffer.compare(req.body as Buffer, gz)).toBe(0);
+    expect(gunzipSync(req.body as Buffer).toString()).toBe(BENIGN);
+    expect(Buffer.compare(req.rawBody as Buffer, gz)).toBe(0);
+  });
+
+  it("hands on a body that is not UTF-8 byte for byte, and a UTF-8 one as its string", async () => {
+    const boundary = "xYz";
+    const binary = Buffer.concat([
+      Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="f"; filename="a.bin"\r\nContent-Type: application/octet-stream\r\n\r\n`),
+      Buffer.from([0xff, 0xfe, 0x00, 0xc3, 0x28, 0x80]),
+      Buffer.from(`\r\n--${boundary}--\r\n`),
+    ]);
+    const req = streamed([binary], { "content-type": `multipart/form-data; boundary=${boundary}` });
+    await nodeMiddleware(opts())(req as never, nodeRes(), () => {});
+    expect(Buffer.isBuffer(req.body)).toBe(true);
+    expect(Buffer.compare(req.body as Buffer, binary)).toBe(0);
+    expect(Buffer.compare(req.rawBody as Buffer, binary)).toBe(0);
+
+    const text = '{"messages":[{"role":"user","content":"Grüße, 你好, a summary please."}]}';
+    const utf8 = Buffer.from(text);
+    const r2 = streamed([utf8.subarray(0, 40), utf8.subarray(40)]); // a split inside a multi-byte character
+    await nodeMiddleware(opts())(r2 as never, nodeRes(), () => {});
+    expect(r2.body).toBe(text);
+    expect(Buffer.compare(r2.rawBody as Buffer, utf8)).toBe(0);
+  });
+
+  it("a body parser mounted after it (body-parser 1.x) takes the body as read, not the spent stream", async () => {
+    const req = streamed([Buffer.from(BENIGN)]);
+    await nodeMiddleware(opts())(req as never, nodeRes(), () => {});
+    // body-parser 1.x json()/text(): skip when req._body says a parser ran,
+    // else read the stream, which this middleware already consumed
+    const bodyParser1 = (r: typeof req, _res: unknown, next: (err?: unknown) => void) => {
+      if (r._body) return next();
+      next(Object.assign(new Error("stream is not readable"), { status: 500 }));
+    };
+    let err: unknown = "not called";
+    bodyParser1(req, nodeRes(), (e?: unknown) => { err = e; });
+    expect(err).toBeUndefined();
+    expect(req._body).toBe(true);
+    expect(req.body).toBe(BENIGN);
+  });
+
+  it("mounted twice, the second one judges the bytes that came, not its own req.body as a parser's", async () => {
+    const { gzipSync } = await import("node:zlib");
+    const keyword = { name: "kw", call: async (p: { text: string }) => [{ injection: p.text.includes("Ignore all previous") ? 0.95 : 0.05 }, null] as never };
+    const cfg = { jev: { timeout_ms: 400 } };
+    const req = streamed([gzipSync(Buffer.from(ATTACK))], { "content-encoding": "gzip" });
+    await nodeMiddleware({ provider: keyword, config: { ...cfg, policy: { mode: "monitor" as const } } })(req as never, nodeRes(), () => {});
+    expect((req.headers as Record<string, string>)["x-jev-verdict"]).toBe("malicious");
+    req.readableEnded = true; // as node:http sets it once the stream was read
+    const res = nodeRes();
+    let nexted = false;
+    await nodeMiddleware({ provider: keyword, config: { ...cfg, policy: { mode: "enforce" as const } } })(req as never, res, () => { nexted = true; });
+    expect(nexted).toBe(false);
     expect(res.statusCode).toBe(403);
   });
 
@@ -311,7 +444,10 @@ describe("nodeMiddleware", () => {
     const res = nodeRes();
     await mw(mounted("/v1", "/v1/_jev/health", null) as never, res, () => {});
     expect(res.ended).toBe(true);
-    expect(JSON.parse(res.body)).toMatchObject({ ok: true, provider: "mock" });
+    expect(JSON.parse(res.body)).toEqual({ ok: true, adapter: "js", core: expect.any(String) });
+    const detailed = nodeRes();
+    await nodeMiddleware({ ...opts(), health: "details" })(mounted("/v1", "/v1/_jev/health", null) as never, detailed, () => {});
+    expect(JSON.parse(detailed.body)).toMatchObject({ ok: true, provider: "mock", mode: "enforce" });
   });
 
   it("judges an absolute-form target on its path", async () => {
@@ -423,20 +559,52 @@ describe("honoMiddleware", () => {
     return { c: { req: { raw: req }, set: (k: string, v: unknown) => { vars[k] = v; }, header: (k: string, v: string) => { resHeaders[k] = v; } }, vars, resHeaders };
   }
 
-  it("strips inbound X-Jev-* from the request and sets the verdict headers on request and response", async () => {
+  it("strips inbound X-Jev-* from the request and sets the verdict headers on it, the response gets the request id only", async () => {
     const mw = honoMiddleware(opts());
     const { c, resHeaders } = ctx(chat(BENIGN, { "x-jev-verdict": "malicious", "x-jev-subject": "header:00" }));
     await mw(c, async () => {});
     expect(c.req.raw.headers.get("x-jev-verdict")).toBe("safe");
+    expect(c.req.raw.headers.get("x-jev-score")).toBe("0.20");
     expect(c.req.raw.headers.get("x-jev-subject")).toBeNull();
     expect(c.req.raw.headers.get("x-jev-request-id")).toBeTruthy();
-    expect(resHeaders["x-jev-verdict"]).toBe("safe");
-    expect(resHeaders["x-jev-score"]).toBe("0.20");
+    expect(resHeaders).toEqual({ "X-Jev-Request-Id": c.req.raw.headers.get("x-jev-request-id") });
   });
 
-  it("fails open when the runtime cannot be built", async () => {
+  it("tells the client nothing of the verdict: monitor-mode score, open breaker, the judge's error text", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const failing = (reason: string) => ({ name: "failing", call: async () => [null, reason, "unusable"] as [null, string, "unusable"] });
+      // monitor mode: an attack scored 0.97 passes
+      const monitor = honoMiddleware({ ...opts("monitor"), config: { ...opts("monitor").config, subject: { enabled: true, from: "ip" as const, salt: "pepper" } } });
+      const m = ctx(chat(ATTACK, { "x-jev-mock-score": "0.97" }));
+      await monitor(m.c, async () => {});
+      expect(m.c.req.raw.headers.get("x-jev-verdict")).toBe("malicious");
+      expect(m.c.req.raw.headers.get("x-jev-subject")).toMatch(/^ip:/);
+      expect(Object.keys(m.resHeaders)).toEqual(["X-Jev-Request-Id"]);
+      // a judge whose error text would echo into X-Jev-Reason
+      const leaky = honoMiddleware({ provider: failing("openai-compat: no numeric answers in SECRET deployment notes"), config: { policy: { mode: "enforce" } } });
+      const l = ctx(chat(ATTACK));
+      await leaky(l.c, async () => {});
+      expect(decodeURIComponent(l.c.req.raw.headers.get("x-jev-reason") ?? "")).toMatch(/SECRET/);
+      expect(Object.keys(l.resHeaders)).toEqual(["X-Jev-Request-Id"]);
+      // the breaker open: every request fails open, and the client must not learn it
+      const down = honoMiddleware({
+        provider: { name: "down", call: async () => [null, "fetch failed", "transport"] as [null, string, "transport"] },
+        config: { policy: { mode: "enforce" }, breaker: { min_samples: 1 } },
+      });
+      await down(ctx(chat(ATTACK)).c, async () => {});
+      const b = ctx(chat(ATTACK.replace("print", "show")));
+      await down(b.c, async () => {});
+      expect(b.c.req.raw.headers.get("x-jev-source")).toBe("breaker");
+      expect(Object.keys(b.resHeaders)).toEqual(["X-Jev-Request-Id"]);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("fails open when the runtime cannot be built, with the client's X-Jev-* replaced", async () => {
     const mw = honoMiddleware({ config: { policy: { mode: "bogus" as never } } });
-    const { c, vars, resHeaders } = ctx(chat(BENIGN));
+    const { c, vars, resHeaders } = ctx(chat(BENIGN, { "x-jev-verdict": "safe", "x-jev-source": "l2", "x-jev-subject": "header:00" }));
     const err = vi.spyOn(console, "error").mockImplementation(() => {});
     let nexted = false;
     const out = await mw(c, async () => { nexted = true; });
@@ -444,7 +612,61 @@ describe("honoMiddleware", () => {
     expect(out).toBeUndefined();
     expect(nexted).toBe(true);
     expect((vars.jev as { verdict: string; source: string })).toMatchObject({ verdict: "error", source: "adapter" });
-    expect(resHeaders["X-Jev-Source"]).toBe("adapter");
+    expect(c.req.raw.headers.get("x-jev-verdict")).toBe("error");
+    expect(c.req.raw.headers.get("x-jev-source")).toBe("adapter");
+    expect(c.req.raw.headers.get("x-jev-subject")).toBeNull();
+    expect(await c.req.raw.text()).toBe(BENIGN); // the body still goes to the handler
+    expect(resHeaders["X-Jev-Source"]).toBeUndefined();
+    expect(resHeaders["X-Jev-Verdict"]).toBeUndefined();
+    expect(resHeaders["X-Jev-Request-Id"]).toBe(c.req.raw.headers.get("x-jev-request-id"));
+  });
+
+  /** A context whose body a middleware before this one read through HonoRequest: raw consumed, the text cached. */
+  async function readBefore(req: Request) {
+    const text = await req.text();
+    const h = ctx(req);
+    const c = { ...h.c, req: { ...h.c.req, arrayBuffer: async () => new TextEncoder().encode(text).buffer as ArrayBuffer } };
+    return { ...h, c };
+  }
+
+  it("judges a body an earlier middleware already read, from Hono's cached copy", async () => {
+    const mw = honoMiddleware(opts());
+    const blocked = await readBefore(chat(ATTACK, { "x-jev-mock-score": "0.95", "x-jev-verdict": "safe" }));
+    let nexted = false;
+    const out = await mw(blocked.c, async () => { nexted = true; });
+    expect(out?.status).toBe(403);
+    expect(nexted).toBe(false);
+    const passed = await readBefore(chat(BENIGN, { "x-jev-verdict": "malicious" }));
+    await mw(passed.c, async () => {});
+    expect((passed.vars.jev as { verdict: string; source: string })).toMatchObject({ verdict: "safe", source: "l2" });
+    expect(passed.c.req.raw.headers.get("x-jev-verdict")).toBe("safe");
+    expect(await passed.c.req.raw.text()).toBe(BENIGN); // raw readable again, for handlers that read it
+  });
+
+  it("a consumed body with no cached copy fails open with the client's X-Jev-* replaced", async () => {
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const mw = honoMiddleware(opts());
+      // read straight off raw: HonoRequest has nothing cached and rejects
+      const req = chat(ATTACK, { "x-jev-mock-score": "0.95", "x-jev-verdict": "safe", "x-jev-source": "l2" });
+      await req.text();
+      const h = ctx(req);
+      const c = { ...h.c, req: { ...h.c.req, arrayBuffer: () => req.arrayBuffer() } };
+      let nexted = false;
+      expect(await mw(c, async () => { nexted = true; })).toBeUndefined();
+      expect(nexted).toBe(true);
+      expect(c.req.raw.headers.get("x-jev-verdict")).toBe("error");
+      expect(c.req.raw.headers.get("x-jev-source")).toBe("adapter");
+      // no HonoRequest at all (another framework): the runtime's own error verdict, headers replaced as well
+      const bare = chat(ATTACK, { "x-jev-mock-score": "0.95", "x-jev-verdict": "safe" });
+      await bare.text();
+      const b = ctx(bare);
+      await mw(b.c, async () => {});
+      expect(b.c.req.raw.headers.get("x-jev-verdict")).toBe("error");
+      expect(b.c.req.raw.headers.get("x-jev-source")).toBe("adapter");
+    } finally {
+      err.mockRestore();
+    }
   });
 
   it("sets c.get('jev') and continues", async () => {
@@ -512,6 +734,32 @@ describe("lambdaEdgeHandler", () => {
     const out = await h(event(ATTACK, {}, { "X-Jev-Mock-Score": "0.95" }));
     expect("status" in out && out.status).toBe("403");
     expect("body" in out && out.body).toBe('{"error":"request rejected"}');
+  });
+
+  it("Include Body off: a POST with Content-Length and no body is 'no body', warned once, never 'no text'", async () => {
+    let calls = 0;
+    const counting = { ...providers.mock, call: (...a: Parameters<typeof providers.mock.call>) => { calls++; return providers.mock.call(...a); } };
+    const h = lambdaEdgeHandler({ ...opts("monitor"), provider: counting });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      for (let i = 0; i < 2; i++) {
+        const ev = event(null, { method: "POST", body: undefined }, { "Content-Length": "5000" });
+        const out = (await h(ev)) as CfRequest;
+        expect(out.headers["x-jev-verdict"][0].value).toBe("skipped");
+        expect(out.headers["x-jev-reason"][0].value).toBe("no+body");
+        // the request CloudFront forwards keeps its headers as they came
+        expect(out.headers["content-length"][0].value).toBe("5000");
+      }
+      expect(calls).toBe(0);
+      const msgs = warn.mock.calls.map((c) => String(c[0]));
+      expect(msgs.filter((m) => m.includes("Include Body"))).toHaveLength(1);
+      // with Include Body on, the same request is judged as before
+      const on = (await h(event(BENIGN, {}, { "Content-Length": String(BENIGN.length) }))) as CfRequest;
+      expect(on.headers["x-jev-source"][0].value).toBe("l2");
+      expect(calls).toBe(1);
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("a truncated body is scanned as the head of a larger one, not passed", async () => {

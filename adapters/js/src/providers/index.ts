@@ -393,9 +393,25 @@ export const openaiCompat: Provider = {
  * `/_jev/authz` (the same endpoint Envoy uses) and turns its X-Jev-* answer
  * back into an answer map, so the Worker applies its own L1 and cache but the
  * judgment, thresholds and deployment context live in one place: the origin.
- * A 403 from the backend is reported as score 1 so the Worker's policy blocks
- * in enforce mode too; an X-Jev-Verdict: error answer is an error here as well.
+ * A block from the backend (any 4xx carrying X-Jev-Verdict: its
+ * policy.block_status) is reported as score 1, whatever X-Jev-Score says, so
+ * the Worker's policy blocks it too at any block_threshold and the cached 1
+ * blocks a repeat; an X-Jev-Verdict: error answer is an error here as well.
  */
+/** The labels an origin gives a text it judged; any other answer was not judged there. */
+const JUDGED = new Set(["safe", "suspicious", "malicious"]);
+
+/** X-Jev-Reason as text (form-encoded on the wire), or a placeholder. */
+function reasonText(res: Response): string {
+  const r = res.headers.get("x-jev-reason");
+  if (r === null || r === "") return "no reason";
+  try {
+    return decodeURIComponent(r.replace(/\+/g, " "));
+  } catch {
+    return r;
+  }
+}
+
 export const backend: Provider = {
   name: "backend",
   async call(prompt, cfg, timeoutMs, info) {
@@ -427,15 +443,27 @@ export const backend: Provider = {
     }
     const verdict = res.headers.get("x-jev-verdict") ?? "";
     const score = Number(res.headers.get("x-jev-score"));
-    if (res.status === 403) {
+    // A block is the origin's decision, made at its own (calibrated)
+    // thresholds: its score, below the Worker's block_threshold, would pass
+    // here what the origin blocked, and cache it as passable. Any 4xx, as the
+    // origin's policy.block_status may be 429 or 451; with X-Jev-Verdict,
+    // since a 4xx without it is not jev-edge's answer (an allow/deny or a
+    // limit in front of it) and fails open like any other status.
+    if (res.status >= 400 && res.status <= 499 && res.headers.has("x-jev-verdict")) {
       const name = (res.headers.get("x-jev-reason") ?? "backend").split("+")[0] || "backend";
-      return [{ [name]: Number.isFinite(score) && score > 0 ? score : 1 }, null];
+      return [{ [name]: 1 }, null];
     }
     if (res.status !== 200) return [null, "backend http " + res.status, statusKind(res.status)];
-    // The origin answered but had no score: its own L2 failed, and its own
-    // breaker counts that when it should. The origin itself is healthy.
-    if (verdict === "error") return [null, "backend: " + decodeURIComponent((res.headers.get("x-jev-reason") ?? "error").replace(/\+/g, " ")), UNUSABLE];
-    if (!Number.isFinite(score)) return [null, "backend: no X-Jev-Score", UNUSABLE];
+    // A 200 is an answer only when the origin judged the text: a verdict it
+    // labelled from a score, with the score. `skipped` (its breaker open,
+    // the path not watched there, unjudgeable), `error` (its own L2 failed)
+    // and a 200 without X-Jev-* (a catch-all route) are not, and must not be
+    // cached here as safe. The origin itself answered, so none of them counts
+    // against the Worker's breaker: the origin's own breaker does that.
+    const raw = res.headers.get("x-jev-score");
+    if (!JUDGED.has(verdict) || raw === null || raw.trim() === "" || !Number.isFinite(score)) {
+      return [null, "backend: not judged (" + (verdict || "no X-Jev-Verdict") + ": " + reasonText(res) + ")", UNUSABLE];
+    }
     const name = (res.headers.get("x-jev-reason") ?? "backend").split("+")[0] || "backend";
     return [{ [name]: score }, null];
   },

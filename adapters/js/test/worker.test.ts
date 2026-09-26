@@ -255,6 +255,27 @@ describe("fullWorker and pagesMiddleware", () => {
     expect(j.v).toBe("safe");
   });
 
+  it("the Worker presets answer 400 to a path nginx would refuse and send nothing on", async () => {
+    const fetched: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: Request) => { fetched.push(input.url); return Response.json({ upstream: true }); }));
+    const full = fullWorker({ upstream: "https://app.internal", provider: providers.mock, config: { jev: { mock_score: 0.1, timeout_ms: 400 } } });
+    const thin = thinWorker({ origin: "https://origin.example" });
+    const pages = pagesMiddleware({ provider: providers.mock });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      for (const path of ["/v1/%u0063ompletions", "/%u0063ompletion", "/v1%u002fchat/completions", "/v1/chat/completions%", "/v1/%zz"]) {
+        expect((await full.fetch(chat(ATTACK, {}, path), {})).status, "full " + path).toBe(400);
+        expect((await thin.fetch(chat(ATTACK, {}, path), {})).status, "thin " + path).toBe(400);
+        let nexted = false;
+        const res = await pages({ request: chat(ATTACK, {}, path), env: {}, next: async () => { nexted = true; return new Response("app"); } });
+        expect({ path, status: res.status, nexted }).toEqual({ path, status: 400, nexted: false });
+      }
+    } finally {
+      warn.mockRestore();
+    }
+    expect(fetched).toEqual([]);
+  });
+
   it("fullWorker picks up the API key from env", async () => {
     let seenAuth = "";
     vi.stubGlobal("fetch", vi.fn(async (input: string | Request, init?: RequestInit) => {

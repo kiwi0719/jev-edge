@@ -87,6 +87,13 @@ post /v1/chat/completions '' "$LONG" >/dev/null
 check "whole body is not flagged partial" 'jev_partial=- reason="injection+0.20"' "$(last_authz)"
 curl -s -o /dev/null -H 'Content-Type: application/json' -H 'X-Jev-Body-Partial: 1' -d "$LONG" $base/v1/chat/completions
 check "a client's X-Jev-Body-Partial is dropped" 'jev_partial=- reason="injection+0.20"' "$(last_authz)"
+# /_jev/authz takes x-envoy-auth-partial-body as Envoy's cut flag: a client's
+# copy would mark this whole body cut (and, with policy.partial =
+# "unjudgeable", leave it unjudged)
+curl -s -o /dev/null -H 'Content-Type: application/json' -H 'X-Envoy-Auth-Partial-Body: true' -d "$LONG" $base/v1/chat/completions
+check "a client's x-envoy-auth-partial-body is dropped" 'envoy_partial=- jev_partial=- reason="injection+0.20"' \
+  "$(docker compose logs --no-log-prefix jev-edge 2>/dev/null | grep '^authz ' | tail -n 1 |
+     sed -n 's/.*\(envoy_partial=[^ ]*\) \(jev_partial=[^ ]*\) .* \(reason=.*\)/\1 \2 \3/p')"
 
 # The largest message the caps allow still fits one frame: a long Content-Type
 # (sent once, in the header block), headers and path at their caps, and a body
@@ -108,6 +115,61 @@ check "authz refused, -unjudged block: 403" "403" \
   "$(http_code -H 'X-E2e-Refuse: 1' -H 'Content-Type: application/json' -d "$LONG" $bbase/v1/chat/completions)"
 check "block variant judges as usual" "app verdict=safe score=0.20 source=l2" \
   "$(curl -s -H 'Content-Type: application/json' -d "$LONG" $bbase/v1/chat/completions)"
+
+# A path nginx refuses inline with 400: IIS-style %u0063, which cpp-httplib
+# under llama.cpp decodes to 'c', any other '%' without two hex digits, a
+# %00. Blocked with 400 and the block body, whatever the unjudged policy
+# says. Before, the agent failed open and the request reached the app (whose
+# nginx answers its own HTML 400 here; llama.cpp served it).
+for p in '/v1/%u0063ompletions' '/v1/chat/%u0063ompletions' '/v1%u002fchat/completions' '/%u0063ompletion' \
+         '/v1/chat/completions%zz' '/v1/chat/completions%' '/v1/chat/completions%00'; do
+  for b in $base $bbase; do
+    code=$(curl -s -o /tmp/jev-haproxy-body -w '%{http_code}' -H 'Content-Type: application/json' -d "$ATTACK" "$b$p")
+    check "malformed path $p (${b##*:}): 400" '400 {"error":"request rejected"}' "$code $(cat /tmp/jev-haproxy-body)"
+  done
+done
+# Well-formed escapes are judged on the path as sent, an escape of a byte that
+# is not UTF-8 (the overlong %C0%AE for '.') included, as nginx takes it inline.
+for p in '/v1/chat/%63ompletions' '/v1/chat/%C0%AEcompletions'; do
+  check "well-formed escape $p is judged" "403" \
+    "$(http_code -H 'Content-Type: application/json' -H 'X-Jev-Mock-Score: 0.97' -d "$ATTACK" "$base$p")"
+done
+check "overlong escape on an unwatched path passes with skipped" "app verdict=skipped score=0.00 source=l1" \
+  "$(curl -s "$base/%C0%AEhealthz")"
+
+# A dot segment, an encoded dot or a doubled slash is judged on the path
+# nginx reads inline (before, the agent failed open on it: verdict=error,
+# passed). The path jev-edge gets cannot climb out of /_jev/authz/:
+# /x/%2e%2e/_jev/metrics is judged as the unwatched path /_jev/metrics, not
+# answered by jev-edge's metrics endpoint. A ".." above the root gets 400,
+# as nginx gives it.
+authz_uri() { sleep 0.3; docker compose logs --no-log-prefix jev-edge 2>/dev/null | grep '^authz ' | tail -n 1 | cut -d' ' -f2; }
+for p in '/v1/x/../chat/completions' '/v1/x/%2e%2e/chat/completions' '/v1/x/%2E./chat/completions' \
+         '/v1//chat/completions' '//v1/chat/completions' '/v1/./chat/completions' '/v1/chat%2fcompletions'; do
+  code=$(curl -s --path-as-is -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' -H 'X-Jev-Mock-Score: 0.97' -d "$ATTACK" "$base$p")
+  check "path $p is judged as /v1/chat/completions" "403 /_jev/authz/v1/chat/completions" "$code $(authz_uri)"
+done
+check "/x/%2e%2e/_jev/metrics is judged as that path" "app verdict=skipped score=0.00 source=l1 /_jev/authz/_jev/metrics" \
+  "$(curl -s --path-as-is "$base/x/%2e%2e/_jev/metrics") $(authz_uri)"
+for p in '/../v1/chat/completions' '/v1/%2e%2e/%2e%2e/_jev/metrics'; do
+  for b in $base $bbase; do
+    code=$(curl -s --path-as-is -o /tmp/jev-haproxy-body -w '%{http_code}' -H 'Content-Type: application/json' -d "$ATTACK" "$b$p")
+    check "path above the root $p (${b##*:}): 400" '400 {"error":"request rejected"}' "$code $(cat /tmp/jev-haproxy-body)"
+  done
+done
+
+# A header net/http cannot send failed the agent open. HAProxy passes a
+# control character in a value (nginx takes it inline too; left out, a
+# Content-Type could stop being read): the agent refuses it with 400 on both
+# variants. A header name that is not a token never reaches the agent (HAProxy
+# answers 400 itself); the agent leaves one out (spoa/main_test.go).
+CTL=$(printf '\001')
+for b in $base $bbase; do
+  code=$(curl -s -o /tmp/jev-haproxy-body -w '%{http_code}' -H "Content-Type: application/json$CTL" -d "$LONG" "$b/v1/chat/completions")
+  check "control character in a header value (${b##*:}): 400" '400 {"error":"request rejected"}' "$code $(cat /tmp/jev-haproxy-body)"
+  code=$(curl -s -o /tmp/jev-haproxy-body -w '%{http_code}' -H 'Content-Type: application/json' -H "X-Pad: a${CTL}b" -d "$LONG" "$b/v1/chat/completions")
+  check "control character in another header value (${b##*:}): 400" '400 {"error":"request rejected"}' "$code $(cat /tmp/jev-haproxy-body)"
+done
 
 docker compose stop jev-edge >/dev/null 2>&1
 check "jev-edge down fails open" "app verdict=error score=0.00 source=adapter" "$(post /v1/chat/completions '' "$LONG")"

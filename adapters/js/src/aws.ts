@@ -80,7 +80,8 @@ export function lambdaEdgeHandler(opts: Options): (event: CfEvent) => Promise<Cf
       if (response) {
         const headers: Record<string, CfHeader[]> = {};
         response.headers.forEach((v, k) => (headers[k] = [{ key: k, value: v }]));
-        const status = rt.config.policy.block_status ?? response.status;
+        // policy.block_status, or 400 for a path that is not well formed
+        const status = response.status;
         return { status: String(status), statusDescription: STATUS_TEXT[status] ?? "Blocked", headers, body: await response.text() };
       }
       setJevHeaders(cf, verdictHeaders(verdict), requestId, subjectId);

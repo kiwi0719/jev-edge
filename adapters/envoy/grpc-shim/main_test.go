@@ -153,16 +153,155 @@ func TestFailOpenWhenAdapterFails(t *testing.T) {
 	}
 }
 
-func TestUnsafePathsAreNotForwarded(t *testing.T) {
-	called := false
-	s, _ := newServer(t, func(w http.ResponseWriter, r *http.Request) { called = true })
-	for _, p := range []string{"/v1/../config", "/v1/%2e%2e/config", "/v1/%2E%2E/config", "/v1//config", "v1/chat"} {
+// normalizePath gives the path nginx reads into $uri (each case checked
+// against openresty 1.31), escaped again: %XX decoded, a decoded '/' or '.'
+// taken as path syntax, doubled slashes merged, "." and ".." resolved, a
+// trailing slash kept; "" where nginx answers 400.
+var normalized = map[string]string{
+	"/v1/chat/completions": "/v1/chat/completions", "/": "/", "/v1/chat/": "/v1/chat/",
+	"/a/../b": "/b", "/a/%2E%2E/b": "/b", "/a/%2e./b": "/b", "/a/.%2e/b": "/b", "/a/..%2Fb": "/b",
+	"//x": "/x", "/v1//chat///completions": "/v1/chat/completions", "/a/%2F/b": "/a/b", "/a%2F%2Fb": "/a/b",
+	"/a/./b/": "/a/b/", "/a/.": "/a/", "/a/b/..": "/a/", "/a/..": "/", "/.": "/", "//": "/", "/%2e": "/",
+	"/a/%2e%2e%2f": "/", "/a/b%2f..%2fc": "/a/c",
+	"/a/...": "/a/...", "/a/.b": "/a/.b", "/a/b..": "/a/b..",
+	// a decoded '%' is only a '%': no second decoding
+	"/a/%252e%252e/x": "/a/%252e%252e/x", "/a/%25": "/a/%25",
+	// a decoded '?' or '#' is part of the path
+	"/a/%3F": "/a/%3F", "/a/%23b": "/a/%23b",
+	// bytes that are not UTF-8, the overlong %C0%AE included, are not a '.'
+	"/a/%C0%AE%C0%AE/x": "/a/%C0%AE%C0%AE/x", "/a/%c0%ae": "/a/%C0%AE", "/a/%FF": "/a/%FF",
+	"/a/%0a": "/a/%0A", "/a%20b": "/a%20b", "/a+b": "/a+b", "/a;b": "/a;b", "/a%5c..%5cb": "/a%5C..%5Cb",
+	// what a path may carry as it is stays as it is (the path never grows)
+	"/a/%21%24%26%27%28%29%2A%2B%2C%3B%3D%3A%40%5B%5D": "/a/!$&'()*+,;=:@[]", "/a/!*()": "/a/!*()",
+	"/a/%63hat": "/a/chat", "/a/%7E%2D%2E%5F": "/a/~-._",
+	// nginx: 400
+	"/..": "", "/../x": "", "/a/../../x": "", "/%2e%2e/x": "", "/a/%2e%2e%2f%2e%2e/x": "", "/a/..%2f..%2fb": "",
+	"": "", "v1": "", "*": "", "%2Fa": "",
+}
+
+func TestNormalizePath(t *testing.T) {
+	for p, want := range normalized {
+		got, ok := normalizePath(p)
+		if !ok {
+			got = ""
+		}
+		if got != want || (want == "") == ok {
+			t.Errorf("normalizePath(%q) = %q, %v; want %q", p, got, ok, want)
+		}
+	}
+}
+
+// A dot segment, an encoded dot or a doubled slash used to fail open
+// (X-Jev-Verdict: error) while nginx inline resolves them and judges the
+// path; Istio, for one, does not merge slashes by default, so
+// /v1//chat/completions reached the shim and passed unjudged. Now the
+// adapter judges the path nginx reads, and the forwarded one cannot climb
+// out of /_jev/authz/: /x/../_jev/metrics is judged as the path
+// /_jev/metrics. A ".." above the root, or a path that does not start with
+// '/', is denied with 400, as nginx refuses it.
+func TestDotSegmentsAndDoubledSlashesAreJudged(t *testing.T) {
+	var got string
+	s, _ := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		got = r.RequestURI
+		w.Header().Set("X-Jev-Verdict", "malicious")
+		w.WriteHeader(403)
+	})
+	for p, want := range map[string]string{
+		"/v1/x/../chat/completions": "/v1/chat/completions", "/v1/x/%2e%2e/chat/completions": "/v1/chat/completions",
+		"/v1/x/%2E%2E/chat/completions": "/v1/chat/completions", "/v1/x/..%2fchat/completions": "/v1/chat/completions",
+		"/v1//chat/completions": "/v1/chat/completions", "//v1/chat/completions": "/v1/chat/completions",
+		"/v1/./chat/completions": "/v1/chat/completions", "/v1/chat/completions/.": "/v1/chat/completions/",
+		"/x/../_jev/metrics": "/_jev/metrics", "/x/%2e%2e/_jev/authz/../metrics?a=/../b": "/_jev/metrics",
+		"": "/",
+	} {
+		for _, unj := range []string{"pass", "block"} {
+			s.unjudged = unj
+			res, _ := s.Check(context.Background(), checkReq(p, nil))
+			if d := res.GetDeniedResponse(); d == nil || d.Status.Code != 403 {
+				t.Fatalf("-unjudged=%s %q: expected jev-edge's 403, got %v", unj, p, res)
+			}
+			if got != "/_jev/authz"+want {
+				t.Fatalf("%q: adapter saw %q, want %q", p, got, "/_jev/authz"+want)
+			}
+		}
+	}
+	for _, p := range []string{"/../v1/chat/completions", "/v1/../../_jev/metrics", "/v1/%2e%2e/%2e%2e/_jev/metrics", "/..", "v1/chat", "*"} {
+		got = ""
 		res, _ := s.Check(context.Background(), checkReq(p, nil))
-		if v, _ := header(res.GetOkResponse().GetHeaders(), "X-Jev-Verdict"); v != "error" {
-			t.Fatalf("%s: expected fail-open, got %v", p, res)
+		if d := res.GetDeniedResponse(); d == nil || d.Status.Code != 400 || got != "" {
+			t.Fatalf("%q: expected 400 without asking the adapter, got %v (adapter saw %q)", p, res, got)
+		}
+	}
+}
+
+// Paths nginx refuses with 400 before jev-edge runs: a '%' without two hex
+// digits after it (IIS-style %u0063, a bare %, %zz, a cut-off %4) and a %00;
+// and a control character, which Go cannot put in a URL. cpp-httplib
+// (llama.cpp) decodes %u0063 to 'c', so /v1/%u0063ompletions is
+// /v1/completions there.
+var malformedPaths = []string{
+	"/v1/%u0063ompletions", "/%u0063ompletion", "/v1%u002fchat/completions", "/v1/chat/%U0063ompletions",
+	"/v1/chat/completions%", "/v1/%zzchat/completions", "/v1/chat/completions%4", "/v1/%u0063ompletions?stream=true",
+	"/v1/chat/completions%00", "/v1/comp\x01letions", "/v1/comp\x7fletions",
+	// refused with 400 even with a dot segment or a doubled slash
+	"/v1//%u0063ompletions", "/v1/../%zz", "/v1/%2e%2e/%u002f", "v1/%u0063ompletions",
+}
+
+// They are denied with 400, as nginx answers them inline and Envoy's HTTP
+// ext_authz hands that 400 on, whatever -unjudged says; before, Go could not
+// build the authz URL for most of them and the shim failed open.
+func TestMalformedPathIsDeniedWith400(t *testing.T) {
+	called := false
+	s, _ := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.Header().Set("X-Jev-Verdict", "safe")
+	})
+	for _, unj := range []string{"pass", "block"} {
+		s.unjudged = unj
+		for _, p := range malformedPaths {
+			res, _ := s.Check(context.Background(), checkReq(p, nil))
+			d := res.GetDeniedResponse()
+			if res.Status.Code != int32(codes.PermissionDenied) || d == nil {
+				t.Fatalf("-unjudged=%s %q: expected denied, got %v", unj, p, res)
+			}
+			if int(d.Status.Code) != 400 || d.Body != `{"error":"request rejected"}` {
+				t.Fatalf("-unjudged=%s %q: status/body = %d %q", unj, p, d.Status.Code, d.Body)
+			}
+			if v, _ := header(d.Headers, "Content-Type"); v != "application/json" || len(d.Headers) != 1 {
+				t.Fatalf("-unjudged=%s %q: headers = %v", unj, p, d.Headers)
+			}
 		}
 	}
 	if called {
-		t.Fatal("adapter was called for an unsafe path")
+		t.Fatal("adapter was called for a malformed path")
+	}
+}
+
+// Well-formed escapes reach the adapter as nginx reads them inline: UTF-8,
+// an escaped control character, and escapes of bytes that are not UTF-8
+// (the overlong %C0%AE, %FF), which nginx, Envoy and HAProxy take and
+// jev-edge judges; a decoded '%' stays a '%'. The query string is not the
+// path and is not checked.
+func TestWellFormedEscapesAreForwardedAsNginxReadsThem(t *testing.T) {
+	var got string
+	s, _ := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		got = r.RequestURI
+		w.Header().Set("X-Jev-Verdict", "safe")
+	})
+	for p, want := range map[string]string{
+		"/v1/%63ompletions": "/v1/completions", "/v1/chat%2Fcompletions": "/v1/chat/completions",
+		"/v1/models/%E6%A8%A1%E5%9E%8B": "/v1/models/%E6%A8%A1%E5%9E%8B", "/v1/a%25b": "/v1/a%25b", "/v1/%0a": "/v1/%0A",
+		"/v1/%01x": "/v1/%01x", "/v1/%C0%AEchat/completions": "/v1/%C0%AEchat/completions",
+		"/v1%C0%AFchat/completions": "/v1%C0%AFchat/completions", "/v1/%E0%80%AE/completions": "/v1/%E0%80%AE/completions",
+		"/v1/%FFchat": "/v1/%FFchat", "/v1/%c0%ae": "/v1/%C0%AE", "/v1/a%2500": "/v1/a%2500",
+		"/v1/chat/completions#x": "/v1/chat/completions", "/v1/chat%23x": "/v1/chat%23x",
+	} {
+		res, _ := s.Check(context.Background(), checkReq(p+"?x=%zz", nil))
+		if res.GetOkResponse() == nil {
+			t.Fatalf("%q: expected OK, got %v", p, res)
+		}
+		if got != "/_jev/authz"+want {
+			t.Fatalf("%q: adapter saw %q, want %q", p, got, "/_jev/authz"+want)
+		}
 	}
 }

@@ -50,6 +50,20 @@ describe("nextMiddleware", () => {
     }
   });
 
+  it("answers 400 to a path nginx would refuse (%u0063, a bare %, %zz)", async () => {
+    const mw = nextMiddleware(opts(), NextResponse);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      for (const path of ["/v1/%u0063ompletions", "/v1/chat/completions%", "/v1/%zzchat/completions"]) {
+        const res = await mw(chat(ATTACK, {}, path));
+        expect({ path, status: res.status }).toEqual({ path, status: 400 });
+        expect(res.headers.get("x-jev-reason")).toBe("invalid+path");
+      }
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it("hands the subject write to the event's waitUntil", async () => {
     const { memoryStore } = await import("../src/cf/stores");
     const { ringLoad } = await import("../src/core/subject");
@@ -105,6 +119,24 @@ describe("nodeMiddleware", () => {
     expect((req.headers as Record<string, string>)["x-jev-verdict"]).toBe("safe");
     expect(req.body).toBe(BENIGN);
     expect((req as { jev?: { source: string } }).jev?.source).toBe("l2");
+  });
+
+  it("answers 400 to a path nginx would refuse and never calls next", async () => {
+    const mw = nodeMiddleware(opts());
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      for (const path of ["/v1/%u0063ompletions", "/%u0063ompletion", "/v1%u002fchat/completions", "/v1/chat/completions%", "/v1/%zz"]) {
+        const req = nodeReq(ATTACK, {}, path);
+        const res = nodeRes();
+        let nexted = false;
+        await mw(req as never, res, () => { nexted = true; });
+        expect({ path, status: res.statusCode, nexted }).toEqual({ path, status: 400, nexted: false });
+        expect(res.body).toBe('{"error":"request rejected"}');
+        expect((req as { jev?: { verdict: string } }).jev?.verdict).toBe("skipped");
+      }
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("uses a parsed body when express.json ran first", async () => {
@@ -355,6 +387,22 @@ describe("nodeMiddleware on node:http, crafted requests", () => {
     }
   });
 
+  it("a target nginx would refuse gets 400, under a mount path too", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    for (const prefix of [undefined, "/v1"]) {
+      const { srv, port } = await serve(prefix);
+      try {
+        for (const target of ["/v1/%u0063ompletions", "/v1/chat/%u0063ompletions", "/v1/chat/completions%", "/v1/%zzchat/completions"]) {
+          const r = await raw(port, target, "app.example");
+          expect({ prefix, target, status: r.status, body: r.body }).toEqual({ prefix, target, status: 400, body: '{"error":"request rejected"}' });
+        }
+      } finally {
+        srv.close();
+      }
+    }
+    warn.mockRestore();
+  });
+
   it("the same under a mount path", async () => {
     const { srv, port } = await serve("/v1");
     try {
@@ -415,6 +463,21 @@ describe("honoMiddleware", () => {
     const out = await mw(c, async () => {});
     expect(out?.status).toBe(403);
   });
+
+  it("returns 400 for a path nginx would refuse and never calls next", async () => {
+    const mw = honoMiddleware(opts());
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      for (const path of ["/v1/%u0063ompletions", "/v1/chat/completions%", "/v1/%zzchat/completions"]) {
+        const { c } = ctx(chat(ATTACK, {}, path));
+        let nexted = false;
+        const out = await mw(c, async () => { nexted = true; });
+        expect({ path, status: out?.status, nexted }).toEqual({ path, status: 400, nexted: false });
+      }
+    } finally {
+      warn.mockRestore();
+    }
+  });
 });
 
 describe("lambdaEdgeHandler", () => {
@@ -470,6 +533,20 @@ describe("lambdaEdgeHandler", () => {
     const out = await h(event(ATTACK, {}, { "X-Jev-Mock-Score": "0.95" }));
     expect("status" in out && out.status).toBe("429");
     expect("statusDescription" in out && out.statusDescription).toBe("Too Many Requests");
+  });
+
+  it("answers 400 Bad Request to a path nginx would refuse, whatever policy.block_status is", async () => {
+    const h = lambdaEdgeHandler({ ...opts(), config: { ...opts().config, policy: { mode: "enforce", block_status: 429 } } });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      for (const uri of ["/v1/%u0063ompletions", "/%u0063ompletion", "/v1/chat/completions%", "/v1/%zzchat/completions"]) {
+        const out = (await h(event(ATTACK, { uri }))) as CfResponse;
+        expect({ uri, status: out.status, description: out.statusDescription }).toEqual({ uri, status: "400", description: "Bad Request" });
+        expect(out.body).toBe('{"error":"request rejected"}');
+      }
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("overwrites all five X-Jev-* headers on the error path", async () => {

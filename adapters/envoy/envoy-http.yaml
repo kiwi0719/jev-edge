@@ -29,9 +29,13 @@ static_resources:
                         - match: { prefix: "/" }
                           route: { cluster: app }
                 http_filters:
-                  # never trust a client-supplied verdict: a route-level
-                  # request_headers_to_remove runs at the router, after ext_authz has
-                  # set the real verdict; this filter runs before ext_authz instead
+                  # never trust a client-supplied verdict, subject or cut flag: a
+                  # route-level request_headers_to_remove runs at the router, after
+                  # ext_authz has set the real verdict; this filter runs before
+                  # ext_authz instead. x-jev-body-partial is the HAProxy agent's
+                  # cut flag: allowed_headers keeps a client's copy from
+                  # /_jev/authz, and this keeps it from the upstream and from a
+                  # config that forwards more headers to ext_authz.
                   - name: envoy.filters.http.header_mutation
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutation
@@ -43,6 +47,7 @@ static_resources:
                           - remove: x-jev-source
                           - remove: x-jev-request-id
                           - remove: x-jev-subject
+                          - remove: x-jev-body-partial
                   - name: envoy.filters.http.ext_authz
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz

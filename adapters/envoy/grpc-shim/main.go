@@ -17,9 +17,16 @@
 // header included), and any error talking to the adapter, fails open: OK
 // with X-Jev-Verdict: error and X-Jev-Source: shim, matching the adapter's
 // own behaviour. Every X-Jev-* header is overwritten on the way upstream so
-// a forged inbound value never survives. Paths containing "..", "%2e" or
-// "//" are not forwarded at all (they could reach the adapter's admin
-// endpoints).
+// a forged inbound value never survives. The path the adapter judges is
+// the one nginx reads inline: escapes decoded, "." and ".." segments
+// (%2e%2e too) resolved and doubled slashes merged, then escaped again, so
+// it cannot climb out of /_jev/authz/ to the adapter's admin endpoints. A
+// path nginx refuses with 400 before jev-edge runs (a '%' without two hex
+// digits after it, such as the IIS-style %u0063 that cpp-httplib under
+// llama.cpp decodes to 'c', a %00, a ".." above the root) or that Go cannot
+// put in a URL (a control character) is denied with 400, as nginx answers
+// it inline, whatever -unjudged says: it is the client's error, so it
+// never fails open.
 package main
 
 import (
@@ -65,13 +72,26 @@ func (s *server) Check(ctx context.Context, req *authv3.CheckRequest) (*authv3.C
 		method = http.MethodGet
 	}
 	path := httpReq.GetPath()
-	if i := strings.IndexByte(path, '?'); i >= 0 {
+	// the query, and a fragment: nginx ends $uri at a '#' (net/url would
+	// have taken the rest for the URL's fragment and not sent it)
+	if i := strings.IndexAny(path, "?#"); i >= 0 {
 		path = path[:i]
 	}
-	if !safePath(path) {
-		return failOpen("refusing path " + path), nil
+	if path == "" {
+		path = "/"
 	}
-	url := s.upstream + path
+	// a dot segment, an encoded dot or a doubled slash (Istio, for one, does
+	// not merge slashes by default) is judged the way nginx reads it inline,
+	// never failed open: forwarded as sent, it could reach the adapter's
+	// admin endpoints next to /_jev/authz
+	norm, ok := "", wellFormedPath(path)
+	if ok {
+		norm, ok = normalizePath(path)
+	}
+	if !ok {
+		return badPath(path), nil
+	}
+	url := s.upstream + norm
 
 	var body io.Reader
 	if raw := httpReq.GetRawBody(); len(raw) > 0 {
@@ -158,19 +178,107 @@ func (s *server) Check(ctx context.Context, req *authv3.CheckRequest) (*authv3.C
 	}, nil
 }
 
-// safePath rejects anything that could escape /_jev/authz/ once the adapter
-// (or a proxy in between) normalises it: dot segments, encoded dots, and
-// doubled slashes. The adapter's admin endpoints live next to the authz
-// prefix, so these must never be forwarded.
-func safePath(p string) bool {
-	if p == "" {
-		return true
+// normalizePath returns the path nginx reads from p into $uri, the path
+// jev-edge judges inline, escaped again for the authz URL; ok is false
+// where nginx answers 400 instead: a path that does not start with '/', or
+// a ".." that climbs above the root. nginx decodes every %XX and takes a
+// decoded '/' or '.' as path syntax (%2e%2e is "..", %2F a slash; %25 is
+// only a '%'), merges doubled slashes and resolves "." and "..", keeping a
+// trailing slash. Forwarded as sent, "/_jev/authz" followed by such a path
+// could climb out of /_jev/authz/ to the adapter's admin endpoints; this
+// one has no "." or ".." segment and no empty one, so jev-edge's nginx
+// decodes it once into the same $uri and has nothing left to resolve.
+// p must be well formed (wellFormedPath).
+func normalizePath(p string) (string, bool) {
+	if !strings.HasPrefix(p, "/") {
+		return "", false
 	}
-	if p[0] != '/' {
+	dec, err := url.PathUnescape(p)
+	if err != nil {
+		return "", false
+	}
+	segs := strings.Split(dec[1:], "/")
+	out := make([]string, 0, len(segs))
+	for _, s := range segs {
+		switch s {
+		case "", ".":
+		case "..":
+			if len(out) == 0 {
+				return "", false
+			}
+			out = out[:len(out)-1]
+		default:
+			out = append(out, escapeSegment(s))
+		}
+	}
+	norm := "/" + strings.Join(out, "/")
+	if last := segs[len(segs)-1]; len(out) > 0 && (last == "" || last == "." || last == "..") {
+		norm += "/"
+	}
+	return norm, true
+}
+
+// escapeSegment escapes one decoded path segment for the authz URL: '%',
+// '/', '?', '#', controls, spaces, bytes past ASCII and the other bytes
+// net/url would not send as they are. The rest (letters, digits,
+// "-._~!$&'()*+,;=:@[]") goes as it is, so the forwarded path is no longer
+// than the client's but for bytes it sent raw that a URL cannot carry
+// (net/url escaped those before too), and fits jev-edge's header buffers
+// as before (README: size contract).
+func escapeSegment(s string) string {
+	const hex = "0123456789ABCDEF"
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if 'a' <= c && c <= 'z' || 'A' <= c && c <= 'Z' || '0' <= c && c <= '9' ||
+			strings.IndexByte("-._~!$&'()*+,;=:@[]", c) >= 0 {
+			b.WriteByte(c)
+			continue
+		}
+		b.WriteByte('%')
+		b.WriteByte(hex[c>>4])
+		b.WriteByte(hex[c&15])
+	}
+	return b.String()
+}
+
+// wellFormedPath reports whether p is a path nginx would take: every '%'
+// starts a two-digit hex escape, none of them is %00, and there is no
+// control character. nginx answers anything else with 400 before jev-edge
+// runs, so the inline deployment never judges such a path, and Go cannot
+// build the authz URL from an invalid escape or a control character.
+// Backends may still decode it (cpp-httplib, under llama.cpp, reads %u0063
+// as 'c'). An escape of a byte that is not UTF-8 (%FF, the overlong %C0%AE)
+// is well formed: nginx, Envoy and HAProxy take it, and jev-edge judges the
+// path as sent.
+func wellFormedPath(p string) bool {
+	if _, err := url.PathUnescape(p); err != nil {
 		return false
 	}
-	lower := strings.ToLower(p)
-	return !strings.Contains(p, "..") && !strings.Contains(lower, "%2e") && !strings.Contains(p, "//")
+	for i := 0; i < len(p); i++ {
+		if p[i] < 0x20 || p[i] == 0x7f {
+			return false
+		}
+	}
+	return !strings.Contains(p, "%00")
+}
+
+// badPath denies a request whose path is not well formed with 400 (the
+// status nginx gives it inline and Envoy's HTTP ext_authz hands on) and the
+// default block body. The client's error, not jev-edge's: never fail-open,
+// whatever -unjudged says.
+func badPath(path string) *authv3.CheckResponse {
+	log.Printf("jev-edge shim: refusing malformed path %.256q with 400", path)
+	return &authv3.CheckResponse{
+		Status: &rpcstatus.Status{Code: int32(codes.PermissionDenied)},
+		HttpResponse: &authv3.CheckResponse_DeniedResponse{
+			DeniedResponse: &authv3.DeniedHttpResponse{
+				Status:  &typev3.HttpStatus{Code: typev3.StatusCode_BadRequest},
+				Headers: []*corev3.HeaderValueOption{overwrite("Content-Type", "application/json")},
+				Body:    `{"error":"request rejected"}`,
+			},
+		},
+	}
 }
 
 func overwrite(key, value string) *corev3.HeaderValueOption {

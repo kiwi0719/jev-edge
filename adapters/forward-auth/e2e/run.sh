@@ -27,6 +27,12 @@ check "traefik safe body judged at l2" "app verdict=safe score=0.20 source=l2" \
   "$(curl -s -X POST $T/v1/chat/completions -H 'Content-Type: application/json' -H 'X-Jev-Mock-Score: 0.2' -d "$BODY_SAFE")"
 check "traefik malicious body blocked 403" "403" \
   "$(curl -s -o /dev/null -w '%{http_code}' -X POST $T/v1/chat/completions -H 'Content-Type: application/json' -H 'X-Jev-Mock-Score: 0.97' -d "$BODY_BAD")"
+# Traefik hands the 403 to the client as it is: the verdict and the request id
+# reach it, never the score, the reason or the source
+hdrs=$(curl -s -o /dev/null -D - -X POST $T/v1/chat/completions -H 'Content-Type: application/json' -H 'X-Jev-Mock-Score: 0.97' -d "$BODY_BAD" | tr -d '\r' | tr 'A-Z' 'a-z')
+check "traefik denial carries x-jev-verdict" "x-jev-verdict: malicious" "$(printf '%s\n' "$hdrs" | grep '^x-jev-verdict:' || true)"
+check "traefik denial carries x-jev-request-id" "1" "$(printf '%s\n' "$hdrs" | grep -c '^x-jev-request-id: [0-9a-f]' || true)"
+check "traefik denial carries no score, reason or source" "" "$(printf '%s\n' "$hdrs" | grep -E '^x-jev-(score|reason|source):' || true)"
 BIG=$(head -c 1500000 /dev/zero | tr '\0' 'a')
 # over max_body_bytes (1 MiB): not denied by Traefik, and judged on head + tail
 check "traefik body over max_body_bytes reaches jev-edge and is judged" "app verdict=safe score=0.20 source=l2" \
@@ -55,6 +61,9 @@ for g in caddy:10003 nginx:10004; do
   check "$name blocked ip ($client_ip) denied without a body" "403" \
     "$(curl -s -o /dev/null -w '%{http_code}' -X POST $B/v1/chat/completions -H 'Content-Type: application/json' -d "$BODY_SAFE")"
 done
+# Caddy returns jev-edge's 403 as it is: nothing in it says it is the IP
+check "caddy ip denial carries no score, reason or source" "" \
+  "$(curl -s -o /dev/null -D - -X POST http://127.0.0.1:10003/v1/chat/completions -H 'Content-Type: application/json' -d "$BODY_SAFE" | tr -d '\r' | tr 'A-Z' 'a-z' | grep -E '^x-jev-(score|reason|source):' || true)"
 # a client cannot dodge the block by naming another path or IP in headers
 SPOOF="-H X-Forwarded-Uri:/healthz -H X-Original-URI:/healthz -H X-Envoy-External-Address:203.0.113.9 -H X-Real-IP:203.0.113.9"
 for g in caddy:10003 nginx:10004; do

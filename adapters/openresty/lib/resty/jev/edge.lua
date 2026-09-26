@@ -625,9 +625,21 @@ local function respond_authz(cfg, rules, over, who)
     ngx.status = 200
     return ngx.exit(200)
   end
-  for k, val in pairs(verdict.headers(v)) do ngx.header[k] = val end
+  local block = v.action == verdict.ACTION_BLOCK
+  if block and who == "forward_auth" then
+    -- Traefik ForwardAuth and Caddy forward_auth hand a denial to the client
+    -- as it is: the client learns that it was blocked and the request id,
+    -- never the score, the reason or which layer decided, which would turn
+    -- the judge into an oracle to tune a prompt against or say that it is
+    -- the IP, not the text, that is blocked. authz() keeps them on a block:
+    -- its relays (Envoy's allowed_client_headers, the shim, the SPOA, the
+    -- thin Worker) filter what reaches the client.
+    ngx.header["X-Jev-Verdict"] = v.verdict
+  else
+    for k, val in pairs(verdict.headers(v)) do ngx.header[k] = val end
+  end
   ngx.header["X-Jev-Request-Id"] = ngx.var.request_id or ""
-  if v.action == verdict.ACTION_BLOCK then
+  if block then
     ngx.status = cfg.policy.block_status or 403
     ngx.header["Content-Type"] = "application/json"
     ngx.say(cfg.policy.block_body or '{"error":"request rejected"}')
@@ -684,7 +696,9 @@ end
 -- X-Original-URI); the client IP by X-Forwarded-For. Only Traefik with
 -- `forwardBody: true` sends the body; without one L1 can only see path,
 -- method and reputation, and the verdict is `skipped` with reason "no body".
--- Responses follow the same contract as authz(): 200 + X-Jev-* or 403 + body.
+-- Responses follow the same contract as authz(): 200 + X-Jev-* or 403 + body,
+-- except that a 403 carries only X-Jev-Verdict and X-Jev-Request-Id, since
+-- these gateways return it to the client unchanged.
 function _M.forward_auth()
   local cfg = config.current()
   local rules = config.rules()

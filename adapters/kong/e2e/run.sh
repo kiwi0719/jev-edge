@@ -61,6 +61,18 @@ check "body spooled to disk is judged at L2" "app verdict=safe score=0.20 source
 check "inline tenant rule (rules_json) watches its path" "app verdict=safe score=0.20 source=l2" "$(post /v1/billing/ask '' "$LONG")"
 code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' -H 'X-Jev-Mock-Score: 0.97' -d "$ATTACK" $base/v1/billing/ask)
 check "inline tenant rule blocks" "403" "$code"
+# Route A's key is out of quota (the stub answers 429): A's breaker opens,
+# and route B on the same endpoint with another key is still judged
+src() { printf '%s' "$1" | sed -n 's/.* source=\([a-z0-9]*\).*/\1/p'; }
+last=""
+for i in $(seq 1 30); do
+  last=$(src "$(post /qa/chat/completions '' "$LONG")")
+  [ "$last" = "breaker" ] && break
+done
+check "route A's breaker opens on its key's 429s" "breaker" "$last"
+check "route B (same endpoint, another key) is still judged at L2" "app verdict=safe score=0.10 source=l2" "$(post /qb/chat/completions '' "$LONG")"
+check "route B still blocks an injection" "403" \
+  "$(curl -s -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' -d "$ATTACK" $base/qb/chat/completions)"
 check "log_line writes the decision" "yes" "$(docker compose logs kong 2>/dev/null | grep -q 'jev-edge: {.*"verdict":"malicious"' && echo yes || echo no)"
 
 if [ $fail -ne 0 ]; then echo; echo "--- kong logs"; docker compose logs kong | tail -40; exit 1; fi

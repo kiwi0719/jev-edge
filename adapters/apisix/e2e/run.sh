@@ -43,5 +43,18 @@ post /c/chat/completions '' "$CACHED" >/dev/null
 check "a repeated text is answered from the verdict cache" "app verdict=safe score=0.20 source=cache" "$(post /c/chat/completions '' "$CACHED")"
 check "no missing-dict error at startup" "0" "$(docker compose logs apisix 2>/dev/null | grep -c 'lua_shared_dict jev_cache is not defined' || true)"
 
+# Route A's key is out of quota (the stub answers 429): A's breaker opens,
+# and route B on the same endpoint with another key is still judged
+src() { printf '%s' "$1" | sed -n 's/.* source=\([a-z0-9]*\).*/\1/p'; }
+last=""
+for i in $(seq 1 30); do
+  last=$(src "$(post /qa/chat/completions '' "$LONG")")
+  [ "$last" = "breaker" ] && break
+done
+check "route A's breaker opens on its key's 429s" "breaker" "$last"
+check "route B (same endpoint, another key) is still judged at L2" "app verdict=safe score=0.10 source=l2" "$(post /qb/chat/completions '' "$LONG")"
+check "route B still blocks an injection" "403" \
+  "$(curl -s -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' -d "$ATTACK" $base/qb/chat/completions)"
+
 if [ $fail -ne 0 ]; then echo; echo "--- apisix logs"; docker compose logs apisix | tail -40; exit 1; fi
 echo "apisix e2e: all checks passed"

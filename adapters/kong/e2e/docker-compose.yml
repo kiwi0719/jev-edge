@@ -23,9 +23,14 @@ services:
       KONG_PROXY_ACCESS_LOG: "off"
       KONG_PROXY_ERROR_LOG: /dev/stderr
     ports: ["9380:8000"]
-    depends_on: [app]
+    depends_on: [app, judge]
   app:
     image: jev-edge-test
     volumes:
       - ../../envoy/e2e/app.conf:/tmp/app/conf/nginx.conf:ro
     command: ["sh", "-c", "mkdir -p /tmp/app/logs && openresty -p /tmp/app -c /tmp/app/conf/nginx.conf -g 'daemon off;'"]
+  judge:
+    image: jev-edge-test
+    volumes:
+      - ./judge-stub.conf:/tmp/judge/conf/nginx.conf:ro
+    command: ["sh", "-c", "mkdir -p /tmp/judge/logs && openresty -p /tmp/judge -c /tmp/judge/conf/nginx.conf -g 'daemon off;'"]

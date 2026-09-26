@@ -280,13 +280,12 @@ local function runtime_for(conf)
     check_dict(SUBJECT_DICT, "subject.enabled: no trajectories, no subject reputation")
   end
   cache = cache or cache_m.new(DICT)
-  -- Breaker, adaptive timeout and in-flight counters describe one provider,
-  -- not the whole gateway: routes that call the same provider, endpoint and
-  -- model share them, a route with another provider (or a broken key on a
-  -- different endpoint) gets its own, so one cannot trip the other's breaker.
-  local st = cache:prefixed("p:" .. sha256_hex(table.concat({
-    tostring(cfg.jev.provider or ""), tostring(cfg.jev.endpoint or ""), tostring(cfg.jev.model or ""),
-  }, "\n")):sub(1, 12) .. ":")
+  -- Breaker, adaptive timeout and in-flight counter: shared by the routes
+  -- and consumers that call the same provider, endpoint and model with the
+  -- same key, max_inflight and breaker settings (resty.jev.http
+  -- state_prefix), and only by them: a conf whose key is revoked or over
+  -- quota, or whose breaker is tuned to trip early, opens its own breaker.
+  local st = cache:prefixed(http.state_prefix(cfg, sha256_hex))
   local judge, err = http.new(cfg.jev, st)
   if not judge then
     core.log.error("jev-edge: ", err)

@@ -45,6 +45,31 @@ services:
             config:
               jev: { provider: mock, mock_score: 0.2, timeout_ms: 300 }
               policy: { mode: enforce }
+      # Two routes on one judge endpoint, the same tuning, different keys: the
+      # stub answers 429 to route A's key (out of quota), and A's breaker
+      # must not open B's.
+      - name: quota-a
+        paths: ["/qa"]
+        strip_path: false
+        plugins:
+          - name: jev-edge
+            config:
+              jev: { provider: jev, endpoint: "http://judge:8082/judge", api_key: over-quota, timeout_ms: 1000 }
+              rules_json: '[{"id":"qa","extends":"llm-endpoints","watch_paths":["^/qa/"]}]'
+              policy: { mode: enforce }
+              breaker: { min_samples: 5 }
+              async: { enabled: false }
+      - name: quota-b
+        paths: ["/qb"]
+        strip_path: false
+        plugins:
+          - name: jev-edge
+            config:
+              jev: { provider: jev, endpoint: "http://judge:8082/judge", api_key: good-key, timeout_ms: 1000 }
+              rules_json: '[{"id":"qb","extends":"llm-endpoints","watch_paths":["^/qb/"]}]'
+              policy: { mode: enforce }
+              breaker: { min_samples: 5 }
+              async: { enabled: false }
       - name: plain
         paths: ["/plain"]
         strip_path: false

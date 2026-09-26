@@ -76,3 +76,58 @@ describe("http judge: error kinds", function()
     assert.is_nil(kind)
   end)
 end)
+
+-- Kong and APISIX key a route's breaker, adaptive timeout and in-flight
+-- counter by state_prefix: one route's key or tuning must not reach another.
+describe("http.state_prefix", function()
+  local http
+  setup(function()
+    package.loaded["resty.jev.http"] = nil
+    http = require "resty.jev.http"
+  end)
+  teardown(function() package.loaded["resty.jev.http"] = nil end)
+
+  -- a stand-in digest (the adapters pass SHA-256)
+  local function hash(s)
+    local a, b = 7, 11
+    for i = 1, #s do
+      a = (a * 31 + s:byte(i)) % 4294967296
+      b = (b * 131 + s:byte(i)) % 4294967291
+    end
+    return string.format("%08x%08x", a, b)
+  end
+  local function cfg(jev, breaker)
+    local j = { provider = "jev", endpoint = "https://judge/v1", model = "m", api_key = "sk-route-a",
+                max_inflight = 64 }
+    for k, v in pairs(jev or {}) do j[k] = v end
+    local b = { window_s = 60, min_samples = 20, fail_ratio = 0.5, open_s = 30 }
+    for k, v in pairs(breaker or {}) do b[k] = v end
+    return { jev = j, breaker = b }
+  end
+
+  it("is the same for the same provider, endpoint, model, key and tuning", function()
+    assert.equals(http.state_prefix(cfg(), hash), http.state_prefix(cfg(), hash))
+    assert.matches("^p:%x+:$", http.state_prefix(cfg(), hash))
+  end)
+
+  it("differs with the key, max_inflight or any breaker setting", function()
+    local base = http.state_prefix(cfg(), hash)
+    assert.not_equals(base, http.state_prefix(cfg({ api_key = "sk-route-b" }), hash))
+    assert.not_equals(base, http.state_prefix(cfg({ api_key = false }), hash))
+    assert.not_equals(base, http.state_prefix(cfg({ max_inflight = 4 }), hash))
+    assert.not_equals(base, http.state_prefix(cfg(nil, { min_samples = 1 }), hash))
+    assert.not_equals(base, http.state_prefix(cfg(nil, { fail_ratio = 0.01 }), hash))
+    assert.not_equals(base, http.state_prefix(cfg(nil, { open_s = 3600 }), hash))
+    assert.not_equals(base, http.state_prefix(cfg({ endpoint = "https://other/v1" }), hash))
+  end)
+
+  it("takes the key only as a hash", function()
+    local seen
+    http.state_prefix(cfg(), function(s)
+      if s:find("\n", 1, true) then seen = s end
+      return hash(s)
+    end)
+    assert.is_nil(seen:find("sk-route-a", 1, true))
+    assert.truthy(seen:find(hash("sk-route-a"), 1, true))
+  end)
+end)

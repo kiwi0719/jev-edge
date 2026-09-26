@@ -113,12 +113,12 @@ local function runtime_for(conf)
     end
   end
   cache = cache or cache_m.new(DICT)
-  -- Breaker, adaptive timeout and in-flight counters describe one provider:
-  -- plugin instances calling the same provider, endpoint and model share
-  -- them, one with another provider gets its own.
-  local st = cache:prefixed("p:" .. sha256_hex(table.concat({
-    tostring(cfg.jev.provider or ""), tostring(cfg.jev.endpoint or ""), tostring(cfg.jev.model or ""),
-  }, "\n")):sub(1, 12) .. ":")
+  -- Breaker, adaptive timeout and in-flight counter: shared by the plugin
+  -- instances that call the same provider, endpoint and model with the same
+  -- key, max_inflight and breaker settings (resty.jev.http state_prefix), and
+  -- only by them: an instance whose key is revoked or over quota, or whose
+  -- breaker is tuned to trip early, opens its own breaker.
+  local st = cache:prefixed(http.state_prefix(cfg, sha256_hex))
   local judge, err = http.new(cfg.jev, st)
   if not judge then
     kong.log.err("jev-edge: ", err)

@@ -21,6 +21,29 @@ end
 local adaptive_m = require "resty.jev.adaptive"
 local judge      = require "jev.core.judge"
 
+--- The prefix a gateway route (a Kong plugin instance, an APISIX conf) keeps
+-- its breaker, adaptive timeout and in-flight counter under. Routes share
+-- that state only when they call the same provider, endpoint and model with
+-- the same credential and the same tuning (max_inflight, the breaker
+-- settings): a route whose key is revoked or over quota, or whose breaker
+-- trips on one failure, opens its own breaker and not every other route's,
+-- and a max_inflight is only ever compared with calls made under that same
+-- cap. The key goes in as a hash, never as it is.
+-- @param cfg  merged config (cfg.jev with the key already read, cfg.breaker)
+-- @param hash function(string) -> hex digest
+function _M.state_prefix(cfg, hash)
+  local j, b = cfg.jev or {}, cfg.breaker or {}
+  local names = {}
+  for k in pairs(b) do names[#names + 1] = k end
+  table.sort(names, function(x, y) return tostring(x) < tostring(y) end)
+  local tuning = {}
+  for i, k in ipairs(names) do tuning[i] = tostring(k) .. "=" .. tostring(b[k]) end
+  return "p:" .. hash(table.concat({
+    tostring(j.provider or ""), tostring(j.endpoint or ""), tostring(j.model or ""),
+    hash(tostring(j.api_key or "")), tostring(j.max_inflight or ""), table.concat(tuning, ","),
+  }, "\n")):sub(1, 12) .. ":"
+end
+
 --- Build a judge object for the current config.
 -- @param cfg      cfg.jev section (provider, endpoint, model, api_key, timeout_*, max_inflight)
 -- @param inflight cache-like object with get/set/incr (shared dict); also backs the adaptive timeout

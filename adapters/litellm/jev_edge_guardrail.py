@@ -35,7 +35,10 @@ which win over the environment; older versions pass only ``guardrail_name``,
     JEV_EDGE_EXTRA_FIELDS    comma list of top-level keys also sent, for the
                              paths jev-edge's untrusted.fields names
     JEV_EDGE_UNJUDGED        pass (default) | block: what a request nobody
-                             could judge gets
+                             could judge gets, and a request with a part
+                             nobody could judge (a Bedrock text document
+                             the guardrail cannot read: the rest is judged,
+                             the verdict notes it as ``unjudged``)
     JEV_EDGE_TEST_ENDPOINT   judge (default) | refuse: what a call from
                              LiteLLM's /guardrails/apply_guardrail gets
 
@@ -131,8 +134,8 @@ MEDIA_KEYS = frozenset({"image_url", "input_audio", "file_data", "inline_data", 
 TEXT_DOCUMENT_FORMATS = frozenset({"txt", "md", "csv", "html"})
 # Strings under these keys name structure, not text: a body with nothing else
 # is not worth a round trip. Below a path sent whole every key and string is
-# text.
-STRUCTURAL_KEYS = frozenset({"role", "type", "id", "call_id", "tool_call_id", "tool_use_id", "name",
+# text. `toolUseId` is Bedrock Converse's tool_use_id.
+STRUCTURAL_KEYS = frozenset({"role", "type", "id", "call_id", "tool_call_id", "tool_use_id", "toolUseId", "name",
                              "media_type", "status", "model", "cache_control"})
 # Paths from a top-level key, keys folded as jev-edge folds them, "*" for
 # each item of an array.
@@ -506,38 +509,59 @@ def _document_text(doc: dict, limit: int) -> Optional[str]:
     return text
 
 
-def _bedrock_documents(msgs: list, limit: int) -> list:
+def _read_document(block: Any, limit: int, texts: list, unread: list) -> Any:
+    """`block` (a message's content block, or one of a toolResult's) as it is
+    judged. The text of its `document`, when that is a text document, goes
+    to `texts` as a {"text": ...} part. One the guardrail cannot read
+    (_Unreadable) is left out of the block, its format added to `unread`,
+    and None is returned when nothing else is left of the block. The
+    block itself is never changed."""
+    doc = block.get("document") if isinstance(block, dict) else None
+    if not isinstance(doc, dict):
+        return block
+    try:
+        text = _document_text(doc, limit)
+    except _Unreadable as e:
+        unread.append(e.format)
+        rest = {k: v for k, v in block.items() if k != "document"}
+        return rest or None
+    if text:
+        texts.append({"text": text})
+    return block
+
+
+def _bedrock_documents(msgs: list, limit: int, unread: list) -> list:
     """`msgs` with the text of every Bedrock Converse document of a text
     format (txt, md, csv, html) as a {"text": ...} part of its message's
     content, right after the block that holds it: the document block, or
     the toolResult it is in. The media filter drops a document's
     source.bytes, and jev-edge reads a message's text parts, not a
     document's source: a text document was sent as no text at all.
-    _Unreadable for one that cannot be read, which leaves the request
-    unjudgeable rather than "no text". New lists; the request is not
-    changed."""
+    A document that cannot be read is left out, and its format added to
+    `unread`: the text beside it is still judged, and the caller notes
+    the document as not judged (jev-edge reads nothing of a Converse
+    document block, so leaving it out hides nothing from it). New lists;
+    the request is not changed."""
     out = []
     for m in msgs:
         content = m.get("content") if isinstance(m, dict) else None
         if not isinstance(content, list):
             out.append(m)
             continue
-        new, added = [], False
+        new, changed = [], False
         for block in content:
-            new.append(block)
-            if not isinstance(block, dict):
-                continue
-            docs = [block["document"]] if isinstance(block.get("document"), dict) else []
-            result = block.get("toolResult")
+            texts: list = []
+            kept = _read_document(block, limit, texts, unread)
+            result = kept.get("toolResult") if isinstance(kept, dict) else None
             if isinstance(result, dict) and isinstance(result.get("content"), list):
-                docs += [b["document"] for b in result["content"]
-                         if isinstance(b, dict) and isinstance(b.get("document"), dict)]
-            for doc in docs:
-                text = _document_text(doc, limit)
-                if text:
-                    new.append({"text": text})
-                    added = True
-        out.append(dict(m, content=new) if added else m)
+                inner = [_read_document(b, limit, texts, unread) for b in result["content"]]
+                if any(n is not o for n, o in zip(inner, result["content"])):
+                    kept = dict(kept, toolResult=dict(result, content=[b for b in inner if b is not None]))
+            if kept is not None:
+                new.append(kept)
+            new.extend(texts)
+            changed = changed or kept is not block or bool(texts)
+        out.append(dict(m, content=new) if changed else m)
     return out
 
 
@@ -587,10 +611,13 @@ def _is_definition(key: str, value: Any) -> bool:
 READ_KEYS = DEFINITION_KEYS + SYSTEM_KEYS + TEXT_KEYS + GEMINI_SYSTEM_KEYS + (GEMINI_CONTENTS,)
 
 
-def _body_dict(data: dict, extra_fields: tuple = (), limit: int = MAX_BODY_BYTES) -> Optional[dict]:
+def _body_dict(data: dict, extra_fields: tuple = (), limit: int = MAX_BODY_BYTES,
+               unread: Optional[list] = None) -> Optional[dict]:
     """The body jev-edge judges (body_for), as a dict, or None without text.
-    limit: the most bytes of one Bedrock text document read (_Unreadable
-    past it)."""
+    limit: the most bytes of one Bedrock text document read; unread: a list
+    the format of each Bedrock text document it cannot read (not base64,
+    past `limit`, an s3Location) is added to. Such a document is left out,
+    so None means no text beside it either."""
     body: dict[str, Any] = {}
     for key in DEFINITION_KEYS + ("text",):
         value = data.get(key)
@@ -609,7 +636,7 @@ def _body_dict(data: dict, extra_fields: tuple = (), limit: int = MAX_BODY_BYTES
     if convo is not None and not isinstance(convo, list):
         convo = [convo]
     if convo is not None:
-        convo = _bedrock_documents(convo, limit)
+        convo = _bedrock_documents(convo, limit, unread if unread is not None else [])
     if system and convo is None:
         # no conversation under `messages` (the Responses API): the system
         # prompt goes first, before the input
@@ -922,14 +949,16 @@ class JevEdgeGuardrail(_ApplyGuardrailBase):
         message, and Gemini's `contents` (a `parts` object followed by its
         keys as text parts); media payloads removed outside the tool calls
         and tool results sent whole, a Bedrock text document's bytes sent as
-        a text part. None when no value holds any text; ValueError for a
-        Bedrock text document it cannot read."""
+        a text part (one it cannot read left out: plan() notes it). None
+        when no value holds any text."""
         body = _body_dict(data, _parse_fields(extra_fields) if extra_fields else ())
         return None if body is None else _dumps(body)
 
     def plan(self, data: dict, call_type: Any) -> tuple:
         """What to do with a call, by call type: ("judge", body or None),
-        ("skip", reason), ("unjudged", reason) or ("refuse", reason)."""
+        ("partial", (body, reason)): the body judged and `reason` noted for
+        the part of the request nobody judged, ("skip", reason),
+        ("unjudged", reason) or ("refuse", reason)."""
         name = str(getattr(call_type, "value", call_type) or "")
         if name in SKIP_CALLS:
             return "skip", f"call type {name} not judged"
@@ -985,10 +1014,22 @@ class JevEdgeGuardrail(_ApplyGuardrailBase):
             data = _run(data)
         elif name in ("create_assistants", "acreate_assistants"):
             data = _assistant(data)
-        try:
-            return "judge", _body_dict(data, self.extra_fields, self.max_body_bytes)
-        except _Unreadable as e:
-            return "unjudged", f"unjudgeable: call type {name}: bedrock document {e.format} not readable"
+        unread: list = []
+        return self._with_unread(name, _body_dict(data, self.extra_fields, self.max_body_bytes, unread), unread)
+
+    @staticmethod
+    def _with_unread(name: str, body: Optional[dict], unread: list) -> tuple:
+        """("judge", body) when the guardrail read every Bedrock text
+        document; with one it cannot read (`unread`, their formats), the
+        text beside it is judged all the same, ("partial", (body, reason)),
+        so attaching such a document hides nothing. Only a request with no
+        text beside it is unjudgeable, ("unjudged", reason)."""
+        if not unread:
+            return "judge", body
+        formats = ", ".join(dict.fromkeys(unread))
+        what = f"bedrock document {formats}" if len(unread) == 1 else f"{len(unread)} bedrock documents ({formats})"
+        reason = f"unjudgeable: call type {name}: {what} not readable"
+        return ("unjudged", reason) if body is None else ("partial", (body, reason))
 
     def _plan_passthrough(self, name: str, body: dict, what: str) -> tuple:
         """A pass-through client's body, in the provider's own format: judged
@@ -996,12 +1037,10 @@ class JevEdgeGuardrail(_ApplyGuardrailBase):
         (Titan's `inputText`, Cohere's `message`, a batch's `requests`, ...)
         is unjudgeable, not "no text": the format is not one it knows. An
         empty one (a Bedrock GET) has no text."""
-        try:
-            judged = _body_dict(body, self.extra_fields, self.max_body_bytes)
-        except _Unreadable as e:
-            return "unjudged", f"unjudgeable: call type {name}: bedrock document {e.format} not readable"
-        if judged is not None:
-            return "judge", judged
+        unread: list = []
+        judged = _body_dict(body, self.extra_fields, self.max_body_bytes, unread)
+        if judged is not None or unread:
+            return self._with_unread(name, judged, unread)
         read = READ_KEYS + self.extra_fields
         if any(body.get(k) is not None for k in read):
             return "judge", None  # the fields it reads, holding no text (an image)
@@ -1077,6 +1116,8 @@ class JevEdgeGuardrail(_ApplyGuardrailBase):
             verdict = self._adapter("skipped", arg)
         elif kind == "unjudged":
             verdict = self._unjudged(arg)
+        elif kind == "partial":
+            verdict = self._partial(await self.judge(arg[0], ip), arg[1])
         elif arg is None:
             verdict = self._adapter("skipped", "no text")
         else:
@@ -1155,6 +1196,20 @@ class JevEdgeGuardrail(_ApplyGuardrailBase):
         log.warning("jev-edge: %s (unjudged: %s)", reason, self.unjudged)
         v = self._adapter("skipped", reason)
         if self.unjudged == "block":
+            v["action"] = "block"
+            v["status"] = 403
+        return v
+
+    def _partial(self, verdict: dict, reason: str) -> dict[str, Any]:
+        """The verdict on the text that was judged, with the part nobody
+        judged (a Bedrock text document the guardrail cannot read) noted as
+        `unjudged`: `reason`. That part is passed or blocked as `unjudged`
+        says, as a request nobody judged is: with block, a request the rest
+        of which passed (or could not be judged: the judge unavailable) is
+        blocked with 403; a block stays jev-edge's."""
+        log.warning("jev-edge: %s (unjudged: %s)", reason, self.unjudged)
+        v = dict(verdict, unjudged=reason)
+        if self.unjudged == "block" and v.get("action") != "block":
             v["action"] = "block"
             v["status"] = 403
         return v

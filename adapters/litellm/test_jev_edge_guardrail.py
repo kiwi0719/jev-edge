@@ -884,16 +884,53 @@ def test_bedrock_text_document_through_the_pass_through_is_judged():
     assert seen["body"]["messages"][0]["content"][-1] == {"text": ATTACK}
 
 
-@pytest.mark.parametrize("source,limit", [
+UNREADABLE = [
     ({"bytes": "not base64 @@"}, None),
-    ({"bytes": b64("x" * 2048)}, 1024),                 # past max_body_bytes
+    ({"bytes": b64("x" * 2048)}, 1024),                        # past max_body_bytes
     ({"s3Location": {"uri": "s3://bucket/notes.txt"}}, None),  # not in the request
     ({}, None),
-])
-def test_bedrock_text_document_the_guardrail_cannot_read_is_unjudged(source, limit):
+]
+
+
+@pytest.mark.parametrize("source,limit", UNREADABLE)
+def test_bedrock_text_document_the_guardrail_cannot_read_leaves_the_rest_judged(source, limit):
+    # A document it cannot read is left out and noted; the text beside it
+    # is judged all the same, so attaching one hides nothing
     kw = {"max_body_bytes": limit} if limit else {}
     doc = {"document": {"format": "csv", "name": "n", "source": source}}
-    for data, call_type in (({"messages": [{"role": "user", "content": [{"text": "hi"}, doc]}]}, "acompletion"),
+    data = {"messages": [{"role": "user", "content": [{"text": "Summarise the notes"}, doc]}]}
+    unread: list = []
+    assert jg._body_dict(data, (), limit or jg.MAX_BODY_BYTES, unread) == {
+        "messages": [{"role": "user", "content": [{"text": "Summarise the notes"}]}]}
+    assert unread == ["csv"]
+    transport, seen = fake_authz()
+    out = run(guard(transport, **kw).async_pre_call_hook({}, None, dict(data), "acompletion"))
+    assert seen["calls"] == 1
+    assert seen["body"] == {"messages": [{"role": "user", "content": [{"text": "Summarise the notes"}]}]}
+    v = out[jg._metadata_key(out)]["jev_verdict"]
+    assert (v["verdict"], v["source"], v["action"], v["unjudged"]) == (
+        "safe", "l2", "pass", "unjudgeable: call type acompletion: bedrock document csv not readable")
+    # with JEV_EDGE_UNJUDGED=block the unread document blocks what jev-edge passed
+    with pytest.raises(Exception) as ei:
+        run(guard(transport, unjudged="block", **kw).async_pre_call_hook({}, None, dict(data), "acompletion"))
+    assert ei.value.status_code == 403 and seen["calls"] == 2
+    assert ei.value.detail["jev"]["verdict"] == "safe" and ei.value.detail["jev"]["unjudged"].endswith("csv not readable")
+    # in a toolResult: the document is left out of it, its text blocks stay
+    result = {"toolResult": {"toolUseId": "t", "status": "success", "content": [{"text": "fetched"}, doc]}}
+    got = jg._body_dict({"messages": [{"role": "user", "content": [result, {"text": "go on"}]}]}, (), limit or jg.MAX_BODY_BYTES)
+    assert got["messages"][0]["content"] == [
+        {"toolResult": {"toolUseId": "t", "status": "success", "content": [{"text": "fetched"}]}}, {"text": "go on"}]
+    # the request LiteLLM sends on is not changed
+    assert doc == {"document": {"format": "csv", "name": "n", "source": source}}
+    assert result["toolResult"]["content"][1] is doc
+
+
+@pytest.mark.parametrize("source,limit", UNREADABLE)
+def test_bedrock_text_document_alone_the_guardrail_cannot_read_is_unjudged(source, limit):
+    # nothing readable left: nobody can judge the request, `unjudged` decides
+    kw = {"max_body_bytes": limit} if limit else {}
+    doc = {"document": {"format": "csv", "name": "n", "source": source}}
+    for data, call_type in (({"messages": [{"role": "user", "content": [doc]}]}, "acompletion"),
                             (bedrock({"messages": [{"role": "user", "content": [
                                 {"toolResult": {"toolUseId": "t", "content": [doc]}}]}]}), "allm_passthrough_route")):
         transport, seen = fake_authz()
@@ -905,6 +942,64 @@ def test_bedrock_text_document_the_guardrail_cannot_read_is_unjudged(source, lim
         with pytest.raises(Exception) as ei:
             run(guard(transport, unjudged="block", **kw).async_pre_call_hook({}, None, dict(data), call_type))
         assert ei.value.status_code == 403 and seen["calls"] == 0
+
+
+@pytest.mark.parametrize("source,limit", UNREADABLE[1:3])
+@pytest.mark.parametrize("where", ["beside", "in a toolResult"])
+def test_bedrock_attack_beside_a_document_the_guardrail_cannot_read_is_blocked(source, limit, where):
+    # the probe: an attack in a text block next to a document over
+    # max_body_bytes (Bedrock takes up to 4.5 MB) or in S3 reaches jev-edge,
+    # which blocks it with 403, under the default JEV_EDGE_UNJUDGED=pass
+    kw = {"max_body_bytes": limit} if limit else {}
+    doc = {"document": {"format": "txt", "name": "n", "source": source}}
+    block = doc if where == "beside" else {"toolResult": {"toolUseId": "t", "content": [doc]}}
+    converse = {"messages": [{"role": "user", "content": [{"text": ATTACK}, block]}], "inferenceConfig": {"maxTokens": 10}}
+    transport, seen = fake_authz(status=403, verdict="malicious", score="0.95")
+    data = bedrock(converse)
+    with pytest.raises(Exception) as ei:
+        run(guard(transport, **kw).async_pre_call_hook({}, None, data, "allm_passthrough_route"))
+    assert ei.value.status_code == 403 and seen["calls"] == 1
+    assert seen["body"]["messages"][0]["content"][0] == {"text": ATTACK}
+    assert "document" not in json.dumps(seen["body"])
+    v = data["metadata"]["jev_verdict"]
+    assert (v["verdict"], v["action"], v["status"]) == ("malicious", "block", 403)
+    assert v["unjudged"] == "unjudgeable: call type allm_passthrough_route: bedrock document txt not readable"
+    assert ei.value.detail["jev"] == v
+    # monitor mode: noted, not blocked
+    transport, seen = fake_authz(status=403, verdict="malicious", score="0.95")
+    out = run(guard(transport, enforce=False, **kw).async_pre_call_hook({}, None, bedrock(converse), "allm_passthrough_route"))
+    v = out["metadata"]["jev_verdict"]
+    assert seen["calls"] == 1 and v["action"] == "block" and v["unjudged"].endswith("txt not readable")
+
+
+def test_bedrock_documents_the_guardrail_cannot_read_are_all_noted():
+    unread = [{"document": {"format": f, "name": "n", "source": {"s3Location": {"uri": "s3://b/" + f}}}} for f in ("csv", "txt", "csv")]
+    readable = {"document": {"format": "md", "name": "r", "source": {"bytes": b64(ATTACK)}}}
+    data = {"messages": [{"role": "user", "content": unread[:2] + [readable]},
+                         {"role": "user", "content": [{"toolResult": {"toolUseId": "t", "content": [unread[2]]}}]}]}
+    transport, seen = fake_authz()
+    out = run(guard(transport).async_pre_call_hook({}, None, data, "acompletion"))
+    # the readable one is judged
+    assert seen["body"]["messages"][0]["content"] == [
+        {"document": {"format": "md", "name": "r", "source": {}}}, {"text": ATTACK}]
+    assert seen["body"]["messages"][1]["content"] == [{"toolResult": {"toolUseId": "t", "content": []}}]
+    assert out["metadata"]["jev_verdict"]["unjudged"] == (
+        "unjudgeable: call type acompletion: 3 bedrock documents (csv, txt) not readable")
+
+
+def test_bedrock_document_the_guardrail_cannot_read_with_the_judge_unavailable():
+    # the text beside it fails open as any judged text does; the document
+    # nobody could read is passed or blocked as `unjudged` says all the same
+    data = {"messages": [{"role": "user", "content": [
+        {"text": "Summarise the notes"}, {"document": {"format": "txt", "name": "n", "source": {"s3Location": {"uri": "s3://b/n"}}}}]}]}
+    for transport in (httpx.MockTransport(lambda r: httpx.Response(503)),
+                      httpx.MockTransport(lambda r: (_ for _ in ()).throw(httpx.ConnectError("refused")))):
+        out = run(guard(transport).async_pre_call_hook({}, None, dict(data), "acompletion"))
+        v = out["metadata"]["jev_verdict"]
+        assert (v["verdict"], v["action"]) == ("error", "pass") and v["unjudged"].endswith("txt not readable")
+        with pytest.raises(Exception) as ei:
+            run(guard(transport, unjudged="block").async_pre_call_hook({}, None, dict(data), "acompletion"))
+        assert ei.value.status_code == 403 and ei.value.detail["jev"]["verdict"] == "error"
 
 
 @pytest.mark.parametrize("call_type,data", [

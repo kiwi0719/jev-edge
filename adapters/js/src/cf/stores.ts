@@ -128,7 +128,7 @@ export function memoryStore(clock: () => number = () => Date.now() / 1000, opts:
  * instance per deployment (`idFromName("jev-edge")`, or the name passed as
  * `{ namespace, name }`). Export it from your Worker and bind it as JEV_STATE.
  *
- * Two kinds of endpoint:
+ * Three kinds of endpoint:
  *   /get, /set, /incr, /expire  the plain Store interface (durableStore);
  *                               /incr is atomic for the same reason as below
  *   /breaker/<op>, /adaptive/<op>  the operation runs HERE, against this
@@ -137,6 +137,10 @@ export function memoryStore(clock: () => number = () => Date.now() / 1000, opts:
  *                               One fetch per operation, and atomic: a
  *                               Durable Object delivers one request at a time
  *                               while the handler only awaits its own storage.
+ *   /pre, /post                 what one judged request needs, in two hops
+ *                               (durableRequest): before the judge, allow()
+ *                               and the timeout; after it, the adaptive
+ *                               samples and the breaker's record together.
  */
 export interface DOStateLike {
   storage: {
@@ -177,6 +181,11 @@ function storeOver(state: DOStateLike, clock: () => number): Store {
 interface BreakerOp { op: "allow" | "state" | "trip" | "success" | "failure" | "release"; cfg?: BreakerConfig; now?: number }
 interface AdaptiveOp { op: "current" | "success" | "timeout"; cfg: JevConfig; ms?: number }
 
+/** An adaptive sample carried by /post: a success in ms, or a timeout (the ms it fired at, null for the floor). */
+type Sample = ["success", number] | ["timeout", number | null];
+/** The breaker's record carried by /post, from core's settle; null records nothing. */
+type Settled = "success" | "failure" | "release" | null;
+
 export class JevState {
   private store: Store;
   private clock = () => Date.now() / 1000;
@@ -188,7 +197,10 @@ export class JevState {
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     if (request.method !== "POST") return new Response("method not allowed", { status: 405 });
-    const body = (await request.json()) as { key?: string; value?: unknown; ttl?: number; by?: number; op?: string; cfg?: unknown; now?: number; ms?: number };
+    const body = (await request.json()) as {
+      key?: string; value?: unknown; ttl?: number; by?: number; op?: string; cfg?: unknown; now?: number; ms?: number;
+      breaker?: unknown; jev?: unknown; samples?: unknown; result?: unknown;
+    };
     if (url.pathname === "/get") {
       const v = await this.store.get(String(body.key));
       return Response.json({ value: v ?? null });
@@ -225,6 +237,29 @@ export class JevState {
         case "timeout": await a.timeout(typeof body.ms === "number" ? body.ms : undefined); return Response.json({ ok: true });
         default: return new Response("bad adaptive op", { status: 400 });
       }
+    }
+    if (url.pathname === "/pre") {
+      const b = new Breaker(this.store, this.clock, (body.breaker as BreakerConfig | undefined) ?? {});
+      const allow = await b.allow();
+      const a = new Adaptive(this.store, (body.jev as JevConfig | undefined) ?? { timeout_ms: 400 });
+      return Response.json({ value: { allow, timeout_ms: allow ? await a.current() : null } });
+    }
+    if (url.pathname === "/post") {
+      const result = body.result ?? null;
+      if (result !== null && result !== "success" && result !== "failure" && result !== "release") {
+        return new Response("bad breaker result", { status: 400 });
+      }
+      const a = new Adaptive(this.store, (body.jev as JevConfig | undefined) ?? { timeout_ms: 400 });
+      for (const s of Array.isArray(body.samples) ? (body.samples as unknown[]) : []) {
+        if (!Array.isArray(s)) continue;
+        if (s[0] === "success") await a.success(Number(s[1]) || 0);
+        else if (s[0] === "timeout") await a.timeout(typeof s[1] === "number" ? s[1] : undefined);
+      }
+      if (result !== null) {
+        const b = new Breaker(this.store, this.clock, (body.breaker as BreakerConfig | undefined) ?? {});
+        await b[result]();
+      }
+      return Response.json({ ok: true });
     }
     return new Response("not found", { status: 404 });
   }
@@ -403,9 +438,14 @@ function caller(target: StateTarget) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
-    if (!res.ok) throw new Error(`jev-state ${path}: http ${res.status}`);
+    if (!res.ok) throw Object.assign(new Error(`jev-state ${path}: http ${res.status}`), { status: res.status });
     return (await res.json()) as { value?: unknown; ok?: boolean };
   };
+}
+
+/** A JevState of a build before this endpoint answers 404 "not found". */
+function missingEndpoint(e: unknown): boolean {
+  return typeof e === "object" && e !== null && (e as { status?: unknown }).status === 404;
 }
 
 /** The plain Store interface over JevState (a namespace, `{ namespace, name }` or a stub): two hops per read-modify-write, one (atomic) per incr. */
@@ -446,5 +486,90 @@ export function durableAdaptive(target: StateTarget, cfg: JevConfig): AdaptiveLi
     current: async () => (t.enabled ? Number((await op("current")).value) || t.floor : t.floor),
     success: async (ms) => { if (t.enabled && ms > 0) await op("success", { ms }); },
     timeout: async (firedMs) => { if (t.enabled) await op("timeout", firedMs === undefined ? {} : { ms: firedMs }); },
+  };
+}
+
+/**
+ * Breaker and adaptive timeout for one judged request over JevState, in two
+ * hops instead of one per operation: allow() asks /pre, which answers the
+ * timeout with it, so current() makes no call; the adaptive samples wait in
+ * the request, and core's settle (success, failure or release, one per
+ * request allow() let through) sends them to /post with the breaker's record.
+ * The factory is made once per runtime, its result once per request. A
+ * JevState that answers 404 to /pre or /post (an older build of the class,
+ * bound from another script) is asked per operation from then on, as
+ * durableBreaker and durableAdaptive do.
+ */
+export function durableRequest(
+  target: StateTarget, bcfg: BreakerConfig, jcfg: JevConfig,
+): () => { breaker: BreakerLike; adaptive: AdaptiveLike } {
+  const call = caller(target);
+  const perOp = { breaker: durableBreaker(target, bcfg), adaptive: durableAdaptive(target, jcfg) };
+  const t = tuning(jcfg);
+  let legacy = false;
+  return () => {
+    let timeout: number | undefined;
+    const samples: Sample[] = [];
+    const post = async (result: Settled): Promise<void> => {
+      const batch = samples.splice(0);
+      if (!legacy) {
+        try {
+          await call("/post", { breaker: bcfg, jev: jcfg, samples: batch, result });
+          return;
+        } catch (e) {
+          if (!missingEndpoint(e)) throw e;
+          legacy = true;
+        }
+      }
+      // each record on its own, as the runtime's wrappers kept them: a
+      // rejected sample does not drop the breaker's record
+      let first: unknown;
+      const each = async (op: () => Promise<void>) => {
+        try {
+          await op();
+        } catch (e) {
+          first ??= e;
+        }
+      };
+      for (const [kind, ms] of batch) {
+        await each(() => (kind === "success" ? perOp.adaptive.success(ms) : perOp.adaptive.timeout(ms ?? undefined)));
+      }
+      if (result !== null) await each(() => perOp.breaker[result]!());
+      if (first !== undefined) throw first;
+    };
+    const breaker: BreakerLike = {
+      state: () => perOp.breaker.state(),
+      allow: async () => {
+        if (!legacy) {
+          try {
+            const v = (await call("/pre", { breaker: bcfg, jev: jcfg })).value as { allow?: unknown; timeout_ms?: unknown } | undefined;
+            timeout = Number(v?.timeout_ms) || t.floor;
+            return v?.allow === true;
+          } catch (e) {
+            if (!missingEndpoint(e)) {
+              // the state is unreachable: current() must not ask it again
+              timeout = t.floor;
+              throw e;
+            }
+            legacy = true;
+          }
+        }
+        return perOp.breaker.allow();
+      },
+      trip: (now) => perOp.breaker.trip(now),
+      success: () => post("success"),
+      failure: () => post("failure"),
+      release: () => post("release"),
+    };
+    const adaptive: AdaptiveLike = {
+      current: async () => timeout ?? perOp.adaptive.current(),
+      success: async (ms) => {
+        if (t.enabled && ms > 0) samples.push(["success", ms]);
+      },
+      timeout: async (firedMs) => {
+        if (t.enabled) samples.push(["timeout", firedMs ?? null]);
+      },
+    };
+    return { breaker, adaptive };
   };
 }

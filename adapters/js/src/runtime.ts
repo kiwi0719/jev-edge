@@ -15,10 +15,10 @@ import { shouldSample, buildSample, type Sample } from "./sampling.js";
 import * as subjectMod from "./core/subject.js";
 import { load as loadProvider, type Provider, type ProviderRequestInfo } from "./providers/index.js";
 import {
-  kvStore, memoryStore, durableStore, durableBreaker, durableAdaptive, isStateTarget, stateStub,
+  kvStore, memoryStore, durableStore, durableBreaker, durableAdaptive, durableRequest, isStateTarget, stateStub,
   type KVLike, type StateTarget,
 } from "./cf/stores.js";
-import { Adaptive, type AdaptiveLike } from "./cf/adaptive.js";
+import { Adaptive, tuning, type AdaptiveLike } from "./cf/adaptive.js";
 import type { Store, BreakerLike } from "./core/breaker.js";
 import { bestEffortStore, bestEffortBreaker, bestEffortAdaptive } from "./besteffort.js";
 
@@ -37,8 +37,10 @@ export interface Options {
   cache?: KVLike | StateTarget | Store;
   /** Breaker + adaptive timeout state: the JevState Durable Object namespace (env.JEV_STATE), the namespace
    *  and an object name (`{ namespace: env.JEV_STATE, name: "staging" }`), a stub, or any Store. Memory (per
-   *  isolate) if absent. With the Durable Object the breaker and adaptive read-modify-write run inside it,
-   *  one fetch per operation.
+   *  isolate) if absent. With the Durable Object the breaker and adaptive read-modify-write run inside it:
+   *  a judged request makes one fetch before the judge (allow and timeout) and one after (the samples and
+   *  the breaker's record, through waitUntil when the host has it). A failed read before the judge is the
+   *  breaker closed and the timeout floor, never a fail-open (besteffort.ts).
    *  Pass the namespace: the runtime makes a stub per operation (`idFromName("jev-edge")`, or the name
    *  given), so it can be kept at module scope. workerd binds a stub to the request that created it; a
    *  runtime kept across requests with a stub logs that once per stub and isolate, and from then on keeps
@@ -78,6 +80,11 @@ export interface Runtime {
   subjectStore: Store;
   breaker: BreakerLike;
   adaptive: AdaptiveLike;
+  /** With `state` a JevState: the breaker and adaptive one judged request
+   *  uses, one hop to the object before the judge and one after it (the
+   *  second through waitUntil when the host has it). Absent otherwise, and a
+   *  request uses `breaker` and `adaptive`. */
+  perRequest?: (rctx?: RequestCtx) => { breaker: BreakerLike; adaptive: AdaptiveLike };
   opts: Options;
 }
 
@@ -144,28 +151,47 @@ export function createRuntime(opts: Options): Runtime {
   let state: Store;
   let breaker: BreakerLike;
   let adaptive: AdaptiveLike;
+  // reads that fail (besteffort.ts) are logged once per outage, per runtime
+  const failing = new Set<string>();
+  const floor = tuning(config.jev).floor;
+  let perRequest: Runtime["perRequest"];
   if (isStateTarget(opts.state)) {
-    // One hop per operation: the Durable Object runs the same Breaker and
-    // Adaptive classes against its own storage, so the read-modify-write is
-    // atomic there instead of three or four round trips from here. The stub
-    // is made per call from a namespace (and name); a stub given as is is
-    // guarded against use past its request (cf/stores.ts), one guard for all
-    // three.
+    // The Durable Object runs the same Breaker and Adaptive classes against
+    // its own storage, so each read-modify-write is atomic there instead of
+    // three or four round trips from here: one hop per operation, and two
+    // per judged request (durableRequest). The stub is made per call from a
+    // namespace (and name); a stub given as is is guarded against use past
+    // its request (cf/stores.ts), one guard for all of them.
     const stub = stateStub(opts.state);
     state = durableStore(stub);
     breaker = durableBreaker(stub, config.breaker);
     adaptive = durableAdaptive(stub, config.jev);
+    const session = durableRequest(stub, config.breaker, config.jev);
+    perRequest = (rctx) => {
+      const s = session();
+      const defer = rctx?.waitUntil
+        ? (p: Promise<void>): boolean => {
+            try {
+              rctx.waitUntil!(p);
+              return true;
+            } catch {
+              return false; // a host that refuses it: awaited instead
+            }
+          }
+        : undefined;
+      return { breaker: bestEffortBreaker(s.breaker, { failing, defer }), adaptive: bestEffortAdaptive(s.adaptive, { failing, floor }) };
+    };
   } else {
     state = (opts.state as Store | undefined) ?? memoryStore(clock);
     breaker = new core.breaker.Breaker(state, clock, config.breaker);
     adaptive = new Adaptive(state, config.jev);
   }
   return {
-    config, rules, provider, state, opts,
+    config, rules, provider, state, opts, perRequest,
     cache: bestEffortStore(cache, "cache"),
     subjectStore: bestEffortStore(subjectStore, "subject store"),
-    breaker: bestEffortBreaker(breaker),
-    adaptive: bestEffortAdaptive(adaptive),
+    breaker: bestEffortBreaker(breaker, { failing }),
+    adaptive: bestEffortAdaptive(adaptive, { failing, floor }),
   };
 }
 
@@ -471,20 +497,21 @@ async function evaluateInner(request: Request, rt: Runtime, requestId: string, r
   const [req, info] = await readReq(request, rt);
   const subject = await subjectCtx(rt, request, info.clientIp, rctx);
   if (subject?.id) info.subjectId = subject.id;
+  const { breaker, adaptive } = rt.perRequest?.(rctx) ?? rt;
   const judgeOnce = async (prompt: core.Prompt): Promise<core.JudgeResult> => {
-    const timeoutMs = await rt.adaptive.current();
+    const timeoutMs = await adaptive.current();
     const t0 = Date.now();
     const r = await rt.provider.call(prompt, rt.config.jev, timeoutMs, info);
     const elapsed = Date.now() - t0;
-    if (r[0]) await rt.adaptive.success(elapsed);
-    else if (String(r[1]).includes("timeout")) await rt.adaptive.timeout(timeoutMs);
+    if (r[0]) await adaptive.success(elapsed);
+    else if (String(r[1]).includes("timeout")) await adaptive.timeout(timeoutMs);
     return r;
   };
   const ctx: core.Ctx = {
     config: rt.config,
     rules: rt.rules,
     cache: rt.cache,
-    breaker: rt.breaker,
+    breaker,
     subject,
     clock: () => Date.now() / 1000,
     // sha256, not djb2: the fingerprint keys the verdict cache and the trust

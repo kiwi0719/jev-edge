@@ -575,21 +575,26 @@ describe("stores", () => {
     }
   });
 
-  it("any other error from a stub still fails open, with no fallback", async () => {
+  it("any other error from a stub is the stub's: no isolate fallback, and the judge still decides", async () => {
     const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
-      const broken = { fetch: async (): Promise<Response> => { throw new Error("network connection lost"); } };
+      let calls = 0;
+      const broken = { fetch: async (): Promise<Response> => { calls++; throw new Error("network connection lost"); } };
       const rt = createRuntime({ config: ENFORCE95, state: broken });
       for (let i = 0; i < 2; i++) {
-        const j = (await (await handle(chat(attack(i)), rt, echo)).json()) as Record<string, string>;
-        expect(j.verdict).toBe("error");
-        expect(j.source).toBe("adapter");
+        const res = await handle(chat(attack(i)), rt, echo);
+        expect(res.status).toBe(403);
+        expect(res.headers.get("x-jev-source")).toBe("l2");
       }
+      expect(calls).toBe(4); // /pre and /post of each request still went to the stub
       const msgs = err.mock.calls.map((c) => String(c[0]));
-      expect(msgs).toHaveLength(2);
-      expect(msgs.every((m) => m.includes("failing open") && m.includes("network connection lost"))).toBe(true);
+      expect(msgs).toHaveLength(1); // the breaker read, once for the outage
+      expect(msgs[0]).toMatch(/breaker read failed, judging with the breaker closed: network connection lost/);
+      expect(warn.mock.calls.map((c) => String(c[0])).filter((m) => m.includes("breaker success failed"))).toHaveLength(2);
     } finally {
       err.mockRestore();
+      warn.mockRestore();
     }
   });
 
@@ -597,6 +602,7 @@ describe("stores", () => {
     // workerd marks an exception that crossed from the object with remote: true;
     // its own cross-request refusal, raised in the caller, carries no such flag
     const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
       const inner = {
         fetch: async (): Promise<Response> => {
@@ -607,13 +613,15 @@ describe("stores", () => {
       await expect(store.get("a")).rejects.toThrow(/thrown by the object/);
       await expect(store.get("a")).rejects.toThrow(/thrown by the object/); // still the object's, no fallback
       const rt = createRuntime({ config: ENFORCE95, state: inner });
-      const j = (await (await handle(chat(attack(0)), rt, echo)).json()) as Record<string, string>;
-      expect(j.verdict).toBe("error");
-      expect(j.source).toBe("adapter");
+      const res = await handle(chat(attack(0)), rt, echo);
+      expect(res.status).toBe(403); // the breaker read closed, the judge decided
+      expect(res.headers.get("x-jev-source")).toBe("l2");
       const msgs = err.mock.calls.map((c) => String(c[0]));
       expect(msgs.some((m) => m.includes("used in a later one"))).toBe(false);
+      expect(msgs.some((m) => m.includes("breaker read failed") && m.includes("thrown by the object"))).toBe(true);
     } finally {
       err.mockRestore();
+      warn.mockRestore();
     }
   });
 
@@ -942,17 +950,40 @@ describe("writes after the verdict are best effort", () => {
     }
   });
 
-  it("Durable Object: breaker success and adaptive sample answering 503 keep the block", async () => {
+  it("Durable Object: the record after the judge (/post) answering 503 keeps the block", async () => {
+    const c = watchConsole();
+    try {
+      const rt = createRuntime({ config: ENFORCE, state: failingDO((path) => path === "/post") });
+      const res = await handle(chat(ATTACK), rt, echo);
+      expect(res.status).toBe(403);
+      expect(c.warned().some((m) => m.includes("breaker success failed") && m.includes("http 503"))).toBe(true);
+      expect(c.errored()).toEqual([]);
+    } finally {
+      c.restore();
+    }
+  });
+
+  /** A JevState build from before /pre and /post: those answer 404, the rest as `inner`. */
+  function olderBuild(inner: { fetch(i: string | Request, init?: RequestInit): Promise<Response> }) {
+    return {
+      fetch: async (i: string | Request, init?: RequestInit) => {
+        const p = new URL(new Request(i, init).url).pathname;
+        return p === "/pre" || p === "/post" ? new Response("not found", { status: 404 }) : inner.fetch(i, init);
+      },
+    };
+  }
+
+  it("Durable Object per operation (an older JevState): breaker success and adaptive sample answering 503 keep the block", async () => {
     const c = watchConsole();
     try {
       for (const failing of ["/breaker", "/adaptive"]) {
-        const stub = failingDO((path, op) => path === failing && (op === "success" || op === "failure"));
+        const stub = olderBuild(failingDO((path, op) => path === failing && (op === "success" || op === "failure")));
         const rt = createRuntime({ config: ENFORCE, state: stub });
         const res = await handle(chat(ATTACK), rt, echo);
         expect({ failing, status: res.status }).toEqual({ failing, status: 403 });
       }
-      expect(c.warned().some((m) => m.includes("breaker success failed") && m.includes("http 503"))).toBe(true);
-      expect(c.warned().some((m) => m.includes("adaptive timeout sample failed"))).toBe(true);
+      expect(c.warned().some((m) => m.includes("jev-state /breaker: http 503"))).toBe(true);
+      expect(c.warned().some((m) => m.includes("jev-state /adaptive: http 503"))).toBe(true);
       expect(c.errored()).toEqual([]);
     } finally {
       c.restore();
@@ -965,7 +996,7 @@ describe("writes after the verdict are best effort", () => {
   it("Durable Object: a failed breaker failure() keeps the judge's error verdict (source l2, not adapter)", async () => {
     const c = watchConsole();
     try {
-      const rt = createRuntime({ config: TIMES_OUT, state: failingDO((path, op) => path === "/breaker" && op === "failure") });
+      const rt = createRuntime({ config: TIMES_OUT, state: failingDO((path) => path === "/post") });
       const j = (await (await handle(chat(ATTACK), rt, echo)).json()) as Record<string, string>;
       expect(j.verdict).toBe("error");
       expect(j.source).toBe("l2");
@@ -1010,5 +1041,148 @@ describe("writes after the verdict are best effort", () => {
     } finally {
       c.restore();
     }
+  });
+});
+
+// Before the judge: the breaker's allow() and the adaptive timeout. A state
+// store that fails them (a Durable Object overloaded or restarting) must not
+// fail the request open while the judge is healthy; the breaker reads closed
+// and the timeout is its floor. Never counted as a breaker failure.
+describe("reads before the judge are best effort", () => {
+  const ENFORCE95 = { jev: { provider: "mock", mock_score: 0.95, mock_delay_ms: 2, timeout_ms: 400 }, policy: { mode: "enforce" as const } };
+  const attack = (i: number) => ATTACK.replace("prompt.", "prompt, read " + i + ".");
+
+  function jevState() {
+    const mem = new Map<string, unknown>();
+    const d = new JevState({ storage: { get: async (k) => mem.get(k), put: async (k, v) => { mem.set(k, v); }, delete: async (k) => mem.delete(k) } });
+    const paths: string[] = [];
+    const stub = { fetch: (i: string | Request, init?: RequestInit) => { const r = new Request(i, init); paths.push(new URL(r.url).pathname); return d.fetch(r); } };
+    return { stub, paths, mem };
+  }
+
+  it("a Durable Object that throws on every call still gets the judge's verdict, logged once", async () => {
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const overloaded = { fetch: async (): Promise<Response> => { throw new Error("Durable Object is overloaded"); } };
+      const rt = createRuntime({ config: ENFORCE95, state: overloaded });
+      for (let i = 0; i < 3; i++) {
+        const res = await handle(chat(attack(i)), rt, echo);
+        expect(res.status).toBe(403);
+        expect(res.headers.get("x-jev-verdict")).toBe("malicious");
+        expect(res.headers.get("x-jev-source")).toBe("l2");
+      }
+      const errors = err.mock.calls.map((c) => String(c[0]));
+      expect(errors.filter((m) => m.includes("breaker read failed"))).toHaveLength(1);
+      expect(errors.some((m) => m.includes("failing open"))).toBe(false);
+      expect(errors.every((m) => m.includes("overloaded"))).toBe(true);
+    } finally {
+      err.mockRestore();
+      warn.mockRestore();
+    }
+  });
+
+  it("the in-process breaker and adaptive over a Store whose reads throw: the verdict stands, no breaker failure", async () => {
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const sets: string[] = [];
+      const state = { get: async () => { throw new Error("store read refused"); }, set: async (k: string) => { sets.push(k); } };
+      const rt = createRuntime({ config: ENFORCE95, state });
+      const res = await handle(chat(attack(0)), rt, echo);
+      expect(res.status).toBe(403);
+      expect(res.headers.get("x-jev-source")).toBe("l2");
+      expect(await rt.breaker.state()).toBe(0); // closed
+      expect(await rt.adaptive.current()).toBe(400); // the floor
+      expect(err.mock.calls.map((c) => String(c[0])).some((m) => m.includes("adaptive timeout read failed") || m.includes("breaker read failed"))).toBe(true);
+    } finally {
+      err.mockRestore();
+      warn.mockRestore();
+    }
+  });
+
+  it("logs again after the reads recovered and failed anew", async () => {
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const { stub } = jevState();
+      let down = true;
+      const flaky = { fetch: async (i: string | Request, init?: RequestInit) => { if (down) throw new Error("overloaded"); return stub.fetch(i, init); } };
+      const rt = createRuntime({ config: ENFORCE95, state: flaky });
+      await handle(chat(attack(0)), rt, echo);
+      await handle(chat(attack(1)), rt, echo);
+      down = false;
+      await handle(chat(attack(2)), rt, echo);
+      down = true;
+      await handle(chat(attack(3)), rt, echo);
+      expect(err.mock.calls.map((c) => String(c[0])).filter((m) => m.includes("breaker read failed"))).toHaveLength(2);
+    } finally {
+      err.mockRestore();
+      warn.mockRestore();
+    }
+  });
+
+  it("one hop before the judge and one after: /pre and /post", async () => {
+    const { stub, paths, mem } = jevState();
+    const rt = createRuntime({ config: ENFORCE95, state: stub });
+    const res = await handle(chat(attack(0)), rt, echo);
+    expect(res.status).toBe(403);
+    expect(paths).toEqual(["/pre", "/post"]);
+    expect(mem.get("adapt")).toMatchObject({ v: { n: 1 } });
+    expect(mem.get("brk:w:" + Math.floor(Date.now() / 1000 / 60))).toMatchObject({ v: { ok: 1, fail: 0 } });
+  });
+
+  it("the record after the judge goes to waitUntil, off the request path", async () => {
+    const { stub, paths, mem } = jevState();
+    const rt = createRuntime({ config: ENFORCE95, state: stub });
+    const kept: Promise<unknown>[] = [];
+    const { evaluate } = await import("../src/runtime");
+    const ev = await evaluate(chat(attack(0)), rt, { waitUntil: (p) => { kept.push(p); } });
+    expect(ev.verdict).toMatchObject({ verdict: "malicious", source: "l2" });
+    expect(kept).toHaveLength(1);
+    await Promise.all(kept);
+    expect(paths).toEqual(["/pre", "/post"]);
+    expect(mem.get("adapt")).toMatchObject({ v: { n: 1 } });
+  });
+
+  it("a judge timeout: the adaptive sample and the breaker failure in the one /post", async () => {
+    const { stub, paths, mem } = jevState();
+    const config = { ...ENFORCE95, jev: { ...ENFORCE95.jev, mock_delay_ms: 50, timeout_ms: 10, timeout_max_ms: 20 } };
+    const rt = createRuntime({ config, state: stub });
+    const j = (await (await handle(chat(attack(0)), rt, echo)).json()) as Record<string, string>;
+    expect(j).toMatchObject({ verdict: "error", source: "l2" });
+    expect(paths).toEqual(["/pre", "/post"]);
+    expect(mem.get("adapt")).toMatchObject({ v: { n: 1, mean: 12 } }); // fired * 1.2
+    expect(mem.get("brk:w:" + Math.floor(Date.now() / 1000 / 60))).toMatchObject({ v: { ok: 0, fail: 1 } });
+  });
+
+  it("an open breaker: /pre says no, nothing is judged or recorded", async () => {
+    const { stub, paths } = jevState();
+    const rt = createRuntime({ config: ENFORCE95, state: stub });
+    await rt.breaker.trip();
+    paths.length = 0;
+    const res = await handle(chat(attack(0)), rt, echo);
+    expect(((await res.json()) as Record<string, string>).source).toBe("breaker");
+    expect(paths).toEqual(["/pre"]);
+  });
+
+  it("a JevState of an older build (no /pre, /post): the per-operation endpoints", async () => {
+    const { stub, paths, mem } = jevState();
+    const old = { fetch: async (i: string | Request, init?: RequestInit) => {
+      const r = new Request(i, init);
+      const p = new URL(r.url).pathname;
+      if (p === "/pre" || p === "/post") { paths.push(p); return new Response("not found", { status: 404 }); }
+      return stub.fetch(r);
+    } };
+    const rt = createRuntime({ config: ENFORCE95, state: old });
+    for (let i = 0; i < 2; i++) {
+      const res = await handle(chat(attack(i)), rt, echo);
+      expect(res.status).toBe(403);
+      expect(res.headers.get("x-jev-source")).toBe("l2");
+    }
+    // one 404 teaches the runtime; the second request goes per operation from the start
+    expect(paths.filter((p) => p === "/pre")).toHaveLength(1);
+    expect(paths.filter((p) => p !== "/pre" && p !== "/post")).toEqual(["/breaker", "/adaptive", "/adaptive", "/breaker", "/breaker", "/adaptive", "/adaptive", "/breaker"]);
+    expect(mem.get("adapt")).toMatchObject({ v: { n: 2 } });
   });
 });

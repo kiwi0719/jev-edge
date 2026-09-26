@@ -28,6 +28,8 @@ Guarantees the gateway relies on, checked by conformance/ (make conformance):
     LAYA_WORKERS requests are scored at once; a request that waits longer
     than LAYA_QUEUE_MS for a worker, and a connection past
     LAYA_MAX_CONNECTIONS, get a 503 `overloaded`;
+  * a client that hangs up or stalls in the middle of its request gets an
+    access-log line at most, never a backend-fault warning;
   * errors are JSON with a non-200 status (400, 401, 404, 405, 411, 413,
     500, 503).
 
@@ -80,6 +82,7 @@ import json
 import math
 import os
 import re
+import socket
 import sys
 import threading
 import time
@@ -429,6 +432,11 @@ class Workers:
             self.sem.release()
 
 
+class ClientGone(ConnectionError):
+    """The client hung up, or went silent past LAYA_IDLE_TIMEOUT_S, in the
+    middle of its request: no one to answer, and not a backend fault."""
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "laya-server"
     protocol_version = "HTTP/1.1"  # keepalive: the gateway pools connections
@@ -463,22 +471,36 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         if self.close_connection:
             self.send_header("Connection", "close")
-        self.end_headers()
         try:
+            self.end_headers()
             self.wfile.write(body)
-        except (BrokenPipeError, ConnectionResetError):
-            self.close_connection = True  # the client gave up (its timeout); nothing to tell it
+        except OSError:
+            # the client hung up or stopped reading (its timeout): nothing to tell it
+            self.close_connection = True
 
     def _error(self, e: Refused) -> None:
         if e.status == 503:
             self.warn("overloaded: %s", e.message)
         self._send(e.status, {"error": {"code": e.code, "message": e.message}})
 
+    def _read(self, n: int) -> bytes:
+        """n bytes of the request body; ClientGone when the client hangs up
+        or goes silent (the socket timeout) before sending them."""
+        try:
+            raw = self.rfile.read(n)
+        except OSError as e:  # socket.timeout, a reset
+            self.close_connection = True
+            raise ClientGone(f"{type(e).__name__} after the headers, reading a {n}-byte body") from None
+        if len(raw) < n:
+            self.close_connection = True
+            raise ClientGone(f"hung up after {len(raw)} of {n} body bytes")
+        return raw
+
     def _drain(self) -> None:
         # read (and drop) a body we are refusing, so the keepalive stream stays in step
         n = int(self.headers.get("Content-Length") or 0)
         if 0 < n <= self.max_body:
-            self.rfile.read(n)
+            self._read(n)
         elif n > self.max_body:
             self.close_connection = True
 
@@ -534,11 +556,7 @@ class Handler(BaseHTTPRequestHandler):
             if n > self.max_body:
                 self.close_connection = True
                 raise Refused(413, "body_too_large", f"body over {self.max_body} bytes")
-            raw = self.rfile.read(n)
-            if len(raw) < n:
-                # the client hung up mid-body: no one to answer
-                self.close_connection = True
-                return
+            raw = self._read(n)
             try:
                 try:
                     req = json.loads(raw)
@@ -557,6 +575,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {"model": self.model_name, "answers": answers, "usage": usage})
         except Refused as e:
             self._error(e)
+        except ClientGone as e:
+            # the client's side, not the model's: an access-log line at most
+            self.log_message("client gone mid-request: %s", e)
         except Exception as e:  # a backend fault: never a score
             self.warn("backend error: %r", e)
             self._error(Refused(500, "backend_error", "the model failed to score this request"))
@@ -606,7 +627,7 @@ class Server(ThreadingHTTPServer):
     def handle_error(self, request, client_address):
         # a client that hung up or went silent (the gateway's timeout, or
         # LAYA_IDLE_TIMEOUT_S) is not a server fault: no traceback for it
-        if isinstance(sys.exc_info()[1], (ConnectionError, TimeoutError)):
+        if isinstance(sys.exc_info()[1], (ConnectionError, TimeoutError, socket.timeout)):
             return
         super().handle_error(request, client_address)
 

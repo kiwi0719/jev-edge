@@ -9,6 +9,7 @@ import json
 import math
 import os
 import random
+import socket
 import sys
 import tempfile
 import threading
@@ -396,6 +397,49 @@ class Load(unittest.TestCase):
                 self.assertEqual(srv.RequestHandlerClass.workers.n, want)
             finally:
                 stop(srv)
+
+
+class ClientGone(unittest.TestCase):
+    """A client that stalls or hangs up in the middle of its body is the
+    client's doing: an access-log line, never a backend-fault warning."""
+
+    def run_client(self, send):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            srv, url = serve({"LAYA_IDLE_TIMEOUT_S": "0.2", "LAYA_ACCESS_LOG": "1"})
+            try:
+                t = conformance.Target(url, None, "laya", 5)
+                body = json.dumps({"state": "hello", "questions": {"q": Q}}).encode()
+                s = conformance.raw_socket(t)
+                try:
+                    s.sendall(conformance.partial_request(t, body))
+                    send(s)
+                finally:
+                    s.close()
+                status = post(url)[0]
+            finally:
+                stop(srv)
+        return status, err.getvalue()
+
+    def test_stall_mid_body(self):
+        def stall(s):
+            s.settimeout(3)
+            self.assertEqual(s.recv(100), b"")  # closed by the server after its idle timeout
+        status, log = self.run_client(stall)
+        self.assertEqual(status, 200)
+        self.assertNotIn("backend error", log)
+        self.assertNotIn("Traceback", log)
+        self.assertRegex(log, r"client gone mid-request: \w+ after the headers, reading a \d+-byte body")
+
+    def test_hang_up_mid_body(self):
+        def hang_up(s):
+            s.shutdown(socket.SHUT_WR)
+            s.settimeout(3)
+            s.recv(100)
+        status, log = self.run_client(hang_up)
+        self.assertEqual(status, 200)
+        self.assertNotIn("backend error", log)
+        self.assertRegex(log, r"client gone mid-request: hung up after \d+ of \d+ body bytes")
 
 
 class OrtOptions(unittest.TestCase):

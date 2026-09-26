@@ -41,6 +41,12 @@ _M.config = {
     -- `body_partial`): "judge" scans the part it has as the head of a larger
     -- body, and what was cut off is never read; "unjudgeable" reports the
     -- request unjudgeable instead, so policy.unjudgeable decides.
+    -- "unjudgeable" makes the gateway's flag (x-envoy-auth-partial-body,
+    -- X-Jev-Body-Partial) mean "do not judge": a flag a client can set
+    -- itself then skips judging whenever policy.unjudgeable = "pass". Use it
+    -- with unjudgeable = "block", where a forged flag only refuses the
+    -- client's own request, and only behind a relay that drops a client's
+    -- copy of the flag (docs/recipes.md, "Bodies past maxRequestBytes").
     partial           = "judge",
   },
   cache = {

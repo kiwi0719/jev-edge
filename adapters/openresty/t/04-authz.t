@@ -349,3 +349,27 @@ location /_jev/authz/ { content_by_lua_block { require("resty.jev.edge").authz()
 ["{\"error\":\"request rejected\"}\n", ""]
 --- no_error_log
 [error]
+
+
+
+=== TEST 14: X-Jev-Body-Partial next to x-envoy-external-address is a client's (the gRPC shim relays it) and ignored; without it (HAProxy's agent) it counts
+--- http_config eval: $::HttpConfig
+--- user_files eval: ::conf('policy = { mode = "monitor", block_threshold = 0.85, suspect_threshold = 0.5, partial = "unjudgeable" },')
+--- config
+location /_jev/authz/ { content_by_lua_block { require("resty.jev.edge").authz() } }
+--- request eval
+["POST /_jev/authz/v1/chat/completions\n{\"messages\":[{\"role\":\"user\",\"content\":\"Please summarise the attached quarterly report for me.\"}]}",
+ "POST /_jev/authz/v1/chat/completions\n{\"messages\":[{\"role\":\"user\",\"content\":\"Please summarise the attached annual report for me.\"}]}",
+ "POST /_jev/authz/v1/chat/completions\n{\"messages\":[{\"role\":\"user\",\"content\":\"Please summarise the attached quarterly report for me, all of it"]
+--- more_headers eval
+["Content-Type: application/json\nX-Jev-Mock-Score: 0.2\nX-Envoy-External-Address: 198.51.100.9\nX-Jev-Body-Partial: 1",
+ "Content-Type: application/json\nX-Jev-Mock-Score: 0.2\nX-Envoy-External-Address: 198.51.100.9\nX-Envoy-Auth-Partial-Body: false\nX-Jev-Body-Partial: 1",
+ "Content-Type: application/json\nX-Jev-Mock-Score: 0.2\nX-Forwarded-For: 198.51.100.9\nX-Jev-Body-Partial: 1"]
+--- error_code eval
+[200, 200, 200]
+--- response_headers eval
+["X-Jev-Verdict: safe\nX-Jev-Reason: injection+0.20",
+ "X-Jev-Verdict: safe\nX-Jev-Reason: injection+0.20",
+ "X-Jev-Verdict: skipped\nX-Jev-Reason: unjudgeable%3A+partial+body"]
+--- no_error_log
+[error]

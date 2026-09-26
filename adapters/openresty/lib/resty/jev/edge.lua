@@ -621,11 +621,19 @@ function _M.authz(prefix)
   local h = ngx.req.get_headers(0)
   local client_ip = client_ip_from(h, cfg, true)
   if not client_ip then metrics.incr_authz("no_client_ip") end
-  -- set by Envoy (with_request_body.allow_partial_message) and the HAProxy
-  -- SPOA agent, which both strip client copies
+  -- The relay's cut flag. Envoy writes x-envoy-auth-partial-body over a
+  -- client's copy whenever it forwards a body (allow_partial_message).
+  -- X-Jev-Body-Partial is the HAProxy agent's, and the agent drops a
+  -- client's copy of it and of x-envoy-external-address. The gRPC shim
+  -- forwards every header the client sent and fills
+  -- x-envoy-external-address from the peer address when Envoy did not set
+  -- it, so next to that header X-Jev-Body-Partial is the client's and is
+  -- ignored: with policy.partial = "unjudgeable" it would turn judging off
+  -- for the request.
   local flag = h["x-envoy-auth-partial-body"]
   if type(flag) == "table" then flag = flag[1] end
-  local partial = flag == "true" or h["x-jev-body-partial"] == "1"
+  local partial = flag == "true"
+    or (h["x-envoy-external-address"] == nil and h["x-jev-body-partial"] == "1")
   local okr, remove = pcall(headers_to_remove, h, cfg)
   if okr then ngx.header["x-envoy-auth-headers-to-remove"] = remove end
 

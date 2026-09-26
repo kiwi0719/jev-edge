@@ -63,16 +63,20 @@ static_resources:
                       failure_mode_allow: true
                       failure_mode_allow_header_add: true
                       # headers forwarded to the authz service (ExtAuthz.allowed_headers; the
-                      # older authorization_request.allowed_headers is deprecated)
+                      # older authorization_request.allowed_headers is deprecated). Not
+                      # x-envoy-external-address: Envoy sets it only for a request it counts
+                      # as external and passes a client's own copy through from a peer on a
+                      # private or loopback address, and jev-edge would take that copy as the
+                      # client address. use_remote_address appends the peer to
+                      # x-forwarded-for, which client_ip.trusted_hops = 1 reads.
                       allowed_headers:
                         patterns:
                           - exact: content-type
                           - exact: content-encoding
                           - exact: content-length
                           - exact: x-forwarded-for
-                          - exact: x-envoy-external-address
                           - exact: x-request-id
-                          - exact: x-jev-mock-score     # e2e only; drop in production
+                          - exact: x-e2e-mock-score     # e2e only; drop in production
                       with_request_body:
                         max_request_bytes: 1048576     # matches rules.max_body_bytes (1 MiB)
                         allow_partial_message: true    # larger bodies arrive cut, with x-envoy-auth-partial-body: true; jev-edge scans them as a head

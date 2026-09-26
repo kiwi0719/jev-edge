@@ -521,9 +521,13 @@ end
 -- The client address as seen by the proxy in front of us. Proxies append to
 -- X-Forwarded-For, so the client's own (forgeable) value is leftmost and the
 -- address the trusted hop saw is rightmost: element `trusted_hops` from the
--- right (1 = last). Envoy's x-envoy-external-address is already that value,
--- but only Envoy sets it: `envoy` is true for authz() alone. Traefik, Caddy
--- and nginx pass a client's copy of it through to forward_auth().
+-- right (1 = last). x-envoy-external-address is read for authz() alone
+-- (`envoy`): the gRPC shim always sets it from the source address Envoy
+-- reports. Envoy itself sets it only for a request it counts as external
+-- and passes a client's own copy through from a peer on a private or
+-- loopback address, so the reference HTTP config does not forward it to
+-- /_jev/authz and X-Forwarded-For is read instead. Traefik, Caddy and nginx
+-- pass a client's copy of it through to forward_auth().
 --
 -- authz() is always called by a relay (Envoy, an Istio sidecar or gateway,
 -- the gRPC shim, HAProxy's agent), never by the client: without either
@@ -638,7 +642,9 @@ function _M.authz(prefix)
   local path = uri
   if uri:sub(1, #prefix) == prefix then path = uri:sub(#prefix + 1) end
   if path == "" then path = "/" end
-  -- Envoy sets x-envoy-external-address / x-forwarded-for; nginx sees Envoy's IP.
+  -- The relay says who its client was (x-envoy-external-address from the
+  -- gRPC shim, x-forwarded-for from Envoy and the others); nginx sees the
+  -- relay's IP.
   local h = ngx.req.get_headers(0)
   local client_ip = client_ip_from(h, cfg, true)
   if not client_ip then metrics.incr_authz("no_client_ip") end
@@ -646,11 +652,10 @@ function _M.authz(prefix)
   -- client's copy whenever it forwards a body (allow_partial_message).
   -- X-Jev-Body-Partial is the HAProxy agent's, and the agent drops a
   -- client's copy of it and of x-envoy-external-address. The gRPC shim
-  -- forwards every header the client sent and fills
-  -- x-envoy-external-address from the peer address when Envoy did not set
-  -- it, so next to that header X-Jev-Body-Partial is the client's and is
-  -- ignored: with policy.partial = "unjudgeable" it would turn judging off
-  -- for the request.
+  -- drops a client's X-Jev-* and sets x-envoy-external-address from the
+  -- source address, so next to that header X-Jev-Body-Partial is not the
+  -- agent's and is ignored: with policy.partial = "unjudgeable" a client's
+  -- copy would turn judging off for the request.
   local flag = h["x-envoy-auth-partial-body"]
   if type(flag) == "table" then flag = flag[1] end
   local partial = flag == "true"

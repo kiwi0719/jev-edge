@@ -254,6 +254,16 @@ rule("gateway-headers", function(r)
   end
   local envoy = read("adapters/envoy/envoy-http.yaml") or ""
   if not envoy:find("exact:%s*content%-encoding") then fail(r, "envoy-http.yaml does not forward content-encoding") end
+  -- Envoy relays a client's own copy from a peer it counts as internal, and
+  -- authz() takes the header as the client address
+  local allowed = envoy:match("\n%s*allowed_headers:%s*\n(.-)\n%s*with_request_body:") or ""
+  local xea = "x-envoy-external-address"
+  for l in (allowed .. "\n"):gmatch("([^\n]*)\n") do
+    local kind, v = l:lower():match("^%s*%-?%s*(%a+):%s*[\"']?([^%s\"'#]+)")
+    local hit = (kind == "exact" and v == xea) or (kind == "prefix" and xea:sub(1, #v) == v)
+      or (kind == "suffix" and xea:sub(-#v) == v) or (kind == "contains" and xea:find(v, 1, true))
+    if hit then fail(r, "envoy-http.yaml forwards a client's x-envoy-external-address to /_jev/authz") end
+  end
   for _, f in ipairs({ "adapters/envoy/envoy-http.yaml", "adapters/envoy/envoy-grpc.yaml" }) do
     local n = tonumber((read(f) or ""):match("max_request_bytes:%s*(%d+)"))
     if not n or n < 1048576 then fail(r, f .. ": max_request_bytes below rules.max_body_bytes (1 MiB)") end

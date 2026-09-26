@@ -108,14 +108,27 @@ func (s *server) Check(ctx context.Context, req *authv3.CheckRequest) (*authv3.C
 		if strings.HasPrefix(k, ":") { // pseudo-headers
 			continue
 		}
+		lk := strings.ToLower(k)
+		// Set below from the source address. Envoy writes this header only
+		// for a request it counts as external and relays a client's own copy
+		// otherwise (a peer on a private or loopback address), and the
+		// adapter takes it as the client address.
+		if lk == "x-envoy-external-address" {
+			continue
+		}
+		// A client's X-Jev-*: jev-edge and the relays in front set these (the
+		// HAProxy agent's X-Jev-Body-Partial, which authz() honours when no
+		// x-envoy-external-address comes with it; a verdict; a subject), so
+		// a client's copy is never passed on.
+		if strings.HasPrefix(lk, "x-jev-") {
+			continue
+		}
 		out.Header.Set(k, v)
 	}
-	// The adapter takes the client address from x-envoy-external-address /
-	// x-forwarded-for; make sure the source address is visible either way.
-	if src := req.GetAttributes().GetSource().GetAddress().GetSocketAddress(); src != nil {
-		if out.Header.Get("x-envoy-external-address") == "" {
-			out.Header.Set("x-envoy-external-address", src.GetAddress())
-		}
+	// The adapter takes the client address from x-envoy-external-address
+	// first: always the source address Envoy reports, never a client's.
+	if src := req.GetAttributes().GetSource().GetAddress().GetSocketAddress(); src != nil && src.GetAddress() != "" {
+		out.Header.Set("x-envoy-external-address", src.GetAddress())
 	}
 	// Envoy already applied its size cap (with_request_body.max_request_bytes);
 	// tell the adapter the length so its own gate sees it.

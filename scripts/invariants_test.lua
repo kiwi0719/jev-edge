@@ -61,7 +61,8 @@ p:close()
 assert(spec, "no rockspec at the repo root")
 local CI = ".github/workflows/ci.yml"
 local TSRULES = "adapters/js/src/rules/index.ts"
-local rs, ci, tsr = read(spec), read(CI), read(TSRULES)
+local ENVOY = "adapters/envoy/envoy-http.yaml"
+local rs, ci, tsr, envoy = read(spec), read(CI), read(TSRULES), read(ENVOY)
 
 local function with_newjob(s)
   return edit(s, "\n  ci%-ok:\n",
@@ -142,6 +143,15 @@ local cases = {
     "ci-ok", "ci-ok does not run jq -e" },
   { "ci.yml: jq line commented out", { [CI] = edit(ci, "\n(%s*)(echo[^\n]*jq %-e 'all)", "\n%1# %2") },
     "ci-ok", "ci-ok does not run jq -e" },
+
+  -- gateway-headers: Envoy passes a client's x-envoy-external-address from an
+  -- internal peer (audit g1-proxy-forwarded-metadata-live#1)
+  { "envoy-http.yaml: x-envoy-external-address allow-listed again",
+    { [ENVOY] = edit(envoy, "(\n(%s*)%- exact: x%-forwarded%-for\n)", "%1%2- exact: x-envoy-external-address\n") },
+    "gateway-headers", "forwards a client's x-envoy-external-address" },
+  { "envoy-http.yaml: x-envoy-external-address as a prefix pattern",
+    { [ENVOY] = edit(envoy, "(\n(%s*)%- exact: x%-forwarded%-for\n)", "%1%2- prefix: X-Envoy-External\n") },
+    "gateway-headers", "forwards a client's x-envoy-external-address" },
 
   -- rule-parity: a path watched for any body on one runtime only
   { "rules: json_only_paths emptied in the TS copy",

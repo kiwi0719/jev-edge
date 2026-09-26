@@ -243,6 +243,29 @@ describe("backend provider (thin Worker)", () => {
     expect(res.headers.get("x-jev-verdict")).toBe("malicious");
   });
 
+  it("answers 404 to the origin's /_jev/* endpoints, however the path is spelled, and fetches nothing", async () => {
+    const fetched: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: string | Request) => { fetched.push(String(input instanceof Request ? input.url : input)); return new Response("origin"); }));
+    const w = thinWorker({ origin: "https://origin.example", config: { policy: { mode: "enforce" } } });
+    const paths = ["/_jev/authz/v1/chat/completions", "/%5Fjev/authz/x", "/%5fJEV/authz/x", "//_jev/config", "/_jev/samples", "/_JEV/authz", "/_jev", "/x/%2e%2e/_jev/authz", "//_jev/health", "/_jev/health/"];
+    for (const path of paths) {
+      for (const method of ["POST", "GET"]) {
+        const req = new Request("https://edge.example" + path, { method, headers: { "x-forwarded-for": "203.0.113.7" }, body: method === "POST" ? BENIGN : undefined });
+        const res = await w.fetch(req, {});
+        expect({ path, method, status: res.status }).toEqual({ path, method, status: 404 });
+        expect(await res.json()).toEqual({ error: "not found" });
+      }
+    }
+    expect(fetched).toEqual([]);
+    const health = await w.fetch(new Request("https://edge.example/_jev/health"), {});
+    expect(health.status).toBe(200);
+    expect(await health.json()).toMatchObject({ ok: true });
+    expect(fetched).toEqual([]); // answered by the Worker, not the origin
+    // a path that only starts with the letters is an ordinary one
+    await w.fetch(new Request("https://edge.example/_jevx/y"), {});
+    expect(fetched).toEqual(["https://origin.example/_jevx/y"]);
+  });
+
   it("blocks what the origin blocked below the Worker's threshold, and blocks the replay from its cache", async () => {
     let authz = 0;
     // the origin calibrated to block at 0.5; the Worker keeps the default 0.7

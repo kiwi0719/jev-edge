@@ -11,7 +11,7 @@
 //                         OpenAI-compatible endpoint) as the provider.
 //   pagesMiddleware(opts) same as fullWorker, exported as a Pages Functions
 //                         middleware: `export const onRequest = pagesMiddleware({...})`.
-import { createRuntime, handle, type Options, type Runtime, type RequestCtx } from "./runtime.js";
+import { createRuntime, handle, normalizePath, type Options, type Runtime, type RequestCtx } from "./runtime.js";
 import { JevState, isStateTarget, type KVLike, type DONamespaceLike } from "./cf/stores.js";
 
 export { JevState };
@@ -53,9 +53,35 @@ function reputationOn(o: Options): boolean {
 }
 
 /**
+ * Is this one of the origin's own /_jev/* endpoints (authz, config, samples,
+ * health), however the path is spelled (%5F, case, `//`, dot segments), as
+ * the origin's nginx would route it? The Worker answers GET /_jev/health
+ * itself (handle); nothing else under /_jev is ever passed to the origin or
+ * the upstream, where /_jev/authz would judge (and answer) for anyone.
+ */
+function originEndpoint(request: Request): boolean {
+  let p: string;
+  try {
+    p = normalizePath(new URL(request.url).pathname).toLowerCase();
+  } catch {
+    return false;
+  }
+  return p === "/_jev" || p.startsWith("/_jev/");
+}
+
+/** handle() answers exactly this request itself; any other /_jev path is originEndpoint's. */
+function ownHealth(request: Request, rt: Runtime): boolean {
+  return rt.opts.health !== false && request.method === "GET" && new URL(request.url).pathname === "/_jev/health";
+}
+
+const NOT_FOUND = () => new Response('{"error":"not found"}', { status: 404, headers: { "Content-Type": "application/json" } });
+
+/**
  * Thin Worker: L1 + cache at the edge, judgment by the jev-edge you already
  * run. `origin` is that gateway's base URL (or env.JEV_ORIGIN); the Worker
  * proxies to `upstream` (default: the same origin) with X-Jev-* attached.
+ * The origin's /_jev/* endpoints answer 404 here, except GET /_jev/health,
+ * which the Worker serves itself.
  */
 export function thinWorker<E extends WorkerEnv = WorkerEnv>(
   opts: Resolve<E> & { origin?: string; upstream?: string } = {},
@@ -63,6 +89,7 @@ export function thinWorker<E extends WorkerEnv = WorkerEnv>(
   const cache = new WeakMap<object, Runtime>();
   return {
     async fetch(request, env, ctx) {
+      const jevPath = originEndpoint(request);
       const o = typeof opts === "function" ? opts(env) : opts;
       const origin = (opts as { origin?: string }).origin ?? env.JEV_ORIGIN;
       if (!origin) throw new Error("thinWorker: origin (or env.JEV_ORIGIN) is required");
@@ -70,6 +97,7 @@ export function thinWorker<E extends WorkerEnv = WorkerEnv>(
         ...o,
         config: { ...o.config, jev: { provider: "backend", endpoint: origin, ...o.config?.jev } },
       }), env, cache);
+      if (jevPath && !ownHealth(request, rt)) return NOT_FOUND();
       const upstream = (opts as { upstream?: string }).upstream ?? origin;
       return handle(request, rt, (req) => {
         return fetch(new Request(upstreamUrl(req.url, upstream), req));

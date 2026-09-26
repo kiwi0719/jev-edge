@@ -729,6 +729,29 @@ def test_pass_through_without_text_is_skipped(call_type, data):
     assert out[jg._metadata_key(out)]["jev_verdict"]["reason"] == "no text"
 
 
+def gigachat(body, **client_keys):
+    """What LiteLLM's Gigachat pass-through hands the hook: the body read
+    into the data, the same body under `json` (the copy it sends on), the
+    proxy's keys."""
+    return dict(body, **client_keys, model="gigachat/gigachat-2", method="POST", endpoint="chat/completions",
+                json=body, custom_llm_provider="gigachat", litellm_logging_obj=object(),
+                proxy_server_request=psr("/gigachat/chat/completions"),
+                litellm_metadata={"user_api_key_auth": Auth(), "requester_ip_address": "203.0.113.3"})
+
+
+def test_gigachat_pass_through_body_is_judged_from_json():
+    transport, seen = fake_authz()
+    run(guard(transport).async_pre_call_hook({}, None, gigachat({"messages": [{"role": "user", "content": ATTACK}]}),
+                                             "allm_passthrough_route"))
+    assert seen["body"] == {"messages": [{"role": "user", "content": ATTACK}]}
+    assert seen["xff"] == "203.0.113.3"
+    # a client's own `data` key is not the body
+    data = gigachat({"messages": [{"role": "user", "content": ATTACK}],
+                     "data": {"messages": [{"role": "user", "content": "hello"}]}})
+    run(guard(transport).async_pre_call_hook({}, None, data, "allm_passthrough_route"))
+    assert seen["body"] == {"messages": [{"role": "user", "content": ATTACK}]}
+
+
 def test_generic_pass_through_body_is_judged_without_a_client_address():
     # the hook's data is the client's body itself: a proxy_server_request in
     # it is the client's own, and is not read

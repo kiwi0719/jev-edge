@@ -189,8 +189,9 @@ NOT_VISIBLE_CALLS = {
 
 # Pass-through routes. The Bedrock pass-through (/bedrock/..., call type
 # allm_passthrough_route) nests the client's body, in Bedrock's own format,
-# under `data`, next to LiteLLM's own keys. The generic pass-through
-# (/anthropic, /openai, /gemini, /vertex_ai, /vllm, ..., and a config's
+# under `data`, next to LiteLLM's own keys; Gigachat's (/gigachat/... for a
+# model of the config) under `json`. The generic pass-through (/anthropic,
+# /openai, /gemini, /vertex_ai, /vllm, ..., and a config's
 # pass_through_endpoints; call type pass_through_endpoint) hands the client's
 # body itself with LiteLLM's logging object added, and a WebSocket
 # pass-through (Vertex AI Live) an empty dict.
@@ -767,7 +768,11 @@ class JevEdgeGuardrail(_ApplyGuardrailBase):
         if name == TEST_ENDPOINT_CALL and self.test_endpoint == "refuse":
             return "refuse", None
         if name in NESTED_PASSTHROUGH_CALLS:
-            inner = data.get("data")
+            # Bedrock's handlers build the data from scratch with the body
+            # under `data`; Gigachat's reads the body into the data and puts
+            # it under `json` too, the copy it sends on (a client's own
+            # `data` key would sit next to it)
+            inner = data.get("json" if "json" in data else "data")
             if isinstance(inner, dict):
                 provider = data.get("custom_llm_provider") or "provider"
                 return self._plan_passthrough(name, inner, f"{provider} body")

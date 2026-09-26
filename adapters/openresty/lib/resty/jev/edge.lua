@@ -160,9 +160,10 @@ local function maybe_async(cfg, v, req, rules)
   if breaker and breaker:state() ~= breaker_m.CLOSED then return end
   -- rebuild the prompt from the request; core does not hand it back. The
   -- same text L2 judged: the window, not the whole body.
-  local rule = rules_mod.rule_for(req, rules)
+  local rctx = { json_decode = cjson.decode, re_find = re_find }
+  local rule = rules_mod.rule_for(req, rules, rctx)
   if not rule then return end
-  local text = rules_mod.judged_text(req, rule, { json_decode = cjson.decode, re_find = re_find })
+  local text = rules_mod.judged_text(req, rule, rctx)
   if text == "" then return end
   -- Same prompt L2 built, deployment context included: L3's verdict replaces
   -- L2's in the cache, so it must not be judged with less context.
@@ -184,7 +185,7 @@ end
 local function maybe_sample(cfg, v, req, rules)
   if not sampling.should_sample(cfg, v, math.random) then return end
   local ok, err = pcall(function()
-    local s = sampling.build(cfg, v, req, rules_mod.rule_for(req, rules),
+    local s = sampling.build(cfg, v, req, rules_mod.rule_for(req, rules, { json_decode = cjson.decode }),
       { rid = ngx.var.request_id, ts = ngx.now(), json_decode = cjson.decode })
     sampling.store(cfg, cache, s)
     if cfg.sampling.log then ngx.log(ngx.INFO, "jev-edge sample: ", cjson.encode(s)) end

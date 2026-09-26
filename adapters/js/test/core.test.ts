@@ -140,6 +140,10 @@ describe("rules: json_only_paths (twin of core/spec/rules_spec.lua)", () => {
       ["application/x-www-form-urlencoded", FORM], [undefined, FORM], ["text/plain", ASK],
       ["multipart/form-data; boundary=B", `--B\r\nContent-Disposition: form-data; name="a"\r\n\r\n${ASK}\r\n--B--\r\n`],
       ["application/octet-stream", "\0\x01\x02 binary upload body"],
+      // what extract() reads the body as decides, not its first byte
+      ["text/plain", "{" + ASK + "}"], [undefined, "[" + ASK],
+      ["application/x-www-form-urlencoded", "[note]=" + ASK.replace(/ /g, "+")],
+      ["application/json", '{"username":"alice","password":"hunter2'],
     ] as const) {
       expect(await rulesEvaluate(root(ct, body), rule, ctx())).toEqual(["pass", "", "path not watched: body not JSON"]);
     }
@@ -148,6 +152,7 @@ describe("rules: json_only_paths (twin of core/spec/rules_spec.lua)", () => {
   it("decides before the reputation checks, on the Content-Type when there is no body", async () => {
     const blocked = { "rep:203.0.113.7": { blocked_until: 2000 } };
     expect((await rulesEvaluate(root("application/x-www-form-urlencoded", FORM), rule, ctx(blocked)))[0]).toBe("pass");
+    expect((await rulesEvaluate(root("text/plain", "{" + ASK), rule, ctx(blocked)))[0]).toBe("pass");
     expect((await rulesEvaluate(root(undefined, undefined, { method: "GET" }), rule, ctx(blocked)))[0]).toBe("pass");
     expect((await rulesEvaluate(root("application/json", JSON.stringify({ inputs: ASK })), rule, ctx(blocked)))[0]).toBe("block");
     expect((await rulesEvaluate(root("application/json", undefined, { body_size: 100 }), rule, ctx(blocked)))[0]).toBe("block");
@@ -169,7 +174,22 @@ describe("rules: json_only_paths (twin of core/spec/rules_spec.lua)", () => {
     expect(core.rules.ruleFor(req, [rule])).toBeUndefined();
     expect(await core.rules.judgedText(req, rule, ctx())).toBe("");
     expect(await core.rules.judgedText(req, site, ctx())).toBe(ASK);
+    // text that starts with {: ruleFor decides on what the decoder makes of it
+    const brace = root("text/plain", "{" + ASK + "}");
+    const [r2, , , by2] = await core.rules.evaluateAll(brace, [rule, site], ctx());
+    expect([r2, by2?.id]).toEqual(["suspect", "site"]);
+    expect(core.rules.ruleFor(brace, [rule, site], ctx())?.id).toBe("site");
+    expect(await core.rules.judgedText(brace, rule, ctx())).toBe("");
+    expect(await core.rules.judgedText(brace, site, ctx())).toBe("{" + ASK + "}");
   });
+
+  it("decides a body it cannot parse on its first byte or media type", async () => {
+    const gz = { "content-type": "application/json", "content-encoding": "gzip" };
+    expect((await rulesEvaluate(root(undefined, "\x1f\b\0\0 bytes", { headers: gz }), rule, ctx()))[0]).toBe("unjudgeable");
+    const plain = { "content-type": "text/plain", "content-encoding": "gzip" };
+    expect((await rulesEvaluate(root(undefined, "\x1f\b\0\0 bytes", { headers: plain }), rule, ctx()))[0]).toBe("pass");
+  });
+
 
   it("applies only to the paths it lists", async () => {
     const form = { "content-type": "application/x-www-form-urlencoded" };

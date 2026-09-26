@@ -48,10 +48,12 @@ return {
     "^/api/v0/chat/completions", "^/api/v0/completions", "^/api/v1/chat/?$",
     "^/v2/chat/?$", "^/v1/generate/?$",
   },
-  -- Of the watch_paths, those watched only for a JSON body (a JSON media
-  -- type, or a body that starts with { or [): TGI's root. A site's own POST
-  -- to / (a login form, an upload) passes as "path not watched: body not
-  -- JSON", before the judge and the reputation checks. Lua patterns, like
+  -- Of the watch_paths, those watched only for a JSON body (one that parses
+  -- as JSON, or declared JSON with text fields the scanner finds; past
+  -- max_body_bytes, a JSON media type or a head that starts with { or [):
+  -- TGI's root. A site's own POST to / (a login form, an upload, text that
+  -- starts with {) passes as "path not watched: body not JSON", before the
+  -- judge and the reputation checks. Lua patterns, like
   -- watch_paths; a rule that extends this one and watches / for any body
   -- sets json_only_paths = {}.
   json_only_paths = { "^/$" },

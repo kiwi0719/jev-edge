@@ -543,6 +543,17 @@ do
   rules_case("route: JSON to / after a BOM and whitespace is judged",
     root("application/octet-stream", "\239\187\191 \n" .. '{"inputs":' .. ASK .. '}'))
   rules_case("route: declared JSON to / the decoder refuses is read", root("application/json", '{"inputs":' .. ASK))
+  -- decided on what extract() reads the body as, not its first byte
+  rules_case("route: text to / that starts with { is not watched", root("text/plain", "{" .. LONG .. "}"))
+  rules_case("route: a form POST to / that starts with [ is not watched",
+    root("application/x-www-form-urlencoded", "[note]=" .. LONG:gsub(" ", "+")))
+  rules_case("route: declared JSON to / the decoder refuses, with no text field, is not watched",
+    root("application/json", '{"username":"alice","password":"hunter2hunter2"'))
+  rules_case("route: text to / that starts with { from a blocked IP is not watched", root(nil, "{" .. LONG),
+    { cache = { ["rep:203.0.113.7"] = { blocked_until = 2000 } } })
+  rules_case("route: an encoded JSON POST to / is unjudgeable",
+    root("application/json", "\31\8\0\0\0\0\0\0\3 compressed bytes", { headers = {
+      ["content-type"] = "application/json", ["content-encoding"] = "gzip" } }))
   rules_case("route: a form POST to / from a blocked IP is not watched",
     root("application/x-www-form-urlencoded", FORM), { cache = { ["rep:203.0.113.7"] = { blocked_until = 2000 } } })
   rules_case("route: JSON to / from a blocked IP is blocked", root("application/json", '{"inputs":' .. ASK .. '}'),

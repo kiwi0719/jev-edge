@@ -346,15 +346,34 @@ function ctWatched(ct: string, rule: Rule): boolean | "media" {
 
 const CT_NOT_WATCHED = "content-type not watched";
 
+// The body's size as core counts it: the larger of what the adapter declared
+// and what it handed over (bytes, like Lua's #body).
+function bodySize(req: Req): number {
+  const declared = Number(req.body_size);
+  return Math.max(Number.isFinite(declared) ? declared : 0, typeof req.body === "string" ? byteLength(req.body) : 0);
+}
+
 // Port of json_only_miss() in core/rules.lua: a json_only_paths path is
-// watched only for a JSON body (a JSON media type, or a body that starts with
-// { or [), decided on the body the adapter kept or, with none, the
-// Content-Type alone. A site's own POST to TGI's root passes.
+// watched only for a JSON body, one extract() reads as JSON ("json") or
+// declared JSON the decoder refused whose text fields the scanner found
+// ("scan"). A body extract() cannot read (past max_body_bytes, still
+// encoded, empty) is decided on its first byte or JSON media type (jsonLike
+// on the head the adapter kept); with no body at all, on the Content-Type
+// alone. A site's own POST to TGI's root passes. Returns the extraction when
+// it ran, for judged() to reuse. (Lua also falls back to the first byte when
+// ctx has no json_decode; extract() here always has one.)
+type Extraction = ReturnType<typeof extract>;
 const NOT_JSON = "path not watched: body not JSON";
-function jsonOnlyMiss(req: Req, rule: Rule, ct: string): boolean {
+function jsonOnlyMiss(req: Req, rule: Rule, ct: string, ctx: RulesCtx | undefined): [boolean, Extraction?] {
   const jo = rule.json_only_paths;
-  if (!Array.isArray(jo) || jo.length === 0 || !pathMatches(req.path ?? "", jo, rule.paths_case_sensitive)) return false;
-  return !jsonLike(req.body_head ?? req.body, ct);
+  if (!Array.isArray(jo) || jo.length === 0 || !pathMatches(req.path ?? "", jo, rule.paths_case_sensitive)) return [false];
+  const body = req.body;
+  if (typeof body !== "string" || body === "" || bodySize(req) > (rule.max_body_bytes ?? MAX_BODY_BYTES)
+    || (contentEncoding(req.headers) !== "" && !req.decoded)) {
+    return [!jsonLike(req.body_head ?? body, ct)];
+  }
+  const ex = extract(body, ct, rule.text_fields, ctx?.json_decode);
+  return [ex[1] !== "json" && ex[1] !== "scan", ex];
 }
 
 /**
@@ -386,9 +405,10 @@ function untrustedPart(decoded: JsonValue | undefined, rule: Rule, ctx: RulesCtx
   return { text: w, windowed: cut };
 }
 
-// Port of judged() in core/rules.lua.
+// Port of judged() in core/rules.lua. `ex`: the body's extraction
+// jsonOnlyMiss already has, or undefined.
 async function judged(
-  req: Req, rule: Rule, ctx: RulesCtx | undefined, ct: string, size: number,
+  req: Req, rule: Rule, ctx: RulesCtx | undefined, ct: string, size: number, ex?: Extraction,
 ): Promise<{ text: string; unj?: string; hit?: string; windowed?: boolean; chunks?: string[]; capped?: boolean; untrusted?: UntrustedPart }> {
   const max = rule.max_body_bytes ?? MAX_BODY_BYTES;
   // a media type is taken at its word only when the bytes agree (or there
@@ -417,7 +437,7 @@ async function judged(
   } else {
     let kind: string;
     let decoded: JsonValue | undefined;
-    [text, kind, values, decoded] = extract(req.body, ct, rule.text_fields, ctx?.json_decode);
+    [text, kind, values, decoded] = ex ?? extract(req.body, ct, rule.text_fields, ctx?.json_decode);
     if (media && (kind === "binary" || kind === "none")) return { text: "", unj: CT_NOT_WATCHED };
     if (kind === "binary") return { text: "", unj: "unjudgeable: binary body" };
     // declared JSON the decoder refused, with no text-field value to scan
@@ -449,22 +469,24 @@ async function judged(
 /** Port of rules.judged_text: the text evaluate() judges under `rule` ("" when none). */
 export async function judgedText(req: Req, rule: Rule | undefined, ctx?: RulesCtx): Promise<string> {
   if (!rule || !req) return "";
-  const declared = Number(req.body_size);
-  const size = Math.max(Number.isFinite(declared) ? declared : 0, typeof req.body === "string" ? byteLength(req.body) : 0);
+  const size = bodySize(req);
   // one window, never chunks: L3-style re-judging uses one call
   const ct = contentType(req.headers);
-  if (jsonOnlyMiss(req, rule, ct)) return "";
-  const r = await judged(req, { ...rule, max_judge_chunks: 1 }, ctx, ct, size);
+  const [miss, ex] = jsonOnlyMiss(req, rule, ct, ctx);
+  if (miss) return "";
+  const r = await judged(req, { ...rule, max_judge_chunks: 1 }, ctx, ct, size, ex);
   return r.text;
 }
 
 export async function evaluate(
   req: Req, rule: Rule, ctx?: RulesCtx,
 ): Promise<[RuleResult, string, string, boolean?, string[]?, boolean?, UntrustedPart?]> {
-  // 1. path watch list; a json_only_paths path only for a JSON body
+  // 1. path watch list; a json_only_paths path only for a JSON body (what
+  //    extract() reads it as, or the Content-Type when there is no body)
   if (!pathMatches(req.path ?? "", rule.watch_paths, rule.paths_case_sensitive)) return [PASS, "", "path not watched"];
   const ct = contentType(req.headers);
-  if (jsonOnlyMiss(req, rule, ct)) return [PASS, "", NOT_JSON];
+  const [miss, ex] = jsonOnlyMiss(req, rule, ct, ctx);
+  if (miss) return [PASS, "", NOT_JSON];
 
   // 2. reputation, before anything that needs a body. It only ever blocks:
   //    safe verdicts earn an IP nothing (see core/rules.lua)
@@ -487,8 +509,7 @@ export async function evaluate(
   // 4. body size: the larger of what the adapter declared and what it handed
   //    over, so a wrong or missing Content-Length cannot shrink the body
   //    (bytes, like Lua's #body).
-  const declared = Number(req.body_size);
-  const size = Math.max(Number.isFinite(declared) ? declared : 0, typeof req.body === "string" ? byteLength(req.body) : 0);
+  const size = bodySize(req);
   if (size === 0 && (req.body === undefined || req.body === null) && (req.body_head === undefined || req.body_head === null)) {
     return [PASS, "", "no body"];
   }
@@ -499,7 +520,7 @@ export async function evaluate(
   if (ce !== "" && !req.decoded) return [UNJUDGEABLE, "", "unjudgeable: content-encoding " + ce];
 
   // 6+7. extract, prefilter over all of it, judging window, length
-  const j = await judged(req, rule, ctx, ct, size);
+  const j = await judged(req, rule, ctx, ct, size, ex);
   if (j.unj === CT_NOT_WATCHED) return [PASS, "", j.unj];
   if (j.unj) return [UNJUDGEABLE, "", j.unj];
   const minChars = rule.min_text_chars ?? 20;
@@ -520,12 +541,16 @@ export async function evaluate(
   return [PASS, "", "text too short"];
 }
 
-/** Port of rules.rule_for: the first rule whose path (json_only_paths included), method and content type all match. */
-export function ruleFor(req: Req, rules: Rule[] | undefined): Rule | undefined {
+/**
+ * Port of rules.rule_for: the first rule whose path (json_only_paths
+ * included), method and content type all match. `ctx.json_decode`, as
+ * evaluateAll had it, decides a json_only_paths path (JSON.parse without one).
+ */
+export function ruleFor(req: Req, rules: Rule[] | undefined, ctx?: Pick<RulesCtx, "json_decode">): Rule | undefined {
   const ct = contentType(req.headers);
   for (const r of rules ?? []) {
     if (pathMatches(req.path ?? "", r.watch_paths, r.paths_case_sensitive)
-      && !jsonOnlyMiss(req, r, ct)
+      && !jsonOnlyMiss(req, r, ct, ctx)[0]
       && !(r.methods && !r.methods[(req.method ?? "").toUpperCase()])
       && ctWatched(ct, r)) return r;
   }

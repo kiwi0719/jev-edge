@@ -251,6 +251,10 @@ describe("rules: json_only_paths", function()
       { "multipart/form-data; boundary=B", "--B\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\n"
         .. ASK .. "\r\n--B--\r\n" },
       { "application/octet-stream", "\0\1\2 binary upload body" },
+      -- what extract() reads the body as decides, not its first byte
+      { "text/plain", "{" .. ASK .. "}" }, { nil, "[" .. ASK },
+      { "application/x-www-form-urlencoded", "[note]=" .. ASK:gsub(" ", "+") },
+      { "application/json", '{"username":"alice","password":"hunter2' },
     }) do
       local r, text, reason = R.evaluate(root(c[1], c[2]), rule, ctx)
       assert.equals(R.PASS, r, c[1])
@@ -263,6 +267,7 @@ describe("rules: json_only_paths", function()
     ctx.cache:set("rep:203.0.113.7", { blocked_until = 2000 })
     ctx.clock = function() return 1000 end
     assert.equals(R.PASS, (R.evaluate(root("application/x-www-form-urlencoded", FORM), rule, ctx)))
+    assert.equals(R.PASS, (R.evaluate(root("text/plain", "{" .. ASK), rule, ctx)))
     assert.equals(R.PASS, (R.evaluate(root(nil, nil, { method = "GET" }), rule, ctx)))
     assert.equals(R.BLOCK, (R.evaluate(root("application/json", H.json.encode({ inputs = ASK })), rule, ctx)))
     assert.equals(R.BLOCK, (R.evaluate(root("application/json", nil, { body_size = 100 }), rule, ctx)))
@@ -289,6 +294,29 @@ describe("rules: json_only_paths", function()
     assert.is_nil(R.rule_for(req, { rule }))
     assert.equals("", R.judged_text(req, rule, ctx))
     assert.equals(ASK, R.judged_text(req, site, ctx))
+    -- text that starts with {: rule_for decides on what the decoder makes of it
+    req = root("text/plain", "{" .. ASK .. "}")
+    r, text, _, by = R.evaluate_all(req, { rule, site }, ctx)
+    assert.equals(R.SUSPECT, r)
+    assert.equals("{" .. ASK .. "}", text)
+    assert.equals("site", by.id)
+    assert.equals("site", R.rule_for(req, { rule, site }, ctx).id)
+    assert.equals("", R.judged_text(req, rule, ctx))
+    assert.equals("{" .. ASK .. "}", R.judged_text(req, site, ctx))
+  end)
+
+  it("decides a body it cannot parse on its first byte or media type", function()
+    local gz = { ["content-type"] = "application/json", ["content-encoding"] = "gzip" }
+    assert.equals(R.UNJUDGEABLE, (R.evaluate(root(nil, "\31\8\0\0 bytes", { headers = gz }), rule, ctx)))
+    local plain = { ["content-type"] = "text/plain", ["content-encoding"] = "gzip" }
+    assert.equals(R.PASS, (R.evaluate(root(nil, "\31\8\0\0 bytes", { headers = plain }), rule, ctx)))
+    -- without a decoder, as before: the first byte (extract() then reads nothing)
+    local nodec = H.ctx()
+    nodec.json_decode = nil
+    local req = root("text/plain", "{" .. ASK .. "}")
+    assert.equals("llm-endpoints", R.rule_for(req, { rule }).id)
+    assert.is_nil(R.rule_for(req, { rule }, ctx))
+    assert.equals("no text", select(3, R.evaluate(req, rule, nodec)))
   end)
 
   it("applies only to the paths it lists", function()

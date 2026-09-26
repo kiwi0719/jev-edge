@@ -356,6 +356,26 @@ local function token_ok(given, want)
   return diff == 0
 end
 
+-- The admin endpoints (config, samples, feedback, health, metrics) answer
+-- only a request that named them. nginx decodes %2F and resolves "..", "."
+-- and "//" before it picks a location, so a raw path such as
+-- /_jev/authz/v1/..%2F..%2F_jev/config reaches `location = /_jev/config` when
+-- the relay in front forwarded it as is (Envoy leaves %2F escaped unless
+-- path_with_escaped_slashes_action says otherwise). No real call to an admin
+-- endpoint needs any of these in its path: answer 400 whatever the gateway
+-- config is.
+local function admin_path_refused()
+  local raw = ((ngx.var.request_uri or ""):match("^[^?]*") or ""):lower()
+  if not (raw:find("..", 1, true) or raw:find("//", 1, true) or raw:find("%2e", 1, true)
+          or raw:find("%2f", 1, true) or raw:find("%5c", 1, true)) then
+    return false
+  end
+  ngx.status = 400
+  ngx.header["Content-Type"] = "application/json"
+  ngx.say('{"error":"admin path must be sent as is: no dot segments, doubled or encoded slashes"}')
+  return true
+end
+
 local BENIGN = { benign = true, ok = true, good = true, ["0"] = true, ["false"] = true,
                  ["not-an-attack"] = true, fp = true }
 local ATTACK = { attack = true, bad = true, malicious = true, ["1"] = true, ["true"] = true }
@@ -375,6 +395,7 @@ local ATTACK = { attack = true, bad = true, malicious = true, ["1"] = true, ["tr
 -- one line into the jev log. `lua bench/labels-from-log.lua` turns those lines
 -- into the labels file calibrate reads.
 function _M.feedback()
+  if admin_path_refused() then return end
   ngx.header["Content-Type"] = "application/json"
   local cfg = config.current()
   local fcfg = cfg.feedback or {}
@@ -457,6 +478,7 @@ end
 
 --- content_by_lua for /_jev/config (restrict with allow/deny in nginx.conf).
 function _M.config_api()
+  if admin_path_refused() then return end
   local method = ngx.req.get_method()
   ngx.header["Content-Type"] = "application/json"
   if method == "GET" then
@@ -668,6 +690,7 @@ end
 -- answer is 503 too: what runs is the previous config, or the defaults in
 -- monitor mode when nothing valid was ever loaded.
 function _M.health()
+  if admin_path_refused() then return end
   local cfg = config.current()
   local cerr = config.error()
   ngx.header["Content-Type"] = "application/json"
@@ -707,6 +730,7 @@ end
 -- normalized text, fingerprint, score and verdict so it can be replayed and
 -- labelled; label lines for `make calibrate` are `<rid or fp>,<0|1>`.
 function _M.samples()
+  if admin_path_refused() then return end
   local cfg = config.current()
   ngx.header["Content-Type"] = "application/json"
   if not cache then cache = cache_m.new(CACHE_DICT) end
@@ -726,6 +750,7 @@ end
 
 --- content_by_lua for /_jev/metrics.
 function _M.metrics()
+  if admin_path_refused() then return end
   ngx.header["Content-Type"] = "text/plain"
   ngx.say(metrics.render())
 end

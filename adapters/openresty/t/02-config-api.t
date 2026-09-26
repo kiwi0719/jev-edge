@@ -302,3 +302,27 @@ config invalid, using the defaults (monitor mode): sampling.rate must be in [0,1
 --- no_error_log
 JEV_T_UNSET
 unset when it ran
+
+
+
+=== TEST 13: an admin endpoint reached through "..", an encoded slash or "//" in the raw path answers 400 and changes nothing
+--- http_config eval: $::HttpConfig
+--- user_files eval: ::conf()
+--- config
+location /_jev/authz/ { content_by_lua_block { require("resty.jev.edge").authz() } }
+location = /_jev/config { content_by_lua_block { require("resty.jev.edge").config_api() } }
+location = /_jev/metrics { content_by_lua_block { require("resty.jev.edge").metrics() } }
+location = /_jev/samples { content_by_lua_block { require("resty.jev.edge").samples() } }
+--- request eval
+["PUT /_jev/authz/v1/..%2F..%2F..%2F_jev/config\n{\"policy\":{\"mode\":\"enforce\"}}",
+ "DELETE /_jev/authz/v1/..%2f..%2f..%2f_jev/samples",
+ "GET /_jev/authz/v1/%2e%2e/%2E%2E/%2e%2e/_jev/metrics",
+ "PUT //_jev/config\n{\"policy\":{\"mode\":\"enforce\"}}",
+ "PUT /_jev/authz/v1/../../../_jev/config\n{\"policy\":{\"mode\":\"enforce\"}}",
+ "GET /_jev/config?next=..%2F"]
+--- error_code eval
+[400, 400, 400, 400, 400, 200]
+--- response_body_like eval
+[("^\\{\"error\":\"admin path must be sent as is") x 5, '"override":null']
+--- no_error_log
+[error]

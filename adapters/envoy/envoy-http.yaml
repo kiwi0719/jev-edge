@@ -15,6 +15,13 @@ static_resources:
                 # ext_authz, so it cannot be steered at the adapter's admin endpoints
                 normalize_path: true
                 merge_slashes: true
+                # and refuse (400) an encoded slash or backslash: Envoy leaves
+                # %2F escaped by default, so "..%2F" is no dot segment to it,
+                # while nginx decodes it and resolves the ".." after
+                # path_prefix: /_jev/authz/v1/..%2F..%2F..%2F_jev/config is
+                # /_jev/config there. UNESCAPE_AND_REDIRECT is the choice for
+                # an API that needs %2F in its paths.
+                path_with_escaped_slashes_action: REJECT_REQUEST
                 # size contract of the authz hop: the whole header block, path
                 # included, is capped here (431 past it), and the nginx serving
                 # /_jev/authz must take any request under the cap (README:

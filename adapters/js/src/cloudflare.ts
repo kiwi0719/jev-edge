@@ -26,12 +26,16 @@ export interface WorkerEnv {
   [k: string]: unknown;
 }
 
-type Resolve<E> = Options | ((env: E) => Options);
+/** The options, or a function of the Worker's env returning them (called once per env, like the runtime built from them). */
+type Resolve<E, X = unknown> = (Options & X) | ((env: E) => Options & X);
 
-function runtimeFor<E extends WorkerEnv>(resolve: Resolve<E>, env: E, cache: WeakMap<object, Runtime>): Runtime {
-  const hit = cache.get(env);
-  if (hit) return hit;
-  const o: Options = { ...(typeof resolve === "function" ? resolve(env) : resolve), platform: "cloudflare" };
+function resolveOptions<E, X>(resolve: Resolve<E, X>, env: E): Options & X {
+  return typeof resolve === "function" ? resolve(env) : resolve;
+}
+
+/** The runtime for these options, with the env's bindings filled in where the options name none. */
+function presetRuntime<E extends WorkerEnv>(opts: Options, env: E): Runtime {
+  const o: Options = { ...opts, platform: "cloudflare" };
   if (!o.cache && env.JEV_CACHE) o.cache = env.JEV_CACHE;
   // the namespace, not a stub: this runtime lives as long as the isolate,
   // and a stub only as long as the request that made it (cf/stores.ts)
@@ -42,9 +46,65 @@ function runtimeFor<E extends WorkerEnv>(resolve: Resolve<E>, env: E, cache: Wea
   // unless the options name one.
   if (!o.subjectStore && isStateTarget(o.state) && reputationOn(o)) o.subjectStore = o.state;
   if (env.TYPESAFE_API_KEY) o.config = { ...o.config, jev: { api_key: env.TYPESAFE_API_KEY, ...o.config?.jev } };
-  const rt = createRuntime(o);
+  return createRuntime(o);
+}
+
+/** The runtime for this env, built once per env (and again after a failed build, which is not kept). */
+function runtimeFor<E extends WorkerEnv>(resolve: Resolve<E>, env: E, cache: WeakMap<object, Runtime>): Runtime {
+  const hit = cache.get(env);
+  if (hit) return hit;
+  const rt = presetRuntime(resolveOptions(resolve, env), env);
   cache.set(env, rt);
   return rt;
+}
+
+/** `v` when it is an absolute http(s) URL, else undefined. */
+function usable(v: unknown): string | undefined {
+  if (typeof v !== "string" || v === "") return undefined;
+  try {
+    const u = new URL(v);
+    return u.protocol === "https:" || u.protocol === "http:" ? v : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** `v` as an address the preset forwards to, checked when the preset is built for an env, not per request. */
+function address(name: string, v: unknown): string | undefined {
+  if (v === undefined || v === null || v === "") return undefined;
+  const ok = usable(v);
+  if (!ok) throw new Error(`${name} must be an absolute http(s) URL, got ${JSON.stringify(String(v))}`);
+  return ok;
+}
+
+/**
+ * What a preset keeps per env: its runtime and where it forwards. `to` is
+ * also where a failed build fails open to: whatever address the options did
+ * name usably, else undefined (the request's own URL).
+ */
+interface Built { rt?: Runtime; to?: string; error?: unknown }
+
+/**
+ * The addresses set as properties of a resolver function, the one way a
+ * function worked before the presets read them from what it returns; still
+ * taken, after the returned ones.
+ */
+function attached<A>(opts: unknown): Partial<A> {
+  return typeof opts === "function" ? (opts as unknown as Partial<A>) : {};
+}
+
+/** One Built per env, rebuilt after a failure. */
+function builtFor<E extends WorkerEnv>(env: E, cache: WeakMap<object, Built>, build: (env: E) => Built): Built {
+  const hit = cache.get(env);
+  if (hit) return hit;
+  const b = build(env);
+  if (b.rt) cache.set(env, b);
+  return b;
+}
+
+/** Forwards to `to` (its origin, the request's path and query), or the request as it is. */
+function forwarder(to: string | undefined): (req: Request) => Promise<Response> {
+  return (req) => fetch(to ? new Request(upstreamUrl(req.url, to), req) : req);
 }
 
 function reputationOn(o: Options): boolean {
@@ -81,33 +141,49 @@ const NOT_FOUND = () => new Response('{"error":"not found"}', { status: 404, hea
  * run. `origin` is that gateway's base URL (or env.JEV_ORIGIN); the Worker
  * proxies to `upstream` (default: the same origin) with X-Jev-* attached.
  * The origin's /_jev/* endpoints answer 404 here, except GET /_jev/health,
- * which the Worker serves itself.
+ * which the Worker serves itself. `opts` may be a function of env returning
+ * the options, origin and upstream included: called once per env, and both
+ * addresses checked then. An address it cannot use (missing origin, not an
+ * absolute http(s) URL) fails open, logged once.
  */
 export function thinWorker<E extends WorkerEnv = WorkerEnv>(
-  opts: Resolve<E> & { origin?: string; upstream?: string } = {},
+  opts: Resolve<E, { origin?: string; upstream?: string }> = {},
 ): { fetch(request: Request, env: E, ctx?: RequestCtx): Promise<Response> } {
-  const cache = new WeakMap<object, Runtime>();
+  const cache = new WeakMap<object, Built>();
+  const own = attached<{ origin: string; upstream: string }>(opts);
+  const build = (env: E): Built => {
+    let o: Options & { origin?: string; upstream?: string };
+    try {
+      o = resolveOptions(opts, env);
+    } catch (e) {
+      return { error: e, to: usable(own.upstream) ?? usable(own.origin ?? env.JEV_ORIGIN) };
+    }
+    const named = { origin: o.origin ?? own.origin ?? env.JEV_ORIGIN, upstream: o.upstream ?? own.upstream };
+    const to = usable(named.upstream) ?? usable(named.origin);
+    try {
+      const origin = address("thinWorker: origin (or env.JEV_ORIGIN)", named.origin);
+      if (!origin) throw new Error("thinWorker: origin (or env.JEV_ORIGIN) is required");
+      const upstream = address("thinWorker: upstream", named.upstream) ?? origin;
+      const rt = presetRuntime({
+        ...o,
+        config: { ...o.config, jev: { provider: "backend", endpoint: origin, ...o.config?.jev } },
+      }, env);
+      return { rt, to: upstream };
+    } catch (e) {
+      return { error: e, to };
+    }
+  };
   return {
     async fetch(request, env, ctx) {
       const jevPath = originEndpoint(request);
-      const origin = (opts as { origin?: string }).origin ?? env.JEV_ORIGIN;
-      const upstream = (opts as { upstream?: string }).upstream ?? origin;
-      const forward = (req: Request) => fetch(upstream ? new Request(upstreamUrl(req.url, upstream), req) : req);
-      let rt: Runtime;
-      try {
-        const o = typeof opts === "function" ? opts(env) : opts;
-        if (!origin) throw new Error("thinWorker: origin (or env.JEV_ORIGIN) is required");
-        rt = runtimeFor(() => ({
-          ...o,
-          config: { ...o.config, jev: { provider: "backend", endpoint: origin, ...o.config?.jev } },
-        }), env, cache);
-      } catch (e) {
+      const b = builtFor(env, cache, build);
+      if (!b.rt) {
         // unjudged, but never the origin's own endpoints
         if (jevPath) return NOT_FOUND();
-        return failOpen(request, forward, e);
+        return failOpen(request, forwarder(b.to), b.error);
       }
-      if (jevPath && !ownHealth(request, rt)) return NOT_FOUND();
-      return handle(request, rt, forward, ctx);
+      if (jevPath && !ownHealth(request, b.rt)) return NOT_FOUND();
+      return handle(request, b.rt, forwarder(b.to), ctx);
     },
   };
 }
@@ -125,22 +201,36 @@ export function upstreamUrl(requestUrl: string, upstream: string): string {
 /**
  * Full Worker: everything runs here. `upstream` is where allowed requests go;
  * bind JEV_CACHE (KV) and JEV_STATE (Durable Object, class JevState) in
- * wrangler.toml, and TYPESAFE_API_KEY as a secret.
+ * wrangler.toml, and TYPESAFE_API_KEY as a secret. `opts` may be a function
+ * of env returning the options, upstream included, as for thinWorker.
  */
 export function fullWorker<E extends WorkerEnv = WorkerEnv>(
-  opts: Resolve<E> & { upstream: string },
+  opts: Resolve<E, { upstream: string }> | (((env: E) => Options) & { upstream: string }),
 ): { fetch(request: Request, env: E, ctx?: RequestCtx): Promise<Response> } {
-  const cache = new WeakMap<object, Runtime>();
+  const cache = new WeakMap<object, Built>();
+  const own = attached<{ upstream: string }>(opts);
+  const build = (env: E): Built => {
+    let o: Options & { upstream?: string };
+    try {
+      o = resolveOptions<E, { upstream?: string }>(opts, env);
+    } catch (e) {
+      return { error: e, to: usable(own.upstream) };
+    }
+    const named = o.upstream ?? own.upstream;
+    const to = usable(named);
+    try {
+      const upstream = address("fullWorker: upstream", named);
+      if (!upstream) throw new Error("fullWorker: upstream is required");
+      return { rt: presetRuntime(o, env), to: upstream };
+    } catch (e) {
+      return { error: e, to };
+    }
+  };
   return {
     async fetch(request, env, ctx) {
-      const forward = (req: Request) => fetch(new Request(upstreamUrl(req.url, opts.upstream), req));
-      let rt: Runtime;
-      try {
-        rt = runtimeFor(opts, env, cache);
-      } catch (e) {
-        return failOpen(request, forward, e);
-      }
-      return handle(request, rt, forward, ctx);
+      const b = builtFor(env, cache, build);
+      if (!b.rt) return failOpen(request, forwarder(b.to), b.error);
+      return handle(request, b.rt, forwarder(b.to), ctx);
     },
   };
 }

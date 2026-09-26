@@ -463,6 +463,73 @@ describe("fullWorker and pagesMiddleware", () => {
     }
   });
 
+  it("the Worker presets forward where a resolver function's options say, resolved once per env", async () => {
+    const seen: { url: string; verdict: string | null }[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: string | Request, init?: RequestInit) => {
+      const req = input instanceof Request ? input : new Request(input, init);
+      seen.push({ url: req.url, verdict: req.headers.get("x-jev-verdict") });
+      if (new URL(req.url).pathname.startsWith("/_jev/authz")) {
+        return new Response(null, { status: 200, headers: { "X-Jev-Verdict": "safe", "X-Jev-Score": "0.10", "X-Jev-Reason": "injection+0.10" } });
+      }
+      return Response.json({ upstream: true });
+    }));
+    type Env = { APP: string; GATEWAY: string; JEV_ORIGIN?: string };
+    let calls = 0;
+    const full = fullWorker((env: Env) => {
+      calls++;
+      return { upstream: env.APP, provider: providers.mock, config: { jev: { mock_score: 0.1, timeout_ms: 400 } } };
+    });
+    const env: Env = { APP: "https://app.internal", GATEWAY: "https://gateway.internal" };
+    for (let i = 0; i < 3; i++) expect((await full.fetch(chat(BENIGN), env)).status).toBe(200);
+    expect(calls).toBe(1);
+    expect(seen.map((s) => s.url)).toEqual(Array(3).fill("https://app.internal/v1/chat/completions"));
+    expect(seen.every((s) => s.verdict === "safe")).toBe(true);
+
+    // the function's origin, not env.JEV_ORIGIN, judges; its upstream gets the request
+    seen.length = 0;
+    const thin = thinWorker((e: Env) => ({ origin: e.GATEWAY, upstream: e.APP }));
+    expect((await thin.fetch(chat(BENIGN), { ...env, JEV_ORIGIN: "https://stale.example" })).status).toBe(200);
+    expect(seen.map((s) => s.url)).toEqual(["https://gateway.internal/_jev/authz/v1/chat/completions", "https://app.internal/v1/chat/completions"]);
+    expect(seen[1].verdict).toBe("safe");
+    // upstream defaults to the origin the function returned
+    seen.length = 0;
+    expect((await thinWorker((e: Env) => ({ origin: e.GATEWAY })).fetch(chat(BENIGN), env)).status).toBe(200);
+    expect(seen.map((s) => s.url)).toEqual(["https://gateway.internal/_jev/authz/v1/chat/completions", "https://gateway.internal/v1/chat/completions"]);
+    // an address set on the function itself, as the only working form was, still counts
+    seen.length = 0;
+    const legacy = Object.assign(() => ({ provider: providers.mock, config: { jev: { mock_score: 0.1, timeout_ms: 400 } } }), { upstream: "https://old.internal" });
+    expect((await fullWorker(legacy).fetch(chat(BENIGN), env)).status).toBe(200);
+    expect(seen.map((s) => s.url)).toEqual(["https://old.internal/v1/chat/completions"]);
+  });
+
+  it("the Worker presets fail open on an address they cannot use, and name it once", async () => {
+    const fetched: Request[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: Request) => { fetched.push(input); return Response.json({ upstream: true }); }));
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      // a missing origin: "the Worker presets fail open when the runtime cannot be built"
+      const noOrigin = thinWorker((e: { APP?: string }) => ({ origin: "gateway.internal", upstream: e.APP }));
+      const badUpstream = fullWorker(() => ({ upstream: "app.internal", provider: providers.mock }));
+      const noUpstream = fullWorker(() => ({ provider: providers.mock }) as unknown as { upstream: string });
+      for (let i = 0; i < 2; i++) {
+        expect((await noOrigin.fetch(chat(ATTACK), { APP: "https://app.internal" })).status).toBe(200);
+        expect((await badUpstream.fetch(chat(ATTACK), {})).status).toBe(200);
+        expect((await noUpstream.fetch(chat(ATTACK), {})).status).toBe(200);
+      }
+      // unjudged, to the one usable address or the request's own URL
+      expect(fetched.map((r) => r.url)).toEqual(Array(2).fill([
+        "https://app.internal/v1/chat/completions", "https://edge.example/v1/chat/completions", "https://edge.example/v1/chat/completions",
+      ]).flat());
+      expect(fetched.every((r) => r.headers.get("x-jev-verdict") === "error" && r.headers.get("x-jev-source") === "adapter")).toBe(true);
+      const msgs = error.mock.calls.map((c) => String(c[0]));
+      expect(msgs.filter((m) => m.includes('thinWorker: origin (or env.JEV_ORIGIN) must be an absolute http(s) URL, got "gateway.internal"'))).toHaveLength(1);
+      expect(msgs.filter((m) => m.includes('fullWorker: upstream must be an absolute http(s) URL, got "app.internal"'))).toHaveLength(1);
+      expect(msgs.filter((m) => m.includes("fullWorker: upstream is required"))).toHaveLength(1);
+    } finally {
+      error.mockRestore();
+    }
+  });
+
   it("fullWorker picks up the API key from env", async () => {
     let seenAuth = "";
     vi.stubGlobal("fetch", vi.fn(async (input: string | Request, init?: RequestInit) => {

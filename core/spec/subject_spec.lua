@@ -68,7 +68,8 @@ describe("subject: history is accepted and ignored", function()
     { "malicious",  { answers = { injection = 0.95 }, req = req(ATTACK),
                       config = { policy = { mode = "enforce" } } } },
     { "l2 error",   { error = "timeout" } },
-    { "l1 block",   { cache = { ["rep:203.0.113.7"] = { blocked_until = 2000 } } } },
+    { "l1 block",   { cache = { ["rep:203.0.113.7"] = { blocked_until = 2000 } },
+                      config = { async = { rep_block_after = 1 } } } },
     { "cache hit",  { cache = { [core.cache_key(normalize.fingerprint(LONG, { prefix_bytes = 2048 }, normalize.djb2),
                                   require("jev.rules.llm-endpoints"), defaults.merge(defaults.config, nil),
                                   normalize.djb2)]
@@ -136,5 +137,50 @@ describe("subject.id_of", function()
     assert.is_nil(subject.id_of({ subject = { id = 17 } }))
     assert.is_nil(subject.id_of({ subject = { id = "" } }))
     assert.equals("u-1", subject.id_of({ subject = { id = "u-1" } }))
+  end)
+end)
+
+describe("subject.rep_record: counted / on_counted (g1-subject-id-evasion#5)", function()
+  local REP = { subject = { reputation = { block_at = 5 } } }
+  local function ctx(extra)
+    local store = H.store()
+    local s = { id = "header:abc", store = store }
+    for k, v in pairs(extra or {}) do s[k] = v end
+    return { config = REP, clock = function() return 1000 end, subject = s }, store
+  end
+  local V = { verdict = "suspicious", source = "cache", fingerprint = "fp1" }
+
+  it("adds the points and then calls on_counted with the fingerprint", function()
+    local seen = {}
+    local c, store = ctx({ on_counted = function(fp) seen[#seen + 1] = fp end })
+    assert.equals(1, subject.rep_record(c, V))
+    assert.same({ "fp1" }, seen)
+    assert.equals(1, store:get("srep:header:abc:b:1"))
+  end)
+
+  it("adds nothing when counted says the other leg already did", function()
+    local asked, told = {}, 0
+    local c, store = ctx({ counted = function(fp) asked[#asked + 1] = fp return true end,
+                           on_counted = function() told = told + 1 end })
+    assert.is_nil(subject.rep_record(c, V))
+    assert.same({ "fp1" }, asked)
+    assert.equals(0, told)
+    assert.is_nil(store:get("srep:header:abc:b:1"))
+  end)
+
+  it("charges when counted says no or throws, and a throwing on_counted changes nothing", function()
+    for _, counted in ipairs({ function() return false end, function() error("dict gone") end }) do
+      local c, store = ctx({ counted = counted, on_counted = function() error("dict full") end })
+      assert.equals(1, subject.rep_record(c, V))
+      assert.equals(1, store:get("srep:header:abc:b:1"))
+    end
+  end)
+
+  it("asks neither for a verdict that adds no points", function()
+    local called = false
+    local c = ctx({ counted = function() called = true return true end, on_counted = function() called = true end })
+    assert.is_nil(subject.rep_record(c, { verdict = "safe", source = "l2", fingerprint = "fp1" }))
+    assert.is_nil(subject.rep_record(c, { verdict = "malicious", source = "l1", fingerprint = "fp1" }))
+    assert.is_false(called)
   end)
 end)

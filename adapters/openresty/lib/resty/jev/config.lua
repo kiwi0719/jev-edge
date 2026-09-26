@@ -150,6 +150,34 @@ local function env_hint(err)
     .. " (workers only see the variables nginx.conf declares)"
 end
 
+-- The dotted path of the first JSON null in an override, or nil. Merged
+-- over the defaults, null replaces the default with a value no code on the
+-- request path expects (policy.block_body, jev.provider): every request
+-- then threw and failed open. Keys are visited in sorted order, so the
+-- path named is the same on every run.
+local function null_path(t, prefix, depth)
+  if depth > 32 then return nil end
+  local keys = {}
+  for k in pairs(t) do keys[#keys + 1] = k end
+  table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+  for _, k in ipairs(keys) do
+    local v = t[k]
+    local path = prefix .. (type(k) == "number" and ("[" .. k .. "]") or ((prefix ~= "" and "." or "") .. tostring(k)))
+    if v == cjson.null then return path end
+    if type(v) == "table" then
+      local p = null_path(v, path, depth + 1)
+      if p then return p end
+    end
+  end
+  return nil
+end
+
+local function null_error(tbl)
+  local path = type(tbl) == "table" and null_path(tbl, "", 0)
+  if not path then return nil end
+  return path .. " is null: remove the key; DELETE /_jev/config resets the override"
+end
+
 local function read_override()
   local dict = ngx.shared[state.dict_name]
   local raw = dict and dict:get("override")
@@ -202,6 +230,15 @@ end
 -- error (config.error()) until the file asked for passes.
 local function rebuild(reloaded)
   local override = read_override()
+  -- an override stored before set_override refused nulls: the config in
+  -- force stays, or, when there is none yet, the file goes in without it
+  local nerr = null_error(override)
+  if nerr then
+    ngx.log(ngx.ERR, "jev-edge: config override invalid, ",
+      state.applied and "keeping previous: " or "ignoring it: ", nerr)
+    if state.applied then return false end
+    override = {}
+  end
   local was_applied = state.applied
   local lenient = not was_applied
   local pending, perr = state.file_pending, nil
@@ -357,6 +394,8 @@ function _M.error() return state.error or state.file_error end
 function _M.set_override(tbl)
   local dict = ngx.shared[state.dict_name]
   if not dict then return nil, "lua_shared_dict " .. state.dict_name .. " not defined" end
+  local nerr = null_error(tbl)
+  if nerr then return nil, nerr end
   local merged = defaults.merge(defaults.merge(defaults.config, state.file_cfg), tbl or {})
   local ok, err = defaults.validate(merged)
   if not ok then return nil, err end

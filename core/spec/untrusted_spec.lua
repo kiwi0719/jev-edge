@@ -63,6 +63,17 @@ describe("untrusted content: extraction", function()
     assert.equals("tool says\nfunction says", t)
   end)
 
+  -- r5 tool_results: collect() read none of an object content's keys
+  it("reads a tool or function message's object content whole", function()
+    local t = normalize.extract_untrusted({ messages = {
+      { role = "user", content = { x = "a user's object is not a tool result" } },
+      { role = "tool", content = { x = "tool says", n = 2, more = { "deep" } } },
+      { role = "function", name = "f", content = { text = "function says", k = "v" } },
+      { role = "tool", content = { { type = "text", text = "parts as before" } } },
+    } }, spec)
+    assert.equals("more\ndeep\nn\nx\ntool says\nk\nv\ntext\nfunction says\nparts as before", t)
+  end)
+
   it("finds Anthropic tool_result blocks, nested content included", function()
     local t = normalize.extract_untrusted({ messages = {
       { role = "user", content = {
@@ -279,6 +290,22 @@ describe("untrusted content: pipeline", function()
     assert.matches("^untrusted 0.90", v.reason)
   end)
 
+  it("judges a tool message's object content, with the whole text when off and on its own when on", function()
+    local obj = { x = ATTACK }
+    local j = recording({ injection = 0.2, untrusted = 0.9 })
+    local v = core.evaluate(tool_req("Any news?", obj), H.ctx({ judge = j }))
+    assert.equals(1, #j.prompts)
+    assert.truthy(j.prompts[1].text:find(ATTACK, 1, true))
+    assert.equals(0.2, v.score)
+    j = recording({ injection = 0.2, untrusted = 0.9 })
+    v = core.evaluate(tool_req("Any news?", obj), H.ctx({ judge = j, config = on({ policy = { mode = "enforce" } }) }))
+    local asked
+    for _, p in ipairs(j.prompts) do if p.questions.untrusted then asked = p end end
+    assert.truthy(asked)
+    assert.equals("x\n" .. ATTACK, asked.text)
+    assert.equals(V.ACTION_BLOCK, v.action)
+  end)
+
   it("asks the untrusted question without the deployment context", function()
     local j = recording({})
     local ctx = H.ctx({ judge = j, config = on({ jev = { deployment_context = "An email assistant." } }) })
@@ -373,6 +400,34 @@ describe("untrusted content: pipeline", function()
     ctx = H.ctx({ judge = failing(0.9), config = on({ policy = { mode = "enforce" } }) })
     v = core.evaluate(tool_req(USER, ATTACK), ctx)
     assert.equals(V.ACTION_BLOCK, v.action)
+  end)
+
+  it("leaves out a part whose template judge does not know, and judges the rest", function()
+    -- config validation refuses the name; core.evaluate does not validate
+    local j = recording({ injection = 0.95 })
+    local ctx = H.ctx({ judge = j, config = { untrusted = { enabled = true, templates = { "nope" } },
+      policy = { mode = "enforce" } } })
+    local v = core.evaluate(tool_req(USER, ATTACK), ctx)
+    assert.equals(V.ACTION_BLOCK, v.action)
+    assert.equals("injection 0.95", v.reason)
+    assert.equals(1, #j.prompts)
+    assert.is_nil(j.prompts[1].questions.untrusted)
+    local logged = false
+    for _, l in ipairs(ctx.logs) do if l:find("nope", 1, true) then logged = true end end
+    assert.is_true(logged)
+    -- the score is for less than the whole request: only the part's own entry is written
+    local n = 0
+    for _ in pairs(ctx.cache.dump()) do n = n + 1 end
+    assert.equals(1, n)
+    -- with no part left, the request is an error, as before
+    j = recording({ injection = 0.95 })
+    ctx = H.ctx({ judge = j, config = { untrusted = { enabled = true, fields = { "context[*].text" },
+      templates = { "nope" } }, policy = { mode = "enforce" } } })
+    local short = req_for({ messages = { { role = "user", content = "ok?" } }, context = { { text = ATTACK } } })
+    v = core.evaluate(short, ctx)
+    assert.equals(V.ERROR, v.verdict)
+    assert.equals(V.ACTION_PASS, v.action)
+    assert.equals(0, #j.prompts)
   end)
 
   it("turns on for one rule only", function()

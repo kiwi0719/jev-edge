@@ -17,9 +17,17 @@
 --   * a reply that leaves any asked question unanswered is an error, not a
 --     partial (and lower) score.
 -- adapters/js/src/providers/index.ts (openaiCompat) mirrors this file; keep
--- the prompt strings and the parsing rules identical.
+-- the prompt strings, the request body and the parsing rules identical.
+--
+-- The request body: model, response_format json_object and the two
+-- messages, then jev.temperature (0; false leaves it out, for a model that
+-- takes only its default), the reply's token budget jev.max_tokens (200)
+-- under jev.token_param ("max_tokens", or "max_completion_tokens" for
+-- OpenAI's reasoning models), and the keys of jev.extra_body, merged in
+-- (never model, messages or response_format: core/defaults.lua refuses them).
 
 local cjson = require "cjson.safe"
+local defaults = require "jev.core.defaults"
 
 local _M = { name = "openai-compat" }
 
@@ -182,6 +190,28 @@ end
 _M.system_prompt = system_prompt
 _M.user_message = user_message
 
+--- The request body as a table (see the header): exposed for the spec, whose
+-- table adapters/js/test/providers.test.ts repeats.
+function _M.body(cfg, system, user)
+  local body = {
+    model = cfg.model or "gpt-4o-mini",
+    response_format = { type = "json_object" },
+    messages = {
+      { role = "system", content = system },
+      { role = "user",   content = user },
+    },
+  }
+  if cfg.temperature ~= false then body.temperature = tonumber(cfg.temperature) or 0 end
+  local param = cfg.token_param == "max_completion_tokens" and "max_completion_tokens" or "max_tokens"
+  body[param] = tonumber(cfg.max_tokens) or 200
+  if type(cfg.extra_body) == "table" then
+    for k, v in pairs(cfg.extra_body) do
+      if type(k) == "string" and not defaults.OWN_BODY_KEYS[k] then body[k] = v end
+    end
+  end
+  return body
+end
+
 function _M.build_request(prompt, cfg, nonce)
   -- The question ids this call asked for, handed back through req.ctx so
   -- parse_response can filter the model's reply. Never stored on cfg: that
@@ -191,16 +221,8 @@ function _M.build_request(prompt, cfg, nonce)
   nonce = nonce or new_nonce()
   local deployment = prompt.context and prompt.context.deployment
   local endpoint = (cfg.endpoint or "http://127.0.0.1:11434/v1"):gsub("/+$", "")
-  local body = cjson.encode({
-    model = cfg.model or "gpt-4o-mini",
-    temperature = 0,
-    max_tokens = 200,
-    response_format = { type = "json_object" },
-    messages = {
-      { role = "system", content = system_prompt(prompt.questions, nonce, deployment) },
-      { role = "user",   content = user_message(prompt.text, nonce) },
-    },
-  })
+  local body = cjson.encode(_M.body(cfg, system_prompt(prompt.questions, nonce, deployment),
+    user_message(prompt.text, nonce)))
   return {
     method  = "POST",
     url     = endpoint .. "/chat/completions",
@@ -346,14 +368,45 @@ function _M.parse_content(content, wanted)
   return out
 end
 
+-- What a JSON error body says, for the error string: error.message (OpenAI
+-- and most servers), error as a string (Ollama) or message (vLLM's older
+-- shape); control characters as spaces, cut to 200 bytes on a character
+-- boundary. nil when the body says nothing readable.
+local function error_message(body)
+  local d = type(body) == "string" and cjson.decode(body)
+  if type(d) ~= "table" then return nil end
+  local m = type(d.error) == "table" and d.error.message or d.error
+  if type(m) ~= "string" then m = d.message end
+  if type(m) ~= "string" or m == "" then return nil end
+  m = m:gsub("%c", " ")
+  if #m > 200 then
+    local cut = m:sub(1, 200)
+    -- a cut inside a UTF-8 sequence drops its first bytes too
+    if m:byte(201) >= 0x80 and m:byte(201) < 0xC0 then cut = cut:gsub("[\192-\255][\128-\191]*$", "") end
+    m = cut
+  end
+  return m
+end
+_M.error_message = error_message
+
+_M.CUT = "openai-compat: reply cut at max_tokens (reasoning model? raise jev.max_tokens)"
+
 function _M.parse_response(status, body, _cfg, ctx)
   if status ~= 200 then
-    return nil, "openai-compat http " .. tostring(status)
+    -- classified by the status (http.lua), whatever the message says
+    local m = error_message(body)
+    return nil, "openai-compat http " .. tostring(status) .. (m and (": " .. m) or "")
   end
   -- without a UTF-8 BOM before it, as fetch's res.text() reads a body
   local decoded = type(body) == "string" and decode((body:gsub("^\239\187\191", ""))) or nil
-  local content = type(decoded) == "table" and type(decoded.choices) == "table" and decoded.choices[1]
-    and decoded.choices[1].message and decoded.choices[1].message.content
+  local choice = type(decoded) == "table" and type(decoded.choices) == "table" and decoded.choices[1]
+  local content = type(choice) == "table" and type(choice.message) == "table" and choice.message.content
+  -- the token budget ran out before the answer (a reasoning model spends it
+  -- thinking): say so, instead of "no content" or "not JSON"
+  if type(choice) == "table" and choice.finish_reason == "length"
+     and (type(content) ~= "string" or #json_objects(content) == 0) then
+    return nil, _M.CUT
+  end
   if type(content) ~= "string" then
     return nil, "openai-compat: no content"
   end

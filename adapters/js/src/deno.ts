@@ -45,9 +45,18 @@ export interface DenoKvAtomicLike {
   commit(): Promise<{ ok: boolean }>;
 }
 
+/** Deno KV's read consistency: "strong" (the default) reads the newest
+ *  value from the primary region; "eventual" may read a slightly stale one
+ *  from a nearby replica, with lower latency. */
+export type DenoKvConsistency = "strong" | "eventual";
+
 /** The subset of Deno.Kv this module uses; `await Deno.openKv()` satisfies it. */
 export interface DenoKvLike {
-  get(key: DenoKvKey): Promise<DenoKvEntryLike>;
+  get(key: DenoKvKey, opts?: { consistency?: DenoKvConsistency }): Promise<DenoKvEntryLike>;
+  /** Several keys in one round trip, entries in key order (Deno KV takes at
+   *  most 10 per call). Optional here, so a KV-like without it still works:
+   *  the store then reads the keys one get each, in parallel. */
+  getMany?(keys: DenoKvKey[], opts?: { consistency?: DenoKvConsistency }): Promise<DenoKvEntryLike[]>;
   set(key: DenoKvKey, value: unknown, opts?: { expireIn?: number }): Promise<unknown>;
   delete(key: DenoKvKey): Promise<void>;
   atomic(): DenoKvAtomicLike;
@@ -61,6 +70,16 @@ interface Entry { v: unknown; exp: number }
 /** Retries for one incr / expire before giving up. Each failed commit means
  *  another writer's commit succeeded, so this bounds contention, not latency. */
 const MAX_CAS_ATTEMPTS = 64;
+
+/** The most keys Deno KV reads in one getMany. */
+const GET_MANY_MAX = 10;
+
+export interface DenoKvStoreOptions {
+  /** How plain reads (get, getMany) read: "strong" (default) or "eventual".
+   *  The check-and-set loops of incr and expire always read strong: they
+   *  need the current versionstamp, and a stale one only fails the commit. */
+  consistency?: DenoKvConsistency;
+}
 
 function live(e: unknown, now: number): e is Entry {
   return typeof e === "object" && e !== null && "v" in e && !((e as Entry).exp && (e as Entry).exp <= now);
@@ -83,9 +102,22 @@ function expireIn(ttl: number): { expireIn: number } | undefined {
  * with this store they are shared across isolates but can lose an increment
  * under contention; that makes the breaker a little slower to trip, never
  * wrong about a request.
+ *
+ * `opts.consistency = "eventual"` makes plain reads (get, getMany) read from
+ * the nearest replica: right for the verdict cache, whose entries a stale
+ * read at worst judges again, and wrong for the breaker state and the
+ * subject store. getMany reads several keys in one round trip each 10 keys
+ * (kv.getMany), which the subject ring's load uses for its slots.
  */
-export function denoKvStore(kv: DenoKvLike, prefix: DenoKvKey = ["jev"], clock: () => number = () => Date.now() / 1000): Store {
+export function denoKvStore(
+  kv: DenoKvLike, prefix: DenoKvKey = ["jev"], clock: () => number = () => Date.now() / 1000,
+  opts: DenoKvStoreOptions = {},
+): Store {
   const key = (k: string): DenoKvKey => [...prefix, k];
+  // strong is Deno KV's default: pass nothing, as before
+  const read = opts.consistency === "eventual" ? { consistency: "eventual" as const } : undefined;
+  const value = (res: DenoKvEntryLike | undefined): unknown =>
+    res && live(res.value, clock()) ? (res.value as Entry).v : undefined;
 
   async function cas(k: string, update: (cur: Entry | undefined, now: number) => [Entry, number] | null): Promise<Entry | undefined> {
     for (let i = 0; i < MAX_CAS_ATTEMPTS; i++) {
@@ -102,9 +134,17 @@ export function denoKvStore(kv: DenoKvLike, prefix: DenoKvKey = ["jev"], clock: 
   }
 
   return {
-    get: async (k) => {
-      const res = await kv.get(key(k));
-      return live(res.value, clock()) ? (res.value as Entry).v : undefined;
+    get: async (k) => value(await (read ? kv.get(key(k), read) : kv.get(key(k)))),
+    // in batches of GET_MANY_MAX, the batches at once
+    getMany: async (ks) => {
+      const getMany = kv.getMany?.bind(kv);
+      if (!getMany) return Promise.all(ks.map((k) => (read ? kv.get(key(k), read) : kv.get(key(k))).then(value)));
+      const batches: Promise<DenoKvEntryLike[]>[] = [];
+      for (let i = 0; i < ks.length; i += GET_MANY_MAX) {
+        const part = ks.slice(i, i + GET_MANY_MAX).map(key);
+        batches.push(read ? getMany(part, read) : getMany(part));
+      }
+      return (await Promise.all(batches)).flat().map(value);
     },
     set: async (k, v, ttl) => {
       if (v === null || v === undefined) return kv.delete(key(k));
@@ -168,7 +208,10 @@ export function denoHandler(opts: DenoOptions): (req: Request, info?: DenoServeI
     if (rt) return rt;
     const { upstream: _u, kv, ...o } = opts;
     if (kv) {
-      o.cache ??= denoKvStore(kv, ["jev", "cache"]);
+      // the verdict cache (and rep: records) reads the nearest replica: a
+      // stale miss is one more judge call, a stale hit what KV caches
+      // elsewhere accept; the breaker state and the subject store read strong
+      o.cache ??= denoKvStore(kv, ["jev", "cache"], undefined, { consistency: "eventual" });
       o.state ??= denoKvStore(kv, ["jev", "state"]);
       o.subjectStore ??= denoKvStore(kv, ["jev", "subject"]);
     }

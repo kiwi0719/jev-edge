@@ -50,7 +50,7 @@ Per route, per service or global, with the same keys as the Lua config file:
    }'
    ```
 
-Your upstream receives `X-Jev-Verdict`, `X-Jev-Score`, `X-Jev-Source`, `X-Jev-Reason` and `X-Jev-Request-Id`. In `enforce` mode a block is a 403 with `policy.block_body` and the verdict headers on the response.
+Your upstream receives `X-Jev-Verdict`, `X-Jev-Score`, `X-Jev-Source`, `X-Jev-Reason` and `X-Jev-Request-Id`. In `enforce` mode a block is a 403 with `policy.block_body`, `X-Jev-Verdict` and `X-Jev-Request-Id` on the response; the score, reason and source go to the upstream and the log only, never to the client.
 
 ## What maps to what
 
@@ -63,7 +63,7 @@ Your upstream receives `X-Jev-Verdict`, `X-Jev-Score`, `X-Jev-Source`, `X-Jev-Re
 | `$jev_log` | `$jev_log`, registered as an APISIX variable: use it in `log_format` of `http-logger`, `file-logger`, `kafka-logger` |
 | `PUT /_jev/config` hot reload | the Admin API: change the route's plugin conf, APISIX pushes it without a reload |
 | `/_jev/health`, `/_jev/metrics` | not exposed; APISIX's own `prometheus` plugin and the logger carry the verdict fields |
-| L3 side-path, reputation | same modules, same `async` config |
+| L3 side-path, reputation | same modules, same `async` config. IP reputation (`rep:<ip>` in `jev_cache`) is one namespace for every route: a route blocks on it only with its own `async.rep_block_after > 0`, and those that turn it on block the IPs any of them flagged |
 | inline tenant rules | same: `"rules": [{"id": "billing", "extends": "llm-endpoints", "watch_paths": ["^/v1/billing"], "deployment_context": "..."}, "llm-endpoints"]`; or simply one route per tenant, each with its own `jev.deployment_context` |
 | `subject` | same keys; needs `nginx_config.http.lua_shared_dict.jev_subject` (trajectories: never evicts, drops new entries when full), and `jev_subject_rep` with `reputation` (points and blocks; without it they share `jev_subject`, with a warning) |
 | `client_max_body_size`, `max_body_bytes` | `nginx_config.http.client_max_body_size` in `config.yaml` and `max_body_bytes` in the plugin `rules`; the body is read by the same `resty.jev.body` (whole up to 1 MiB, head and tail past it, `gzip` / `deflate` / `br` decoded; `br` needs `libbrotli1` in the image). See [Body size and what L1 reads](../../docs/design.md#body-size-and-what-l1-reads) |

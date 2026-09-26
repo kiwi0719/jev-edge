@@ -85,7 +85,7 @@ local function one(r, mode)
     config = MODES[mode], rules = { rule }, cache = store(), judge = judge,
     clock = function() ngx.update_time(); return ngx.now() end,
     hash = normalize.djb2, json_decode = cjson.decode,
-    re_find = function(s, p) return ngx.re.find(s, p, "joi") end,
+    re_find = function(s, p, init) return ngx.re.find(s, p, "joi", init and init > 1 and { pos = init } or nil) end,
   }
   local v = core.evaluate(req, ctx)
   return { id = r.id, mode = mode, label = r.label, source = r.source, category = r.category, carrier = r.carrier,

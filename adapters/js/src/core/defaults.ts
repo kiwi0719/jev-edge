@@ -3,6 +3,7 @@ import type { Policy } from "./policy.js";
 import type { BreakerConfig } from "./breaker.js";
 import type { FeedbackConfig } from "./trust.js";
 import { pathError } from "./normalize.js";
+import { get as getTemplate } from "./judge.js";
 
 export interface QuestionWording {
   instructions?: string;
@@ -24,6 +25,13 @@ export interface JevConfig {
   timeout_alpha?: number;
   timeout_warmup?: number;
   max_inflight?: number;
+  /** openai-compat: the reply's token budget (default 200) and the body key that carries it. */
+  max_tokens?: number;
+  token_param?: "max_tokens" | "max_completion_tokens";
+  /** openai-compat: 0 by default; false leaves it out (a model that takes only its default). */
+  temperature?: number | false;
+  /** openai-compat: more body keys, merged in; never model, messages or response_format. */
+  extra_body?: Record<string, unknown>;
   /** Per-provider question wording: fields here replace the bundled template's for jev / laya requests. */
   questions?: Record<string, QuestionWording>;
   [k: string]: unknown;
@@ -43,7 +51,7 @@ export interface Config {
    * balancer in front of the gateway), and so on. Never the first element:
    * that is whatever the client typed.
    */
-  client_ip: { trusted_hops: number };
+  client_ip: { trusted_hops: number; ipv6_prefix: number };
   async: { enabled: boolean; max_async: number; rep_block_after: number; rep_block_ttl: number };
   subject: {
     enabled: boolean; from: "ip" | "header" | "cookie"; name: string | null; salt: string | null; hashed: boolean;
@@ -78,7 +86,7 @@ export const config: Config = {
     max_inflight: 64,
   },
   rules: ["llm-endpoints"],
-  client_ip: { trusted_hops: 1 },
+  client_ip: { trusted_hops: 1, ipv6_prefix: 64 },
   policy: {
     mode: "monitor",
     block_threshold: 0.7,
@@ -117,6 +125,17 @@ export function merge<T extends object>(base: T, over?: object | null): T {
   return out as T;
 }
 
+/** Port of OWN_BODY_KEYS: the openai-compat body's own keys, which jev.extra_body may not set. */
+export const OWN_BODY_KEYS: ReadonlySet<string> = new Set(["model", "messages", "response_format"]);
+
+/** Port of validate_extra_body: a table of body keys (a JSON object), none of them the body's own. */
+export function validateExtraBody(eb: unknown): [true, null] | [null, string] {
+  if (eb === undefined) return [true, null];
+  if (typeof eb !== "object" || eb === null || Array.isArray(eb)) return [null, "jev.extra_body must be a table of body keys"];
+  for (const k of Object.keys(eb)) if (OWN_BODY_KEYS.has(k)) return [null, `jev.extra_body may not set ${k}`];
+  return [true, null];
+}
+
 export function validate(c: Config): [true, null] | [null, string] {
   const p = c.policy ?? {};
   if (p.mode !== "monitor" && p.mode !== "enforce") return [null, "policy.mode must be monitor|enforce"];
@@ -129,9 +148,16 @@ export function validate(c: Config): [true, null] | [null, string] {
   if (typeof p.block_threshold !== "number" || typeof p.suspect_threshold !== "number") return [null, "policy thresholds must be numbers"];
   if (p.suspect_threshold > p.block_threshold) return [null, "policy.suspect_threshold must be <= block_threshold"];
   if (p.block_threshold > 1 || p.suspect_threshold < 0) return [null, "policy thresholds must be in [0,1]"];
+  // the host writes it as the block response's body: an object (a JSON
+  // object where a JSON document encoded as a string belongs) or null is
+  // refused, as core/defaults.lua refuses a table or cjson.null
+  const bb = p.block_body as unknown;
+  if (bb !== undefined && typeof bb !== "string") return [null, "policy.block_body must be a string"];
   const bs = p.block_status as unknown;
-  if (bs !== undefined && bs !== null && (typeof bs !== "number" || bs < 200 || bs > 599 || !Number.isInteger(bs))) {
-    return [null, "policy.block_status must be an HTTP status code"];
+  // a block is a 4xx: a relay tells a block from an allow and from an error
+  // that fails open by it (core/defaults.lua); null is refused, as cjson.null is
+  if (bs !== undefined && (typeof bs !== "number" || bs < 400 || bs > 499 || !Number.isInteger(bs))) {
+    return [null, "policy.block_status must be a 4xx status"];
   }
   const ca: Partial<Config["cache"]> = c.cache ?? {};
   if (ca.fp_ttl !== undefined && (typeof ca.fp_ttl !== "number" || ca.fp_ttl <= 0)) return [null, "cache.fp_ttl must be > 0"];
@@ -146,9 +172,29 @@ export function validate(c: Config): [true, null] | [null, string] {
   if (ci.trusted_hops !== undefined && (typeof ci.trusted_hops !== "number" || ci.trusted_hops < 1 || !Number.isInteger(ci.trusted_hops))) {
     return [null, "client_ip.trusted_hops must be an integer >= 1"];
   }
+  if (ci.ipv6_prefix !== undefined && (typeof ci.ipv6_prefix !== "number" || !Number.isInteger(ci.ipv6_prefix) || ci.ipv6_prefix < 1 || ci.ipv6_prefix > 128)) {
+    return [null, "client_ip.ipv6_prefix must be an integer from 1 to 128"];
+  }
   const as: Partial<Config["async"]> = c.async ?? {};
   if (as.max_async !== undefined && (typeof as.max_async !== "number" || as.max_async < 0)) return [null, "async.max_async must be >= 0"];
   if (typeof c.jev.timeout_ms !== "number" || c.jev.timeout_ms <= 0) return [null, "jev.timeout_ms must be > 0"];
+  // the judge is built from these; null counts as given (Lua's cjson.null), undefined as left out
+  for (const k of ["provider", "model", "endpoint", "api_key", "api_key_env", "deployment_context"]) {
+    const v = c.jev[k];
+    if (v !== undefined && typeof v !== "string") return [null, `jev.${k} must be a string`];
+  }
+  if (c.jev.provider === "") return [null, "jev.provider must be a non-empty string"];
+  // the openai-compat request (providers/index.ts): see core/defaults.lua
+  const mt = c.jev.max_tokens;
+  if (mt !== undefined && (typeof mt !== "number" || !Number.isInteger(mt) || mt < 1)) return [null, "jev.max_tokens must be an integer >= 1"];
+  const tp = c.jev.token_param;
+  if (tp !== undefined && tp !== "max_tokens" && tp !== "max_completion_tokens") return [null, "jev.token_param must be max_tokens|max_completion_tokens"];
+  const temp = c.jev.temperature;
+  if (temp !== undefined && temp !== false && (typeof temp !== "number" || !(temp >= 0 && temp <= 2))) {
+    return [null, "jev.temperature must be a number from 0 to 2, or false"];
+  }
+  const [eok, eerr] = validateExtraBody(c.jev.extra_body);
+  if (!eok) return [null, eerr];
   const fb = c.feedback ?? {};
   if (fb.trust_ttl !== undefined && (typeof fb.trust_ttl !== "number" || fb.trust_ttl <= 0)) return [null, "feedback.trust_ttl must be > 0"];
   if (fb.max_renewals !== undefined && (typeof fb.max_renewals !== "number" || fb.max_renewals < 0)) return [null, "feedback.max_renewals must be >= 0"];
@@ -185,6 +231,11 @@ export function validate(c: Config): [true, null] | [null, string] {
       }
       for (const k of ["criteria", "criteria_ctx"]) {
         if (o[k] !== undefined && (typeof o[k] !== "object" || o[k] === null)) return [null, `jev.questions.${name}.${k} must be a table`];
+        // a side it names is sent as the judge's criterion: a string, not empty
+        for (const side of ["true", "false"]) {
+          const v = (o[k] as Record<string, unknown> | undefined)?.[side];
+          if (v !== undefined && (typeof v !== "string" || v === "")) return [null, `jev.questions.${name}.${k}.${side} must be a non-empty string`];
+        }
       }
     }
   }
@@ -203,25 +254,50 @@ export function untrustedSpec(cfg: { untrusted?: UntrustedConfig } | undefined, 
   return { ...base, ...over };
 }
 
-/** Port of defaults.validate_untrusted: type check for the config section or a rule's override. */
+/** Port of defaults.string_list_error: why `v` is not a list of non-empty strings (`nonempty`: with one at least), or null. */
+export function stringListError(v: unknown, what: string, nonempty = false): string | null {
+  if (!Array.isArray(v)) return `${what} must be a list of strings`;
+  if (nonempty && v.length === 0) return `${what} must not be empty`;
+  for (let i = 0; i < v.length; i++) {
+    if (typeof v[i] !== "string" || v[i] === "") return `${what}[${i + 1}] must be a non-empty string`;
+  }
+  return null;
+}
+
+/** Port of defaults.templates_error: why `v` is not a list of template names judge knows, or null. */
+export function templatesError(v: unknown, what: string): string | null {
+  const err = stringListError(v, what, true);
+  if (err) return err;
+  const names = v as string[];
+  for (let i = 0; i < names.length; i++) {
+    if (!getTemplate(names[i])) return `${what}[${i + 1}] ${names[i]} is not a template`;
+  }
+  return null;
+}
+
+/** Port of defaults.validate_untrusted: type check for the config section or a rule's override (JSON null is not one). */
 export function validateUntrusted(u: unknown, where: string): [true, null] | [null, string] {
-  if (u === undefined || u === null) return [true, null];
-  if (typeof u !== "object" || Array.isArray(u)) return [null, `${where} must be a table`];
+  if (u === undefined) return [true, null];
+  if (typeof u !== "object" || u === null || Array.isArray(u)) return [null, `${where} must be a table`];
   const t = u as Record<string, unknown>;
   for (const k of ["enabled", "tool_results"]) {
     if (t[k] !== undefined && typeof t[k] !== "boolean") return [null, `${where}.${k} must be true|false`];
   }
-  for (const k of ["fields", "templates"]) {
-    const v = t[k];
-    if (v === undefined) continue;
-    if (!Array.isArray(v)) return [null, `${where}.${k} must be a list of strings`];
-    for (let i = 0; i < v.length; i++) {
-      if (typeof v[i] !== "string" || v[i] === "") return [null, `${where}.${k}[${i + 1}] must be a non-empty string`];
-      // a field path is checked the way a rule's text_fields are
-      const perr = k === "fields" ? pathError(v[i]) : null;
-      if (perr) return [null, `${where}.${k}[${i + 1}] ${perr}`];
+  if (t.fields !== undefined) {
+    const err = stringListError(t.fields, `${where}.fields`);
+    if (err) return [null, err];
+    // a field path is checked the way a rule's text_fields are
+    const fields = t.fields as string[];
+    for (let i = 0; i < fields.length; i++) {
+      const perr = pathError(fields[i]);
+      if (perr) return [null, `${where}.fields[${i + 1}] ${perr}`];
     }
   }
-  if (Array.isArray(t.templates) && t.templates.length === 0) return [null, `${where}.templates must not be empty`];
+  // a name judge does not know makes every request with retrieved content an
+  // L2 error, the whole-text judgment included
+  if (t.templates !== undefined) {
+    const err = templatesError(t.templates, `${where}.templates`);
+    if (err) return [null, err];
+  }
   return [true, null];
 }

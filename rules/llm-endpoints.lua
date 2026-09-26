@@ -73,9 +73,10 @@ return {
   -- L2: the always_suspect hit, then the newest messages.
   max_judge_bytes = 32768,
   -- Text over max_judge_bytes in up to this many chunks, one judge call each
-  -- (in parallel). 1 = one window (hit + newest messages + head/tail), the
-  -- cheapest; raise it (4 covers 128 KiB) to judge long text in full, and
-  -- policy.unjudgeable then decides what still does not fit. See README.
+  -- (in parallel), consecutive chunks sharing 1 KiB. 1 = one window (hit +
+  -- newest messages + head/tail), the cheapest; raise it (4 covers 32 KiB +
+  -- 3 x 31 KiB = 125 KiB) to judge long text in full, and policy.unjudgeable
+  -- then decides what still does not fit. See README.
   max_judge_chunks = 1,
   -- Oldest first: the judging window keeps the last ones first. The paths
   -- are walked together, in document order: each message's content, tool
@@ -110,7 +111,8 @@ return {
   -- prompt takes them on OpenAI completions, vLLM, SGLang and llama.cpp) makes
   -- the request unjudgeable: see token_prompts below.
   -- suffix: OpenAI completions and Ollama; input_prefix, input_suffix,
-  -- input_extra: llama.cpp /infill.
+  -- input_extra: llama.cpp /infill, each extra file's filename and text (it
+  -- renders both for the model).
   text_fields = { "system", "instructions", "preamble", "system_prompt", "systemInstruction.parts",
                   "system_instruction.parts", "documents", "template",
                   "messages[*].content", "messages[*].tool_calls[*].function.arguments.**",
@@ -121,7 +123,8 @@ return {
                   "prompt", "prompt.prompt_string", "prompt[*].prompt_string", "prompt.variables.**",
                   "input", "input[*].arguments.**", "input[*].input", "input[*].output",
                   "inputs", "instances[*].inputs", "instances[*].messages[*].content",
-                  "query", "text", "input_ids", "suffix", "input_prefix", "input_suffix", "input_extra[*].text" },
+                  "query", "text", "input_ids", "suffix", "input_prefix", "input_suffix",
+                  "input_extra[*].filename", "input_extra[*].text" },
   -- Tool definitions and output schemas, judged as a part of their own with
   -- the rule's templates and their own verdict-cache entry, so an unchanged
   -- tool set costs one judge call per cache lifetime: OpenAI chat, Ollama,
@@ -153,7 +156,9 @@ return {
     [[\bdeveloper mode\b]],
     [[\b(DAN|do anything now)\b]],
     [[\b(reveal|print|repeat|show)\b.{0,30}\b(instructions|system prompt|rules)\b]],
-    [[(?:[A-Za-z0-9+/]{4}){40,}={0,2}]],   -- long base64 blob
+    -- a long base64 blob: one class run, not a repeated group, so PCRE's
+    -- JIT needs no stack per 4 characters and a 20 KB run still matches
+    [[[A-Za-z0-9+/]{160,}={0,2}]],
     -- Judge-directed text: the input talks to the classifier judging it
     -- (docs/design.md, "Judge robustness"). A hit only guarantees an L2 call
     -- and keeps the hit inside the judging window of a long body.

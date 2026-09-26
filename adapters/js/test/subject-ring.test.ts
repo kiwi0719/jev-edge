@@ -6,6 +6,8 @@ import { describe, it, expect } from "vitest";
 import * as subject from "../src/core/subject";
 import { memoryStore as coreMemoryStore, type Store } from "../src/core/breaker";
 import { memoryStore, durableStore, kvStore, JevState, type KVLike } from "../src/cf/stores";
+import { createRuntime, handle } from "../src";
+import { evaluate } from "../src/runtime";
 
 const E = (score: number): subject.Entry => ({ at: score, subject: "s", verdict: "safe", score, source: "l2", reason: "", fingerprint: "" });
 const scores = (h: unknown) => (h as subject.Entry[] | null)?.map((e) => e.score) ?? null;
@@ -107,6 +109,58 @@ describe("subject ring store", () => {
     expect(scores(await subject.loadHistory(plain, "ip:g", 3))).toEqual([2, 3, 4]);
     expect(scores(await inner.get("subj:ip:g"))).toEqual([2, 3, 4]);
     expect(await inner.get("subj:ip:g:n")).toBeUndefined();
+  });
+
+  // js-hosts#12: a request no rule watches reads nothing from the subject
+  // store, and a watched one reads the ring's slots at once, not one by one
+  describe("reads on the request path", () => {
+    const counting = (delayMs: number) => {
+      const inner = memoryStore();
+      const c = { gets: 0, inFlight: 0, maxInFlight: 0 };
+      const store: Store = {
+        ...inner,
+        get: async (k) => {
+          c.gets++;
+          c.inFlight++;
+          c.maxInFlight = Math.max(c.maxInFlight, c.inFlight);
+          await new Promise((r) => setTimeout(r, delayMs));
+          c.inFlight--;
+          return inner.get(k);
+        },
+      };
+      return { store, c };
+    };
+    const cfg = { jev: { provider: "mock", mock_score: 0.2, timeout_ms: 400 }, subject: { enabled: true, from: "ip" as const, salt: "pepper" } };
+    const req = (method: string, path: string, body?: string) => new Request("https://edge.example" + path, {
+      method, headers: { "content-type": "application/json", "x-forwarded-for": "203.0.113.9" }, body,
+    });
+    const up = async () => new Response("ok");
+
+    it("an unwatched GET makes no store read, and still names its subject", async () => {
+      const { store, c } = counting(0);
+      const rt = createRuntime({ config: cfg, subjectStore: store });
+      const { subjectId } = await evaluate(req("GET", "/static/logo.png"), rt);
+      expect(subjectId).toMatch(/^ip:[0-9a-f]{64}$/);
+      expect(c.gets).toBe(0);
+      // a watched path with a method no rule watches: no history either
+      await handle(req("GET", "/v1/chat/completions"), rt, up);
+      expect(c.gets).toBe(0);
+    });
+
+    it("a watched POST reads the counter, then the slots concurrently", async () => {
+      const { store, c } = counting(5);
+      const id = "ip:x";
+      for (let i = 1; i <= 20; i++) await subject.ringAppend(store, id, E(i), 20, 60);
+      c.gets = 0;
+      expect(scores(await subject.ringLoad(store, id, 20))).toEqual(Array.from({ length: 20 }, (_, i) => i + 1));
+      expect(c.gets).toBe(21);
+      expect(c.maxInFlight).toBe(20);
+      const rt = createRuntime({ config: cfg, subjectStore: store });
+      c.gets = 0;
+      const body = '{"messages":[{"role":"user","content":"Please write a detailed summary of the attached quarterly report."}]}';
+      await handle(req("POST", "/v1/chat/completions", body), rt, up);
+      expect(c.gets).toBeGreaterThan(0);
+    });
   });
 
   it("KV incr is a best-effort get + put that always carries the ttl", async () => {

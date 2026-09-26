@@ -163,6 +163,91 @@ local function fold(s)
 end
 _M.fold = fold
 
+--- s without the whitespace Lua's %s matches (space, \t, \n, \v, \f, \r)
+-- at either end. Linear: '^%s*(.-)%s*$' tries %s*$ again at every byte the
+-- lazy capture grows by, so a whitespace run inside the value costs its
+-- length squared (a Content-Type of 32 KB of spaces between two letters held
+-- a worker for over a second); '^%s*(.*%S)' does the same on a value of
+-- whitespace only.
+function _M.trim(s)
+  local i = s:find("%S")
+  if not i then return "" end
+  local j = #s
+  local b = s:byte(j)
+  while b == 32 or (b >= 9 and b <= 13) do
+    j = j - 1
+    b = s:byte(j)
+  end
+  return s:sub(i, j)
+end
+
+-- The 16-bit groups of the part of an IPv6 address on one side of "::",
+-- or nil when a group is not 1 to 4 hex digits.
+local function hextets(part)
+  local out = {}
+  if part == "" then return out end
+  for g in (part .. ":"):gmatch("([^:]*):") do
+    if not g:find("^%x%x?%x?%x?$") then return nil end
+    out[#out + 1] = tonumber(g, 16)
+  end
+  return out
+end
+
+--- The key one client address is counted under: IP reputation (rep:<key>)
+-- and subject.from = "ip". IPv6 is aggregated to its first `prefix` bits
+-- (client_ip.ipv6_prefix, 64 by default): one host holds a whole /64 and
+-- would otherwise get a fresh reputation per address. A %zone is dropped,
+-- "::" expanded and the address masked, written as eight lowercase
+-- four-digit groups and "/<prefix>", so every spelling of one network is
+-- one key. IPv4, and IPv4-mapped IPv6 (::ffff:a.b.c.d, which is IPv4), are
+-- the dotted address. Anything that does not parse is returned as it is.
+function _M.ip_key(ip, prefix)
+  if type(ip) ~= "string" or not ip:find(":", 1, true) or #ip > 64 then return ip end
+  prefix = math.floor(tonumber(prefix) or 64)
+  if prefix < 1 or prefix > 128 then prefix = 64 end
+  local s = ip:match("^([^%%]*)")
+  -- an IPv4 address in the last 32 bits
+  local v4
+  local last = s:match("[^:]*$")
+  if last:find(".", 1, true) then
+    local a, b, c, d = last:match("^(%d%d?%d?)%.(%d%d?%d?)%.(%d%d?%d?)%.(%d%d?%d?)$")
+    a, b, c, d = tonumber(a), tonumber(b), tonumber(c), tonumber(d)
+    if not (a and a <= 255 and b <= 255 and c <= 255 and d <= 255) then return ip end
+    v4 = { a * 256 + b, c * 256 + d }
+    s = s:sub(1, #s - #last)
+    -- "::1.2.3.4" leaves "::", "0::1.2.3.4" leaves "0::", "0:...:0:1.2.3.4" a ':'
+    if s:sub(-2) ~= "::" then
+      if s:sub(-1) ~= ":" then return ip end
+      s = s:sub(1, -2)
+    end
+  end
+  local want = v4 and 6 or 8
+  local h
+  local dc = s:find("::", 1, true)
+  if dc then
+    if s:find("::", dc + 1, true) then return ip end
+    local l, r = hextets(s:sub(1, dc - 1)), hextets(s:sub(dc + 2))
+    if not l or not r or #l + #r >= want then return ip end
+    h = l
+    for _ = 1, want - #l - #r do h[#h + 1] = 0 end
+    for _, x in ipairs(r) do h[#h + 1] = x end
+  else
+    h = hextets(s)
+    if not h or #h ~= want then return ip end
+  end
+  if v4 then h[7], h[8] = v4[1], v4[2] end
+  if h[1] == 0 and h[2] == 0 and h[3] == 0 and h[4] == 0 and h[5] == 0 and h[6] == 0xffff then
+    return string.format("%d.%d.%d.%d", math.floor(h[7] / 256), h[7] % 256, math.floor(h[8] / 256), h[8] % 256)
+  end
+  local out = {}
+  for i = 1, 8 do
+    local bits = math.max(0, math.min(16, prefix - (i - 1) * 16))
+    local x = h[i]
+    out[i] = string.format("%04x", x - x % 2 ^ (16 - bits))
+  end
+  return table.concat(out, ":") .. "/" .. prefix
+end
+
 -- A folded key starts with the folded name's first byte, or with that
 -- letter's other case, or with the first byte of U+017F / U+212A.
 local FIRST = { s = 0xC5, k = 0xE2 }
@@ -420,9 +505,10 @@ end
 -- flags; `item` when the value is an item of the list the path ends at, where
 -- a number is a token id),
 -- a "**" here ({ kind = DEEP }), or a key the
--- paths go on through ({ kind = KEY, key, whole, whole_arr, items_arr }):
--- the plan for the value under the key when it is not an array (`whole`),
--- and when it is, the plans for the array itself and for each of its items.
+-- paths go on through ({ kind = KEY, key, whole, whole_arr, items_arr,
+-- content }): the plan for the value under the key when it is not an array
+-- (`whole`), and when it is, the plans for the array itself and for each of
+-- its items; `content` when the key folds to "content" (see walk).
 -- ---------------------------------------------------------------------------
 
 -- Field paths whose values are read whole (read_whole), whatever their
@@ -470,7 +556,7 @@ local function compile(cursors, leaf)
     else
       local g = groups[seg.key]
       if not g then
-        g = { kind = KEY, key = seg.key, cursors = {} }
+        g = { kind = KEY, key = seg.key, cursors = {}, content = fold(seg.key) == "content" }
         groups[seg.key] = g
         ops[#ops + 1] = g
       end
@@ -597,8 +683,16 @@ end
 -- st.out collects the values; st.leaf, when set, reads the value a path
 -- ends at (tool_fields), read_whole() or collect() otherwise. A "**" value leaves a slot
 -- for settle() to fill.
+--
+-- The content of a message with role "tool" or "function" that is an
+-- object, not a list or a string, is read whole (every key and string, as
+-- tool_results reads it): collect() reads only the keys content parts keep
+-- their text under, and {"x": <instruction>} gave nothing, while a backend
+-- that takes such a content renders all of it. st.tool_content is that
+-- value while the walk goes through the message's content key.
 walk = function(node, plan, st)
   if node == nil then return end
+  local whole_here = type(node) == "table" and node[1] == nil and st.tool_content == node
   local found = plan.folded and type(node) == "table" and node[1] == nil and variants_of(node, plan)
   for i = 1, #plan do
     local op = plan[i]
@@ -606,7 +700,7 @@ walk = function(node, plan, st)
     if kind == END then
       if st.leaf then
         st.leaf(node, st)
-      elseif op.whole then
+      elseif op.whole or whole_here then
         read_whole(node, st.out, op.depth)
       else
         if op.item and type(node) == "number" then st.tokens = true end
@@ -622,11 +716,17 @@ walk = function(node, plan, st)
     elseif op.key == "" then
       through(node, op, st)
     elseif type(node) == "table" then
+      local tool, saved = op.content and (node.role == "tool" or node.role == "function"), st.tool_content
+      if tool then st.tool_content = node[op.key] end
       through(node[op.key], op, st)
       local others = found and found[i]
       if others then
-        for _, k in ipairs(others) do through(node[k], op, st) end
+        for _, k in ipairs(others) do
+          if tool then st.tool_content = node[k] end
+          through(node[k], op, st)
+        end
       end
+      st.tool_content = saved
     end
   end
 end
@@ -686,7 +786,8 @@ function _M.extract_tools(decoded, fields, json_decode)
 end
 
 -- Tool results in the chat shapes gateways see:
---   OpenAI Chat Completions  messages[*] with role "tool" (or legacy "function"): content
+--   OpenAI Chat Completions  messages[*] with role "tool" (or legacy "function"): content,
+--                            read whole when it is an object (see walk)
 --   Anthropic Messages       messages[*].content[*] with type "tool_result": content
 --   OpenAI Responses         input[*] with a type ending in "_call_output"
 --                            (function_call_output, custom_tool_call_output,
@@ -717,7 +818,8 @@ local function tool_results(decoded, st)
     for _, m in ipairs(msgs) do
       if type(m) == "table" then
         if m.role == "tool" or m.role == "function" then
-          collect(m.content, out, 1)
+          local c = m.content
+          if type(c) == "table" and c[1] == nil then read_whole(c, out, 1) else collect(c, out, 1) end
         elseif type(m.content) == "table" then
           for _, block in ipairs(m.content) do
             if type(block) == "table" and block.type == "tool_result" then collect(block.content, out, 1) end
@@ -846,35 +948,182 @@ local function form_values(body, out)
   end
 end
 
--- multipart/form-data: every field without a filename, and file parts whose
--- own Content-Type is text or JSON (a prompt uploaded as prompt.txt). Binary
--- files contribute nothing. At most MAX_PARTS parts are read.
-local MAX_PARTS = 100
-local function multipart_values(body, content_type, out)
-  local boundary = content_type:match('[Bb][Oo][Uu][Nn][Dd][Aa][Rr][Yy]="([^"]+)"')
-    or content_type:match("[Bb][Oo][Uu][Nn][Dd][Aa][Rr][Yy]=([^;%s,]+)")
-  if not boundary then return end
-  local delim = "--" .. boundary
-  local pos = body:find(delim, 1, true)
-  local parts = 0
-  while pos and parts < MAX_PARTS do
-    local after = pos + #delim
-    if body:sub(after, after + 1) == "--" then break end   -- closing delimiter
-    local next_pos = body:find(delim, after, true)
-    local part = body:sub(after, (next_pos or #body + 1) - 1)
-    part = part:gsub("^\r?\n", ""):gsub("\r?\n$", "")
-    local hs, he = part:find("\r?\n\r?\n")
-    if hs then
-      local head, value = part:sub(1, hs - 1):lower(), part:sub(he + 1)
-      local has_file = head:find("filename%*?=") ~= nil
-      local pct = head:match("content%-type:%s*([^\r\n;]+)") or ""
-      if (not has_file or pct:find("^text/") or pct:find("json", 1, true)) and _M.is_text(value) then
-        out[#out + 1] = value
+-- The parameters of a header value such as Content-Type or
+-- Content-Disposition, in order: { { name, value }, ... }. The value before
+-- the first ';' (the media or disposition type) is not one. Parameters are
+-- split on ';' outside quoted strings; a name is trimmed and lowercased; a
+-- value is a quoted string (backslash escapes removed) or a token that ends
+-- at ';', ',' or whitespace, so the values of repeated headers that
+-- rules.content_type joined with ", " come apart. Linear: plain finds, each
+-- byte looked at a bounded number of times.
+local function header_params(s)
+  local out, n = {}, #s
+  local i = s:find(";", 1, true)
+  if not i then return out end
+  i = i + 1
+  while i <= n do
+    local eq = s:find("[=;]", i)
+    if not eq then break end
+    if s:byte(eq) == 59 then
+      i = eq + 1   -- a parameter without '=': nothing to read
+    else
+      local a, e = s:find("%S", i), eq - 1
+      while e >= i and s:find("^%s", e) do e = e - 1 end
+      local name = (a and a <= e) and s:sub(a, e):lower() or ""
+      local v = s:find("%S", eq + 1) or n + 1
+      local value, after
+      if s:byte(v) == 34 then
+        -- a quoted string, to its closing quote (or the end)
+        local buf, j = {}, v + 1
+        while j <= n do
+          local k = s:find('["\\]', j)
+          if not k then
+            buf[#buf + 1] = s:sub(j)
+            j = n + 1
+            break
+          end
+          buf[#buf + 1] = s:sub(j, k - 1)
+          if s:byte(k) == 34 then
+            j = k + 1
+            break
+          end
+          buf[#buf + 1] = s:sub(k + 1, k + 1)
+          j = k + 2
+        end
+        value, after = table.concat(buf), j
+      else
+        local e2 = s:find("[;,%s]", v) or n + 1
+        value, after = s:sub(v, e2 - 1), e2
+      end
+      out[#out + 1] = { name = name, value = value }
+      local nxt = s:find(";", after, true)
+      if not nxt then break end
+      i = nxt + 1
+    end
+  end
+  return out
+end
+_M.header_params = header_params
+
+-- The index just past a delimiter's line when the "--" .. boundary that ends
+-- before `at` is a delimiter: "--" (the close: returns false), or optional
+-- space or tab and then `nl` (or, with no `nl` yet, "\r\n" or "\n", which is
+-- returned as well). nil when it is not a delimiter, only text that starts
+-- like one.
+local function delimiter_end(body, at, nl)
+  if body:sub(at, at + 1) == "--" then return false end
+  local e = body:find("[^ \t]", at) or #body + 1
+  if nl then
+    if body:sub(e, e + #nl - 1) == nl then return e + #nl end
+    return nil
+  end
+  if body:sub(e, e + 1) == "\r\n" then return e + 2, "\r\n" end
+  if body:byte(e) == 10 then return e + 1, "\n" end
+  return nil
+end
+
+-- One part: its headers, one per line. A part is a file when its
+-- Content-Disposition has a filename or filename* parameter, and it is read
+-- when it is not a file or its Content-Type (text/plain when it has none,
+-- RFC 7578 4.4) is text or JSON, and the value reads as text.
+-- A file part's media type the backend may read as text: text/*, any JSON
+-- type, none (the RFC 7578 default is text/plain), and
+-- application/octet-stream, what curl -F, openai-python and Node's FormData
+-- send for a .jsonl or .md file. is_text still keeps binary out.
+local function text_part_type(ct)
+  return ct == "" or ct:find("^text/") ~= nil or ct:find("json", 1, true) ~= nil
+    or ct == "application/octet-stream"
+end
+
+local function multipart_part(part, out)
+  local hs, he = part:find("^\r?\n")
+  if not hs then hs, he = part:find("\r?\n\r?\n") end
+  if not hs then return end
+  local value = part:sub(he + 1)
+  local has_file, typed, text_type = false, false, false
+  for line in part:sub(1, hs - 1):gmatch("[^\r\n]+") do
+    local colon = line:find(":", 1, true)
+    if colon then
+      local name = line:sub(1, colon - 1):match("^%s*(%S*)"):lower()
+      if name == "content-disposition" then
+        for _, p in ipairs(header_params(line:sub(colon + 1))) do
+          if p.name == "filename" or p.name == "filename*" then has_file = true end
+        end
+      elseif name == "content-type" then
+        local v = line:sub(colon + 1)
+        local semi = v:find(";", 1, true)
+        local ct = _M.trim((semi and v:sub(1, semi - 1) or v):lower())
+        typed = true
+        if text_part_type(ct) then text_type = true end
       end
     end
-    parts = parts + 1
-    pos = next_pos
   end
+  if (not has_file or not typed or text_type) and _M.is_text(value) then out[#out + 1] = value end
+end
+
+-- The parts of a multipart body under `boundary`, as RFC 2046, Go's
+-- mime/multipart and Starlette read them: the first delimiter at the start
+-- of the body or of a line (a preamble before it is skipped), its line
+-- ending CRLF, or LF as Go also takes it; then every delimiter is that line
+-- ending, "--" and the boundary, followed by "--" (the close, after which
+-- nothing is read) or by optional space or tab and the line ending. The
+-- boundary anywhere else, mid-line or with more after it, is part of a
+-- value. A part's value runs to the line ending before the next delimiter.
+local function multipart_parts(body, boundary, out)
+  local delim = "--" .. boundary
+  local after, nl
+  if body:sub(1, #delim) == delim then after, nl = delimiter_end(body, 1 + #delim) end
+  local pos = 1
+  while after == nil do
+    local p = body:find("\n" .. delim, pos, true)
+    if not p then return end
+    after, nl = delimiter_end(body, p + 1 + #delim)
+    pos = p + 1
+  end
+  if not after then return end   -- the close before any part
+  local sep = nl .. delim
+  while true do
+    local stop, next_after
+    local q = after
+    while true do
+      local m = body:find(sep, q, true)
+      if not m then break end
+      next_after = delimiter_end(body, m + #sep, nl)
+      if next_after ~= nil then
+        stop = m - 1
+        break
+      end
+      q = m + 1
+    end
+    multipart_part(body:sub(after, stop or #body), out)
+    -- nil: no delimiter left (a body cut short); false: the close
+    if not next_after then return end
+    after = next_after
+  end
+end
+
+-- multipart/form-data: every field without a filename, and file parts whose
+-- own Content-Type is text or JSON, or that have none (a prompt uploaded as
+-- prompt.txt). Binary files contribute nothing. Every part is read:
+-- max_body_bytes bounds the body, and the scan is linear. Several distinct
+-- boundary parameters (a repeated one, or repeated headers joined with ", ")
+-- are each read, the values of all of them judged, since the backend may
+-- take any one; each costs a scan of the body, so past MAX_BOUNDARIES of
+-- them (a client does not send more than one, Go refuses a second) none is
+-- read and the body is unreadable: returns true.
+_M.MAX_BOUNDARIES = 8
+local function multipart_values(body, content_type, out)
+  local list, seen = {}, {}
+  for _, p in ipairs(header_params(content_type)) do
+    local b = p.value
+    if p.name == "boundary" and b ~= "" and not b:find("[\r\n]") and not seen[b] then
+      seen[b] = true
+      list[#list + 1] = b
+      if #list > _M.MAX_BOUNDARIES then return true end
+    end
+  end
+  for _, b in ipairs(list) do multipart_parts(body, b, out) end
+  return false
 end
 
 --- `s` with every \uD800-\uDFFF escape that is not half of a valid pair
@@ -930,7 +1179,9 @@ end
 -- @param fields       list of JSON paths
 -- @param json_decode  function(string) -> table|nil
 -- @return text string (the values joined with "\n"),
---         kind ("json"|"scan"|"invalid"|"form"|"multipart"|"text"|"binary"|"none"),
+--         kind ("json"|"scan"|"invalid"|"form"|"multipart"|"boundaries"|"text"|
+--         "binary"|"none"; "boundaries": a multipart type with more boundary
+--         parameters than MAX_BOUNDARIES, nothing read),
 --         list of the values found (newest last), for window(),
 --         the decoded JSON value when kind is "json", true when a "**"
 --         walk hit a bound and left something out, and true when a text
@@ -963,16 +1214,23 @@ function _M.extract(body, content_type, fields, json_decode)
     -- reads it, declared JSON or not: the text fields' string values and the
     -- objects under a "**" path's key. Under a form or multipart type the
     -- values that reading gives follow, since a backend of that kind reads
-    -- the body so. Declared JSON with nothing to scan is unjudgeable, never
-    -- "no text"; any other body with nothing to scan is read as before. A
-    -- text field that holds token ids is found the same way.
+    -- the body so. Under any other type (text/plain, none) the whole body
+    -- follows too, when it is text: a backend that reads it as text (a raw
+    -- prompt route, req.text()) reads all of it, the bytes after the JSON
+    -- value included. Declared JSON with nothing to scan is unjudgeable,
+    -- never "no text"; any other body with nothing to scan is read as before.
+    -- A text field that holds token ids is found the same way.
     local found = {}
     local out = _M.scan_strings(body, _M.field_keys(fields), {}, _M.deep_keys(fields), found)
     if #out > 0 or found.tokens then
-      if form and not declared_json then
-        form_values(body, out)
-      elseif multipart and not declared_json then
-        multipart_values(body, raw_ct, out)
+      if not declared_json then
+        if form then
+          form_values(body, out)
+        elseif multipart then
+          if multipart_values(body, raw_ct, out) then return "", "boundaries", {} end
+        elseif _M.is_text(body) then
+          out[#out + 1] = body
+        end
       end
       return table.concat(out, "\n"), "scan", out, nil, nil, found.tokens
     end
@@ -984,7 +1242,7 @@ function _M.extract(body, content_type, fields, json_decode)
     return table.concat(out, "\n"), "form", out
   end
   if multipart then
-    multipart_values(body, raw_ct, out)
+    if multipart_values(body, raw_ct, out) then return "", "boundaries", {} end
     return table.concat(out, "\n"), "multipart", out
   end
   if _M.is_text(body) then return body, "text", { body } end
@@ -1062,29 +1320,170 @@ function _M.field_keys(fields)
   return keys
 end
 
+-- The depth of the key text-field path `f` ends at (`last`, folded): the
+-- objects and arrays around that key in a body whose root is an object,
+-- "input" 1, "input[*].output" 3, "messages[*].parts[*].input.**" 5, as
+-- the walk goes down them; nil when the path's segments end at another key.
+local function key_depth(f, last)
+  local segs = split_path((f:gsub("%.%*%*$", "")))
+  local n = #segs
+  -- "[*]" alone steps into an array without a key
+  while n > 0 and segs[n].key == "" do n = n - 1 end
+  if n == 0 or fold(segs[n].key) ~= last then return nil end
+  local depth = 1
+  for i = 1, n - 1 do
+    depth = depth + ((segs[i].each and segs[i].key ~= "") and 2 or 1)
+  end
+  return depth
+end
+
 --- The last key of each "**" text-field path, folded, for scan_strings:
--- "messages[*].tool_calls[*].function.arguments.**" -> arguments = "any";
--- "object" instead when a path without "**" ends at the same key too
--- ("input": a tool_use input, and the Responses input list).
+-- "messages[*].tool_calls[*].function.arguments.**" -> arguments = "any".
+-- When a path without "**" ends at the same key too ("input": a tool_use
+-- input and an AI SDK tool part's input, and the Responses input list), the
+-- key maps to the set of depths (see key_depth) at which only such plain
+-- paths end: an array there is a list the walk reads item by item (the
+-- Responses input list at 1, a function_call_output's output at 3), not a
+-- "**" value. A path whose depth is unknown leaves the set empty for a "**"
+-- path, and adds nothing to it for a plain one.
 function _M.deep_keys(fields)
   local deep, plain = {}, {}
   for _, f in ipairs(fields or {}) do
     local last = f:gsub("%.%*%*$", ""):match("([^%.%[%]%*]+)[%[%]%*]*$")
     if last then
-      if f:find("%.%*%*$") then deep[fold(last)] = true else plain[fold(last)] = true end
+      last = fold(last)
+      local set = f:find("%.%*%*$") and deep or plain
+      local depths = set[last] or {}
+      set[last] = depths
+      depths[key_depth(f, last) or "unknown"] = true
     end
   end
   local out = {}
-  for k in pairs(deep) do out[k] = plain[k] and "object" or "any" end
+  for k, at in pairs(deep) do
+    if plain[k] then
+      local lists = {}
+      if not at.unknown then
+        for d in pairs(plain[k]) do
+          if d ~= "unknown" and not at[d] then lists[d] = true end
+        end
+      end
+      out[k] = lists
+    else
+      out[k] = "any"
+    end
+  end
   return out
 end
 
--- True when `key` is ASCII word characters, U+017F and U+212A only: the
--- byte class scan_strings finds keys with also matches other sequences of
--- those bytes (U+0144 is \197\132), which are not keys to either core.
-local function key_chars(key)
-  if not key:find("[\128-\255]") then return true end
-  return key:gsub("\197\191", "s"):gsub("\226\132\170", "k"):find("^[%w_%-]+$") ~= nil
+-- The index of the first '"' at or after `i` that no backslash escapes (a
+-- backslash escapes the byte after it), or nil.
+local function next_quote(s, i)
+  while true do
+    local j = s:find('["\\]', i)
+    if not j then return nil end
+    if s:byte(j) == 34 then return j end
+    i = j + 2
+  end
+end
+
+-- The keys of possibly truncated JSON, one at a time. `q` is an unescaped
+-- '"'; the string it opens ends at the next one, and it is a key when a
+-- colon follows (then a value start, when `start` is given: a quote or a
+-- bracket). Returns the key decoded and folded, the index of the byte after
+-- the colon's white space (the value's first byte), and the next '"' to try
+-- when this one opens no key: the string's closing quote, which may open the
+-- next key. No string is read twice, so a scan is linear, and a key written
+-- with JSON escapes ("\u0063ontent") is the key it decodes to, as the walk
+-- reads it. The scan is not thrown off by where the text starts: after a
+-- string that is no key, its closing quote is tried as an opening one. So
+-- the text between two strings is tried as a key too, and it is one when
+-- the next string starts with a colon (["x",":"]); it never names a field
+-- (a comma or a colon is in it), and the scans read only the value of a key
+-- they look for, so it cannot swallow the key after it.
+local function key_at(s, q, start)
+  local e = next_quote(s, q + 1)
+  if not e then return nil end
+  local b = s:match(start and '^%s*:%s*()["{%[]' or "^%s*:%s*()", e + 1)
+  if not b then return nil, nil, e end
+  return fold((read_string(s, q + 1))), b
+end
+
+-- The brackets outside strings from `i` (outside any string) up to `to`
+-- (not included), counted +1 for { and [ and -1 for } and ]: the count, and
+-- the lowest it went (0 or less); nil when a string runs on past `to`.
+local function brackets(s, i, to)
+  local n, low = 0, 0
+  while true do
+    local j = s:find('[{}%[%]"]', i)
+    if not j or j >= to then return n, low end
+    local c = s:byte(j)
+    if c == 34 then
+      local e = next_quote(s, j + 1)
+      if not e or e >= to then return nil end
+      i = e + 1
+    else
+      if c == 123 or c == 91 then
+        n = n + 1
+      else
+        n = n - 1
+        if n < low then low = n end
+      end
+      i = j + 1
+    end
+  end
+end
+
+-- The depth at `b`, the first byte of a key's value (see key_depth), from
+-- cursor `cur`: { s = s, pos = 1, depth = 0 } counts from the start of a
+-- body (a head, or all of it), and moves on with each call, since `b` only
+-- grows. A tail ({ s = s }) starts at a depth it cannot know, but ends where
+-- the body does, at depth 0: the first call counts from `b` to the end, and
+-- the depth at `b` is how far below 0 that count ends. The count must end at
+-- its lowest, as the root's closing bracket leaves it: bytes after the root
+-- (which Go's decoder never reads) can then only make the depth deeper,
+-- never shallower. nil once the count fails (a string that does not end, a
+-- tail that ends above its lowest): the depth is unknown.
+local function depth_at(cur, b)
+  if cur.bad then return nil end
+  if not cur.pos then
+    local n, low = brackets(cur.s, b, #cur.s + 1)
+    if not n or n >= 0 or n ~= low then cur.bad = true; return nil end
+    cur.pos, cur.depth = b, -n
+    return cur.depth
+  end
+  local n = brackets(cur.s, cur.pos, b)
+  if not n then cur.bad = true; return nil end
+  cur.pos, cur.depth = b, cur.depth + n
+  return cur.depth
+end
+
+-- The strings of the array that starts at `i`, to its end or the end of `s`,
+-- that are its items or items of arrays in it, with no object between (the
+-- strings collect reads there without a key: ["a", ["b"]]); the keys of its
+-- objects are for the scan to find.
+local function list_items(s, i, out)
+  local depth, objects = 0, 0
+  while true do
+    local j = s:find('[{}%[%]"]', i)
+    if not j then return end
+    local c = s:byte(j)
+    if c == 34 then
+      local v, nexti = read_string(s, j + 1)
+      if objects == 0 and v ~= "" then out[#out + 1] = v end
+      i = nexti
+    else
+      if c == 123 then
+        depth, objects = depth + 1, objects + 1
+      elseif c == 91 then
+        depth = depth + 1
+      else
+        depth = depth - 1
+        if c == 125 and objects > 0 then objects = objects - 1 end
+        if depth <= 0 then return end
+      end
+      i = j + 1
+    end
+  end
 end
 
 local scan_value
@@ -1116,37 +1515,66 @@ local function holds_number(s, i)
 end
 
 --- Collect the string values of `keys` (from field_keys) from possibly
--- truncated JSON. Keys match the way walk() matches them: folded, so every
--- spelling a case-insensitive backend reads is collected. With `deep` (from
--- deep_keys), the value of a "**" path's key is read as the walk reads it,
--- every key and string in it, in the order they come: an object (Ollama and
--- Anthropic tool-call arguments), and an array when no other path ends at
--- that key; otherwise the scan goes on inside it, as for any other key.
--- With `found`, found.tokens is set when one of `keys` holds a list with a
--- number in it: token ids (see collect).
-function _M.scan_strings(s, keys, out, deep, found)
-  local i = 1
-  while true do
-    -- key bytes: ASCII word characters and the bytes of U+017F and U+212A;
-    -- `b` is the value's first byte (a number or a literal is passed over)
-    local a, b, key = s:find('"([%w_%-\197\191\226\132\170]+)"%s*:%s*["{%[]', i)
-    if not a then break end
-    local c = s:byte(b)
-    if not key_chars(key) then
-      i = a + 1   -- not a key: look again from the next byte
-    elseif c == 34 then
-      local value, nexti = read_string(s, b + 1)
-      if keys[fold(key)] and value ~= "" then out[#out + 1] = value end
-      i = nexti
+-- truncated JSON. Keys match the way walk() matches them: decoded and
+-- folded, so every spelling a case-insensitive backend reads is collected.
+-- With `deep` (from deep_keys), the value of a "**" path's key is read as
+-- the walk reads it, every key and string in it, in the order they come: an
+-- object (Ollama and Anthropic tool-call arguments) or an array (an AI SDK
+-- tool part's input or output). A plain path may end at that key too
+-- (deep_keys gives the depths where only plain paths end): an array there,
+-- the Responses input list at the root, is a list the walk reads item by
+-- item for its text, so its string items are read (list_items) and the scan
+-- goes on inside it for text-field keys, as for any other value: the list's
+-- type and role words are no text. The depth comes from the start of `s`,
+-- or from its end with `opts.tail` (see depth_at); where it is unknown the
+-- array is read whole, its base64 data URLs (data_url) left out. With
+-- `found`, found.tokens is set when one of `keys` holds a list with a
+-- number in it: token ids (see collect and holds_number). With
+-- `opts.tail` (`s` is the end of a body whose middle was not read), the
+-- bytes before the first unescaped '"' are the end of a value cut at its
+-- start: kept when that quote ends a value (a comma or a closing bracket
+-- follows, or nothing) and they read as natural text (white space in them,
+-- and is_text), so the end of an instruction in a long message is judged
+-- and the end of a base64 data URL is not. The value of a key that is not
+-- one of `keys` is not read: the scan goes on at its first byte, as from
+-- any other string (see key_at).
+function _M.scan_strings(s, keys, out, deep, found, opts)
+  local q = next_quote(s, 1)
+  local tail = opts and opts.tail
+  if q and tail and (s:find("^%s*[,}%]]", q + 1) or s:find("^%s*$", q + 1)) then
+    local v = read_string(s, 1)
+    if v:find("%s") and _M.is_text(v) then out[#out + 1] = v end
+  end
+  local cur
+  while q do
+    local key, b, nq = key_at(s, q, true)
+    if not key then
+      q = nq
     else
-      local d = deep and deep[fold(key)]
-      if d and (c == 123 or d == "any") then
-        i = scan_value(s, b, out, false)
+      local c = s:byte(b)
+      if c == 34 and keys[key] then
+        local value, nexti = read_string(s, b + 1)
+        if value ~= "" then out[#out + 1] = value end
+        q = next_quote(s, nexti)
       else
-        if found and c == 91 and not found.tokens and keys[fold(key)] and holds_number(s, b) then
+        if found and c == 91 and not found.tokens and keys[key] and holds_number(s, b) then
           found.tokens = true
         end
-        i = b + 1
+        local d = deep and deep[key]
+        local list = false
+        if d and d ~= "any" and c == 91 then
+          cur = cur or (tail and { s = s } or { s = s, pos = 1, depth = 0 })
+          local depth = depth_at(cur, b)
+          list = depth ~= nil and d[depth] == true
+        end
+        if list then
+          list_items(s, b, out)
+          q = next_quote(s, b)
+        elseif d and (c == 123 or c == 91) then
+          q = next_quote(s, scan_value(s, b, out, false, d ~= "any" and c == 91))
+        else
+          q = next_quote(s, b)
+        end
       end
     end
   end
@@ -1186,12 +1614,28 @@ local function type_names(s, i)
   end
 end
 
+-- The keys an image or a file is sent under as a data URL: a Responses
+-- input_image's image_url and input_file's file_data, and the url of an
+-- image_url object or an AI SDK file part.
+local DATA_KEYS = { image_url = true, url = true, file_data = true }
+
+-- A base64 data URL (data:image/png;base64,iVBORw0...): an image or a file,
+-- not text, when every byte after "base64," is a base64 one (a string that
+-- only starts so is text: "data:text/plain;base64,Ignore all ..."). ASCII
+-- only, so both cores read the same strings as one.
+local function data_url(v)
+  local b = v:match("^[Dd][Aa][Tt][Aa]:[%w!#$&%-%^_%.%+/=;]*;[Bb][Aa][Ss][Ee]64,()")
+  return b ~= nil and v:find("^[%w%+/=]*$", b) ~= nil
+end
+
 -- Every key and string of the JSON value that starts at `i` (a `{` or `[`),
 -- to its end or the end of `s`, in the order they come; with `schema` (tool
 -- definitions) a "type" key whose value is a JSON Schema type name is left
--- out with it, as tool_leaf does. Returns the index after the value.
-scan_value = function(s, i, out, schema)
-  local depth, n = 0, #s
+-- out with it, as tool_leaf does; with `nodata`, a base64 data URL that is
+-- the value of one of DATA_KEYS is left out. Returns the index after the
+-- value.
+scan_value = function(s, i, out, schema, nodata)
+  local depth, n, key = 0, #s, nil
   while true do
     local j = s:find('[{}%[%]"]', i)
     if not j then return n + 1 end
@@ -1199,17 +1643,20 @@ scan_value = function(s, i, out, schema)
     if c == 34 then
       local v, nexti = read_string(s, j + 1)
       local k = s:find("[^ \t\n\r]", nexti)
-      local skip = schema and v == "type" and k and s:byte(k) == 58 and type_names(s, k + 1)
+      local colon = k and s:byte(k) == 58
+      local skip = schema and v == "type" and colon and type_names(s, k + 1)
       if skip then
-        i = skip
+        i, key = skip, nil
       else
-        if v ~= "" then out[#out + 1] = v end
-        i = nexti
+        if v ~= "" and not (nodata and not colon and key and DATA_KEYS[key] and data_url(v)) then
+          out[#out + 1] = v
+        end
+        i, key = nexti, colon and v or nil
       end
     elseif c == 123 or c == 91 then
-      depth, i = depth + 1, j + 1
+      depth, i, key = depth + 1, j + 1, nil
     else
-      depth, i = depth - 1, j + 1
+      depth, i, key = depth - 1, j + 1, nil
       if depth <= 0 then return i end
     end
   end
@@ -1221,24 +1668,23 @@ end
 -- left out, in the order they come. There is no structure to walk, so a key
 -- is found wherever it is, and keys are not sorted.
 function _M.scan_tools(s, keys, out)
-  local i = 1
-  while true do
-    local a, b, key = s:find('"([%w_%-\197\191\226\132\170]+)"%s*:%s*', i)
-    if not a then break end
-    if not key_chars(key) then
-      i = a + 1
-    elseif not keys[fold(key)] then
-      i = b + 1
+  local q = next_quote(s, 1)
+  while q do
+    local key, b, nq = key_at(s, q, false)
+    if not key then
+      q = nq
+    elseif not keys[key] then
+      q = next_quote(s, b)
     else
-      local c = s:sub(b + 1, b + 1)
-      if c == '"' then
-        local v, nexti = read_string(s, b + 2)
+      local c = s:byte(b)
+      if c == 34 then
+        local v, nexti = read_string(s, b + 1)
         if v ~= "" then out[#out + 1] = v end
-        i = nexti
-      elseif c == "{" or c == "[" then
-        i = scan_value(s, b + 1, out, true)
+        q = next_quote(s, nexti)
+      elseif c == 123 or c == 91 then
+        q = next_quote(s, scan_value(s, b, out, true))
       else
-        i = b + 1
+        q = next_quote(s, b)
       end
     end
   end
@@ -1278,23 +1724,39 @@ end
 
 _M.HIT_CONTEXT = 1024
 
+--- Bytes two consecutive chunks share: HIT_CONTEXT, at most a quarter of
+-- the budget so that a small budget still makes progress. It is counted in
+-- each piece's budget, so a call never carries more than max_judge_bytes.
+function _M.chunk_overlap(budget)
+  return math.max(0, math.min(_M.HIT_CONTEXT, math.floor(budget / 4)))
+end
+
 --- Split `text` into consecutive pieces of at most `budget` bytes covering
 -- all of it, for judging in chunks (rule.max_judge_chunks). A cut prefers the
 -- last newline in the second half of a piece (the newline itself is dropped,
--- it joined two values) and never splits a UTF-8 sequence.
+-- it joined two values) and never splits a UTF-8 sequence. With `overlap`,
+-- the piece after one that ends at e starts at e + 1 - overlap (moved
+-- forward to a character start), so an instruction cut at a seam is still
+-- whole in one piece when it is no longer than the overlap. `hard`: no
+-- newline preference, and every piece but the last advances at least
+-- budget - overlap bytes, so text of up to budget + (n-1) x (budget -
+-- overlap) bytes always fits in n pieces.
 -- @return pieces, and the byte offset in `text` where each piece starts
-function _M.chunks(text, budget)
+function _M.chunks(text, budget, overlap, hard)
   local pieces, starts = {}, {}
   local i, n = 1, #text
   local half = math.floor(budget / 2)
+  overlap = math.floor(tonumber(overlap) or 0)
   while i <= n do
     if n - i + 1 <= budget then
       pieces[#pieces + 1], starts[#starts + 1] = text:sub(i), i
       break
     end
     local e, nexti = i + budget - 1, nil
-    for j = e, i + half + 1, -1 do
-      if text:byte(j) == 10 then e, nexti = j - 1, j + 1 break end
+    if not hard then
+      for j = e, i + half + 1, -1 do
+        if text:byte(j) == 10 then e, nexti = j - 1, j + 1 break end
+      end
     end
     if not nexti then
       -- back to a character boundary: at most 3 bytes, the longest run of
@@ -1307,26 +1769,89 @@ function _M.chunks(text, budget)
       nexti = e + 1
     end
     pieces[#pieces + 1], starts[#starts + 1] = text:sub(i, e), i
+    if overlap > 0 then
+      local nx = math.max(i + 1, e + 1 - overlap)
+      -- a cut walked back to a character boundary does not eat the advance
+      if hard then nx = math.max(nx, math.min(e + 1, i + budget - overlap)) end
+      while nx <= e and cont(text, nx) do nx = nx + 1 end
+      nexti = nx
+    end
     i = nexti
   end
   return pieces, starts
 end
 
---- @param text   the joined values
--- @param values the values, in order (newest last)
--- @param budget max bytes
--- @param from,to byte span of an always_suspect hit in `text`, or nil
--- @return the text to judge, true when it was cut
-function _M.window(text, values, budget, from, to)
-  if #text <= budget then return text, false end
-  local out, rem = {}, budget
-  if from and to then
-    -- the hit and up to HIT_CONTEXT bytes each side, in at most half the budget
-    local half = math.floor(budget / 2)
+-- The hits' part of a window, in at most `half` bytes. One span: the hit and
+-- up to HIT_CONTEXT bytes each side. Several (text_matches keeps up to
+-- rules.MAX_SPANS, in text order): overlapping ones are merged, and each gets
+-- its match and the same context each side, which shrinks evenly toward 0 so
+-- that all of them fit; only when the matches alone do not fit are the
+-- oldest dropped. Pieces whose context meets are joined, the others are
+-- separated by a newline.
+local function hit_part(text, spans, half)
+  local merged = {}
+  for _, sp in ipairs(spans) do
+    local last = merged[#merged]
+    if last and sp[1] <= last[2] + 1 then
+      if sp[2] > last[2] then last[2] = sp[2] end
+    else
+      merged[#merged + 1] = { sp[1], sp[2] }
+    end
+  end
+  -- the matches from `first` on and the newlines between them
+  local function needed(first)
+    local need = #merged - first
+    for i = first, #merged do need = need + merged[i][2] - merged[i][1] + 1 end
+    return need
+  end
+  local first = 1
+  local need = needed(first)
+  while need > half and first < #merged do
+    first = first + 1
+    need = needed(first)
+  end
+  if first == #merged then
+    local from, to = merged[first][1], merged[first][2]
     local ctxb = math.max(0, math.min(_M.HIT_CONTEXT, math.floor((half - (to - from + 1)) / 2)))
     local a = math.max(1, from - ctxb)
     while a > 1 and cont(text, a) do a = a - 1 end
-    local piece = _M.head(text:sub(a), math.min(math.min(to + ctxb, #text) - a + 1, half))
+    return _M.head(text:sub(a), math.min(math.min(to + ctxb, #text) - a + 1, half))
+  end
+  local m = #merged - first + 1
+  local ctxb = math.max(0, math.min(_M.HIT_CONTEXT, math.floor((half - need) / (2 * m))))
+  local ranges = {}
+  for i = first, #merged do
+    local from, to = merged[i][1], merged[i][2]
+    -- forward to a character start: the context never grows past its share
+    local a = math.max(1, from - ctxb)
+    while a < from and cont(text, a) do a = a + 1 end
+    local b = math.min(#text, to + ctxb)
+    local last = ranges[#ranges]
+    if last and a <= last[2] + 1 then
+      last[2] = b
+    else
+      ranges[#ranges + 1] = { a, b }
+    end
+  end
+  local parts = {}
+  for i, r in ipairs(ranges) do parts[i] = _M.head(text:sub(r[1], r[2] + 1), r[2] - r[1] + 1) end
+  return table.concat(parts, "\n")
+end
+
+--- @param text   the joined values
+-- @param values the values, in order (newest last)
+-- @param budget max bytes
+-- @param spans  byte spans { { from, to }, ... } of always_suspect hits in
+--               `text`, in text order, or nil; or, as before, one span given
+--               as two numbers (from, to)
+-- @return the text to judge, true when it was cut
+function _M.window(text, values, budget, spans, to)
+  if #text <= budget then return text, false end
+  if type(spans) == "number" then spans = to and { { spans, to } } or nil end
+  local out, rem = {}, budget
+  if type(spans) == "table" and #spans > 0 then
+    -- the hits and their context, in at most half the budget
+    local piece = hit_part(text, spans, math.floor(budget / 2))
     out[1] = piece
     rem = rem - #piece - 1
   end
@@ -1404,8 +1929,9 @@ local DEFAULTS = {
   strip_uuid     = true,
 }
 
---- Normalize text so that trivially varied payloads share a fingerprint.
--- Steps: lowercase, strip UUIDs / long digit runs, collapse whitespace, truncate.
+--- Normalize text for sampling and logs: lowercase, strip UUIDs / long digit
+-- runs, collapse whitespace, truncate. fingerprint() keeps the digits and
+-- UUIDs (they can be the payload) and the whole length.
 function _M.normalize(text, opts)
   opts = opts or DEFAULTS
   local s = tostring(text or ""):lower()
@@ -1422,13 +1948,15 @@ function _M.normalize(text, opts)
   return s
 end
 
---- Fingerprint = hash(normalize(text)) over the WHOLE normalized text.
--- `opts.prefix_bytes` is deliberately ignored here: a fingerprint that only
--- covers a prefix lets any text that shares the prefix reuse a cached or
--- trusted verdict (0.3.0 hashed the first 2048 bytes; fixed in 0.3.1).
--- Text that normalizes to nothing (digit runs, UUIDs) is hashed as typed, so
--- it still gets a cache entry instead of a judge call per request; text that
--- is only whitespace is hashed as one space, one entry for every such body.
+--- Fingerprint = hash(normalize(text)) over the WHOLE normalized text, with
+-- ASCII lowercase and whitespace collapse only. `opts` is deliberately
+-- ignored: a fingerprint that only covers a prefix lets any text that shares
+-- the prefix reuse a cached or trusted verdict (0.3.0 hashed the first 2048
+-- bytes; fixed in 0.3.1), and one that drops digit runs and UUIDs lets
+-- "transfer 12345 to acct" reuse the verdict of "transfer 99999 to acct",
+-- where the digits are the payload. Only texts that are the same but for
+-- case and whitespace share a verdict. Text that is only whitespace is
+-- hashed as one space, one entry for every such body.
 --
 -- `hash` is injected by the adapter and MUST be collision-resistant
 -- (sha256 hex or better). The fingerprint keys the verdict cache and the
@@ -1436,13 +1964,10 @@ end
 -- judge call, so an attacker who can forge a hash forges a verdict. CRC32
 -- and djb2 are linear and let a few appended bytes hit any chosen value;
 -- `djb2` below exists for the golden vectors only.
-function _M.fingerprint(text, opts, hash)
-  local o = { strip_digits = opts and opts.strip_digits, strip_uuid = opts and opts.strip_uuid,
-              prefix_bytes = math.huge }
-  local norm = _M.normalize(text, o)
-  if norm == "" then
-    norm = _M.normalize(text, { strip_digits = false, strip_uuid = false, prefix_bytes = math.huge })
-  end
+local FP_OPTS = { strip_digits = false, strip_uuid = false, prefix_bytes = math.huge }
+
+function _M.fingerprint(text, _, hash)
+  local norm = _M.normalize(text, FP_OPTS)
   if norm == "" and text ~= nil and tostring(text) ~= "" then norm = " " end
   if norm == "" then return "" end
   return tostring(hash(norm))

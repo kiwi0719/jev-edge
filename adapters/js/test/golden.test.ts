@@ -20,7 +20,8 @@ function load(name: string): Doc {
 }
 
 const reFind = core.rules.reFind;
-const jsonDecode = (s: string) => JSON.parse(s);
+// what H.body_decode takes (core/spec/helper.lua): NaN, Infinity and -Infinity too
+const jsonDecode = core.normalize.jsonDecode;
 
 function storeFrom(map: Record<string, unknown>) {
   const s = memoryStore();
@@ -83,7 +84,7 @@ describe("golden: verdict", () => {
   for (const c of load("verdict").cases) {
     it(c.name, () => {
       const v = core.verdict.newVerdict(c.input);
-      expect({ verdict: v, headers: core.verdict.headers(v) }).toEqual(c.expect);
+      expect({ verdict: v, headers: core.verdict.headers(v), client_headers: core.verdict.clientHeaders(v) }).toEqual(c.expect);
     });
   }
 });
@@ -120,7 +121,7 @@ describe("golden: evaluate", () => {
         config: core.defaults.merge(core.defaults.config, inp.config),
         subject: inp.subject
           ? {
-            id: inp.subject.id, history: inp.subject.history, record: (e) => { recorded = e; },
+            id: inp.subject.id, ids: inp.subject.ids, history: inp.subject.history, record: (e) => { recorded = e; },
             store: {
               get: (k) => sstore.get(k),
               set: (k, v, ttl) => { swrites![k] = { value: v, ttl }; sstore.set(k, v, ttl); },
@@ -159,6 +160,7 @@ describe("golden: evaluate", () => {
             }
             return [inp.judge.answers, null];
           },
+          whole: inp.judge.whole,
         },
         log: () => {},
       };

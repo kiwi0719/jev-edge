@@ -99,9 +99,24 @@ export interface Runtime {
   opts: Options;
 }
 
-/** Per-request host facilities. `waitUntil` (Workers, Pages) keeps the subject write alive after the response is sent. */
+/** Per-request host facilities. `waitUntil` (Workers, Pages) keeps the
+ *  writes made once the verdict is decided (subject trajectory and
+ *  reputation, verdict cache, breaker and adaptive bookkeeping) alive after
+ *  the response is sent, so the response does not wait for them. */
 export interface RequestCtx {
   waitUntil?: (p: Promise<unknown>) => void;
+}
+
+/** Hand `p` to the host's waitUntil. false when there is none or it refused
+ *  the promise: the caller then awaits it, or lets it run on its own. */
+function keepAlive(rctx: RequestCtx | undefined, p: Promise<unknown>): boolean {
+  if (!rctx?.waitUntil) return false;
+  try {
+    rctx.waitUntil(p);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function isKV(x: unknown): x is KVLike {
@@ -374,7 +389,9 @@ function wholeChars(b: Uint8Array, max: number): Uint8Array {
   return b.subarray(0, end);
 }
 
-async function readReq(request: Request, rt: Runtime): Promise<[core.Req, ProviderRequestInfo]> {
+/** The request as core sees it, what the provider may use of it, and
+ *  whether a rule watches its path and method (isCandidate). */
+async function readReq(request: Request, rt: Runtime): Promise<[core.Req, ProviderRequestInfo, boolean]> {
   const url = new URL(request.url);
   const path = normalizePath(url.pathname);
   const headers: Record<string, string> = {};
@@ -390,9 +407,14 @@ async function readReq(request: Request, rt: Runtime): Promise<[core.Req, Provid
   const len = lenHeader === null ? NaN : Number(lenHeader);
   const req: core.Req = { method: request.method, path, headers, client_ip: clientIp, body_size: Number.isFinite(len) ? len : 0 };
   let body: string | null = null;
+  // the body's length in bytes as read (or decoded): TextDecoder turns each
+  // invalid byte into U+FFFD, three bytes once re-encoded, so the decoded
+  // string's UTF-8 length is not the body's size (Lua's #body is)
+  let bodyBytes = 0;
+  const candidate = isCandidate(rt, path, request.method);
   // The body is only read for a request some rule would judge; everything
   // else passes at L1 on path or method without touching the stream.
-  if (request.body && isCandidate(rt, path, request.method)) {
+  if (request.body && candidate) {
     const r = await readBounded(request, maxBytes);
     const whole = r.complete && r.size <= maxBytes && !truncatedBodies.has(request);
     req.body_size = Math.max(req.body_size ?? 0, r.size, truncatedBodies.has(request) ? maxBytes + 1 : 0);
@@ -422,7 +444,7 @@ async function readReq(request: Request, rt: Runtime): Promise<[core.Req, Provid
             }
           } else {
             body = utf8.decode(d[0]);
-            req.body_size = d[0].byteLength;
+            bodyBytes = d[0].byteLength;
           }
         } else {
           warnDecoder(d[1], rt);
@@ -430,6 +452,7 @@ async function readReq(request: Request, rt: Runtime): Promise<[core.Req, Provid
       }
     } else if (whole) {
       body = utf8.decode(r.head);
+      bodyBytes = r.head.byteLength;
     } else {
       req.body_head = utf8.decode(r.head);
       if (r.tail) req.body_tail = utf8.decode(r.tail);
@@ -437,9 +460,10 @@ async function readReq(request: Request, rt: Runtime): Promise<[core.Req, Provid
   }
   if (body !== null) {
     req.body = body;
-    req.body_size = core.normalize.byteLength(body);
+    req.body_size = bodyBytes;
+    req.body_bytes = bodyBytes;
   }
-  return [req, { method: request.method, path, headers: request.headers, body, clientIp }];
+  return [req, { method: request.method, path, headers: request.headers, body, clientIp }, candidate];
 }
 
 const decodersMissing = new Set<string>();
@@ -461,28 +485,32 @@ function warnDecoder(reason: string, rt: Runtime): void {
   );
 }
 
-/** Subject context for this request, or undefined: hashed id, one history read, a sink that writes without being awaited. */
-async function subjectCtx(rt: Runtime, request: Request, clientIp: string, candidate: boolean, rctx?: RequestCtx): Promise<subjectMod.SubjectCtx | undefined> {
+let warnedLong = false;
+
+/** Subject context for this request, or undefined: hashed id, the history
+ *  (read only for a request a rule watches), a sink that writes without being
+ *  awaited. */
+async function subjectCtx(
+  rt: Runtime, request: Request, clientIp: string, candidate: boolean, rctx?: RequestCtx,
+): Promise<subjectMod.SubjectCtx | undefined> {
   const scfg = rt.config.subject;
   if (!scfg?.enabled) return undefined;
-  const raw = subjectMod.extract(scfg, {
+  // every candidate value (a cookie sent twice, quoted or not): reputation
+  // checks and charges each id, the first one names the trajectory
+  const raws = subjectMod.extractAll(scfg, {
     ip: clientIp,
+    ipv6Prefix: rt.config.client_ip?.ipv6_prefix,
     header: (n) => request.headers.get(n),
-    cookie: (n) => subjectMod.cookieValue(request.headers.get("cookie"), n),
+    cookieHeader: request.headers.get("cookie"),
+  }, (why) => {
+    // once per isolate: a subject value past the limit names no trajectory
+    if (warnedLong) return;
+    warnedLong = true;
+    console.warn(`jev-edge: ${why}, dropped (subject.from = ${scfg.from ?? "ip"})`);
   });
-  const id = await subjectMod.hashId(scfg, raw, subjectMod.sha256Hex);
+  const ids = await subjectMod.hashIds(scfg, raws, subjectMod.sha256Hex);
+  const id = ids[0];
   if (!id) return undefined;
-  // On Workers the isolate may be torn down right after the response;
-  // waitUntil keeps the write alive. Elsewhere it is plain fire-and-forget.
-  const keep = (p: Promise<unknown>) => {
-    if (rctx?.waitUntil) {
-      try {
-        rctx.waitUntil(p);
-      } catch {
-        /* a host that refuses the promise still gets the fire-and-forget write */
-      }
-    }
-  };
   if (rt.subjectSession) {
     // The subject's own object: one hop for the trajectory and the reputation
     // keys, and only for a request some rule would judge (any other passes L1
@@ -494,20 +522,41 @@ async function subjectCtx(rt: Runtime, request: Request, clientIp: string, candi
       store: s ? bestEffortStore(s.store, "subject store") : rt.subjectStore,
       record: (e) => {
         const write = s ? s.append(e) : subjectMod.appendHistory(rt.subjectStore, id, e, scfg.max_entries, scfg.history_ttl ?? 3600);
-        keep(write.catch(() => {}));
+        // On Workers the isolate may be torn down right after the response;
+        // waitUntil keeps the write alive. Elsewhere (or refused) it is plain
+        // fire-and-forget.
+        keepAlive(rctx, write.catch(() => {}));
       },
     };
   }
   const store = rt.subjectStore;
+  // Core ignores the history in this version, and a request no rule watches
+  // passes at L1 before it could look: only a candidate pays the read (one
+  // counter get, then the slots at once). A read that fails is no history,
+  // never an adapter error that fails the request open.
+  let history: unknown;
+  if (candidate) {
+    try {
+      history = await subjectMod.loadHistory(store, id, scfg.max_entries);
+    } catch (e) {
+      console.warn("jev-edge: subject history read failed: " + describe(e));
+      history = null;
+    }
+  }
   return {
     id,
+    ids,
     // ring layout (incr + one key per entry) when the store has incr, so
     // concurrent requests do not lose entries; the one-list layout otherwise
-    history: await subjectMod.loadHistory(store, id, scfg.max_entries),
+    history,
     // reputation counters (subject.reputation); atomic where the store has incr
     store,
     record: (e) => {
-      keep(subjectMod.appendHistory(store, id, e, scfg.max_entries, scfg.history_ttl ?? 3600).catch(() => {}));
+      const p = subjectMod.appendHistory(store, id, e, scfg.max_entries, scfg.history_ttl ?? 3600).catch(() => {});
+      // On Workers the isolate may be torn down right after the response;
+      // waitUntil keeps the write alive. Elsewhere (or refused) it is plain
+      // fire-and-forget.
+      keepAlive(rctx, p);
     },
   };
 }
@@ -559,8 +608,9 @@ function describe(e: unknown): string {
  * A path that is not well formed (wellFormedPath): refused with 400 and the
  * block body, whatever policy.mode and policy.unjudgeable say, as nginx
  * answers it inline and the Envoy shim and HAProxy agent do. It is the
- * client's error, not a verdict, so it never fails open. The X-Jev-* headers
- * say skipped / adapter / "invalid path", as the HAProxy agent sets them.
+ * client's error, not a verdict, so it never fails open. The client sees
+ * X-Jev-Verdict: skipped and the request id (clientHeaders); the log says
+ * why.
  */
 function badPath(rt: Runtime, requestId: string, pathname: string): Evaluation {
   console.warn("jev-edge: refusing malformed path " + JSON.stringify(pathname.slice(0, 256)) + " with 400");
@@ -569,7 +619,7 @@ function badPath(rt: Runtime, requestId: string, pathname: string): Evaluation {
   });
   const response = new Response(rt.config.policy.block_body ?? '{"error":"request rejected"}', {
     status: 400,
-    headers: { "Content-Type": "application/json", ...core.verdict.headers(verdict), "X-Jev-Request-Id": requestId },
+    headers: { "Content-Type": "application/json", ...core.verdict.clientHeaders(verdict), "X-Jev-Request-Id": requestId },
   });
   return { verdict, response, requestId };
 }
@@ -597,8 +647,8 @@ export async function evaluate(request: Request, rt: Runtime, rctx?: RequestCtx)
 }
 
 async function evaluateInner(request: Request, rt: Runtime, requestId: string, rctx?: RequestCtx): Promise<Evaluation> {
-  const [req, info] = await readReq(request, rt);
-  const subject = await subjectCtx(rt, request, info.clientIp, isCandidate(rt, info.path, info.method), rctx);
+  const [req, info, candidate] = await readReq(request, rt);
+  const subject = await subjectCtx(rt, request, info.clientIp, candidate, rctx);
   if (subject?.id) info.subjectId = subject.id;
   const { breaker, adaptive } = rt.perRequest?.(rctx) ?? rt;
   const judgeOnce = async (prompt: core.Prompt): Promise<core.JudgeResult> => {
@@ -606,8 +656,17 @@ async function evaluateInner(request: Request, rt: Runtime, requestId: string, r
     const t0 = Date.now();
     const r = await rt.provider.call(prompt, rt.config.jev, timeoutMs, info);
     const elapsed = Date.now() - t0;
-    if (r[0]) await adaptive.success(elapsed);
-    else if (String(r[1]).includes("timeout")) await adaptive.timeout(timeoutMs);
+    if (r[0]) {
+      // the sample only serves later requests: past the response where the host can keep it alive
+      const p = adaptive.success(elapsed).catch(() => {});
+      if (!keepAlive(rctx, p)) await p;
+    }
+    // a timeout by its kind: an HTTP error whose message says "timeout"
+    // (openai-compat quotes the provider's) is not one; the error string
+    // only for a provider that gives no kind
+    else if (r[2] === core.judge.TIMEOUT || (r[2] === undefined && String(r[1]).includes("timeout"))) {
+      await adaptive.timeout(timeoutMs);
+    }
     return r;
   };
   const ctx: core.Ctx = {
@@ -620,22 +679,25 @@ async function evaluateInner(request: Request, rt: Runtime, requestId: string, r
     // sha256, not djb2: the fingerprint keys the verdict cache and the trust
     // store, and a linear hash lets a few appended bytes hit a chosen value.
     hash: core.sha256Hex,
-    json_decode: (s) => JSON.parse(s),
+    // JSON.parse, and NaN, Infinity and -Infinity as Python's json.loads
+    // and cjson take them (normalize.jsonDecode)
+    json_decode: core.normalize.jsonDecode,
     re_find: core.rules.reFind,
     judge: {
       call: judgeOnce,
-      // chunks judged in parallel. The backend provider sends the whole body
-      // to the origin, which chunks it itself: one call answers for all.
-      call_many: async (prompts) => {
-        if (rt.provider.name === "backend") {
-          const r = await judgeOnce(prompts[0]);
-          return prompts.map(() => r);
-        }
-        return Promise.all(prompts.map((p) => judgeOnce(p)));
-      },
+      // chunks and other parts judged in parallel
+      call_many: (prompts) => Promise.all(prompts.map((p) => judgeOnce(p))),
+      // The backend provider asks the origin about the whole request: the
+      // body when it was read whole, else every chunk and part in one text,
+      // which the origin chunks itself. One call, and its answer is kept
+      // under the whole request's key only, never a part's.
+      whole: rt.provider.name === "backend",
     },
     log: (level, msg) => console[level === "error" ? "error" : "warn"](msg),
   };
+  // the writes core makes once the verdict is decided go past the response
+  // where the host keeps promises alive; awaited everywhere else
+  if (rctx?.waitUntil) ctx.defer = (p) => rctx.waitUntil!(p);
   let verdict: core.Verdict;
   try {
     verdict = await core.evaluate(req, ctx);
@@ -659,9 +721,11 @@ async function evaluateInner(request: Request, rt: Runtime, requestId: string, r
   }
   const out: Evaluation = { verdict, requestId, subjectId: subject?.id };
   if (verdict.action === core.verdict.ACTION_BLOCK) {
+    // the client sees the verdict and the request id, never the score, the
+    // reason or the source (core.verdict.clientHeaders): those go to logs
     out.response = new Response(rt.config.policy.block_body ?? '{"error":"request rejected"}', {
       status: rt.config.policy.block_status ?? 403,
-      headers: { "Content-Type": "application/json", ...core.verdict.headers(verdict), "X-Jev-Request-Id": requestId },
+      headers: { "Content-Type": "application/json", ...core.verdict.clientHeaders(verdict), "X-Jev-Request-Id": requestId },
     });
   }
   return out;

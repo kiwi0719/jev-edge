@@ -98,7 +98,7 @@ describe("golden: verdict", function()
   for _, c in ipairs(load("verdict").cases) do
     it(c.name, function()
       local v = verdict.new(c.input)
-      same(c.expect, { verdict = v, headers = verdict.headers(v) })
+      same(c.expect, { verdict = v, headers = verdict.headers(v), client_headers = verdict.client_headers(v) })
     end)
   end
 end)
@@ -132,7 +132,7 @@ describe("golden: evaluate", function()
       if inp.subject then
         local sstore = store_from(inp.subject.store)
         swrites = {}
-        subject_ctx = { id = inp.subject.id, history = inp.subject.history,
+        subject_ctx = { id = inp.subject.id, ids = inp.subject.ids, history = inp.subject.history,
                         record = function(e) recorded = e end,
                         store = {
                           get = function(_, k) return sstore:get(k) end,
@@ -162,7 +162,7 @@ describe("golden: evaluate", function()
             return a
           end
           return inp.judge.answers
-        end },
+        end, whole = inp.judge.whole },
         log = function() end,
       }
       local v = core.evaluate(inp.req, ctx)

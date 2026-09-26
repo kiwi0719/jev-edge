@@ -17,6 +17,13 @@ local function incr(key, by)
   if d then d:incr(key, by or 1, 0) end
 end
 
+-- What an L2 error verdict ran into (verdict.error_kind, judge.error_kind):
+-- a fixed set, anything else counted as "other".
+local L2_ERROR_KINDS = {
+  transport = true, timeout = true, unavailable = true, rejected = true,
+  unusable = true, busy = true, other = true,
+}
+
 function _M.record(v)
   incr("req:" .. v.source .. ":" .. v.verdict)
   incr("action:" .. v.action)
@@ -26,7 +33,15 @@ function _M.record(v)
   if unj then incr("unjudged:" .. unj) end
   if v.reason:find("(window)", 1, true) then incr("window") end
   if v.reason == "subject reputation" then incr("subject_blocks") end
-  if v.source == "l2" then
+  if v.source == "l2" and v.verdict == "error" then
+    local kind = v.error_kind
+    if not L2_ERROR_KINDS[kind] then kind = "other" end
+    incr("l2_err:" .. kind)
+  end
+  -- the latency of L2 calls made: a verdict jev.max_inflight turned away
+  -- (error_kind "busy") made none, and its ~0 ms would drag the quantiles
+  -- down just as the provider saturates (counted in jev_l2_errors_total)
+  if v.source == "l2" and v.error_kind ~= "busy" then
     incr("l2_count")
     incr("l2_sum_ms", math.floor(v.l2_ms))
     for _, b in ipairs(BUCKETS) do
@@ -131,6 +146,7 @@ local FAMILIES = {
   { "jev_authz_events_total", "counter" },
   { "jev_adapter_errors_total", "counter" },
   { "jev_async_total", "counter" },
+  { "jev_l2_errors_total", "counter" },
 }
 
 -- One dict key as { family, sample line }, or nil for a key render() emits
@@ -161,6 +177,8 @@ local function sample_of(key, val)
     return "jev_subject_blocks_total", "jev_subject_blocks_total " .. val
   elseif key == "l2_timeout_max_ms" then
     return "jev_l2_timeout_max_ms", "jev_l2_timeout_max_ms " .. val
+  elseif key:match("^l2_err:") then
+    return "jev_l2_errors_total", string.format('jev_l2_errors_total{kind="%s"} %d', key:sub(8), val)
   elseif key:match("^adapter_error:") then
     return "jev_adapter_errors_total", string.format('jev_adapter_errors_total{entry="%s"} %d', key:sub(15), val)
   elseif key:match("^authz:") then

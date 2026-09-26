@@ -127,19 +127,21 @@ verdict=skipped score=0.00 source=l1 reason=path+not+watched
 
 
 
-=== TEST 8: second identical payload is served from cache
+=== TEST 8: second identical payload is served from cache; other digits are another text (core-l1#9)
 --- http_config eval: $::HttpConfig
 --- user_files eval: ::conf()
 --- config eval: "location /v1/chat/completions { $::Access $::Echo }"
 --- request eval
 ["POST /v1/chat/completions\n{\"messages\":[{\"role\":\"user\",\"content\":\"Please summarise report number 1001 for me today.\"}]}",
- "POST /v1/chat/completions\n{\"messages\":[{\"role\":\"user\",\"content\":\"please  SUMMARISE report number 2002 for me today.\"}]}"]
+ "POST /v1/chat/completions\n{\"messages\":[{\"role\":\"user\",\"content\":\"please  SUMMARISE report number 1001 for me today.\"}]}",
+ "POST /v1/chat/completions\n{\"messages\":[{\"role\":\"user\",\"content\":\"Please summarise report number 2002 for me today.\"}]}"]
 --- more_headers
 Content-Type: application/json
 X-Jev-Mock-Score: 0.3
 --- response_body eval
 ["verdict=safe score=0.30 source=l2 reason=injection+0.30\n",
- "verdict=safe score=0.30 source=cache reason=injection+0.30\n"]
+ "verdict=safe score=0.30 source=cache reason=injection+0.30\n",
+ "verdict=safe score=0.30 source=l2 reason=injection+0.30\n"]
 --- no_error_log
 [error]
 
@@ -977,3 +979,40 @@ X-Jev-Other: y
 x-jev-reason x-jev-request-id x-jev-score x-jev-source x-jev-subject x-jev-verdict
 --- no_error_log
 [error]
+
+
+
+=== TEST 44: an adapter error fails open without the client's X-Jev-* headers (openresty-edge#4)
+--- http_config eval: $::HttpConfig
+--- user_files eval: ::conf()
+--- config
+location /v1/chat/completions {
+    access_by_lua_block {
+        -- the judge cannot be built: ensure_runtime throws on every request
+        local http = require "resty.jev.http"
+        local real = http.new
+        http.new = function() error("judge cannot be built") end
+        require("resty.jev.edge").access()
+        http.new = real
+    }
+    content_by_lua_block {
+        local h = ngx.req.get_headers(0)
+        ngx.say("verdict=", h["x-jev-verdict"] or "-", " score=", h["x-jev-score"] or "-",
+                " source=", h["x-jev-source"] or "-", " reason=", h["x-jev-reason"] or "-",
+                " rid=", h["x-jev-request-id"] or "-")
+    }
+}
+--- request
+POST /v1/chat/completions
+{"messages":[{"role":"user","content":"Please summarise the attached quarterly report for me."}]}
+--- more_headers
+Content-Type: application/json
+X-Jev-Verdict: safe
+X-Jev-Score: 0.01
+X-Jev-Source: l2
+X-Jev-Reason: forged
+X-Jev-Request-Id: forged-id
+--- response_body
+verdict=error score=- source=adapter reason=- rid=-
+--- error_log
+access error, failing open

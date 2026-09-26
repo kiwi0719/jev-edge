@@ -2,7 +2,7 @@
 // echoed fake answer cannot lower. Twin of adapters/openresty/spec/openai_compat_spec.lua.
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { build } from "../src/core/judge";
-import { jev, laya, backend, openaiCompat, openaiSystemPrompt, openaiUserMessage, parseOpenaiContent, jsonObjects, stripNonce, echoesInput } from "../src/providers";
+import { jev, laya, backend, openaiCompat, openaiSystemPrompt, openaiUserMessage, parseOpenaiContent, jsonObjects, stripNonce, echoesInput, openaiBody, openaiErrorMessage, OPENAI_CUT } from "../src/providers";
 import type { JevConfig } from "../src/core/defaults";
 import { readFileSync } from "node:fs";
 import { injection as injectionTemplate } from "../src/core/templates";
@@ -274,6 +274,27 @@ describe("System One providers: jev and laya", () => {
     expect(await jev.call(prompt("x"), {} as JevConfig, 1000)).toEqual([null, "jev http 500", "unavailable"]);
   });
 
+  // lead-hosted-api-providers#1: the wording-override vectors in
+  // conformance/vectors.json are the bodies providers/jev.lua builds; the JS
+  // provider must send the same questions (a criteria side left out is not
+  // sent, an empty override is {}).
+  it("builds the wording-override bodies of conformance/vectors.json, as providers/jev.lua does", async () => {
+    const { readFileSync } = await import("node:fs");
+    const vectors = JSON.parse(readFileSync(new URL("../../../conformance/vectors.json", import.meta.url), "utf8")) as {
+      cases: { name: string; input: { body?: { state: unknown; questions: unknown }; wording?: unknown; deployment?: string } }[];
+    };
+    const cases = vectors.cases.filter((c) => c.input.wording !== undefined);
+    expect(cases.length).toBe(5);
+    for (const c of cases) {
+      const seen = capture(() => Response.json({ answers: { injection: { noul: 0.1 } } }));
+      const text = typeof c.input.body!.state === "string" ? c.input.body!.state : (c.input.body!.state as { user_message: string }).user_message;
+      const [p] = build(["injection"], text, { path: "/v1/chat/completions", method: "POST", deployment: c.input.deployment ?? "" });
+      await jev.call(p!, { questions: { injection: c.input.wording } } as unknown as JevConfig, 1000);
+      expect(seen.body!.questions, c.name).toEqual(c.input.body!.questions);
+      expect(seen.body!.state, c.name).toEqual(c.input.body!.state);
+    }
+  });
+
   it("cfg.questions replaces the wording of that question only", async () => {
     const seen = capture(() => Response.json({ answers: {} }));
     const cfg = { questions: { injection: { instructions: "Custom?", criteria: { true: "yes-case", false: "no-case" } } } } as unknown as JevConfig;
@@ -400,5 +421,84 @@ describe("providers: error kinds", () => {
     expect(await backend.call(prompt("x"), cfg, 1000)).toEqual([null, "backend http 414", "rejected"]);
     reply(() => new Response(null, { status: 502 }));
     expect(await backend.call(prompt("x"), cfg, 1000)).toEqual([null, "backend http 502", "unavailable"]);
+  });
+});
+
+// lead-hosted-api-providers#2: the request body from jev.max_tokens,
+// token_param, temperature and extra_body. The same table is in
+// adapters/openresty/spec/openai_compat_spec.lua ("openai-compat provider: body keys").
+describe("openai-compat provider: body keys", () => {
+  afterEach(() => vi.unstubAllGlobals());
+  const MSGS = [{ role: "system", content: "S" }, { role: "user", content: "U" }];
+  const RF = { type: "json_object" };
+  const CASES: [string, Partial<JevConfig>, Record<string, unknown>][] = [
+    ["defaults", {},
+      { model: "gpt-4o-mini", response_format: RF, messages: MSGS, temperature: 0, max_tokens: 200 }],
+    ["a reasoning model: max_completion_tokens, no temperature",
+      { model: "o3-mini", token_param: "max_completion_tokens", max_tokens: 2000, temperature: false },
+      { model: "o3-mini", response_format: RF, messages: MSGS, max_completion_tokens: 2000 }],
+    ["temperature, max_tokens and extra keys; the body's own keys are not taken from extra_body",
+      { temperature: 1, max_tokens: 64, extra_body: { reasoning_effort: "low", seed: 7, model: "x", messages: "y", response_format: "z" } },
+      { model: "gpt-4o-mini", response_format: RF, messages: MSGS, temperature: 1, max_tokens: 64, reasoning_effort: "low", seed: 7 }],
+    ["extra_body comes last, nested values as they are",
+      { extra_body: { max_tokens: 999, chat_template_kwargs: { enable_thinking: false } } },
+      { model: "gpt-4o-mini", response_format: RF, messages: MSGS, temperature: 0, max_tokens: 999, chat_template_kwargs: { enable_thinking: false } }],
+  ];
+  for (const [name, cfg, want] of CASES) {
+    it(name, async () => {
+      expect(openaiBody(cfg as JevConfig, "S", "U")).toEqual(want);
+      // and as the call sends it
+      let sent: Record<string, unknown> | undefined;
+      vi.stubGlobal("fetch", vi.fn(async (_url: string, init: RequestInit) => {
+        sent = JSON.parse(String(init.body));
+        return Response.json({ choices: [{ message: { content: '{"injection": 0.1}' } }] });
+      }));
+      await openaiCompat.call(prompt("hello there, how are you today?"), { endpoint: "http://x/v1", ...cfg } as JevConfig, 1000);
+      expect({ ...sent, messages: MSGS }).toEqual(want);
+    });
+  }
+});
+
+describe("openai-compat provider: what a failed call says", () => {
+  afterEach(() => vi.unstubAllGlobals());
+  const OAI = { provider: "openai-compat", endpoint: "http://x/v1" } as JevConfig;
+  const reply = (r: () => Response) => vi.stubGlobal("fetch", vi.fn(async () => r()));
+
+  it("appends a JSON error body's message to the status, classified by the status alone", async () => {
+    reply(() => Response.json({ error: { message: "Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead.", type: "invalid_request_error" } }, { status: 400 }));
+    expect(await openaiCompat.call(prompt("x"), OAI, 1000)).toEqual([null,
+      "openai-compat http 400: Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead.", "rejected"]);
+    reply(() => Response.json({ error: 'model "llama9" not found, try pulling it first' }, { status: 404 }));
+    expect(await openaiCompat.call(prompt("x"), OAI, 1000)).toEqual([null, 'openai-compat http 404: model "llama9" not found, try pulling it first', "unavailable"]);
+    reply(() => Response.json({ object: "error", message: "bad\n\trequest" }, { status: 400 }));
+    expect((await openaiCompat.call(prompt("x"), OAI, 1000))[1]).toBe("openai-compat http 400: bad  request");
+    reply(() => new Response("<html>oops</html>", { status: 500 }));
+    expect(await openaiCompat.call(prompt("x"), OAI, 1000)).toEqual([null, "openai-compat http 500", "unavailable"]);
+    reply(() => Response.json({ error: { code: 1 } }, { status: 502 }));
+    expect((await openaiCompat.call(prompt("x"), OAI, 1000))[1]).toBe("openai-compat http 502");
+  });
+
+  it("reads the error body under the call's deadline", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(new ReadableStream({ start() {} }), { status: 400 })));
+    expect(await openaiCompat.call(prompt("x"), OAI, 30)).toEqual([null, "timeout after 30 ms", "timeout"]);
+  });
+
+  it("cuts the message to 200 bytes on a character boundary", () => {
+    expect(openaiErrorMessage(JSON.stringify({ error: { message: "é".repeat(250) } }))).toBe("é".repeat(100));
+    expect(openaiErrorMessage(JSON.stringify({ error: { message: "a" + "é".repeat(150) } }))).toBe("a" + "é".repeat(99));
+    expect(openaiErrorMessage(JSON.stringify({ error: "x".repeat(300) }))).toBe("x".repeat(200));
+    expect(openaiErrorMessage("not json")).toBeUndefined();
+  });
+
+  it("says the reply was cut at max_tokens when it ran out before the answer", async () => {
+    const cut = (content: unknown) => reply(() => Response.json({ choices: [{ message: { content }, finish_reason: "length" }] }));
+    for (const c of ["", '{"injection": 0.', null]) {
+      cut(c);
+      expect(await openaiCompat.call(prompt("x"), OAI, 1000)).toEqual([null, OPENAI_CUT, "unusable"]);
+    }
+    expect(OPENAI_CUT).toBe("openai-compat: reply cut at max_tokens (reasoning model? raise jev.max_tokens)");
+    // an answer that fit is read, whatever finish_reason says
+    cut('{"injection": 0.4}');
+    expect(await openaiCompat.call(prompt("x"), OAI, 1000)).toEqual([{ injection: 0.4 }, null]);
   });
 });

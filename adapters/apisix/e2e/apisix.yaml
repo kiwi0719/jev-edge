@@ -213,6 +213,41 @@ routes:
       nodes:
         "app:8081": 1
       type: roundrobin
+  # check_schema resolves the rules (kong-apisix#4): an inline rule is
+  # accepted and judges; a typo'd rule set id and an inline rule whose
+  # extends is not an id are refused by the standalone loader, so their
+  # routes do not exist (404) instead of passing everything unjudged or
+  # answering 500
+  - uri: /ok/*
+    upstream:
+      nodes:
+        "app:8081": 1
+      type: roundrobin
+    plugins:
+      jev-edge:
+        jev: { provider: mock, mock_score: 0.2, timeout_ms: 300 }
+        rules: [{ id: "ok", extends: "llm-endpoints", watch_paths: ["^/ok/"] }]
+        policy: { mode: enforce }
+  - uri: /typo/*
+    upstream:
+      nodes:
+        "app:8081": 1
+      type: roundrobin
+    plugins:
+      jev-edge:
+        jev: { provider: mock, mock_score: 0.2, timeout_ms: 300 }
+        rules: ["llm-endpoint"]
+        policy: { mode: enforce }
+  - uri: /badext/*
+    upstream:
+      nodes:
+        "app:8081": 1
+      type: roundrobin
+    plugins:
+      jev-edge:
+        jev: { provider: mock, mock_score: 0.2, timeout_ms: 300 }
+        rules: [{ id: "x", extends: { a: 1 }, watch_paths: ["^/badext/"] }]
+        policy: { mode: enforce }
 # A global rule, active only for requests that carry X-E2e-Global: 1 so the
 # other checks do not see it. It watches every path; the mock takes 400 ms.
 global_rules:

@@ -252,7 +252,28 @@ def test_block_raises_403():
         run(g.async_pre_call_hook({}, None, dict(CHAT), "completion"))
     assert isinstance(ei.value, JevEdgeBlocked) or type(ei.value).__name__ == "HTTPException"
     assert ei.value.status_code == 403
-    assert ei.value.detail["jev"]["score"] == "0.95"
+    assert ei.value.jev_verdict["score"] == "0.95"
+    # the client sees that it was refused and the id to quote, nothing the
+    # judge said (g2-block-response-verdict-oracle#1)
+    assert ei.value.detail == {"error": "request rejected", "request_id": ei.value.jev_verdict.get("request_id")}
+    assert "jev" not in ei.value.detail and "score" not in str(ei.value.detail)
+
+
+def test_block_detail_carries_the_request_id_only():
+    # g2-block-response-verdict-oracle#1: score, reason and source stay in
+    # the proxy's metadata and the log
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, content='{"error":"request rejected"}', headers={
+            "X-Jev-Verdict": "malicious", "X-Jev-Score": "0.95", "X-Jev-Source": "l2",
+            "X-Jev-Reason": "pattern%3A+ignore", "X-Jev-Request-Id": "rid-42"})
+    g = guard(httpx.MockTransport(handler))
+    data = dict(CHAT)
+    with pytest.raises(Exception) as ei:
+        run(g.async_pre_call_hook({}, None, data, "completion"))
+    assert ei.value.status_code == 403
+    assert ei.value.detail == {"error": "request rejected", "request_id": "rid-42"}
+    assert ei.value.jev_verdict["reason"] == "pattern: ignore"
+    assert data["metadata"]["jev_verdict"]["score"] == "0.95"
 
 
 def test_monitor_mode_never_blocks():
@@ -302,7 +323,7 @@ def test_413_blocks_with_unjudged_block():
     with pytest.raises(Exception) as ei:
         run(g.async_pre_call_hook({}, None, dict(CHAT), "completion"))
     assert ei.value.status_code == 403
-    assert ei.value.detail["jev"]["reason"] == "unjudgeable: authz answered 413"
+    assert ei.value.jev_verdict["reason"] == "unjudgeable: authz answered 413"
     # monitor mode annotates the block, never raises
     transport, _ = fake_authz(status=413, with_verdict=False)
     g = guard(transport, unjudged="block", enforce=False)
@@ -316,7 +337,7 @@ def test_block_uses_jev_edge_status():
     with pytest.raises(Exception) as ei:
         run(g.async_pre_call_hook({}, None, dict(CHAT), "completion"))
     assert ei.value.status_code == 429
-    assert ei.value.detail["jev"]["status"] == 429
+    assert ei.value.jev_verdict["status"] == 429
 
 
 def test_3xx_with_verdict_fails_open():
@@ -1070,7 +1091,7 @@ def test_pass_through_without_a_body_the_guardrail_sees_is_unjudged(data):
                                               "reason": reason, "action": "pass"}
     with pytest.raises(Exception) as ei:
         run(guard(transport, unjudged="block").async_pre_call_hook({}, None, dict(data), "pass_through_endpoint"))
-    assert ei.value.status_code == 403 and ei.value.detail["jev"]["reason"] == reason
+    assert ei.value.status_code == 403 and ei.value.jev_verdict["reason"] == reason
     assert seen["calls"] == 0
     # LiteLLM 1.80 parses the form: its fields are the body
     out = run(guard(transport).async_pre_call_hook({}, None, {"purpose": "batch", "file": object(),
@@ -1384,7 +1405,7 @@ def test_calls_nobody_can_judge_are_marked_unjudgeable(monkeypatch, call_type, r
         run(guard(transport, unjudged="block").async_pre_call_hook({}, None, dict(data, proxy_server_request=psr(route)),
                                                                    call_type))
     assert seen["calls"] == 0
-    assert ei.value.status_code == 403 and ei.value.detail["jev"]["reason"] == reason
+    assert ei.value.status_code == 403 and ei.value.jev_verdict["reason"] == reason
 
 
 def test_batch_upload_is_left_to_litellms_per_line_scan(monkeypatch):
@@ -1576,7 +1597,7 @@ def test_realtime_text_block_raises_and_monitor_passes():
     transport, seen = fake_authz(status=403, verdict="malicious", score="0.95")
     with pytest.raises(Exception) as ei:
         run(guard(transport).apply_guardrail(inputs={"texts": [ATTACK]}, request_data={}, input_type="request"))
-    assert ei.value.status_code == 403 and ei.value.detail["jev"]["verdict"] == "malicious"
+    assert ei.value.status_code == 403 and ei.value.jev_verdict["verdict"] == "malicious"
     run(guard(transport, enforce=False).apply_guardrail(inputs={"texts": [ATTACK]}, request_data={}, input_type="request"))
     # jev-edge down: fail open
     g = guard(httpx.MockTransport(lambda r: (_ for _ in ()).throw(httpx.ConnectError("refused"))))
@@ -1693,7 +1714,7 @@ def test_the_test_endpoint_is_judged_by_default_without_an_address():
     transport, seen = fake_authz(status=403, verdict="malicious", score="0.95")
     with pytest.raises(Exception) as ei:
         run(guard(transport).apply_guardrail(inputs={"texts": [ATTACK]}, request_data={}, input_type="request"))
-    assert ei.value.status_code == 403 and ei.value.detail["jev"]["score"] == "0.95"
+    assert ei.value.status_code == 403 and ei.value.jev_verdict["score"] == "0.95"
     assert seen["calls"] == 1 and seen["xff"] is None
 
 
@@ -1710,7 +1731,7 @@ def test_the_test_endpoint_can_be_refused(request_data, enforce):
         with pytest.raises(Exception) as ei:
             run(g.apply_guardrail(inputs={"texts": ["hello"]}, request_data=request_data, input_type=input_type))
         assert ei.value.status_code == 403
-        assert ei.value.detail["jev"]["reason"] == "refused: /guardrails/apply_guardrail is off (JEV_EDGE_TEST_ENDPOINT=refuse)"
+        assert ei.value.jev_verdict["reason"] == "refused: /guardrails/apply_guardrail is off (JEV_EDGE_TEST_ENDPOINT=refuse)"
     assert seen["calls"] == 0
     # the realtime bridge is still judged
     run(g.apply_guardrail(inputs={"texts": ["hello realtime"]}, request_data={"user_api_key_dict": Auth()}, input_type="request"))
@@ -1748,7 +1769,7 @@ def test_the_test_endpoint_on_1_102_is_refused_in_the_pre_call_hook():
         run(guard(transport, test_endpoint="refuse", enforce=False).async_pre_call_hook({}, None, endpoint_call(),
                                                                                        "apply_guardrail"))
     assert ei.value.status_code == 403 and seen["calls"] == 0
-    assert ei.value.detail["jev"]["action"] == "block" and ei.value.detail["jev"]["source"] == "adapter"
+    assert ei.value.jev_verdict["action"] == "block" and ei.value.jev_verdict["source"] == "adapter"
 
 
 @pytest.mark.parametrize("test_endpoint", ["judge", "refuse"])

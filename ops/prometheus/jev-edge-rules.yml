@@ -33,8 +33,8 @@ groups:
             JevL2TimeoutAtCeiling. The gauge is written per request, so with
             no traffic it keeps its last value.
 
-      # L2 calls that failed (timeout, 5xx, unparseable answer, no scores):
-      # policy.on_error() passes them with verdict=error.
+      # L2 calls that failed (timeout, 5xx, 4xx, unparseable answer, no
+      # scores): policy.on_error() passes them with verdict=error.
       - alert: JevL2ErrorRatioHigh
         expr: |
           sum by (job, instance) (rate(jev_requests_total{source="l2",verdict="error"}[5m]))
@@ -51,11 +51,46 @@ groups:
             10 minutes. Failed calls pass (verdict=error) and are queued for
             async re-judging, so protection is degraded, not traffic.
           runbook: >-
-            Read the error log for "jev-edge: L2 failed: <reason>". Timeouts:
+            Break it down: sum by (kind) (rate(jev_l2_errors_total[5m])), and
+            read the error log for "jev-edge: L2 failed: <reason>". timeout:
             compare jev_l2_latency_ms quantiles with jev_l2_timeout_ms and
             raise jev.timeout_max_ms if the provider is slow but healthy.
-            401/403: rotate the key. 5xx: provider incident. Past fail_ratio
-            the breaker opens (JevBreakerOpen).
+            unavailable: 5xx or 429 is a provider incident, 401 a bad key,
+            404/405 a wrong endpoint or model; these count, and past
+            fail_ratio the breaker opens (JevBreakerOpen). rejected (another
+            4xx) and unusable (no scores) never open it, as the judged text
+            can provoke them: near 100% usually means a model parameter, the
+            key's permissions or a WAF (JevL2NoVerdicts). busy ("max_inflight
+            exceeded"): jev.max_inflight was full and no call was made; see
+            JevL2Saturated.
+
+      # jev.max_inflight is full: the gateway's own cap refuses L2 calls
+      # before they are made (jev_l2_errors_total{kind="busy"}, reason
+      # "max_inflight exceeded"; not in jev_l2_latency_ms), and those requests
+      # pass with verdict=error. The breaker never counts them, so nothing
+      # else pages. Denominator: every request that reached the L2 stage.
+      - alert: JevL2Saturated
+        expr: |
+          sum by (job, instance) (rate(jev_l2_errors_total{kind="busy"}[5m]))
+            /
+          sum by (job, instance) (rate(jev_requests_total{source=~"l2|breaker"}[5m]))
+            > 0.10
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "jev-edge L2 saturated at max_inflight on {{ $labels.instance }}"
+          description: >-
+            {{ $value | humanizePercentage }} of the requests reaching L2 on
+            {{ $labels.instance }} have been refused by jev.max_inflight for
+            5 minutes: they pass unjudged (verdict=error, reason "max_inflight
+            exceeded"), with no call made and the breaker closed.
+          runbook: >-
+            Raise jev.max_inflight if the provider has headroom (its rate
+            limits, the L2 latency panel), or scale the provider. A slow
+            provider holds each slot longer: check jev_l2_latency_ms and
+            JevL2TimeoutAtCeiling first, since a higher cap on a provider
+            that is timing out only moves the errors to timeout.
 
       # Watched requests nobody could read (body too large, binary body,
       # unknown content-encoding). Denominator: every request that got past
@@ -200,3 +235,32 @@ groups:
             failing open". After a config change: GET /_jev/config, then
             DELETE /_jev/config to drop the override, or fix the rule in the
             config file. Otherwise it is a bug: report the log line.
+
+      # Every L2 call fails and none gives a verdict, whatever the breaker
+      # says. A provider that refuses every call for a reason the breaker
+      # does not count (a 400 for a model parameter, a WAF 403, answers with
+      # no scores) leaves it closed, so JevBreakerOpen and JevL2Starved stay
+      # quiet while nothing past L1 is judged.
+      - alert: JevL2NoVerdicts
+        expr: |
+          sum by (job, instance) (rate(jev_requests_total{source="l2",verdict="error"}[5m])) > 0
+          unless on (job, instance)
+          sum by (job, instance) (rate(jev_requests_total{source="l2",verdict!="error"}[5m])) > 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "jev-edge L2 calls all fail on {{ $labels.instance }}"
+          description: >-
+            For 10 minutes every L2 call on {{ $labels.instance }} has failed
+            and none has given a verdict. Those requests pass with
+            verdict=error: only L1, the verdict cache and trusted fingerprints
+            are protecting traffic, and the breaker may still be closed.
+          runbook: >-
+            Break it down: sum by (kind) (rate(jev_l2_errors_total[5m])), and
+            read "jev-edge: L2 failed: <reason>" in the error log. rejected:
+            the provider refuses every call (a parameter the model does not
+            take, the key's permissions, a WAF). unusable: it answers, but
+            not in the judge's format (a wrong model or template). busy:
+            jev.max_inflight is full. unavailable, transport or timeout: see
+            JevBreakerOpen.

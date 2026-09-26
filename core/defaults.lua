@@ -2,6 +2,7 @@
 -- Default configuration and a deep-merge helper.
 
 local normalize = require "jev.core.normalize"
+local judge     = require "jev.core.judge"
 
 local _M = {}
 
@@ -24,6 +25,11 @@ _M.config = {
     -- before it (a load balancer in front of the gateway), and so on. Never
     -- the first element: that is whatever the client typed.
     trusted_hops = 1,
+    -- IP reputation and subject.from = "ip" count an IPv6 client by its
+    -- network's first ipv6_prefix bits: one host holds a whole /64, and a
+    -- fresh address per request would start clean every time. IPv4 is
+    -- counted per address.
+    ipv6_prefix = 64,
   },
   policy = {
     mode              = "monitor",
@@ -157,6 +163,42 @@ function _M.untrusted_spec(cfg, rule)
   return out
 end
 
+--- True when `t` is a list: a table whose keys are exactly 1..#t (an empty
+-- table is one). A JSON object is not, nor is JSON null (cjson.null).
+function _M.is_list(t)
+  if type(t) ~= "table" then return false end
+  local n, count = #t, 0
+  for k in pairs(t) do
+    if type(k) ~= "number" or k < 1 or k > n or k % 1 ~= 0 then return false end
+    count = count + 1
+  end
+  return count == n
+end
+
+--- Why `v` is not a list of non-empty strings (`nonempty`: with one at
+-- least), or nil.
+function _M.string_list_error(v, what, nonempty)
+  if not _M.is_list(v) then return what .. " must be a list of strings" end
+  if nonempty and #v == 0 then return what .. " must not be empty" end
+  for i, s in ipairs(v) do
+    if type(s) ~= "string" or s == "" then return what .. "[" .. i .. "] must be a non-empty string" end
+  end
+  return nil
+end
+
+--- Why `v` is not a list of template names judge knows, or nil: a rule's
+-- templates (core/rules.lua resolve) and untrusted.templates. A name
+-- judge.build cannot find turns every request judged with it into an L2
+-- error, which fails open.
+function _M.templates_error(v, what)
+  local err = _M.string_list_error(v, what, true)
+  if err then return err end
+  for i, name in ipairs(v) do
+    if not judge.get(name) then return what .. "[" .. i .. "] " .. name .. " is not a template" end
+  end
+  return nil
+end
+
 --- Type check for an untrusted table (config section or a rule's override).
 function _M.validate_untrusted(u, where)
   if u == nil then return true end
@@ -164,20 +206,21 @@ function _M.validate_untrusted(u, where)
   for _, k in ipairs({ "enabled", "tool_results" }) do
     if u[k] ~= nil and type(u[k]) ~= "boolean" then return nil, where .. "." .. k .. " must be true|false" end
   end
-  for _, k in ipairs({ "fields", "templates" }) do
-    if u[k] ~= nil then
-      if type(u[k]) ~= "table" then return nil, where .. "." .. k .. " must be a list of strings" end
-      for i, v in ipairs(u[k]) do
-        if type(v) ~= "string" or v == "" then
-          return nil, where .. "." .. k .. "[" .. i .. "] must be a non-empty string"
-        end
-        -- a field path is checked the way a rule's text_fields are
-        local perr = k == "fields" and normalize.path_error(v)
-        if perr then return nil, where .. "." .. k .. "[" .. i .. "] " .. perr end
-      end
+  if u.fields ~= nil then
+    local err = _M.string_list_error(u.fields, where .. ".fields")
+    if err then return nil, err end
+    -- a field path is checked the way a rule's text_fields are
+    for i, v in ipairs(u.fields) do
+      local perr = normalize.path_error(v)
+      if perr then return nil, where .. ".fields[" .. i .. "] " .. perr end
     end
   end
-  if u.templates ~= nil and #u.templates == 0 then return nil, where .. ".templates must not be empty" end
+  -- a name judge does not know makes every request with retrieved content
+  -- an L2 error, the whole-text judgment included
+  if u.templates ~= nil then
+    local err = _M.templates_error(u.templates, where .. ".templates")
+    if err then return nil, err end
+  end
   return true
 end
 
@@ -201,6 +244,22 @@ function _M.merge(base, over)
   return out
 end
 
+-- The openai-compat request body's own keys (providers/openai_compat.lua):
+-- jev.extra_body may add any other key, never one of these.
+_M.OWN_BODY_KEYS = { model = true, messages = true, response_format = true }
+
+--- jev.extra_body: a table of body keys (a JSON object), none of them the
+-- body's own. Kong decodes its extra_body_json with this too.
+function _M.validate_extra_body(eb)
+  if eb == nil then return true end
+  if type(eb) ~= "table" or eb[1] ~= nil then return nil, "jev.extra_body must be a table of body keys" end
+  for k in pairs(eb) do
+    if type(k) ~= "string" then return nil, "jev.extra_body must be a table of body keys" end
+    if _M.OWN_BODY_KEYS[k] then return nil, "jev.extra_body may not set " .. k end
+  end
+  return true
+end
+
 --- Validate a merged config. Returns true or nil, err.
 function _M.validate(c)
   local p = c.policy or {}
@@ -222,9 +281,19 @@ function _M.validate(c)
   if p.partial ~= nil and p.partial ~= "judge" and p.partial ~= "unjudgeable" then
     return nil, "policy.partial must be judge|unjudgeable"
   end
+  -- the adapters write it as the block response's body: a table (a JSON
+  -- object where a JSON document encoded as a string belongs) or JSON null
+  -- turned every block into a 500, which a relay's failure mode allows
+  if p.block_body ~= nil and type(p.block_body) ~= "string" then
+    return nil, "policy.block_body must be a string"
+  end
+  -- a block is a 4xx: a relay in front (a thin Worker, the recipes' gateways)
+  -- tells a block from an allow (200) and from an error that fails open
+  -- (5xx, no X-Jev-Verdict) by it, and a 2xx or 3xx "block" reaches the
+  -- client as a success or a redirect
   if p.block_status ~= nil and (type(p.block_status) ~= "number"
-     or p.block_status < 200 or p.block_status > 599 or p.block_status % 1 ~= 0) then
-    return nil, "policy.block_status must be an HTTP status code"
+     or p.block_status < 400 or p.block_status > 499 or p.block_status % 1 ~= 0) then
+    return nil, "policy.block_status must be a 4xx status"
   end
   local ca = c.cache or {}
   if ca.fp_ttl ~= nil and (type(ca.fp_ttl) ~= "number" or ca.fp_ttl <= 0) then
@@ -250,6 +319,10 @@ function _M.validate(c)
   if hops ~= nil and (type(hops) ~= "number" or hops < 1 or hops % 1 ~= 0) then
     return nil, "client_ip.trusted_hops must be an integer >= 1"
   end
+  local v6 = ci.ipv6_prefix
+  if v6 ~= nil and (type(v6) ~= "number" or v6 < 1 or v6 > 128 or v6 % 1 ~= 0) then
+    return nil, "client_ip.ipv6_prefix must be an integer from 1 to 128"
+  end
   local as = c.async or {}
   if as.max_async ~= nil and (type(as.max_async) ~= "number" or as.max_async < 0) then
     return nil, "async.max_async must be >= 0"
@@ -257,6 +330,31 @@ function _M.validate(c)
   if type(c.jev.timeout_ms) ~= "number" or c.jev.timeout_ms <= 0 then
     return nil, "jev.timeout_ms must be > 0"
   end
+  -- the judge is built from these on the request path (ensure_runtime), where
+  -- a table or JSON null (cjson.null) threw and failed every request open
+  for _, k in ipairs({ "provider", "model", "endpoint", "api_key", "api_key_env", "deployment_context" }) do
+    if c.jev[k] ~= nil and type(c.jev[k]) ~= "string" then
+      return nil, "jev." .. k .. " must be a string"
+    end
+  end
+  if c.jev.provider == "" then return nil, "jev.provider must be a non-empty string" end
+  -- the openai-compat request (providers/openai_compat.lua): the reply's
+  -- token budget and the parameter that carries it, the temperature (false:
+  -- not sent, for a model that takes only its default) and extra body keys
+  local mt = c.jev.max_tokens
+  if mt ~= nil and (type(mt) ~= "number" or mt < 1 or mt % 1 ~= 0) then
+    return nil, "jev.max_tokens must be an integer >= 1"
+  end
+  local tp = c.jev.token_param
+  if tp ~= nil and tp ~= "max_tokens" and tp ~= "max_completion_tokens" then
+    return nil, "jev.token_param must be max_tokens|max_completion_tokens"
+  end
+  local temp = c.jev.temperature
+  if temp ~= nil and temp ~= false and (type(temp) ~= "number" or not (temp >= 0 and temp <= 2)) then
+    return nil, "jev.temperature must be a number from 0 to 2, or false"
+  end
+  local eok, eerr = _M.validate_extra_body(c.jev.extra_body)
+  if not eok then return nil, eerr end
   local sm = c.sampling or {}
   if sm.rate ~= nil and (type(sm.rate) ~= "number" or sm.rate < 0 or sm.rate > 1) then
     return nil, "sampling.rate must be in [0,1]"
@@ -326,6 +424,17 @@ function _M.validate(c)
       for _, k in ipairs({ "criteria", "criteria_ctx" }) do
         if q[k] ~= nil and type(q[k]) ~= "table" then
           return nil, "jev.questions." .. name .. "." .. k .. " must be a table"
+        end
+        -- a side it names is sent as the judge's criterion: a string, not
+        -- empty (a JSON null or a number would reach the judge as is)
+        -- (keyed by string in JSON, or by boolean as the templates are)
+        for _, side in ipairs({ "true", "false" }) do
+          for _, key in ipairs({ side, side == "true" }) do
+            local v = q[k] and q[k][key]
+            if v ~= nil and (type(v) ~= "string" or v == "") then
+              return nil, "jev.questions." .. name .. "." .. k .. "." .. side .. " must be a non-empty string"
+            end
+          end
         end
       end
     end

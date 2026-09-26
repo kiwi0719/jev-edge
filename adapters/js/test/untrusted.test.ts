@@ -45,6 +45,21 @@ describe("untrusted: extraction", () => {
     expect(v).toEqual(["tool says", "function says"]);
   });
 
+  // r5 tool_results: collect() read none of an object content's keys
+  it("reads a tool or function message's object content whole", () => {
+    const v = normalize.extractUntrustedValues({ messages: [
+      { role: "user", content: { x: "a user's object is not a tool result" } },
+      { role: "tool", content: { x: "tool says", n: 2, more: ["deep"] } },
+      { role: "function", name: "f", content: { text: "function says", k: "v" } },
+      { role: "tool", content: [{ type: "text", text: "parts as before" }] },
+    ] }, spec);
+    expect(v).toEqual(["more", "deep", "n", "x", "tool says", "k", "v", "text", "function says", "parts as before"]);
+    // the text walk reads it the same way
+    const decoded: normalize.JsonValue = { messages: [{ role: "user", content: "Any news?" },
+      { role: "tool", content: { x: "tool says", n: 2 } }, { role: "user", content: { x: "not read" } }] };
+    expect(normalize.extractJson(decoded, ["messages[*].content"])).toBe("Any news?\nn\nx\ntool says");
+  });
+
   it("finds Anthropic tool_result blocks, nested content included", () => {
     const v = normalize.extractUntrustedValues({ messages: [{ role: "user", content: [
       { type: "tool_result", tool_use_id: "t1", content: "plain result" },
@@ -282,5 +297,53 @@ describe("untrusted: subject reputation", () => {
     const v = await core.evaluate(reqFor({ messages: [{ role: "user", content: "ok?" }], context: [{ text: ATTACK }] }), ctx);
     expect(v.verdict).toBe("malicious");
     expect(points()).toBe(0);
+  });
+});
+
+// twin of the untrusted_spec, defaults_spec and rules_resolve_spec cases for
+// a template name judge does not know
+describe("untrusted: an unknown template", () => {
+  const check = (u: unknown) => defaults.validate(defaults.merge(defaults.config, { untrusted: u }))[1];
+
+  it("is refused by config validation and resolve()", () => {
+    expect(check({ templates: ["untrusted", "injection"] })).toBeNull();
+    expect(check({ templates: ["untrusted", "untrustd"] })).toBe("untrusted.templates[2] untrustd is not a template");
+    expect(check({ templates: "untrusted" })).toBe("untrusted.templates must be a list of strings");
+    expect(check({ fields: { a: "x" } })).toBe("untrusted.fields must be a list of strings");
+    expect(check(null)).toBe("untrusted must be a table");
+    expect(() => resolve({ id: "t", extends: "llm-endpoints", untrusted: { enabled: true, templates: ["nope"] } }))
+      .toThrow("rule t: untrusted.templates[1] nope is not a template");
+  });
+
+  const ctxWith = (j: core.Judge, untrusted: Record<string, unknown>) => {
+    const cache = memoryStore();
+    const logs: string[] = [];
+    const ctx: core.Ctx = {
+      config: core.defaults.merge(core.defaults.config, { untrusted, policy: { mode: "enforce" } }),
+      rules: [load("llm-endpoints")],
+      cache: { get: (k) => cache.get(k), set: (k, v, ttl) => cache.set(k, v, ttl) },
+      clock: () => 1000, hash: normalize.djb2, json_decode: decode, re_find: rules.reFind, judge: j,
+      log: (level, msg) => logs.push(`${level}: ${msg}`),
+    };
+    return { ctx, logs, entries: () => [...cache.dump()].length };
+  };
+
+  it("leaves that part out and judges the rest, whose score is not the whole request's", async () => {
+    const j = recording({ injection: 0.95 });
+    const { ctx, logs, entries } = ctxWith(j, { enabled: true, templates: ["nope"] });
+    const v = await core.evaluate(toolReq(USER, ATTACK), ctx);
+    expect([v.action, v.reason]).toEqual(["block", "injection 0.95"]);
+    expect(j.prompts.length).toBe(1);
+    expect(j.prompts[0].questions.untrusted).toBeUndefined();
+    expect(logs.some((l) => l.includes("nope"))).toBe(true);
+    expect(entries()).toBe(1);
+  });
+
+  it("is an error with no part left", async () => {
+    const j = recording({ injection: 0.95 });
+    const { ctx } = ctxWith(j, { enabled: true, fields: ["context[*].text"], templates: ["nope"] });
+    const v = await core.evaluate(reqFor({ messages: [{ role: "user", content: "ok?" }], context: [{ text: ATTACK }] }), ctx);
+    expect([v.verdict, v.action]).toEqual(["error", "pass"]);
+    expect(j.prompts.length).toBe(0);
   });
 });

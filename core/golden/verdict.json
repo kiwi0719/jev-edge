@@ -2,6 +2,9 @@
   "cases": [
     {
       "expect": {
+        "client_headers": {
+          "X-Jev-Verdict": "skipped"
+        },
         "headers": {
           "X-Jev-Reason": "",
           "X-Jev-Score": "0.00",
@@ -11,6 +14,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "",
           "l2_ms": 0,
           "reason": "",
@@ -24,6 +28,9 @@
     },
     {
       "expect": {
+        "client_headers": {
+          "X-Jev-Verdict": "malicious"
+        },
         "headers": {
           "X-Jev-Reason": "injection+0.91",
           "X-Jev-Score": "0.91",
@@ -33,6 +40,7 @@
         "verdict": {
           "action": "block",
           "async": false,
+          "error_kind": "",
           "fingerprint": "a1b2c3d4",
           "l2_ms": 184,
           "reason": "injection 0.91",
@@ -55,6 +63,9 @@
     },
     {
       "expect": {
+        "client_headers": {
+          "X-Jev-Verdict": "skipped"
+        },
         "headers": {
           "X-Jev-Reason": "",
           "X-Jev-Score": "1.00",
@@ -64,6 +75,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "",
           "l2_ms": 0,
           "reason": "",
@@ -79,6 +91,9 @@
     },
     {
       "expect": {
+        "client_headers": {
+          "X-Jev-Verdict": "skipped"
+        },
         "headers": {
           "X-Jev-Reason": "",
           "X-Jev-Score": "0.00",
@@ -88,6 +103,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "",
           "l2_ms": 0,
           "reason": "",
@@ -103,6 +119,9 @@
     },
     {
       "expect": {
+        "client_headers": {
+          "X-Jev-Verdict": "skipped"
+        },
         "headers": {
           "X-Jev-Reason": "",
           "X-Jev-Score": "0.00",
@@ -112,6 +131,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "",
           "l2_ms": 0,
           "reason": "",
@@ -127,6 +147,9 @@
     },
     {
       "expect": {
+        "client_headers": {
+          "X-Jev-Verdict": "skipped"
+        },
         "headers": {
           "X-Jev-Reason": "pattern%3A+%5Cbyou+are+now%5Cb+%26+more%2Fless%3F",
           "X-Jev-Score": "0.00",
@@ -136,6 +159,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "",
           "l2_ms": 0,
           "reason": "pattern: \\byou are now\\b & more/less?",
@@ -151,6 +175,9 @@
     },
     {
       "expect": {
+        "client_headers": {
+          "X-Jev-Verdict": "skipped"
+        },
         "headers": {
           "X-Jev-Reason": "ip+reputation",
           "X-Jev-Score": "0.00",
@@ -160,6 +187,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "",
           "l2_ms": 0,
           "reason": "ip reputation",
@@ -175,6 +203,9 @@
     },
     {
       "expect": {
+        "client_headers": {
+          "X-Jev-Verdict": "skipped"
+        },
         "headers": {
           "X-Jev-Reason": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
           "X-Jev-Score": "0.00",
@@ -184,6 +215,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "",
           "l2_ms": 0,
           "reason": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
@@ -199,6 +231,9 @@
     },
     {
       "expect": {
+        "client_headers": {
+          "X-Jev-Verdict": "skipped"
+        },
         "headers": {
           "X-Jev-Reason": "%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F%2F",
           "X-Jev-Score": "0.00",
@@ -208,6 +243,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "",
           "l2_ms": 0,
           "reason": "//////////////////////////////////////////////////////////////////////ab",
@@ -223,6 +259,9 @@
     },
     {
       "expect": {
+        "client_headers": {
+          "X-Jev-Verdict": "skipped"
+        },
         "headers": {
           "X-Jev-Reason": "%C3%BCber",
           "X-Jev-Score": "0.00",
@@ -232,6 +271,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "",
           "l2_ms": 0,
           "reason": "über",
@@ -247,6 +287,9 @@
     },
     {
       "expect": {
+        "client_headers": {
+          "X-Jev-Verdict": "skipped"
+        },
         "headers": {
           "X-Jev-Reason": "",
           "X-Jev-Score": "0.34",
@@ -256,6 +299,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "",
           "l2_ms": 0,
           "reason": "",
@@ -271,6 +315,9 @@
     },
     {
       "expect": {
+        "client_headers": {
+          "X-Jev-Verdict": "skipped"
+        },
         "headers": {
           "X-Jev-Reason": "",
           "X-Jev-Score": "0.12",
@@ -280,6 +327,7 @@
         "verdict": {
           "action": "pass",
           "async": false,
+          "error_kind": "",
           "fingerprint": "",
           "l2_ms": 0,
           "reason": "",
@@ -292,6 +340,37 @@
         "score": 0.125
       },
       "name": "score header rounds half"
+    },
+    {
+      "expect": {
+        "client_headers": {
+          "X-Jev-Verdict": "error"
+        },
+        "headers": {
+          "X-Jev-Reason": "timeout",
+          "X-Jev-Score": "0.00",
+          "X-Jev-Source": "l2",
+          "X-Jev-Verdict": "error"
+        },
+        "verdict": {
+          "action": "pass",
+          "async": false,
+          "error_kind": "timeout",
+          "fingerprint": "",
+          "l2_ms": 0,
+          "reason": "timeout",
+          "score": 0,
+          "source": "l2",
+          "verdict": "error"
+        }
+      },
+      "input": {
+        "error_kind": "timeout",
+        "reason": "timeout",
+        "source": "l2",
+        "verdict": "error"
+      },
+      "name": "an L2 error keeps its kind"
     }
   ],
   "core_version": "0.6.1",

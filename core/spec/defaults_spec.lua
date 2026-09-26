@@ -30,6 +30,12 @@ describe("defaults.validate", function()
     for _, over in ipairs({
       { policy = { block_threshold = 5, suspect_threshold = 2 } },
       { policy = { block_status = 42 } },
+      -- a block is a 4xx (openresty-edge#5)
+      { policy = { block_status = 200 } },
+      { policy = { block_status = 302 } },
+      { policy = { block_status = 503 } },
+      { policy = { block_status = 403.5 } },
+      { policy = { block_status = "403" } },
       { breaker = { window_s = 0 } },
       { breaker = { min_samples = 0 } },
       { breaker = { fail_ratio = 0 } },
@@ -38,6 +44,85 @@ describe("defaults.validate", function()
       { async = { max_async = -1 } },
     }) do
       assert.is_nil((D.validate(D.merge(D.config, over))))
+    end
+  end)
+
+  -- keys the request path reads as strings (openresty-edge#4): a table, a
+  -- number or JSON null (cjson.null is userdata; io.stdout stands in for it)
+  it("wants block_body and the judge's settings to be strings", function()
+    local NULL = io.stdout
+    for _, c in ipairs({
+      { { policy = { block_body = { error = "blocked" } } }, "policy.block_body must be a string" },
+      { { policy = { block_body = NULL } }, "policy.block_body must be a string" },
+      { { jev = { provider = 123 } }, "jev.provider must be a string" },
+      { { jev = { provider = NULL } }, "jev.provider must be a string" },
+      { { jev = { provider = "" } }, "jev.provider must be a non-empty string" },
+      { { jev = { model = {} } }, "jev.model must be a string" },
+      { { jev = { endpoint = NULL } }, "jev.endpoint must be a string" },
+      { { jev = { api_key = 42 } }, "jev.api_key must be a string" },
+      { { jev = { api_key_env = true } }, "jev.api_key_env must be a string" },
+      { { jev = { deployment_context = { "a" } } }, "jev.deployment_context must be a string" },
+    }) do
+      local ok, err = D.validate(D.merge(D.config, c[1]))
+      assert.is_nil(ok, c[2])
+      assert.equals(c[2], err)
+    end
+    assert.is_true(D.validate(D.merge(D.config, { policy = { block_body = '{"error":"blocked"}' },
+      jev = { provider = "openai-compat", model = "m", endpoint = "http://j/v1", api_key = "k",
+              api_key_env = "K", deployment_context = "A support assistant." } })))
+  end)
+
+  -- lead-hosted-api-providers#2: the openai-compat request knobs. The same
+  -- table is in adapters/js/test/core.test.ts ("defaults.validate").
+  it("checks jev.max_tokens, token_param, temperature and extra_body", function()
+    local NULL = io.stdout
+    for _, c in ipairs({
+      { { jev = { max_tokens = 0 } }, "jev.max_tokens must be an integer >= 1" },
+      { { jev = { max_tokens = 1.5 } }, "jev.max_tokens must be an integer >= 1" },
+      { { jev = { max_tokens = "200" } }, "jev.max_tokens must be an integer >= 1" },
+      { { jev = { token_param = "max_output_tokens" } }, "jev.token_param must be max_tokens|max_completion_tokens" },
+      { { jev = { temperature = true } }, "jev.temperature must be a number from 0 to 2, or false" },
+      { { jev = { temperature = 2.5 } }, "jev.temperature must be a number from 0 to 2, or false" },
+      { { jev = { temperature = -1 } }, "jev.temperature must be a number from 0 to 2, or false" },
+      { { jev = { temperature = NULL } }, "jev.temperature must be a number from 0 to 2, or false" },
+      { { jev = { extra_body = "seed=1" } }, "jev.extra_body must be a table of body keys" },
+      { { jev = { extra_body = { "a", "b" } } }, "jev.extra_body must be a table of body keys" },
+      { { jev = { extra_body = { model = "other" } } }, "jev.extra_body may not set model" },
+      { { jev = { extra_body = { messages = {} } } }, "jev.extra_body may not set messages" },
+      { { jev = { extra_body = { response_format = { type = "text" } } } },
+        "jev.extra_body may not set response_format" },
+    }) do
+      local ok, err = D.validate(D.merge(D.config, c[1]))
+      assert.is_nil(ok, c[2])
+      assert.equals(c[2], err)
+    end
+    for _, jev in ipairs({
+      { max_tokens = 1 }, { max_tokens = 4096, token_param = "max_completion_tokens" }, { token_param = "max_tokens" },
+      { temperature = 0 }, { temperature = 2 }, { temperature = 0.7 }, { temperature = false },
+      { extra_body = { reasoning_effort = "low", seed = 7, chat_template_kwargs = { enable_thinking = false } } },
+    }) do
+      assert.is_true((D.validate(D.merge(D.config, { jev = jev }))))
+    end
+  end)
+
+  it("takes any 4xx as policy.block_status", function()
+    for _, st in ipairs({ 400, 403, 429, 451, 499 }) do
+      assert.is_true(D.validate(D.merge(D.config, { policy = { block_status = st } })), st)
+    end
+    local _, err = D.validate(D.merge(D.config, { policy = { block_status = 503 } }))
+    assert.equals("policy.block_status must be a 4xx status", err)
+  end)
+
+  -- lead-gateways-live#21
+  it("takes client_ip.ipv6_prefix as an integer from 1 to 128, 64 by default", function()
+    assert.equals(64, D.config.client_ip.ipv6_prefix)
+    for _, v in ipairs({ 1, 48, 56, 64, 128 }) do
+      assert.is_true((D.validate(D.merge(D.config, { client_ip = { ipv6_prefix = v } }))), v)
+    end
+    for _, v in ipairs({ 0, 129, 64.5, "64", -1 }) do
+      local ok, err = D.validate(D.merge(D.config, { client_ip = { ipv6_prefix = v } }))
+      assert.is_nil(ok, tostring(v))
+      assert.equals("client_ip.ipv6_prefix must be an integer from 1 to 128", err)
     end
   end)
 
@@ -79,5 +164,36 @@ describe("defaults.validate jev.questions", function()
     assert.is_nil(ok)
     assert.matches("jev.questions.injection.instructions", err, 1, true)
     assert.is_nil((v({ injection = { criteria_ctx = "x" } })))
+  end)
+  -- lead-hosted-api-providers#1: a criteria override replaces the pair and
+  -- sends only the sides it names; each one named is a non-empty string
+  it("takes a partial or empty criteria, and refuses a side that is not a non-empty string", function()
+    for _, c in ipairs({ { ["true"] = "a" }, { ["false"] = "b" }, {}, { [true] = "a", [false] = "b" } }) do
+      assert.is_true((v({ injection = { criteria = c, criteria_ctx = c } })))
+    end
+    -- io.stdout is a userdata, as cjson.null is
+    for _, c in ipairs({ { ["true"] = "" }, { ["false"] = 5 }, { [true] = "" }, { ["true"] = io.stdout } }) do
+      local ok, err = v({ injection = { criteria_ctx = c } })
+      assert.is_nil(ok)
+      assert.matches("^jev%.questions%.injection%.criteria_ctx%.%a+ must be a non%-empty string$", err)
+    end
+  end)
+end)
+
+describe("defaults.validate untrusted.templates", function()
+  local function check(u)
+    return D.validate(D.merge(D.config, { untrusted = u }))
+  end
+
+  it("wants names judge knows", function()
+    assert.is_true(check({ templates = { "untrusted", "injection" } }))
+    local ok, err = check({ templates = { "untrusted", "untrustd" } })
+    assert.is_nil(ok)
+    assert.equals("untrusted.templates[2] untrustd is not a template", err)
+    ok, err = check({ templates = {} })
+    assert.is_nil(ok)
+    assert.equals("untrusted.templates must not be empty", err)
+    assert.is_nil((check({ templates = "untrusted" })))
+    assert.is_nil((check({ fields = { a = "x" } })))
   end)
 end)

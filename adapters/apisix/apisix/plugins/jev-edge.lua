@@ -74,6 +74,15 @@ local schema = {
         ssl_verify         = { type = "boolean" },
         -- per-template question wording: { <template> = { instructions, criteria, ... } }
         questions          = { type = "object" },
+        -- the openai-compat request: the reply's token budget and the
+        -- parameter that carries it, the temperature (false: not sent),
+        -- extra body keys (core/defaults.lua refuses model, messages and
+        -- response_format there)
+        max_tokens         = { type = "integer", minimum = 1 },
+        token_param        = { type = "string", enum = { "max_tokens", "max_completion_tokens" } },
+        temperature        = { anyOf = { { type = "number", minimum = 0, maximum = 2 },
+                                         { type = "boolean", enum = { false } } } },
+        extra_body         = { type = "object" },
         -- mock provider knobs, for tests
         mock_score         = { type = "number", minimum = 0, maximum = 1 },
         mock_header        = { type = "string" },
@@ -130,7 +139,7 @@ local schema = {
         mode              = { type = "string", enum = { "monitor", "enforce" } },
         block_threshold   = { type = "number", minimum = 0, maximum = 1 },
         suspect_threshold = { type = "number", minimum = 0, maximum = 1 },
-        block_status      = { type = "integer", minimum = 200, maximum = 599 },
+        block_status      = { type = "integer", minimum = 400, maximum = 499 },
         block_body        = { type = "string" },
       },
     },
@@ -207,12 +216,31 @@ local _M = {
   run_policy = "prefer_route",
 }
 
+-- A shipped rule set by id. The id names a module, so only a plain name is
+-- looked up (as the Kong schema allows): anything else is an error, never a
+-- require of a table or a path.
+local function load_rule(id)
+  if type(id) ~= "string" or not id:match("^[%w_%-]+$") then
+    return nil, "rule set id must be a name of letters, digits, '_' or '-', got " .. tostring(id)
+  end
+  local ok, r = pcall(require, "jev.rules." .. id)
+  if ok then return r end
+  -- the require error lists every searched path; the id is what matters
+  return nil, "rule set '" .. id .. "' not found (jev.rules." .. id .. ")"
+end
+
 function _M.check_schema(conf)
   local ok, err = core.schema.check(schema, conf)
   if not ok then return false, err end
   local merged = defaults.merge(defaults.config, conf)
   local vok, verr = defaults.validate(merged)
   if not vok then return false, verr end
+  -- the rules as a request would load them: a typo'd id, an unknown
+  -- template or a malformed pattern is refused here, where the Admin API
+  -- (or the standalone loader) reports it, instead of being dropped at run
+  -- time and turning judging off for the route
+  local _, rerr = rules_mod.resolve_all(merged.rules, load_rule)
+  if rerr then return false, rerr end
   return true
 end
 
@@ -246,20 +274,34 @@ local function sha256_hex(s)
 end
 local sha256_hex_subject = sha256_hex
 
-local function subject_ctx(rt, req, ctx)
+local warned_long = false
+local function subject_ctx(rt, req)
   local scfg = rt.cfg.subject
   if not scfg or not scfg.enabled then return nil end
-  local raw = subject_m.extract(scfg, {
+  -- the raw Cookie header(s), not the cookie variable: nginx's $cookie_<name>
+  -- is the first match, compared case-insensitively, quotes kept, while the
+  -- backend may read another. Every candidate is an id (core/subject.lua
+  -- cookie_values); reputation checks and charges each, ids[1] names the
+  -- trajectory and the logs.
+  local raws, long = subject_m.extract_all(scfg, {
     ip = req.client_ip,
+    ipv6_prefix = rt.cfg.client_ip and rt.cfg.client_ip.ipv6_prefix,
     header = function(n) return req.headers[n] end,
-    cookie = function(n) return ctx.var["cookie_" .. tostring(n)] end,
+    cookie_header = req.headers["cookie"],
   })
-  local id = subject_m.hash_id(scfg, raw, sha256_hex_subject)
+  if long and not warned_long then
+    -- once per worker: a subject value past the limit names no trajectory
+    warned_long = true
+    core.log.warn("jev-edge: ", long, ", dropped (subject.from = ", tostring(scfg.from), ")")
+  end
+  local ids = subject_m.hash_ids(scfg, raws, sha256_hex_subject)
+  local id = ids[1]
   if not id then return nil end
   local rep_on = type(scfg.reputation) == "table" and (tonumber(scfg.reputation.block_at) or 0) > 0
   local ring, rep = cache_m.subject_stores(SUBJECT_DICT, SUBJECT_REP_DICT, rep_on)
   return {
     id = id,
+    ids = ids,
     history = subject_m.ring_load(ring, id, scfg.max_entries),
     -- Two atomic dict operations, inline: cheaper than the timer it
     -- replaces and safe across workers (no read-modify-write). They never
@@ -279,11 +321,7 @@ end
 local function load_rules(specs)
   local out, failed = {}, {}
   for i, spec in ipairs(specs or {}) do
-    local rule, err = rules_mod.resolve(spec, function(id)
-      local ok, r = pcall(require, "jev.rules." .. id)
-      if ok then return r end
-      return nil, tostring(r)
-    end)
+    local rule, err = rules_mod.resolve(spec, load_rule)
     if rule then out[#out + 1] = rule
     else
       local id = type(spec) == "table" and (spec.id or spec.extends) or spec
@@ -315,12 +353,20 @@ end
 
 -- Decision sampling into the shared dict ring; read it with
 -- `resty.jev.edge.samples()` on the OpenResty side or through sampling.log.
+-- Every route's samples go into the one jev_cache ring: each names its route.
+local warned_ring = false
 local function maybe_sample(rt, v, req, ctx)
   if not sampling.should_sample(rt.cfg, v, math.random) then return end
   local ok, err = pcall(function()
     local s = sampling.build(rt.cfg, v, req, rule_for(rt, req),
       { rid = ctx.var.request_id, ts = ngx.now(), json_decode = cjson.decode })
-    sampling.store(rt.cfg, cache, s)
+    s.route = ctx.route_id or ctx.var.route_id
+    local _, other = sampling.store(rt.cfg, cache, s)
+    if other and not warned_ring then
+      warned_ring = true
+      core.log.warn("jev-edge: sampling.max_samples differs from the ring's size in jev_cache; ",
+        "samples go into the ring as its first writer sized it")
+    end
     if rt.cfg.sampling.log then core.log.info("jev-edge sample: ", cjson.encode(s)) end
   end)
   if not ok then core.log.warn("jev-edge: sampling failed: ", err) end
@@ -430,8 +476,12 @@ local function build_req(rt, ctx)
   return req
 end
 
--- the byte span of the match, which places the hit in the judging window
-local function re_find(subject, pattern)
+-- the byte span of the first match at or after byte init (from, to), which
+-- places the hit in the judging window; nil when there is none. When PCRE
+-- fails (a JIT stack or match limit, a pattern it refuses) ngx.re.find
+-- returns nil, nil, err, passed on whole: core counts the pattern as a hit.
+local function re_find(subject, pattern, init)
+  if init and init > 1 then return ngx.re.find(subject, pattern, "ijo", { pos = init }) end
   return ngx.re.find(subject, pattern, "ijo")
 end
 
@@ -508,17 +558,20 @@ function _M.access(conf, ctx)
   end
   -- before anything can fail: a run that failed open is not repeated either
   ctx.jev_ran = true
+  -- the client's own X-Jev-* go first, whatever happens next
   set_request_headers(ctx, nil)
-  local rt = runtime_for(conf)
 
-  local v
+  local rt, v
   local ok, err = pcall(function()
+    -- inside the pcall: a conf that fails to build a runtime fails open,
+    -- as any other adapter error does, instead of a 500 for every request
+    rt = runtime_for(conf)
     if rt.rules_err then
       v = rules_failed(rt)
       return
     end
     local req = build_req(rt, ctx)
-    local subj = subject_ctx(rt, req, ctx)
+    local subj = subject_ctx(rt, req)
     ctx.jev_subject = subj and subj.id or nil
     v = jev_core.evaluate(req, {
       config = rt.cfg, rules = rt.rules, cache = cache, trust = cache, judge = rt.judge, breaker = rt.breaker,
@@ -546,7 +599,11 @@ function _M.access(conf, ctx)
   set_request_headers(ctx, headers)
 
   if v.action == verdict.ACTION_BLOCK then
-    local b = { status = rt.cfg.policy.block_status or 403, headers = verdict.headers(v),
+    -- the client sees the verdict and the request id, never the score, the
+    -- reason or the source (verdict.client_headers): those go to the log
+    local bh = verdict.client_headers(v)
+    bh["X-Jev-Request-Id"] = ctx.var.request_id or ""
+    local b = { status = rt.cfg.policy.block_status or 403, headers = bh,
                 body = rt.cfg.policy.block_body or '{"error":"request rejected"}' }
     ctx.jev_block = b
     core.response.set_header("Content-Type", "application/json")

@@ -36,7 +36,7 @@ local json, re_find
 if under_resty then
   require("resty.jev.loader")()
   json = require "cjson.safe"
-  re_find = function(s, p) return ngx.re.find(s, p, "joi") end
+  re_find = function(s, p, init) return ngx.re.find(s, p, "joi", init and init > 1 and { pos = init } or nil) end
 else
   package.path = "./?.lua;./?/init.lua;" .. package.path
   local H = require "core.spec.helper"   -- jev.* searcher, PCRE matcher

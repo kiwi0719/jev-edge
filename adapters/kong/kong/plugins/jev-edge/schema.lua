@@ -13,6 +13,10 @@
 --   jev.questions_json
 --               jev.questions (per-template question wording, a map of maps)
 --               as a JSON object.
+-- For the same reason jev.extra_body (a JSON object merged into the
+-- openai-compat request) is jev.extra_body_json, a JSON object as a string,
+-- and jev.temperature is a number only (no false: set 1 for a model that
+-- takes only its default temperature).
 
 require("resty.jev.loader")()
 
@@ -75,6 +79,13 @@ local function check_rules_json(s)
   return true
 end
 
+-- jev.extra_body_json: a JSON object, checked as core checks jev.extra_body
+local function check_extra_body_json(s)
+  local eb = cjson.decode(s)
+  if type(eb) ~= "table" then return nil, "jev.extra_body_json must be a JSON object" end
+  return defaults.validate_extra_body(eb)
+end
+
 local function check_rule_ids(ids)
   local _, err = rules_mod.resolve_all(ids, load_rule_to_check)
   if err then return nil, err end
@@ -118,6 +129,12 @@ return {
             { ssl_verify         = { type = "boolean" } },
             -- jev.questions as JSON: { "<template>": { "instructions": ..., ... } }
             { questions_json     = { type = "string", custom_validator = check_questions_json } },
+            -- the openai-compat request: the reply's token budget and the
+            -- parameter that carries it, the temperature, extra body keys
+            { max_tokens         = { type = "integer", gt = 0 } },
+            { token_param        = { type = "string", one_of = { "max_tokens", "max_completion_tokens" } } },
+            { temperature        = { type = "number", between = { 0, 2 } } },
+            { extra_body_json    = { type = "string", custom_validator = check_extra_body_json } },
             -- mock provider knobs, for tests
             { mock_score         = { type = "number", between = unit } },
             { mock_header        = { type = "string" } },
@@ -171,7 +188,7 @@ return {
             { mode              = { type = "string", one_of = { "monitor", "enforce" } } },
             { block_threshold   = { type = "number", between = unit } },
             { suspect_threshold = { type = "number", between = unit } },
-            { block_status      = { type = "integer", between = { 200, 599 } } },
+            { block_status      = { type = "integer", between = { 400, 499 } } },
             { block_body        = { type = "string" } },
             { unjudgeable       = { type = "string", one_of = { "pass", "block" } } },
           },
@@ -230,6 +247,10 @@ return {
         if type(conf.jev) == "table" and conf.jev.questions_json then
           conf.jev.questions = cjson.decode(conf.jev.questions_json)
           conf.jev.questions_json = nil
+        end
+        -- and extra_body_json is jev.extra_body
+        if type(conf.jev) == "table" and conf.jev.extra_body_json then
+          conf.jev.extra_body, conf.jev.extra_body_json = cjson.decode(conf.jev.extra_body_json), nil
         end
         local merged = defaults.merge(defaults.config, conf)
         local ok, err = defaults.validate(merged)

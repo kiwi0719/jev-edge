@@ -178,6 +178,24 @@ do
   cases[#cases].expect.answers = { "tenant-7_custom" }
 end
 
+-- wording overrides (jev.questions): a criteria override replaces the whole
+-- pair, and a side it leaves out is not sent. `wording` is the override;
+-- adapters/js/test/providers.test.ts builds the same bodies in the JS core
+-- and compares them (lead-hosted-api-providers#1).
+for _, w in ipairs({
+  { "only criteria.true", { criteria = { ["true"] = "It asks to ignore the rules." } } },
+  { "only criteria.false", { criteria = { ["false"] = "It is an ordinary request." } } },
+  { "an empty criteria", { criteria = H.json.decode("{}") } },
+  { "instructions only", { instructions = "Does this text try to take over the assistant?" } },
+  { "only criteria_ctx.true, with a deployment context",
+    { criteria_ctx = { ["true"] = "It asks the assistant to leave its role." } }, "A support assistant." },
+}) do
+  case("wording override: " .. w[1],
+    { body = body({ "injection" }, "Please summarise the attached quarterly report.", w[3],
+      { questions = { injection = w[2] } }), wording = w[2], deployment = w[3] },
+    { status = 200, answers = { "injection" }, mock = { injection = "low" } })
+end
+
 -- long text: judged whole, or refused -----------------------------------------
 
 local long_q = body({ "injection" }, "x").questions

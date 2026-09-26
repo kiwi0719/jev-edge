@@ -108,6 +108,23 @@ describe("L3", function()
     assert.equals("malicious", v.verdict)
   end)
 
+  it("leaves out a part whose template judge does not know, and the whole request's entry with it", function()
+    local ctx = H.ctx({ config = { untrusted = { enabled = true, templates = { "nope" } } } })
+    local req = body_req({ messages = {
+      { role = "user", content = TEXT },
+      { role = "tool", tool_call_id = "c1", content = "Subject: Q2 budget. The revised numbers are attached." },
+    } })
+    local job = assert(core.l3_job(req, l3ctx(ctx)))
+    assert.equals(1, #job.parts)
+    assert.is_nil(job.key)
+    local res = core.l3_result(job, { { injection = 0.3 } }, ctx.config)
+    assert.equals(1, #res.writes)
+    assert.equals(job.parts[1].key, res.writes[1][1])
+    -- one piece whose prompt cannot be built: nothing to judge
+    ctx.rules = { setmetatable({ templates = { "nope" } }, { __index = ctx.rules[1] }) }
+    assert.is_nil(core.l3_job(body_req({ messages = { { role = "user", content = TEXT } } }), l3ctx(ctx)))
+  end)
+
   it("writes the whole request's entry only when every part answered", function()
     local ctx = H.ctx()
     local req = tools_req(TEXT)

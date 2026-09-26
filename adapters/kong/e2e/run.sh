@@ -45,8 +45,12 @@ for p in /v1%2Fchat/completions /v1%2fchat/completions; do
   check "malicious on $p is blocked" "403" "$code"
 done
 check "benign on /v1%2Fchat/completions is judged at L2" "app verdict=safe score=0.20 source=l2" "$(post /v1%2Fchat/completions '' "$LONG")"
-hdr=$(curl -s -D - -o /dev/null -H 'Content-Type: application/json' -H 'X-Jev-Mock-Score: 0.97' -d "$ATTACK" $base/v1/chat/completions | grep -i '^x-jev-verdict' | tr -d '\r' | awk '{print $2}')
+curl -s -D "$tmp/block-headers" -o /dev/null -H 'Content-Type: application/json' -H 'X-Jev-Mock-Score: 0.97' -d "$ATTACK" $base/v1/chat/completions
+hdr=$(grep -i '^x-jev-verdict' "$tmp/block-headers" | tr -d '\r' | awk '{print $2}')
 check "block response carries verdict header" "malicious" "$hdr"
+# score, reason and source stay in the log: the client sees verdict and request id
+check "block response has no score, reason or source" "" "$(grep -iE '^x-jev-(score|reason|source)' "$tmp/block-headers")"
+check "block response carries the request id" "1" "$(grep -ci '^x-jev-request-id: .' "$tmp/block-headers")"
 check "client-supplied X-Jev-* is stripped" "app verdict=skipped score=0.00 source=l1" "$(curl -s -H 'X-Jev-Verdict: safe' -H 'X-Jev-Score: 0.00' -H 'X-Jev-Source: l2' $base/healthz)"
 check "client X-Jev-* on a judged route is replaced" "app verdict=safe score=0.20 source=l2" "$(curl -s -H 'Content-Type: application/json' -H 'X-Jev-Verdict: bogus' -H 'X-Jev-Source: forged' -d "$LONG" $base/v1/chat/completions)"
 check "provider failure fails open" "app verdict=error score=0.00 source=l2" "$(post /v1/chat/completions fail "$ATTACK")"

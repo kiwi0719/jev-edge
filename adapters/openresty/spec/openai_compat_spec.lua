@@ -220,3 +220,72 @@ describe("openai-compat provider: an echoed planted answer", function()
     assert.equals("0", string.format("%.6g", parse('{"injection": -0.0}').injection))
   end)
 end)
+
+-- lead-hosted-api-providers#2: the request body from jev.max_tokens,
+-- token_param, temperature and extra_body. The same table is in
+-- adapters/js/test/providers.test.ts ("openai-compat provider: body keys").
+describe("openai-compat provider: body keys", function()
+  local MSGS = { { role = "system", content = "S" }, { role = "user", content = "U" } }
+  local RF = { type = "json_object" }
+  local CASES = {
+    { "defaults", {},
+      { model = "gpt-4o-mini", response_format = RF, messages = MSGS, temperature = 0, max_tokens = 200 } },
+    { "a reasoning model: max_completion_tokens, no temperature",
+      { model = "o3-mini", token_param = "max_completion_tokens", max_tokens = 2000, temperature = false },
+      { model = "o3-mini", response_format = RF, messages = MSGS, max_completion_tokens = 2000 } },
+    { "temperature, max_tokens and extra keys; the body's own keys are not taken from extra_body",
+      { temperature = 1, max_tokens = 64,
+        extra_body = { reasoning_effort = "low", seed = 7, model = "x", messages = "y", response_format = "z" } },
+      { model = "gpt-4o-mini", response_format = RF, messages = MSGS, temperature = 1, max_tokens = 64,
+        reasoning_effort = "low", seed = 7 } },
+    { "extra_body comes last, nested values as they are",
+      { extra_body = { max_tokens = 999, chat_template_kwargs = { enable_thinking = false } } },
+      { model = "gpt-4o-mini", response_format = RF, messages = MSGS, temperature = 0, max_tokens = 999,
+        chat_template_kwargs = { enable_thinking = false } } },
+  }
+  for _, c in ipairs(CASES) do
+    it(c[1], function()
+      assert.same(c[3], P.body(c[2], "S", "U"))
+      -- and as build_request sends it
+      local p = judge.build({ "injection" }, "hello there, how are you today?", {})
+      local sent = H.json.decode(P.build_request(p, c[2], NONCE).body)
+      sent.messages = MSGS
+      assert.same(c[3], sent)
+    end)
+  end
+end)
+
+describe("openai-compat provider: what a failed call says", function()
+  it("appends a JSON error body's message to the status, classified by the status alone", function()
+    local err = select(2, P.parse_response(400, '{"error":{"message":"Unsupported parameter: \'max_tokens\' is not '
+      .. 'supported with this model. Use \'max_completion_tokens\' instead.","type":"invalid_request_error"}}'))
+    assert.equals("openai-compat http 400: Unsupported parameter: 'max_tokens' is not supported with this model. "
+      .. "Use 'max_completion_tokens' instead.", err)
+    assert.equals('openai-compat http 404: model "llama9" not found, try pulling it first',
+      select(2, P.parse_response(404, '{"error":"model \\"llama9\\" not found, try pulling it first"}')))
+    assert.equals("openai-compat http 400: bad  request",
+      select(2, P.parse_response(400, '{"object":"error","message":"bad\\n\\trequest"}')))
+    assert.equals("openai-compat http 500", select(2, P.parse_response(500, "<html>oops</html>")))
+    assert.equals("openai-compat http 502", select(2, P.parse_response(502, '{"error":{"code":1}}')))
+  end)
+
+  it("cuts the message to 200 bytes on a character boundary", function()
+    local e = "\195\169"   -- é, two bytes
+    assert.equals(string.rep(e, 100), P.error_message('{"error":{"message":"' .. string.rep(e, 250) .. '"}}'))
+    assert.equals("a" .. string.rep(e, 99), P.error_message('{"error":{"message":"a' .. string.rep(e, 150) .. '"}}'))
+    assert.equals(string.rep("x", 200), P.error_message('{"error":"' .. string.rep("x", 300) .. '"}'))
+  end)
+
+  it("says the reply was cut at max_tokens when it ran out before the answer", function()
+    local function cut(content)
+      local choice = { message = { content = content }, finish_reason = "length" }
+      return P.parse_response(200, H.json.encode({ choices = { choice } }), {}, { questions = { injection = true } })
+    end
+    assert.equals(P.CUT, select(2, cut("")))
+    assert.equals(P.CUT, select(2, cut('{"injection": 0.')))
+    assert.equals(P.CUT, select(2, cut(H.json.null)))
+    assert.equals("openai-compat: reply cut at max_tokens (reasoning model? raise jev.max_tokens)", P.CUT)
+    -- an answer that fit is read, whatever finish_reason says
+    assert.same({ injection = 0.4 }, (cut('{"injection": 0.4}')))
+  end)
+end)

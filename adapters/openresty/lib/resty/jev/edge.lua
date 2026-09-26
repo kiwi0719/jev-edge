@@ -92,9 +92,12 @@ local function ensure_runtime(cfg)
   end
 end
 
--- the byte span of the match (from, to), which places the hit in the
--- judging window; nil when there is none
-local function re_find(subject, pattern)
+-- the byte span of the first match at or after byte init (from, to), which
+-- places the hit in the judging window; nil when there is none. When PCRE
+-- fails (a JIT stack or match limit, a pattern it refuses) ngx.re.find
+-- returns nil, nil, err, passed on whole: core counts the pattern as a hit.
+local function re_find(subject, pattern, init)
+  if init and init > 1 then return ngx.re.find(subject, pattern, "ijo", { pos = init }) end
   return ngx.re.find(subject, pattern, "ijo")
 end
 
@@ -175,6 +178,19 @@ local function strip_inbound()
   for _, h in ipairs(HEADER_NAMES) do ngx.req.clear_header(h) end
 end
 
+-- The block response. defaults.validate refuses a block_body that is not a
+-- string and a block_status that is not a number; the fallbacks are defence
+-- in depth, so a block is never a 500 that a relay's failure mode lets
+-- through.
+local DEFAULT_BLOCK_BODY = '{"error":"request rejected"}'
+local function block_response(cfg)
+  local p = cfg.policy or {}
+  local status, body = p.block_status, p.block_body
+  if type(status) ~= "number" then status = 403 end
+  if type(body) ~= "string" then body = DEFAULT_BLOCK_BODY end
+  return status, body
+end
+
 -- The subject header the config reads, lowercased: an X-Jev-* name there (a
 -- thin Worker's X-Jev-Subject, read with hashed = true) is the deployment's
 -- own, not a client's, and is left in place.
@@ -226,12 +242,18 @@ end
 
 -- Decision sampling: a share of judged requests, normalized text only, kept
 -- in the cache dict ring for /_jev/samples. Off unless sampling.enabled.
+local warned_ring = false
 local function maybe_sample(cfg, v, req, rules)
   if not sampling.should_sample(cfg, v, math.random) then return end
   local ok, err = pcall(function()
     local s = sampling.build(cfg, v, req, rules_mod.rule_for(req, rules, { json_decode = cjson.decode }),
       { rid = ngx.var.request_id, ts = ngx.now(), json_decode = cjson.decode })
-    sampling.store(cfg, cache, s)
+    local _, other = sampling.store(cfg, cache, s)
+    if other and not warned_ring then
+      warned_ring = true
+      ngx.log(ngx.WARN, "jev-edge: sampling.max_samples differs from the ring's size in the shared dict; ",
+        "samples go into the ring as its first writer sized it")
+    end
     if cfg.sampling.log then ngx.log(ngx.INFO, "jev-edge sample: ", cjson.encode(s)) end
   end)
   if not ok then ngx.log(ngx.WARN, "jev-edge: sampling failed: ", err) end
@@ -259,25 +281,54 @@ local function note_relay_subject(scfg, relay, found)
     "), or no request gets a subject")
 end
 
+-- One request, two legs: a thin Worker asks /_jev/authz here (leg "authz"),
+-- then forwards the request to this same origin (leg "access"), both with
+-- the same X-Jev-Subject, and each leg would add the verdict's reputation
+-- points. The authz leg leaves a marker per (subject, fingerprint) for
+-- COUNTED_TTL seconds when it adds points; the forwarded leg consumes one
+-- instead of adding them again. incr without init is atomic across workers
+-- and never creates the key, so one marker suppresses exactly one forwarded
+-- leg, and a forwarded leg with none (the Worker answered from its cache) is
+-- charged as usual. Both legs still check the block.
+local COUNTED_TTL = 30
+local function counted_key(id, fp) return subject_m.REP_PREFIX .. id .. ":a:" .. tostring(fp) end
+
+local warned_long = false
+
 -- Per-subject trajectory: id extracted per cfg.subject, hashed with the salt
 -- before anything stores or logs it; history read once here; the write is a
--- ring append (see core/subject.lua) and does not yield. relay: the entry a
--- relay called (authz, forward_auth), nil for access().
-local function subject_ctx(cfg, req, relay)
+-- ring append (see core/subject.lua) and does not yield. entry: "access"
+-- (the request itself), or the entry a relay called ("authz",
+-- "forward_auth"), which note_relay_subject watches and which leaves the
+-- counted markers for the forwarded leg.
+local function subject_ctx(cfg, req, entry)
   local scfg = cfg.subject
   if not scfg or not scfg.enabled then return nil end
-  local raw = subject_m.extract(scfg, {
+  -- the raw Cookie header(s), not the cookie variable: nginx's $cookie_<name>
+  -- is the first match, compared case-insensitively, quotes kept, while the
+  -- backend may read another. Every candidate is an id (core/subject.lua
+  -- cookie_values); reputation checks and charges each, ids[1] names the
+  -- trajectory and the logs.
+  local raws, long = subject_m.extract_all(scfg, {
     ip = req.client_ip,
+    ipv6_prefix = cfg.client_ip and cfg.client_ip.ipv6_prefix,
     header = function(n) return req.headers[n] end,
-    cookie = function(n) return ngx.var["cookie_" .. tostring(n)] end,
+    cookie_header = req.headers["cookie"],
   })
-  note_relay_subject(scfg, relay, raw ~= nil)
-  local id = subject_m.hash_id(scfg, raw, sha256_hex)
+  note_relay_subject(scfg, entry ~= "access" and entry or nil, #raws > 0 or long ~= nil)
+  if long and not warned_long then
+    -- once per worker: a subject value past the limit names no trajectory
+    warned_long = true
+    ngx.log(ngx.WARN, "jev-edge: ", long, ", dropped (subject.from = ", tostring(scfg.from), ")")
+  end
+  local ids = subject_m.hash_ids(scfg, raws, sha256_hex)
+  local id = ids[1]
   if not id then return nil end
   local rep_on = type(scfg.reputation) == "table" and (tonumber(scfg.reputation.block_at) or 0) > 0
   local ring, rep = cache_m.subject_stores(SUBJECT_DICT, SUBJECT_REP_DICT, rep_on)
-  return {
+  local subj = {
     id = id,
+    ids = ids,
     history = subject_m.ring_load(ring, id, scfg.max_entries),
     -- Two atomic dict operations, inline: cheaper than the timer it
     -- replaces and safe across workers (no read-modify-write). They never
@@ -289,15 +340,33 @@ local function subject_ctx(cfg, req, relay)
     -- in the dict
     store = rep,
   }
+  if entry == "access" then
+    subj.counted = function(fp)
+      local dict = rep.dict
+      if not dict or not fp or fp == "" then return false end
+      local k = counted_key(id, fp)
+      local n = dict:incr(k, -1)
+      -- none left: put the count back, so the next marker is not eaten
+      if n and n < 0 then dict:incr(k, 1) end
+      return n ~= nil and n >= 0
+    end
+  elseif entry then
+    subj.on_counted = function(fp)
+      if fp and fp ~= "" then rep:incr(counted_key(id, fp), 1, COUNTED_TTL) end
+    end
+  end
+  return subj
 end
 
-local function evaluate_current(cfg, rules, over, relay)
+-- entry: "access" (the request itself), "authz" or "forward_auth" (a relay
+-- asking about it)
+local function evaluate_current(cfg, rules, over, entry)
   -- first: when anything below throws, access() fails open with no client
   -- X-Jev-* left on the request
   strip_inbound()
   ensure_runtime(cfg)
   local req = build_req(rules, over)
-  local subj = subject_ctx(cfg, req, relay)
+  local subj = subject_ctx(cfg, req, entry)
   ngx.ctx.jev_subject = subj and subj.id or nil
   local v = core.evaluate(req, {
     config = cfg, rules = rules, cache = cache, trust = state_store(), judge = judge, breaker = breaker, subject = subj,
@@ -324,7 +393,7 @@ function _M.access()
   local rules = config.rules()
   local v
   local ok, err = pcall(function()
-    v = evaluate_current(cfg, rules)
+    v = evaluate_current(cfg, rules, nil, "access")
     set_headers(v, cfg)
   end)
 
@@ -340,9 +409,10 @@ function _M.access()
   end
 
   if v and v.action == verdict.ACTION_BLOCK then
-    ngx.status = cfg.policy.block_status or 403
+    local status, body = block_response(cfg)
+    ngx.status = status
     ngx.header["Content-Type"] = "application/json"
-    ngx.say(cfg.policy.block_body or '{"error":"request rejected"}')
+    ngx.say(body)
     return ngx.exit(ngx.HTTP_OK)
   end
 end
@@ -697,9 +767,10 @@ local function respond_authz(cfg, rules, over, who)
   end
   ngx.header["X-Jev-Request-Id"] = ngx.var.request_id or ""
   if block then
-    ngx.status = cfg.policy.block_status or 403
+    local status, body = block_response(cfg)
+    ngx.status = status
     ngx.header["Content-Type"] = "application/json"
-    ngx.say(cfg.policy.block_body or '{"error":"request rejected"}')
+    ngx.say(body)
     return ngx.exit(ngx.HTTP_OK)
   end
   ngx.status = 200

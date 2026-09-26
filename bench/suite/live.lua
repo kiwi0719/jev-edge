@@ -71,7 +71,7 @@ local function store()
   local d = {}
   return { get = function(_, k) return d[k] end, set = function(_, k, v) d[k] = v end }
 end
-local function re_find(s, p) return ngx.re.find(s, p, "joi") end
+local function re_find(s, p, init) return ngx.re.find(s, p, "joi", init and init > 1 and { pos = init } or nil) end
 local function now() ngx.update_time(); return ngx.now() * 1000 end
 
 local function one(r)

@@ -1,5 +1,5 @@
 // Port of core/rules.lua: L1, cheap and short-circuiting.
-import { extract, extractTools, extractUntrusted, jsonLike, isText, byteLength, head, tail, fieldKeys, deepKeys, scanStrings, scanTools, window, chunks as splitChunks, utf8Bytes, type JsonValue } from "./normalize.js";
+import { extract, extractTools, extractUntrusted, jsonLike, isText, byteLength, head, tail, fieldKeys, deepKeys, scanStrings, scanTools, window, chunks as splitChunks, chunkOverlap, utf8Bytes, byteString, trim, ipKey as normalizeIpKey, type JsonValue } from "./normalize.js";
 import { untrustedSpec, type UntrustedConfig } from "./defaults.js";
 import { repBlocked, type SubjectCtx, type ReputationConfig } from "./subject.js";
 
@@ -21,7 +21,7 @@ export const SKIP_CONTENT_TYPES = [
 
 export interface Rule {
   id: string;
-  /** Lua patterns in the rule files; the subset used (anchors, literals, %-escapes) converts 1:1. */
+  /** Lua patterns, as in the rule files (luaPatternToRegExp: everything but %b and back-references). */
   watch_paths: string[];
   /** Match watch_paths without folding ASCII case (default: folded, see pathMatches). */
   paths_case_sensitive?: boolean;
@@ -62,6 +62,11 @@ export interface Req {
   /** A repeated header may arrive as a list (Lua's ngx.req.get_headers does this). */
   headers?: Record<string, string | string[] | undefined>;
   body?: string | null;
+  /** The body's length in bytes as the adapter read it, when `body` was
+   *  decoded from bytes that were not all valid UTF-8 (each invalid byte is
+   *  one U+FFFD, three bytes re-encoded): core counts this, as Lua counts
+   *  #body. Absent: the UTF-8 length of `body`. */
+  body_bytes?: number;
   body_size?: number;
   client_ip?: string;
   /** Past max_body_bytes: the first bytes and the last bytes (not overlapping) the adapter kept. */
@@ -82,11 +87,22 @@ export interface RulesCtx {
   cache?: CacheLike;
   clock?: () => number;
   json_decode?: (s: string) => JsonValue;
-  /** Truthy on a match; a [from, to] 1-based inclusive UTF-8 byte span places the hit in the judging window. */
-  re_find?: (subject: string, pattern: string) => boolean | readonly [number, number] | null;
+  /**
+   * The first case-insensitive match at or after byte `init` (1 when
+   * undefined): truthy on a match; a [from, to] 1-based inclusive UTF-8 byte
+   * span places the hit in the judging window. A matcher that ignores init
+   * returns an earlier span again, and the walk of that pattern stops there.
+   * A matcher that throws (a pattern the engine refuses, a match that runs
+   * out of stack) counts that pattern as a hit with no span.
+   */
+  re_find?: (subject: string, pattern: string, init?: number) => boolean | readonly [number, number] | null;
   log?: (level: string, msg: string) => void;
   subject?: SubjectCtx;
-  config?: { subject?: { reputation?: ReputationConfig }; untrusted?: UntrustedConfig; policy?: { partial?: string } };
+  config?: {
+    subject?: { reputation?: ReputationConfig }; untrusted?: UntrustedConfig; policy?: { partial?: string; unjudgeable?: string };
+    async?: { rep_block_after?: number | string };
+    client_ip?: { ipv6_prefix?: number };
+  };
 }
 
 /**
@@ -156,9 +172,90 @@ export function patternError(pattern: string): string | null {
   return null;
 }
 
-const LUA_CLASSES: Record<string, string> = {
-  a: "A-Za-z", d: "0-9", s: " \\t\\n\\v\\f\\r", w: "A-Za-z0-9", x: "0-9A-Fa-f", p: "!-/:-@\\[-`{-~",
-};
+// Lua's character classes (lstrlib match_class in the C locale), over bytes.
+const LUA_CLASSES = new Map<string, (c: number) => boolean>([
+  ["a", (c) => (c >= 65 && c <= 90) || (c >= 97 && c <= 122)],
+  ["c", (c) => c < 32 || c === 127],
+  ["d", (c) => c >= 48 && c <= 57],
+  ["g", (c) => c >= 33 && c <= 126],
+  ["l", (c) => c >= 97 && c <= 122],
+  ["p", (c) => (c >= 33 && c <= 47) || (c >= 58 && c <= 64) || (c >= 91 && c <= 96) || (c >= 123 && c <= 126)],
+  ["s", (c) => (c >= 9 && c <= 13) || c === 32],
+  ["u", (c) => c >= 65 && c <= 90],
+  ["w", (c) => (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122)],
+  ["x", (c) => (c >= 48 && c <= 57) || (c >= 65 && c <= 70) || (c >= 97 && c <= 102)],
+  ["z", (c) => c === 0], // LuaJIT and every Lua since 5.1 keep it
+]);
+
+// Port of match_class: does byte `c` match `%<cl>`? An upper-case class
+// letter is the complement; any other character after '%' is itself.
+function matchClass(c: number, cl: number): boolean {
+  const upper = cl >= 65 && cl <= 90;
+  const test = LUA_CLASSES.get(String.fromCharCode(upper ? cl + 32 : cl));
+  if (!test) return cl === c;
+  return upper ? !test(c) : test(c);
+}
+
+type Bytes = boolean[]; // which of the 256 byte values a single-char class matches
+
+function members(test: (c: number) => boolean): Bytes {
+  const m: Bytes = new Array(256);
+  for (let c = 0; c < 256; c++) m[c] = test(c);
+  return m;
+}
+
+// Port of classEnd and matchbracketclass for the set that opens at p[i]:
+// the bytes it matches and the index past its closing ']'. The first
+// character after '[' or '[^' is always a member, so '[]]' holds ']'.
+function setMembers(p: string, i: number): [Bytes, number] {
+  const n = p.length;
+  let j = i + 1;
+  if (p[j] === "^") j++;
+  do {
+    if (j >= n) throw new Error("malformed pattern (missing ']')");
+    if (p[j++] === "%" && j < n) j++;
+  } while (p[j] !== "]");
+  const ec = j;
+  const m: Bytes = new Array(256).fill(false);
+  let q = i;
+  let sig = true;
+  if (p[q + 1] === "^") { sig = false; q++; }
+  while (++q < ec) {
+    if (p[q] === "%") {
+      q++;
+      const cl = p.charCodeAt(q);
+      for (let c = 0; c < 256; c++) if (matchClass(c, cl)) m[c] = true;
+    } else if (p[q + 1] === "-" && q + 2 < ec) {
+      q += 2;
+      for (let c = p.charCodeAt(q - 2); c <= p.charCodeAt(q); c++) m[c] = true;
+    } else {
+      m[p.charCodeAt(q)] = true;
+    }
+  }
+  if (!sig) for (let c = 0; c < 256; c++) m[c] = !m[c];
+  return [m, ec + 1];
+}
+
+const hex2 = (c: number): string => "\\x" + c.toString(16).padStart(2, "0");
+
+// A RegExp class for exactly these bytes ("[]" when none: it never matches).
+function classOf(m: Bytes): string {
+  let body = "";
+  for (let c = 0; c < 256; c++) {
+    if (!m[c]) continue;
+    let e = c;
+    while (e + 1 < 256 && m[e + 1]) e++;
+    body += e === c ? hex2(c) : hex2(c) + "-" + hex2(e);
+    c = e;
+  }
+  return "[" + body + "]";
+}
+
+// One byte as a RegExp literal.
+function literal(c: number): string {
+  const ch = String.fromCharCode(c);
+  return /[A-Za-z0-9_\/]/.test(ch) ? ch : hex2(c);
+}
 
 /**
  * `s` as Lua sees it: one character (U+0000..U+00FF) per UTF-8 byte. Lua
@@ -167,23 +264,24 @@ const LUA_CLASSES: Record<string, string> = {
  * Lua, and U+2028 is three of them. ASCII comes back as it is.
  */
 export function luaBytes(s: string): string {
-  if (!/[^\x00-\x7f]/.test(s)) return s;
-  let out = "";
-  for (const b of utf8Bytes(s)) out += String.fromCharCode(b);
-  return out;
+  return byteString(s);
 }
 
 /**
- * Lua pattern -> RegExp for the subset rule files use: ^ $ anchors, literals,
- * %-escaped punctuation, the %a %d %s %w %x %p classes and [...] sets (with
- * those classes and ranges inside). Anything else in a watch path is
- * unsupported on this adapter and throws at load time rather than silently
- * matching differently. `-` is Lua's lazy `*?` outside a set and a plain
- * range/literal inside one. The RegExp matches bytes, as Lua does: the
- * pattern is translated from its UTF-8 bytes and the subject must be passed
- * through luaBytes (pathMatches does). `.` is any one byte, line terminators
- * included: JS's `.` stops at \n, \r, U+2028 and U+2029, which a
- * percent-decoded path can hold.
+ * Lua pattern -> RegExp, as string.find reads the pattern (lstrlib): '^'
+ * anchors only as the first character and '$' only as the last, anywhere
+ * else each is a literal; a single-char class is a literal, '.', a %-class
+ * (every Lua class, upper case the complement, any other character after
+ * '%' itself) or a [...] set, and only a single-char class takes a
+ * quantifier ('*', '+', '?', and '-', Lua's lazy '*?'): a quantifier
+ * character anywhere else (first, after '(' or ')') is a literal, so Lua's
+ * '(b)?c' is a capture and a literal '?'. %f[set] is the frontier, the edges
+ * of the subject counting as \0. %b and the back-references %1-%9 have no
+ * translation and throw, so resolve() refuses them at load time. The RegExp
+ * matches bytes, as Lua does: the pattern is translated from its UTF-8 bytes,
+ * every class is spelled out over the 256 byte values, and the subject must
+ * be passed through luaBytes (pathMatches does), so '.' is any one byte, line
+ * terminators included.
  */
 const luaPatternCache = new Map<string, RegExp>();
 export function luaPatternToRegExp(pattern: string): RegExp {
@@ -192,56 +290,80 @@ export function luaPatternToRegExp(pattern: string): RegExp {
   const perr = patternError(pattern);
   if (perr) throw new Error(`malformed Lua pattern ${pattern}: ${perr}`);
   const p = luaBytes(pattern);
+  const n = p.length;
   let out = "";
   let i = 0;
-  const n = p.length;
-  const classFor = (k: string, inSet: boolean): string => {
-    const body = LUA_CLASSES[k];
-    if (body !== undefined) return inSet ? body : "[" + body + "]";
-    if (/[A-Za-z0-9]/.test(k)) throw new Error(`unsupported Lua class %${k} in ${pattern}`);
-    return "\\" + k; // escaped punctuation (or a byte past ASCII) is a literal in both
-  };
+  if (p[0] === "^") {
+    out += "^";
+    i = 1;
+  }
   while (i < n) {
     const c = p[i];
-    if (c === "%") {
-      out += classFor(p[i + 1], false);
-      i += 2;
-    } else if (c === "[") {
-      // copy the set through to its closing ']', translating what is inside
-      let j = i + 1;
-      let set = "[";
-      if (p[j] === "^") { set += "^"; j++; }
-      if (p[j] === "]") { set += "\\]"; j++; }
-      while (p[j] !== "]") {
-        const e = p[j];
-        if (e === "%") {
-          set += classFor(p[j + 1], true);
-          j += 2;
-        } else {
-          if ("\\[".includes(e)) set += "\\" + e;
-          else set += e; // '-' stays a range, '^' inside stays literal for JS too
-          j++;
-        }
-      }
-      out += set + "]";
-      i = j + 1;
-    } else if (c === "-") {
-      out += "*?";
+    if (c === "(" || c === ")") {
+      out += c; // '()' is Lua's position capture: an empty group matches the same
       i++;
-    } else if ("\\{}|".includes(c)) {
-      out += "\\" + c; // literal in Lua, special in JS
-      i++;
-    } else if (c === ".") {
-      out += "[\\s\\S]";
-      i++;
-    } else {
-      out += c; // ^ $ * + ? ( ) mean the same in both for this subset
-      i++;
+      continue;
     }
+    if (c === "$" && i + 1 === n) {
+      out += "$";
+      i++;
+      continue;
+    }
+    let m: Bytes;
+    let next: number;
+    if (c === "%") {
+      const k = p[i + 1];
+      if (k === "b") throw new Error("%b (balanced match) is not supported on this adapter");
+      if (k >= "0" && k <= "9") throw new Error(`back-reference %${k} is not supported on this adapter`);
+      if (k === "f") {
+        const [f, after] = setMembers(p, i + 2);
+        const not = f.map((x) => !x);
+        // the character before is not in the set and the one here is; past
+        // either edge of the subject Lua reads \0
+        out += f[0] ? `(?<=${classOf(not)})` : `(?<!${classOf(f)})`;
+        out += f[0] ? `(?!${classOf(not)})` : `(?=${classOf(f)})`;
+        i = after;
+        continue;
+      }
+      const cl = p.charCodeAt(i + 1);
+      m = members((x) => matchClass(x, cl));
+      next = i + 2;
+    } else if (c === "[") {
+      [m, next] = setMembers(p, i);
+    } else if (c === ".") {
+      m = members(() => true);
+      next = i + 1;
+    } else {
+      m = members((x) => x === p.charCodeAt(i));
+      next = i + 1;
+    }
+    const count = m.reduce((k, x) => k + (x ? 1 : 0), 0);
+    let atom = count === 1 ? literal(m.indexOf(true)) : classOf(m);
+    const q = p[next];
+    if (q === "*" || q === "+" || q === "?") {
+      atom += q;
+      next++;
+    } else if (q === "-") {
+      atom += "*?";
+      next++;
+    }
+    out += atom;
+    i = next;
   }
   const re = new RegExp(out);
   luaPatternCache.set(pattern, re);
   return re;
+}
+
+/** Why a watch path cannot be matched on this adapter (luaPatternToRegExp
+ *  throws for it), in the form pathMatches uses; null when it can. */
+export function pathPatternError(pattern: string, caseSensitive?: boolean): string | null {
+  try {
+    luaPatternToRegExp(caseSensitive === true ? pattern : foldPattern(pattern));
+    return null;
+  } catch (e) {
+    return e instanceof Error ? e.message : String(e);
+  }
 }
 
 // Port of canonical_path() in core/rules.lua: watch paths match the path the
@@ -297,9 +419,23 @@ export function pathMatches(path: string, patterns: string[] | undefined, caseSe
   return null;
 }
 
+// Port of text_matches() in core/rules.lua. Every pattern is run and its
+// matches walked, and the latest MAX_SPANS spans in the text are kept: the
+// first pattern's first match alone let a harmless decoy before the attack
+// take the window's hit half, and the attack was cut out of the judged text.
+// After WALK matches of one pattern the walk skips halfway to the end of the
+// text (the later matches are the ones kept), so a text full of matches
+// costs a bounded number of calls. Returns the first pattern in list order
+// that matched (the reason names it) and the spans, at most MAX_SPANS, the
+// latest in the text, in text order (none when no match gave a span). A
+// matcher that throws counts that pattern as a hit with no span, logged once
+// per pattern: the prefilter fails toward judging, never into a silent miss.
+export const MAX_SPANS = 8;
+const WALK = 64;
+type Span = [number, number];
 let warned = false;
 const badPatterns = new Set<string>();
-function textMatches(s: string, patterns: string[] | undefined, ctx: RulesCtx | undefined): [string, number?, number?] | null {
+function textMatches(s: string, patterns: string[] | undefined, ctx: RulesCtx | undefined): [string, Span[]?] | null {
   if (!patterns || patterns.length === 0) return null;
   const reFind = ctx?.re_find;
   if (!reFind) {
@@ -309,23 +445,45 @@ function textMatches(s: string, patterns: string[] | undefined, ctx: RulesCtx | 
     }
     return null;
   }
+  const n = byteLength(s);
+  let hit: string | undefined;
+  const all: Span[] = [];
   for (const p of patterns) {
-    try {
-      const hit = reFind(s, p);
-      if (Array.isArray(hit)) return [p, hit[0], hit[1]];
-      if (hit) return [p];
-    } catch (e) {
-      // a pattern the engine rejects is skipped, like pcall in Lua, but an
-      // operator should hear about it once instead of losing the prefilter silently
-      if (!badPatterns.has(p)) {
-        badPatterns.add(p);
-        const msg = `jev-edge: always_suspect pattern ${JSON.stringify(p)} does not compile and is skipped: ${e instanceof Error ? e.message : String(e)}`;
-        if (ctx?.log) ctx.log("warn", msg);
-        else console.warn(msg);
+    const mine: Span[] = [];
+    let init = 1;
+    let walked = 0;
+    while (init <= n) {
+      let r: ReturnType<NonNullable<RulesCtx["re_find"]>>;
+      try {
+        r = reFind(s, p, init);
+      } catch (e) {
+        // a pattern the engine refuses, or a match it cannot finish, is a
+        // hit (as a failed ngx.re.find is in Lua), and the operator hears
+        // about it once
+        if (!badPatterns.has(p)) {
+          badPatterns.add(p);
+          const msg = `jev-edge: always_suspect pattern ${p} failed (${e instanceof Error ? e.message : String(e)}); it counts as a hit`;
+          if (ctx?.log) ctx.log("warn", msg);
+          else console.warn(msg);
+        }
+        hit ??= p;
+        break;
       }
+      if (!r) break;
+      hit ??= p;
+      if (!Array.isArray(r) || typeof r[0] !== "number" || typeof r[1] !== "number" || r[0] < init) break;
+      mine.push([r[0], r[1]]);
+      if (mine.length > MAX_SPANS) mine.shift();
+      init = Math.max(r[0], r[1]) + 1;
+      walked++;
+      if (walked % WALK === 0) init = Math.max(init, Math.floor((init + n) / 2));
     }
+    all.push(...mine);
   }
-  return null;
+  if (hit === undefined) return null;
+  if (all.length === 0) return [hit];
+  all.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  return [hit, all.slice(-MAX_SPANS)];
 }
 
 /** Port of rules.content_type: the Content-Type as one string; a repeated
@@ -364,7 +522,7 @@ function ctWatched(ct: string, rule: Rule): boolean | "media" {
   const skip = rule.skip_content_types ?? SKIP_CONTENT_TYPES;
   let any = false;
   for (const raw of c.split(",")) {
-    const v = raw.replace(/^[ \t\n\v\f\r]+|[ \t\n\v\f\r]+$/g, "");
+    const v = trim(raw);
     if (v === "") continue;
     any = true;
     if (!skip.some((sk) => v.startsWith(sk))) return true;
@@ -375,10 +533,12 @@ function ctWatched(ct: string, rule: Rule): boolean | "media" {
 const CT_NOT_WATCHED = "content-type not watched";
 
 // The body's size as core counts it: the larger of what the adapter declared
-// and what it handed over (bytes, like Lua's #body).
+// and what it handed over (bytes as read, like Lua's #body: body_bytes when
+// the adapter gave it).
 function bodySize(req: Req): number {
   const declared = Number(req.body_size);
-  return Math.max(Number.isFinite(declared) ? declared : 0, typeof req.body === "string" ? byteLength(req.body) : 0);
+  const given = typeof req.body !== "string" ? 0 : typeof req.body_bytes === "number" ? req.body_bytes : byteLength(req.body);
+  return Math.max(Number.isFinite(declared) ? declared : 0, given);
 }
 
 // Port of json_only_miss() in core/rules.lua: a json_only_paths path is
@@ -404,21 +564,113 @@ function jsonOnlyMiss(req: Req, rule: Rule, ct: string, ctx: RulesCtx | undefine
   return [ex[1] !== "json" && ex[1] !== "scan", ex];
 }
 
+// PCRE without UTF (ngx.re "ijo", lrexlib) reads the pattern and the
+// subject as bytes. Both run here as one code unit per UTF-8 byte: ASCII as
+// it is, and a byte 0x80-0xFF as U+E080-U+E0FF (pcreBytes), code points with
+// no case mapping, so the 'i' flag folds ASCII letters alone, as PCRE's
+// C-locale tables do. (As U+0080-U+00FF, 'i' would fold U+00C3 with U+00E3,
+// and a pattern 'é', C3 A9, would match the lead bytes of a CJK character.)
+const PCRE_HIGH = 0xe000;
+function pcreBytes(s: string): string {
+  if (!/[^\x00-\x7f]/.test(s)) return s;
+  const b = utf8Bytes(s);
+  const u = new Uint16Array(b.length);
+  for (let i = 0; i < b.length; i++) u[i] = b[i] < 0x80 ? b[i] : PCRE_HIGH + b[i];
+  let out = "";
+  for (let i = 0; i < u.length; i += 8192) out += String.fromCharCode(...u.subarray(i, i + 8192));
+  return out;
+}
+
+// A byte value as a RegExp escape for the code unit pcreBytes gives it.
+function byteEscape(b: number): string {
+  return b < 0x80 ? "\\x" + b.toString(16).padStart(2, "0") : "\\u" + (PCRE_HIGH + b).toString(16);
+}
+
+// PCRE's \s without UTF or UCP: the six ASCII spaces only; and its complement
+// spelled out over the 256 byte values, for use inside a class.
+const PCRE_SPACE = "\\t\\n\\v\\f\\r ";
+const PCRE_NOT_SPACE = "\\x00-\\x08\\x0e-\\x1f\\x21-\\x7f" + byteEscape(0x80) + "-" + byteEscape(0xff);
+
+/**
+ * A PCRE pattern as a RegExp that matches a subject converted by pcreBytes
+ * the way PCRE without the UTF flag matches bytes. The pattern goes through
+ * pcreBytes too, so a non-ASCII literal is its bytes, in a class and under a
+ * quantifier as PCRE reads it, and a hex escape (\xhh, \x{hh}) names a byte
+ * (past \xff it is refused, as PCRE refuses it). `\s` and `\S` are the ASCII
+ * spaces and the rest, in a class too (JS's `\s` also takes U+00A0, U+3000
+ * and more), `.` is any byte but \n (JS's stops at \r too), and a ']' first
+ * in a class is a member, as in PCRE. `\w`, `\d` and `\b` are ASCII in both
+ * already, and other syntax is left as it is.
+ */
+export function pcreToRegExp(pattern: string, flags = "i"): RegExp {
+  const p = pcreBytes(pattern);
+  let out = "";
+  let inClass = false;
+  for (let i = 0; i < p.length; i++) {
+    const c = p[i];
+    if (c === "\\") {
+      const d = p[i + 1];
+      i++;
+      if (d === "s") out += inClass ? PCRE_SPACE : "[" + PCRE_SPACE + "]";
+      else if (d === "S") out += inClass ? PCRE_NOT_SPACE : "[^" + PCRE_SPACE + "]";
+      else if (d === "x") {
+        // \xhh (one or two hex digits) or \x{h...}; PCRE2 refuses the rest
+        const m = /^\{([0-9a-fA-F]+)\}/.exec(p.slice(i + 1)) ?? /^([0-9a-fA-F]{1,2})/.exec(p.slice(i + 1));
+        if (!m) throw new SyntaxError(`digits missing after \\x: ${pattern}`);
+        const v = parseInt(m[1], 16);
+        if (v > 0xff) throw new SyntaxError(`character code point value in \\x{} is too large: ${pattern}`);
+        i += m[0].length;
+        out += byteEscape(v);
+      } else if (d === undefined) out += "\\";
+      else out += "\\" + d;
+    } else if (inClass) {
+      if (c === "]") inClass = false;
+      out += c;
+    } else if (c === "[") {
+      inClass = true;
+      out += c;
+      if (p[i + 1] === "^") out += p[++i];
+      // a ']' first in the class is a member in PCRE; JS would close it
+      if (p[i + 1] === "]") {
+        out += "\\]";
+        i++;
+      }
+    } else if (c === ".") {
+      out += "[^\\n]";
+    } else {
+      out += c;
+    }
+  }
+  return new RegExp(out, flags);
+}
+
 /**
  * Case-insensitive regex search with the same contract the OpenResty adapter
- * gives core: the 1-based inclusive UTF-8 byte span of the first match.
+ * gives core (ngx.re.find with "ijo": PCRE without UTF): the 1-based
+ * inclusive UTF-8 byte span of the first match at or after byte `init` (1
+ * when undefined). The pattern runs over the
+ * subject's bytes (pcreBytes, pcreToRegExp), so `.`, `\b` and `{m,n}` count
+ * bytes as PCRE does, and the match index is the byte offset.
  */
 const reCache = new Map<string, RegExp>();
-export function reFind(subject: string, pattern: string): readonly [number, number] | null {
+let lastSubject: string | undefined;
+let lastBytes = "";
+export function reFind(subject: string, pattern: string, init?: number): readonly [number, number] | null {
   let re = reCache.get(pattern);
   if (!re) {
-    re = new RegExp(pattern, "i");
+    re = pcreToRegExp(pattern, "gi");
     reCache.set(pattern, re);
   }
-  const m = re.exec(subject);
+  // every always_suspect pattern runs over the same text: convert it once
+  if (subject !== lastSubject) {
+    lastSubject = subject;
+    lastBytes = pcreBytes(subject);
+  }
+  // the search starts at byte init, as ngx.re.find's ctx.pos
+  re.lastIndex = init !== undefined && init > 1 ? init - 1 : 0;
+  const m = re.exec(lastBytes);
   if (!m) return null;
-  const from = byteLength(subject.slice(0, m.index)) + 1;
-  return [from, from + byteLength(m[0]) - 1];
+  return [m.index + 1, m.index + m[0].length];
 }
 
 const untrustedOn = (rule: Rule, ctx: RulesCtx | undefined) => untrustedSpec(ctx?.config, rule).enabled === true;
@@ -458,7 +710,7 @@ function toolsPart(values: string[], cut: boolean, rule: Rule, ctx: RulesCtx | u
   const ttext = values.join("\n");
   if (ttext === "") return undefined;
   const hit = textMatches(ttext, rule.always_suspect, ctx);
-  const [w, windowed] = window(ttext, values, rule.max_judge_bytes ?? MAX_JUDGE_BYTES, hit?.[1], hit?.[2]);
+  const [w, windowed] = window(ttext, values, rule.max_judge_bytes ?? MAX_JUDGE_BYTES, hit?.[1]);
   return { text: w, windowed: windowed || cut, hit: hit?.[0] };
 }
 
@@ -499,10 +751,13 @@ async function judged(
   if (size > max) {
     let hd = req.body_head ?? undefined;
     let tl = req.body_tail ?? undefined;
+    // the body fits in its head and tail: the tail starts where the head
+    // ends, and a value cut between them is read whole
+    let joined = size <= max + TAIL_BYTES;
     if (hd === undefined && typeof req.body === "string") {
       hd = head(req.body, max);
       const rest = req.body.slice(hd.length);
-      if (rest !== "") tl = tail(rest, TAIL_BYTES);
+      if (rest !== "") tl = joined ? rest : tail(rest, TAIL_BYTES);
     }
     if (media && !(hd !== undefined && isText(hd))) return { text: "", unj: CT_NOT_WATCHED };
     if (hd === undefined) return { text: "", unj: "unjudgeable: body too large" };
@@ -512,8 +767,15 @@ async function judged(
     const keys = fieldKeys(rule.text_fields);
     const deep = deepKeys(rule.text_fields);
     const found = { tokens: false };
-    values = scanStrings(hd, keys, [], deep, found);
-    if (tl !== undefined) scanStrings(tl, keys, values, deep, found);
+    // head and tail joined are one string to scan; apart, the tail starts
+    // inside a value it has only the end of (g1-chunk-seams-window-math#6)
+    joined = joined && tl !== undefined;
+    if (joined) {
+      values = scanStrings(hd + tl, keys, [], deep, found);
+    } else {
+      values = scanStrings(hd, keys, [], deep, found);
+      if (tl !== undefined) scanStrings(tl, keys, values, deep, found, { tail: true });
+    }
     tokens = found.tokens;
     if (values.length === 0 && !tokens) return { text: "", unj: "unjudgeable: body too large" };
     text = values.join("\n");
@@ -521,8 +783,8 @@ async function judged(
     retrieved = untrustedOn(rule, ctx);
     if (hasToolFields(rule)) {
       const tkeys = fieldKeys(rule.tool_fields);
-      const tvalues = scanTools(hd, tkeys, []);
-      if (tl !== undefined) scanTools(tl, tkeys, tvalues);
+      const tvalues = scanTools(joined ? hd + tl : hd, tkeys, []);
+      if (tl !== undefined && !joined) scanTools(tl, tkeys, tvalues);
       tools = toolsPart(tvalues, true, rule, ctx);
     }
   } else {
@@ -534,6 +796,7 @@ async function judged(
     tokens = ids === true;
     if (media && (kind === "binary" || kind === "none")) return { text: "", unj: CT_NOT_WATCHED };
     if (kind === "binary") return { text: "", unj: "unjudgeable: binary body" };
+    if (kind === "boundaries") return { text: "", unj: "unjudgeable: multipart boundaries" };
     // declared JSON the decoder refused, with no text-field value to scan
     if (kind === "invalid") return { text: "", unj: "unjudgeable: invalid json" };
     // a "**" field hit its bound: the text is not all there
@@ -560,20 +823,46 @@ async function judged(
   const budget = rule.max_judge_bytes ?? MAX_JUDGE_BYTES;
   const maxc = Math.floor(Number(rule.max_judge_chunks ?? 1)) || 1;
   if (maxc > 1 && byteLength(text) > budget) {
-    // port of the chunked branch of judged() in core/rules.lua
-    const [pieces, starts] = splitChunks(text, budget);
-    if (pieces.length <= maxc) return { text: pieces.join("\n"), hit: hit?.[0], windowed: partial, chunks: pieces, capped: false, untrusted, tools, bound, retrieved, tokens };
-    const firstKept = pieces.length - (maxc - 1); // 0-based
-    const tb = utf8Bytes(text);
-    let older = new TextDecoder().decode(tb.subarray(0, starts[firstKept] - 1));
-    if (older.endsWith("\n")) older = older.slice(0, -1);
-    const olderLen = byteLength(older);
-    const inside = hit?.[1] !== undefined && hit?.[2] !== undefined && hit[2] <= olderLen;
-    const [win] = window(older, [older], budget, inside ? hit![1] : undefined, inside ? hit![2] : undefined);
-    const out = [win, ...pieces.slice(firstKept)];
-    return { text: out.join("\n"), hit: hit?.[0], windowed: true, chunks: out, capped: true, untrusted, tools, bound, retrieved, tokens };
+    // port of the chunked branch of judged() in core/rules.lua: consecutive
+    // chunks share chunkOverlap bytes; text up to budget + (maxc - 1) x
+    // (budget - overlap) bytes is judged in full (cut hard when the newline
+    // cuts take more than maxc pieces), longer text is capped
+    const overlap = chunkOverlap(budget);
+    const capacity = budget + (maxc - 1) * (budget - overlap);
+    const textLen = byteLength(text);
+    let [pieces, starts] = splitChunks(text, budget, overlap);
+    if (pieces.length > maxc && textLen <= capacity) [pieces, starts] = splitChunks(text, budget, overlap, true);
+    let out = pieces;
+    let capped = false;
+    const covered: Span[] = [];
+    const spans = hit?.[1] ?? [];
+    if (pieces.length <= maxc) {
+      for (let k = 0; k < pieces.length; k++) covered.push([starts[k], starts[k] + byteLength(pieces[k]) - 1]);
+    } else {
+      const firstKept = pieces.length - (maxc - 1); // 0-based
+      const tb = utf8Bytes(text);
+      let older = new TextDecoder().decode(tb.subarray(0, starts[firstKept] - 1));
+      if (older.endsWith("\n")) older = older.slice(0, -1);
+      const olderLen = byteLength(older);
+      const inside = spans.filter(([, z]) => z <= olderLen);
+      const [win] = window(older, [older], budget, inside);
+      out = [win];
+      capped = true;
+      // the window holds the hits that were inside what it covers
+      covered.push(...inside);
+      for (let k = firstKept; k < pieces.length; k++) {
+        out.push(pieces[k]);
+        covered.push([starts[k], starts[k] + byteLength(pieces[k]) - 1]);
+      }
+    }
+    // backstop: a hit longer than the overlap can still straddle a cut;
+    // such hits and up to HIT_CONTEXT bytes each side are judged as a part
+    // of their own, the way window() keeps them
+    const straddle = spans.filter(([f, t]) => !covered.some(([a, z]) => a <= f && t <= z));
+    if (straddle.length > 0) out = [window(text, [], budget, straddle)[0], ...out];
+    return { text: out.join("\n"), hit: hit?.[0], windowed: capped || partial, chunks: out, capped, untrusted, tools, bound, retrieved, tokens };
   }
-  const [w, cut] = window(text, values, budget, hit?.[1], hit?.[2]);
+  const [w, cut] = window(text, values, budget, hit?.[1]);
   return { text: w, hit: hit?.[0], windowed: cut || partial, untrusted, tools, bound, retrieved, tokens };
 }
 
@@ -595,6 +884,21 @@ export async function judgedText(req: Req, rule: Rule | undefined, ctx?: RulesCt
   return r.text;
 }
 
+// Port of ip_rep_on in core/rules.lua: does the evaluating config block by
+// IP reputation? true when there is no config to ask (rules-only callers).
+function ipRepOn(ctx: RulesCtx): boolean {
+  const cfg = ctx.config;
+  if (typeof cfg !== "object" || cfg === null) return true;
+  const v = cfg.async?.rep_block_after;
+  const n = typeof v === "number" || typeof v === "string" ? Number(v) : 0;
+  return (Number.isNaN(n) ? 0 : n) > 0;
+}
+
+/** Port of rules.ip_key: the key IP reputation counts `ip` under (rep:<key>) and subject.from = "ip" hashes: IPv6 aggregated to cfg.client_ip.ipv6_prefix bits (64 when unset). */
+export function ipKey(ip: string, cfg?: { client_ip?: { ipv6_prefix?: number } } | null): string {
+  return normalizeIpKey(ip, cfg?.client_ip?.ipv6_prefix);
+}
+
 /** The result, text, reason, windowed, chunks, capped, untrusted, tools, retrieved, and tokens (see rules.evaluate in core/rules.lua). */
 export async function evaluate(
   req: Req, rule: Rule, ctx?: RulesCtx,
@@ -607,9 +911,11 @@ export async function evaluate(
   if (miss) return [PASS, "", NOT_JSON];
 
   // 2. reputation, before anything that needs a body. It only ever blocks:
-  //    safe verdicts earn an IP nothing (see core/rules.lua)
-  if (ctx?.cache && req.client_ip) {
-    const rep = (await ctx.cache.get("rep:" + req.client_ip)) as { blocked_until?: number } | undefined;
+  //    safe verdicts earn an IP nothing (see core/rules.lua); and only under
+  //    a config that blocks by IP (async.rep_block_after > 0), since the rep:
+  //    records are shared by every route on the store
+  if (ctx?.cache && req.client_ip && ipRepOn(ctx)) {
+    const rep = (await ctx.cache.get("rep:" + ipKey(req.client_ip, ctx.config))) as { blocked_until?: number } | undefined;
     if (rep && typeof rep === "object") {
       const now = ctx.clock ? ctx.clock() : 0;
       if (rep.blocked_until !== undefined && rep.blocked_until > now) return [BLOCK, "", "ip reputation"];
@@ -681,7 +987,8 @@ export async function evaluate(
 /**
  * Port of rules.rule_for: the first rule whose path (json_only_paths
  * included), method and content type all match. `ctx.json_decode`, as
- * evaluateAll had it, decides a json_only_paths path (JSON.parse without one).
+ * evaluateAll had it, decides a json_only_paths path (normalize.jsonDecode
+ * without one).
  */
 export function ruleFor(req: Req, rules: Rule[] | undefined, ctx?: Pick<RulesCtx, "json_decode">): Rule | undefined {
   const ct = contentType(req.headers);

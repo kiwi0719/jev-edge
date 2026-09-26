@@ -20,6 +20,38 @@ describe("subject extraction and hashing", function()
       { header = function() return "  " end }))
   end)
 
+  it("trims a header or cookie with a long whitespace run in linear time (lead-openresty-runtime#20)", function()
+    local run = string.rep(" ", 32 * 1024)
+    local view = { header = function() return "k" .. run .. "x" .. run end,
+                   cookie_header = "sid=k" .. run .. "x" .. run }
+    local kept = "k" .. run .. "x"
+    for _, c in ipairs({ { { enabled = true, from = "header", name = "x-api-key", hashed = true }, {} },
+                         { { enabled = true, from = "header", name = "x-api-key" }, { kept } },
+                         -- the credentials after the scheme, which one space now separates
+                         { { enabled = true, from = "header", name = "authorization" }, { "k x" } },
+                         { { enabled = true, from = "cookie", name = "sid", hashed = true }, {} },
+                         { { enabled = true, from = "cookie", name = "sid" }, { kept } } }) do
+      local t0 = os.clock()
+      local out = subject.extract_all(c[1], view)
+      local ms = (os.clock() - t0) * 1000
+      assert.same(c[2], out, "longer than MAX_VALUE_BYTES once trimmed, hashed")
+      assert.is_true(ms < 50, ("%s took %.1f ms"):format(c[1].name, ms))
+    end
+  end)
+
+  -- lead-gateways-live#21: an IPv6 client is its network, as IP reputation
+  -- counts it; the same cases are in adapters/js/test/core.test.ts
+  it("keys from = ip by the IPv6 network, IPv4 and mapped IPv4 as the address", function()
+    local s = { enabled = true, from = "ip", salt = "pepper" }
+    local net = "2001:0db8:0000:0000:0000:0000:0000:0000/64"
+    assert.equals(net, subject.extract(s, { ip = "2001:db8::1" }))
+    assert.equals(net, subject.extract(s, { ip = "2001:DB8:0:0:ffff::9" }))
+    assert.equals("2001:0db8:0000:0000:0000:0000:0000:0001/128",
+      subject.extract(s, { ip = "2001:db8::1", ipv6_prefix = 128 }))
+    assert.equals("203.0.113.7", subject.extract(s, { ip = "::ffff:203.0.113.7" }))
+    assert.equals("203.0.113.7", subject.extract(s, { ip = "203.0.113.7" }))
+  end)
+
   it("hashes with the salt and never exposes the raw value", function()
     local id = subject.hash_id({ from = "header", salt = "pepper" }, "key-1", hash)
     assert.equals("header:H(pepper\0key-1)", id)
@@ -27,10 +59,116 @@ describe("subject extraction and hashing", function()
     assert.equals("header:abc123", subject.hash_id({ hashed = true }, "header:abc123", hash))
     assert.is_nil(subject.hash_id({ hashed = true }, "not a hash; drop table", hash),
       "hashed = true only accepts our own id shape")
-    assert.is_nil(subject.extract({ enabled = true, from = "header", name = "x" },
-      { header = function() return string.rep("k", 600) end }), "oversize values are dropped")
+    local long = { header = function() return string.rep("k", 600) end }
+    local v, why = subject.extract({ enabled = true, from = "header", name = "x", hashed = true }, long)
+    assert.is_nil(v, "an oversize id is dropped")
+    assert.equals(subject.TOO_LONG, why)
+    assert.equals(string.rep("k", 600), subject.extract({ enabled = true, from = "header", name = "x" }, long))
     assert.equals("cookie:abc", subject.hash_id({ from = "header", hashed = true }, "cookie:abc", hash))
     assert.is_nil(subject.hash_id({ from = "ip", salt = "x" }, nil, hash))
+  end)
+
+  -- g1-subject-id-evasion#3: MAX_VALUE_BYTES bounds only a value that is the
+  -- id (hashed = true); a salted value is hashed, up to MAX_SALTED_BYTES. The
+  -- same cases are in adapters/js/test/subject.test.ts.
+  it("hashes a long bearer token or cookie in salted mode, and drops it when it is the id", function()
+    local bearer = "Bearer eyJ" .. string.rep("a", 562)
+    assert.equals(572, #bearer)
+    local cookie = "sid=" .. string.rep("c", 4096)
+    local hcfg = { enabled = true, from = "header", name = "authorization", salt = "pepper" }
+    local ccfg = { enabled = true, from = "cookie", name = "sid", salt = "pepper" }
+    local hv = subject.extract(hcfg, { header = function() return bearer end })
+    assert.equals("bearer eyJ" .. string.rep("a", 562), hv)
+    assert.equals("header:H(pepper\0" .. hv .. ")", subject.hash_id(hcfg, hv, hash))
+    local cv = subject.extract_all(ccfg, { cookie_header = cookie })
+    assert.same({ string.rep("c", 4096) }, cv)
+    -- past MAX_SALTED_BYTES: dropped, and said so
+    local all, why = subject.extract_all(ccfg, { cookie_header = "sid=" .. string.rep("c", 65537) })
+    assert.same({}, all)
+    assert.equals(subject.TOO_LONG, why)
+    -- with hashed = true the value is the id: 512 bytes at most
+    for _, c in ipairs({ { hcfg, { header = function() return bearer end } }, { ccfg, { cookie_header = cookie } } }) do
+      local h = { enabled = true, from = c[1].from, name = c[1].name, hashed = true }
+      local v, w = subject.extract(h, c[2])
+      assert.is_nil(v)
+      assert.equals(subject.TOO_LONG, w)
+    end
+    -- a scheme padded past 512 bytes is the unpadded credential
+    local padded = subject.extract(hcfg, { header = function() return "Bearer" .. string.rep(" ", 510) .. "tok" end })
+    assert.equals("bearer tok", padded)
+    assert.equals(subject.extract(hcfg, { header = function() return "Bearer tok" end }), padded)
+    local _, none = subject.extract_all(hcfg, { header = function() return "Bearer tok" end })
+    assert.is_nil(none)
+  end)
+
+  -- The same table is in adapters/js/test/subject.test.ts: both cores must
+  -- give these candidates, so a Worker and its origin agree on the ids.
+  local COOKIES = {
+    { "SID=x; sid=REAL", { "REAL" } },                       -- names are case-sensitive
+    { "sid=x; sid=REAL", { "x", "REAL" } },                  -- duplicates: every one
+    { "sid=REAL; sid=x", { "REAL", "x" } },
+    { { "sid=REAL", "sid=x" }, { "REAL", "x" } },            -- the header sent twice
+    { 'sid="REAL"', { "REAL" } },                            -- one pair of DQUOTEs stripped
+    { 'sid="RE\\AL"', { "RE\\AL", "REAL" } },                 -- and the unescaped form
+    { 'sid="\\122EAL"', { "\\122EAL", "REAL" } },             -- octal escape
+    { 'sid="\\351t\\351"', { "\\351t\\351", "\195\169t\195\169" } }, -- a code point past ASCII, UTF-8
+    { " sid = REAL ;other=1", { "REAL" } },
+    { "sid=; sid=\"\"; foo=REAL", {} },
+    { "sid=a; sid=b; sid=c; sid=d; sid=e; sid=f", { "a", "b", "e", "f" } },   -- capped: first two, last two
+  }
+
+  it("reads every value a Cookie header gives the name, as the backend may (g1-subject-id-evasion#1)", function()
+    local scfg = { enabled = true, from = "cookie", name = "sid", salt = "pepper" }
+    for _, c in ipairs(COOKIES) do
+      assert.same(c[2], subject.cookie_values(c[1], "sid"))
+      assert.same(c[2], subject.extract_all(scfg, { cookie_header = c[1] }))
+      local ids = subject.hash_ids(scfg, subject.extract_all(scfg, { cookie_header = c[1] }), hash)
+      assert.equals(#c[2], #ids)
+      if c[2][1] then assert.equals("cookie:H(pepper\0" .. c[2][1] .. ")", ids[1]) end
+    end
+    -- whoever the backend picks, REAL is among the ids once it is sent
+    local real = subject.hash_id(scfg, "REAL", hash)
+    for _, h in ipairs({ "SID=x; sid=REAL", "sid=x; sid=REAL", "sid=REAL; sid=x", 'sid="REAL"' }) do
+      local ids = subject.hash_ids(scfg, subject.extract_all(scfg, { cookie_header = h }), hash)
+      local found = false
+      for _, id in ipairs(ids) do found = found or id == real end
+      assert.is_true(found, h)
+    end
+    -- an older adapter's single value still works
+    assert.same({ "s-9" }, subject.extract_all(scfg, { cookie = function() return "s-9" end }))
+  end)
+
+  -- The same table is in adapters/js/test/subject.test.ts.
+  local AUTH = {
+    { "Bearer k", "bearer k" }, { "bearer k", "bearer k" }, { "BEARER k", "bearer k" },
+    { "Bearer  k", "bearer k" }, { "Bearer\tk", "bearer k" }, { " Bearer \t k ", "bearer k" },
+    { "Bearer K", "bearer K" },                       -- the credentials are kept byte for byte
+    { "Basic QWxhZGRpbjpvcGVu", "basic QWxhZGRpbjpvcGVu" },
+    { "sk-no-scheme", "sk-no-scheme" },               -- no scheme: as is
+    { "Digest a=1,  b=2", "digest a=1,  b=2" },
+  }
+
+  it("canonicalises the scheme of Authorization and Proxy-Authorization (g1-subject-id-evasion#4)", function()
+    for _, name in ipairs({ "authorization", "Authorization", "proxy-authorization", "Proxy-Authorization" }) do
+      local scfg = { enabled = true, from = "header", name = name, salt = "pepper" }
+      for _, c in ipairs(AUTH) do
+        assert.equals(c[2], subject.extract(scfg, { header = function() return c[1] end }), name .. " " .. c[1])
+      end
+      local one = subject.hash_id(scfg, subject.extract(scfg, { header = function() return "Bearer k" end }), hash)
+      for _, v in ipairs({ "bearer k", "BEARER k", "Bearer  k", "Bearer\tk" }) do
+        assert.equals(one, subject.hash_id(scfg, subject.extract(scfg, { header = function() return v end }), hash))
+      end
+    end
+    -- any other header is kept as sent
+    assert.equals("Bearer  K", subject.extract({ enabled = true, from = "header", name = "x-api-key" },
+      { header = function() return "Bearer  K" end }))
+  end)
+
+  it("ids_of: id first, then the distinct ids, at most MAX_IDS", function()
+    assert.same({}, subject.ids_of({ subject = { ids = { "a" } } }))
+    assert.same({ "a" }, subject.ids_of({ subject = { id = "a" } }))
+    assert.same({ "a", "b", "c", "d" },
+      subject.ids_of({ subject = { id = "a", ids = { "a", "b", "", 7, "b", "c", "d", "e" } } }))
   end)
 
   it("keeps a bounded history in the store", function()

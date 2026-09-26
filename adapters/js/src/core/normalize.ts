@@ -14,6 +14,18 @@ export function byteLength(s: string): number {
 }
 
 /**
+ * `s` as Lua and PCRE without UTF see it: one character (U+0000..U+00FF) per
+ * UTF-8 byte. ASCII comes back as it is.
+ */
+export function byteString(s: string): string {
+  if (!/[^\x00-\x7f]/.test(s)) return s;
+  const b = enc.encode(s);
+  let out = "";
+  for (let i = 0; i < b.length; i += 8192) out += String.fromCharCode(...b.subarray(i, i + 8192));
+  return out;
+}
+
+/**
  * Truncate to at most n UTF-8 bytes on a code point boundary: the output
  * never exceeds n bytes and never contains a U+FFFD from a split code point
  * (the partial code point is dropped). Lua's `s:sub(1, n)` keeps the partial
@@ -186,6 +198,91 @@ export function fold(s: string): string {
   return asciiLower(s).replace(/\u017F/g, "s").replace(/\u212A/g, "k");
 }
 
+// Lua's %s: space, \t, \n, \v, \f, \r (String.prototype.trim also strips
+// Unicode spaces, which Lua keeps).
+function luaSpace(c: number): boolean {
+  return c === 32 || (c >= 9 && c <= 13);
+}
+
+/**
+ * Port of trim() in core/normalize.lua: s without Lua's %s at either end.
+ * Linear: /^[ \t\n\v\f\r]+|[ \t\n\v\f\r]+$/g tries the second branch at
+ * every position of a whitespace run inside the value and scans the run to
+ * its end each time, which costs its length squared.
+ */
+export function trim(s: string): string {
+  let i = 0, j = s.length;
+  while (i < j && luaSpace(s.charCodeAt(i))) i++;
+  while (j > i && luaSpace(s.charCodeAt(j - 1))) j--;
+  return i === 0 && j === s.length ? s : s.slice(i, j);
+}
+
+// Port of hextets(): the 16-bit groups on one side of "::", or null when a
+// group is not 1 to 4 hex digits.
+function hextets(part: string): number[] | null {
+  if (part === "") return [];
+  const out: number[] = [];
+  for (const g of part.split(":")) {
+    if (!/^[0-9a-fA-F]{1,4}$/.test(g)) return null;
+    out.push(parseInt(g, 16));
+  }
+  return out;
+}
+
+/**
+ * Port of normalize.ip_key: the key one client address is counted under
+ * (IP reputation rep:<key>, subject.from = "ip"). IPv6 is aggregated to its
+ * first `prefix` bits (client_ip.ipv6_prefix, 64 by default), written as
+ * eight lowercase four-digit groups and "/<prefix>"; a %zone is dropped.
+ * IPv4 and IPv4-mapped IPv6 are the dotted address; anything that does not
+ * parse is returned as it is. The same bytes as Lua.
+ */
+export function ipKey<T>(ip: T, prefix?: unknown): T | string {
+  if (typeof ip !== "string" || !ip.includes(":") || byteLength(ip) > 64) return ip;
+  let p = Math.floor(Number(prefix ?? 64));
+  if (!(p >= 1 && p <= 128)) p = 64;
+  const pct = ip.indexOf("%");
+  let s = pct === -1 ? ip : ip.slice(0, pct);
+  let v4: [number, number] | undefined;
+  const last = s.slice(s.lastIndexOf(":") + 1);
+  if (last.includes(".")) {
+    const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(last);
+    if (!m) return ip;
+    const [a, b, c, d] = [m[1], m[2], m[3], m[4]].map(Number);
+    if (a > 255 || b > 255 || c > 255 || d > 255) return ip;
+    v4 = [a * 256 + b, c * 256 + d];
+    s = s.slice(0, s.length - last.length);
+    if (!s.endsWith("::")) {
+      if (!s.endsWith(":")) return ip;
+      s = s.slice(0, -1);
+    }
+  }
+  const want = v4 ? 6 : 8;
+  let h: number[];
+  const dc = s.indexOf("::");
+  if (dc !== -1) {
+    if (s.indexOf("::", dc + 1) !== -1) return ip;
+    const l = hextets(s.slice(0, dc)), r = hextets(s.slice(dc + 2));
+    if (!l || !r || l.length + r.length >= want) return ip;
+    h = [...l, ...new Array<number>(want - l.length - r.length).fill(0), ...r];
+  } else {
+    const all = hextets(s);
+    if (!all || all.length !== want) return ip;
+    h = all;
+  }
+  if (v4) h.push(v4[0], v4[1]);
+  if (h[0] === 0 && h[1] === 0 && h[2] === 0 && h[3] === 0 && h[4] === 0 && h[5] === 0xffff) {
+    return `${h[6] >> 8}.${h[6] & 255}.${h[7] >> 8}.${h[7] & 255}`;
+  }
+  const out: string[] = [];
+  for (let i = 0; i < 8; i++) {
+    const bits = Math.max(0, Math.min(16, p - i * 16));
+    const x = h[i];
+    out.push((x - (x % 2 ** (16 - bits))).toString(16).padStart(4, "0"));
+  }
+  return out.join(":") + "/" + p;
+}
+
 // Port of first_bytes: marks in `first` the UTF-16 units a key that folds to
 // `name` can start with: the folded name's first, that letter's other case,
 // U+017F for s and U+212A for k.
@@ -239,6 +336,8 @@ interface WalkState {
   decode?: Decode;
   /** the "**" values, in document order */
   defer: Slot[];
+  /** a tool or function message's content, while the walk goes through its key (see walk) */
+  toolContent?: JsonValue;
 }
 
 function newState(decode?: Decode): WalkState {
@@ -482,8 +581,8 @@ const OP_END = 1, OP_DEEP = 2, OP_KEY = 3;
 interface EndOp { kind: typeof OP_END; depth: number; whole?: boolean; keyed?: boolean; item?: boolean }
 /** A "**" here. */
 interface DeepOp { kind: typeof OP_DEEP }
-/** A key the paths go on through: the plan for its value when that is not an array (`whole`), and when it is, the plans for the array and for each item. */
-interface KeyOp { kind: typeof OP_KEY; key: string; whole?: Plan; wholeArr?: Plan; itemsArr?: Plan }
+/** A key the paths go on through: the plan for its value when that is not an array (`whole`), and when it is, the plans for the array and for each item; `content`: the key folds to "content" (see walk). */
+interface KeyOp { kind: typeof OP_KEY; key: string; whole?: Plan; wholeArr?: Plan; itemsArr?: Plan; content?: boolean }
 type Op = EndOp | DeepOp | KeyOp;
 /** What to do at a node, in the order the first path for each op comes; `folded`, `first`, `lens`, `exact`: for variantsOf. */
 interface Plan { ops: Op[]; folded?: Map<string, number[]>; first?: Set<number>; lens?: Set<number>; exact?: Set<string> }
@@ -509,7 +608,7 @@ function compile(cursors: Cursor[], leaf: boolean): Plan {
       if (!g) {
         g = [];
         groups.set(seg.key, g);
-        ops.push({ kind: OP_KEY, key: seg.key });
+        ops.push({ kind: OP_KEY, key: seg.key, content: fold(seg.key) === "content" });
       }
       g.push(c);
     }
@@ -612,17 +711,21 @@ function through(child: JsonValue | undefined, op: KeyOp, st: WalkState): void {
 
 // Port of walk: a path that ends here, a "**" here, or the paths that go on
 // through one key. A key is matched the way fold() says, and every key that
-// folds to it is read: the exact key first, the others in byte order.
+// folds to it is read: the exact key first, the others in byte order. The
+// content of a message with role "tool" or "function" that is an object is
+// read whole, as toolResults reads it (st.toolContent while the walk goes
+// through the message's content key).
 function walk(node: JsonValue | undefined, plan: Plan, st: WalkState): void {
   if (node === undefined || node === null) return;
   const obj = isObj(node) && !Array.isArray(node) ? node : undefined;
+  const wholeHere = obj !== undefined && st.toolContent === node;
   const found = plan.folded && obj ? variantsOf(obj, plan) : undefined;
   const ops = plan.ops;
   for (let i = 0; i < ops.length; i++) {
     const op = ops[i];
     if (op.kind === OP_END) {
       if (st.leaf) st.leaf(node, st);
-      else if (op.whole) readWhole(node, st.out as string[], op.depth);
+      else if (op.whole || wholeHere) readWhole(node, st.out as string[], op.depth);
       else {
         if (op.item && typeof node === "number") st.tokens = true;
         collect(node, st.out as string[], op.depth, st);
@@ -635,9 +738,18 @@ function walk(node: JsonValue | undefined, plan: Plan, st: WalkState): void {
     } else if (op.key === "") {
       through(node, op, st);
     } else if (obj) {
+      const tool = op.content === true && (obj.role === "tool" || obj.role === "function");
+      const saved = st.toolContent;
+      if (tool) st.toolContent = obj[op.key];
       through(obj[op.key], op, st);
       const others = found?.[i];
-      if (others) for (const k of others) through(obj[k], op, st);
+      if (others) {
+        for (const k of others) {
+          if (tool) st.toolContent = obj[k];
+          through(obj[k], op, st);
+        }
+      }
+      st.toolContent = saved;
     }
   }
 }
@@ -718,7 +830,9 @@ function toolResults(decoded: JsonValue, st: WalkState): void {
     for (const m of msgs) {
       if (!isObj(m) || Array.isArray(m)) continue;
       if (m.role === "tool" || m.role === "function") {
-        collect(m.content, out, 1);
+        // an object content is read whole (see walk)
+        if (isObj(m.content) && !Array.isArray(m.content)) readWhole(m.content, out, 1);
+        else collect(m.content, out, 1);
       } else if (Array.isArray(m.content)) {
         for (const block of m.content) {
           if (isObj(block) && !Array.isArray(block) && block.type === "tool_result") collect(block.content, out, 1);
@@ -799,7 +913,8 @@ export function extractUntrustedValues(
   return extractUntrusted(decoded, spec, jsonDecode)[0];
 }
 
-export type ExtractKind = "json" | "scan" | "invalid" | "text" | "form" | "multipart" | "binary" | "none";
+/** "boundaries": a multipart type with more boundary parameters than MAX_BOUNDARIES, nothing read. */
+export type ExtractKind = "json" | "scan" | "invalid" | "text" | "form" | "multipart" | "boundaries" | "binary" | "none";
 
 /** Lua's tonumber(h, 16) + string.char: bytes, so %C3%BC is two bytes not one char. */
 function formDecode(v: string): string {
@@ -855,30 +970,179 @@ function formValues(body: string, out: string[]): void {
   }
 }
 
-const MAX_PARTS = 100;
-function multipartValues(body: string, contentType: string, out: string[]): void {
-  const bm = /boundary="([^"]+)"/i.exec(contentType) ?? /boundary=([^;\s,]+)/i.exec(contentType);
-  if (!bm) return;
-  const delim = "--" + bm[1];
-  let pos = body.indexOf(delim);
-  let parts = 0;
-  while (pos !== -1 && parts < MAX_PARTS) {
-    const after = pos + delim.length;
-    if (body.slice(after, after + 2) === "--") break; // closing delimiter
-    const next = body.indexOf(delim, after);
-    let part = body.slice(after, next === -1 ? body.length : next);
-    part = part.replace(/^\r?\n/, "").replace(/\r?\n$/, "");
-    const hm = /\r?\n\r?\n/.exec(part);
-    if (hm) {
-      const head = asciiLower(part.slice(0, hm.index));
-      const value = part.slice(hm.index + hm[0].length);
-      const hasFile = /filename\*?=/.test(head);
-      const pct = /content-type:[ \t\n\v\f\r]*([^\r\n;]+)/.exec(head)?.[1] ?? "";
-      if ((!hasFile || pct.startsWith("text/") || pct.includes("json")) && isText(value)) out.push(value);
+// Lua's %s: the ASCII whitespace its patterns know
+const isSpace = (c: string | undefined): boolean =>
+  c === " " || c === "\t" || c === "\n" || c === "\v" || c === "\f" || c === "\r";
+
+/**
+ * Port of header_params() in core/normalize.lua: the parameters of a header
+ * value such as Content-Type or Content-Disposition, in order, names trimmed
+ * and lowercased; split on ';' outside quoted strings, a value a quoted
+ * string (backslash escapes removed) or a token that ends at ';', ',' or
+ * whitespace. Linear.
+ */
+export function headerParams(s: string): { name: string; value: string }[] {
+  const out: { name: string; value: string }[] = [];
+  const n = s.length;
+  let i = s.indexOf(";");
+  if (i === -1) return out;
+  i++;
+  while (i < n) {
+    let eq = i;
+    while (eq < n && s[eq] !== "=" && s[eq] !== ";") eq++;
+    if (eq >= n) break;
+    if (s[eq] === ";") {
+      i = eq + 1; // a parameter without '=': nothing to read
+      continue;
     }
-    parts++;
-    pos = next;
+    let a = i;
+    while (a < eq && isSpace(s[a])) a++;
+    let e = eq - 1;
+    while (e >= a && isSpace(s[e])) e--;
+    const name = asciiLower(s.slice(a, e + 1));
+    let v = eq + 1;
+    while (v < n && isSpace(s[v])) v++;
+    let value = "";
+    let after: number;
+    if (s[v] === '"') {
+      // a quoted string, to its closing quote (or the end)
+      let j = v + 1;
+      for (;;) {
+        if (j >= n) break;
+        const c = s[j];
+        if (c === '"') {
+          j++;
+          break;
+        }
+        if (c === "\\") {
+          value += s.slice(j + 1, j + 2);
+          j += 2;
+        } else {
+          value += c;
+          j++;
+        }
+      }
+      after = j;
+    } else {
+      let e2 = v;
+      while (e2 < n && s[e2] !== ";" && s[e2] !== "," && !isSpace(s[e2])) e2++;
+      value = s.slice(v, e2);
+      after = e2;
+    }
+    out.push({ name, value });
+    const next = s.indexOf(";", after);
+    if (next === -1) break;
+    i = next + 1;
   }
+  return out;
+}
+
+// Port of delimiter_end(): the index just past a delimiter's line when the
+// "--" + boundary that ends before `at` is a delimiter: "--" (the close:
+// false), or optional space or tab and then `nl` (with no `nl` yet, "\r\n"
+// or "\n", returned as well). undefined when it only starts like one.
+function delimiterEnd(body: string, at: number, nl?: string): [number | false | undefined, string?] {
+  if (body.startsWith("--", at)) return [false];
+  let e = at;
+  while (body[e] === " " || body[e] === "\t") e++;
+  if (nl !== undefined) return body.startsWith(nl, e) ? [e + nl.length] : [undefined];
+  if (body.startsWith("\r\n", e)) return [e + 2, "\r\n"];
+  if (body[e] === "\n") return [e + 1, "\n"];
+  return [undefined];
+}
+
+// Port of multipart_part(): a part is a file when its Content-Disposition
+// has a filename or filename* parameter; it is read when it is not a file or
+// its Content-Type (text/plain when it has none) is text or JSON, and the
+// value reads as text.
+// Port of text_part_type(): a file part's media type the backend may read
+// as text: text/*, any JSON type, none (RFC 7578's default text/plain), and
+// application/octet-stream (curl -F, openai-python, Node's FormData for a
+// .jsonl or .md file). isText still keeps binary out.
+function textPartType(ct: string): boolean {
+  return ct === "" || ct.startsWith("text/") || ct.includes("json") || ct === "application/octet-stream";
+}
+
+function multipartPart(part: string, out: string[]): void {
+  const hm = /^\r?\n/.exec(part) ?? /\r?\n\r?\n/.exec(part);
+  if (!hm) return;
+  const value = part.slice(hm.index + hm[0].length);
+  let hasFile = false, typed = false, textType = false;
+  for (const line of part.slice(0, hm.index).split(/[\r\n]+/)) {
+    const colon = line.indexOf(":");
+    if (colon === -1) continue;
+    const name = asciiLower(/^[ \t\n\v\f\r]*([^ \t\n\v\f\r]*)/.exec(line.slice(0, colon))![1]);
+    if (name === "content-disposition") {
+      for (const p of headerParams(line.slice(colon + 1))) if (p.name === "filename" || p.name === "filename*") hasFile = true;
+    } else if (name === "content-type") {
+      const v = line.slice(colon + 1);
+      const semi = v.indexOf(";");
+      const ct = trim(asciiLower(semi === -1 ? v : v.slice(0, semi)));
+      typed = true;
+      if (textPartType(ct)) textType = true;
+    }
+  }
+  if ((!hasFile || !typed || textType) && isText(value)) out.push(value);
+}
+
+// Port of multipart_parts(): the first delimiter at the start of the body or
+// of a line, its line ending CRLF or LF; then every delimiter is that line
+// ending, "--" and the boundary, followed by "--" (the close) or optional
+// space or tab and the line ending. A part's value runs to the line ending
+// before the next delimiter.
+function multipartParts(body: string, boundary: string, out: string[]): void {
+  const delim = "--" + boundary;
+  let after: number | false | undefined;
+  let nl: string | undefined;
+  if (body.startsWith(delim)) [after, nl] = delimiterEnd(body, delim.length);
+  let pos = 0;
+  while (after === undefined) {
+    const p = body.indexOf("\n" + delim, pos);
+    if (p === -1) return;
+    [after, nl] = delimiterEnd(body, p + 1 + delim.length);
+    pos = p + 1;
+  }
+  if (after === false) return; // the close before any part
+  const sep = nl! + delim;
+  for (;;) {
+    let stop: number | undefined;
+    let nextAfter: number | false | undefined;
+    let q: number = after;
+    for (;;) {
+      const m = body.indexOf(sep, q);
+      if (m === -1) break;
+      [nextAfter] = delimiterEnd(body, m + sep.length, nl);
+      if (nextAfter !== undefined) {
+        stop = m;
+        break;
+      }
+      q = m + 1;
+    }
+    multipartPart(body.slice(after, stop ?? body.length), out);
+    // undefined: no delimiter left (a body cut short); false: the close
+    if (nextAfter === undefined || nextAfter === false) return;
+    after = nextAfter;
+  }
+}
+
+// Port of multipart_values(): every field without a filename, and file parts
+// whose own Content-Type is text or JSON or that have none. Every part is
+// read; each distinct boundary parameter is read, the values of all of them
+// judged; past MAX_BOUNDARIES of them none is, and it returns true.
+export const MAX_BOUNDARIES = 8;
+function multipartValues(body: string, contentType: string, out: string[]): boolean {
+  const list: string[] = [];
+  const seen = new Set<string>();
+  for (const p of headerParams(contentType)) {
+    const b = p.value;
+    if (p.name === "boundary" && b !== "" && !/[\r\n]/.test(b) && !seen.has(b)) {
+      seen.add(b);
+      list.push(b);
+      if (list.length > MAX_BOUNDARIES) return true;
+    }
+  }
+  for (const b of list) multipartParts(body, b, out);
+  return false;
 }
 
 /**
@@ -954,6 +1218,60 @@ export function jsonLike(s: string | undefined | null, contentType: string | und
   return first === "{" || first === "[";
 }
 
+// The body with each bare NaN, Infinity and -Infinity token outside strings
+// read as 0, or undefined when it has none. A token stands alone, as Python
+// reads it: after the start, JSON white space, '[', ',' or ':' ("-" for
+// -Infinity), and before the end, white space, ',', ']' or '}'; so "-NaN"
+// and "1NaN" are left as they are. As non_finite in core/spec/helper.lua.
+function nonFinite(s: string): string | undefined {
+  const before = (k: number) => k < 0 || " \t\n\r[,:".includes(s[k]);
+  const after = (k: number) => k >= s.length || " \t\n\r,]}".includes(s[k]);
+  let out = "";
+  let from = 0;
+  let found = false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === '"') {
+      // skip the string: a backslash escapes the character after it
+      for (i++; i < s.length && s[i] !== '"'; i++) if (s[i] === "\\") i++;
+    } else if (c === "N" && s.startsWith("NaN", i) && before(i - 1) && after(i + 3)) {
+      out += s.slice(from, i) + "0";
+      from = i + 3;
+      i += 2;
+      found = true;
+    } else if (c === "I" && s.startsWith("Infinity", i) && after(i + 8)
+      && (before(i - 1) || (s[i - 1] === "-" && before(i - 2)))) {
+      out += s.slice(from, i) + "0";
+      from = i + 8;
+      i += 7;
+      found = true;
+    }
+  }
+  return found ? out + s.slice(from) : undefined;
+}
+
+/**
+ * The JSON decoder the JS runtime gives core (ctx.json_decode) and extract()'s
+ * default: JSON.parse, and when it refuses the text, JSON.parse again with
+ * each bare NaN, Infinity and -Infinity outside strings read as 0. Python's
+ * json.loads takes those three (and cjson in the Lua adapters takes them and
+ * more), so a body a Python backend decodes is read as JSON here too, not
+ * scanned or read as text past a json_only_paths route. A number carries no
+ * text, so 0 stands for it; a number in a text field is still noted (token
+ * ids), as the Lua core notes cjson's NaN.
+ */
+export function jsonDecode(s: string): JsonValue {
+  try {
+    return JSON.parse(s) as JsonValue;
+  } catch (e) {
+    const t = nonFinite(s);
+    if (t === undefined) throw e;
+    return JSON.parse(t) as JsonValue;
+  }
+}
+// extract()'s parameter of the same name would shadow it in its default
+const defaultDecode = jsonDecode;
+
 /**
  * Extract text from a raw body. Returns the text (values joined with "\n"),
  * the kind, the values in order (newest last) for window(), the decoded
@@ -965,7 +1283,7 @@ export function extract(
   body: string | undefined | null,
   contentType: string | undefined | null,
   fields: string[],
-  jsonDecode: (s: string) => JsonValue = (s) => JSON.parse(s) as JsonValue,
+  jsonDecode: (s: string) => JsonValue = defaultDecode,
 ): [string, ExtractKind, string[], JsonValue?, boolean?, boolean?] {
   if (typeof body !== "string" || body === "") return ["", "none", []];
   const rawCt = typeof contentType === "string" ? contentType : "";
@@ -999,14 +1317,21 @@ export function extract(
     // reads it, declared JSON or not: the text fields' string values and the
     // objects under a "**" path's key. Under a form or multipart type the
     // values that reading gives follow, since a backend of that kind reads
-    // the body so. Declared JSON with nothing to scan is unjudgeable, never
-    // "no text"; any other body with nothing to scan is read as before. A
-    // text field that holds token ids is found the same way.
+    // the body so. Under any other type (text/plain, none) the whole body
+    // follows too, when it is text: a backend that reads it as text (a raw
+    // prompt route, req.text()) reads all of it, the bytes after the JSON
+    // value included. Declared JSON with nothing to scan is unjudgeable,
+    // never "no text"; any other body with nothing to scan is read as before.
+    // A text field that holds token ids is found the same way.
     const found = { tokens: false };
     const out = scanStrings(body, fieldKeys(fields), [], deepKeys(fields), found);
     if (out.length > 0 || found.tokens) {
-      if (form && !declaredJson) formValues(body, out);
-      else if (multipart && !declaredJson) multipartValues(body, rawCt, out);
+      if (!declaredJson) {
+        if (form) formValues(body, out);
+        else if (multipart) {
+          if (multipartValues(body, rawCt, out)) return ["", "boundaries", []];
+        } else if (isText(body)) out.push(body);
+      }
       return [out.join("\n"), "scan", out, undefined, undefined, found.tokens];
     }
     if (declaredJson) return ["", "invalid", []];
@@ -1017,7 +1342,7 @@ export function extract(
     return [out.join("\n"), "form", out];
   }
   if (multipart) {
-    multipartValues(body, rawCt, out);
+    if (multipartValues(body, rawCt, out)) return ["", "boundaries", []];
     return [out.join("\n"), "multipart", out];
   }
   if (isText(body)) return [body, "text", [body]];
@@ -1094,20 +1419,56 @@ export function fieldKeys(fields: string[] | undefined): Set<string> {
   return keys;
 }
 
+// Port of key_depth: the depth of the key text-field path `f` ends at
+// (`last`, folded): the objects and arrays around that key in a body whose
+// root is an object, "input" 1, "input[*].output" 3,
+// "messages[*].parts[*].input.**" 5; undefined when the path's segments end
+// at another key.
+function keyDepth(f: string, last: string): number | undefined {
+  const segs = splitPath(f.endsWith(".**") ? f.slice(0, -3) : f);
+  let n = segs.length;
+  // "[*]" alone steps into an array without a key
+  while (n > 0 && segs[n - 1].key === "") n--;
+  if (n === 0 || fold(segs[n - 1].key) !== last) return undefined;
+  let depth = 1;
+  for (let i = 0; i < n - 1; i++) depth += segs[i].each && segs[i].key !== "" ? 2 : 1;
+  return depth;
+}
+
 /**
  * Port of deep_keys: the last key of each "**" text-field path, folded, for
- * scanStrings: "any", or "object" when a path without "**" ends at the same
- * key too ("input": a tool_use input, and the Responses input list).
+ * scanStrings: "any"; or, when a path without "**" ends at the same key too
+ * ("input": a tool_use input and an AI SDK tool part's input, and the
+ * Responses input list), the set of depths (see keyDepth) at which only such
+ * plain paths end: an array there is a list the walk reads item by item (the
+ * Responses input list at 1, a function_call_output's output at 3), not a
+ * "**" value. A path whose depth is unknown leaves the set empty for a "**"
+ * path, and adds nothing to it for a plain one.
  */
-export function deepKeys(fields: string[] | undefined): Map<string, "any" | "object"> {
-  const deep = new Set<string>();
-  const plain = new Set<string>();
+export function deepKeys(fields: string[] | undefined): Map<string, "any" | Set<number>> {
+  const deep = new Map<string, Set<number | "unknown">>();
+  const plain = new Map<string, Set<number | "unknown">>();
   for (const f of fields ?? []) {
     const k = lastKey(f);
-    if (k !== undefined) (f.endsWith(".**") ? deep : plain).add(k);
+    if (k === undefined) continue;
+    const set = f.endsWith(".**") ? deep : plain;
+    let depths = set.get(k);
+    if (!depths) set.set(k, depths = new Set());
+    depths.add(keyDepth(f, k) ?? "unknown");
   }
-  const out = new Map<string, "any" | "object">();
-  for (const k of deep) out.set(k, plain.has(k) ? "object" : "any");
+  const out = new Map<string, "any" | Set<number>>();
+  for (const [k, at] of deep) {
+    const p = plain.get(k);
+    if (!p) {
+      out.set(k, "any");
+      continue;
+    }
+    const lists = new Set<number>();
+    if (!at.has("unknown")) {
+      for (const d of p) if (d !== "unknown" && !at.has(d)) lists.add(d);
+    }
+    out.set(k, lists);
+  }
   return out;
 }
 
@@ -1136,32 +1497,197 @@ function holdsNumber(s: string, i: number): boolean {
   }
 }
 
+// Port of next_quote: the index of the first '"' at or after `i` that no
+// backslash escapes (a backslash escapes the character after it), or -1.
+function nextQuote(s: string, i: number): number {
+  const n = s.length;
+  for (;;) {
+    let j = i;
+    while (j < n && s[j] !== '"' && s[j] !== "\\") j++;
+    if (j >= n) return -1;
+    if (s[j] === '"') return j;
+    i = j + 2;
+  }
+}
+
+// Port of key_at: `q` is an unescaped '"'; the string it opens is a key
+// when a colon follows (then, with `start`, a quote or a bracket). Returns
+// the key decoded and folded and the index of the value's first character,
+// or, when it opens no key, the next '"' to try (the string's closing
+// quote); null at the end of the text. So the text between two strings is
+// tried as a key too, and it is one when the next string starts with a
+// colon (["x",":"]); it never names a field, and the scans read only the
+// value of a key they look for, so it cannot swallow the key after it.
+function keyAt(s: string, q: number, start: boolean): { key?: string; at: number } | null {
+  const e = nextQuote(s, q + 1);
+  if (e === -1) return null;
+  let k = e + 1;
+  while (luaSpace(s.charCodeAt(k))) k++;
+  if (s[k] !== ":") return { at: e };
+  k++;
+  while (luaSpace(s.charCodeAt(k))) k++;
+  if (start && s[k] !== '"' && s[k] !== "{" && s[k] !== "[") return { at: e };
+  return { key: fold(readString(s, q + 1)[0]), at: k };
+}
+
+// The index `i` ends a string value: past Lua white space, a comma, a
+// closing bracket or the end of the text.
+function endsValue(s: string, i: number): boolean {
+  while (luaSpace(s.charCodeAt(i))) i++;
+  return i >= s.length || s[i] === "," || s[i] === "}" || s[i] === "]";
+}
+
+// Port of brackets: the brackets outside strings from `i` (outside any
+// string) up to `to` (not included), counted +1 for { and [ and -1 for }
+// and ]: the count and the lowest it went (0 or less); undefined when a
+// string runs on past `to`.
+function brackets(s: string, i: number, to: number): [number, number] | undefined {
+  let n = 0;
+  let low = 0;
+  const re = /[{}[\]"]/g;
+  for (;;) {
+    re.lastIndex = i;
+    const m = re.exec(s);
+    if (!m || m.index >= to) return [n, low];
+    const j = m.index;
+    const c = s[j];
+    if (c === '"') {
+      const e = nextQuote(s, j + 1);
+      if (e === -1 || e >= to) return undefined;
+      i = e + 1;
+    } else {
+      if (c === "{" || c === "[") n++;
+      else if (--n < low) low = n;
+      i = j + 1;
+    }
+  }
+}
+
+// Port of depth_at: the depth at `b`, the first character of a key's value
+// (see keyDepth). A cursor with `pos` counts from the start of a body (a
+// head, or all of it) and moves on with each call, since `b` only grows. A
+// tail's cursor (no `pos`) starts at a depth it cannot know, but ends where
+// the body does, at depth 0: the first call counts from `b` to the end, and
+// the depth at `b` is how far below 0 that count ends, which must be its
+// lowest (bytes after the root can then only make the depth deeper).
+// undefined once the count fails: the depth is unknown.
+interface DepthCursor { s: string; pos?: number; depth: number; bad?: boolean }
+function depthAt(cur: DepthCursor, b: number): number | undefined {
+  if (cur.bad) return undefined;
+  if (cur.pos === undefined) {
+    const r = brackets(cur.s, b, cur.s.length);
+    if (!r || r[0] >= 0 || r[0] !== r[1]) {
+      cur.bad = true;
+      return undefined;
+    }
+    cur.pos = b;
+    cur.depth = -r[0];
+    return cur.depth;
+  }
+  const r = brackets(cur.s, cur.pos, b);
+  if (!r) {
+    cur.bad = true;
+    return undefined;
+  }
+  cur.pos = b;
+  cur.depth += r[0];
+  return cur.depth;
+}
+
+// Port of list_items: the strings of the array that starts at `i`, to its
+// end or the end of `s`, that are its items or items of arrays in it, with
+// no object between (the strings collect reads there without a key).
+function listItems(s: string, i: number, out: string[]): void {
+  let depth = 0;
+  let objects = 0;
+  const re = /[{}[\]"]/g;
+  for (;;) {
+    re.lastIndex = i;
+    const m = re.exec(s);
+    if (!m) return;
+    const j = m.index;
+    const c = s[j];
+    if (c === '"') {
+      const [v, next] = readString(s, j + 1);
+      if (objects === 0 && v !== "") out.push(v);
+      i = next;
+    } else {
+      if (c === "{") {
+        depth++;
+        objects++;
+      } else if (c === "[") {
+        depth++;
+      } else {
+        depth--;
+        if (c === "}" && objects > 0) objects--;
+        if (depth <= 0) return;
+      }
+      i = j + 1;
+    }
+  }
+}
+
 /**
  * Collect the string values of `keys` (from fieldKeys) from possibly
- * truncated JSON. Keys match the way walk() matches them: folded. With
- * `deep` (from deepKeys), the value of a "**" path's key is read as the walk
- * reads it, every key and string in it in the order they come: an object,
- * and an array when no other path ends at that key; otherwise the scan goes
- * on inside it, as for any other key. With `found`, found.tokens is set when
- * one of `keys` holds a list with a number in it: token ids (see collect).
+ * truncated JSON (port of scan_strings). Keys match the way walk() matches
+ * them: decoded and folded. With `deep` (from deepKeys), the value of a "**"
+ * path's key is read as the walk reads it, every key and string in it in
+ * the order they come: an object or an array. A plain path may end at that
+ * key too (deepKeys gives the depths where only plain paths end): an array
+ * there, the Responses input list at the root, is a list the walk reads
+ * item by item, so its string items are read (listItems) and the scan goes
+ * on inside it for text-field keys: the list's type and role words are no
+ * text. The depth comes from the start of `s`, or from its end with
+ * `opts.tail` (see depthAt); where it is unknown the array is read whole,
+ * its base64 data URLs left out. With `found`, found.tokens is set when one
+ * of `keys` holds a list with a number in it: token ids (see collect and
+ * holdsNumber). With
+ * `opts.tail`, the text before the first unescaped '"' is the end of a value
+ * cut at its start: kept when that quote ends a value and it reads as
+ * natural text (white space in it, and isText). The value of a key that is
+ * not one of `keys` is not read: the scan goes on at its first character, as
+ * from any other string (see keyAt).
  */
 export function scanStrings(
-  s: string, keys: Set<string>, out: string[], deep?: Map<string, "any" | "object">, found?: { tokens: boolean },
+  s: string, keys: Set<string>, out: string[], deep?: Map<string, "any" | Set<number>>, found?: { tokens: boolean },
+  opts?: { tail?: boolean },
 ): string[] {
-  // key characters: ASCII word characters, U+017F and U+212A; the value
-  // starts with a quote or a bracket (a number or a literal is passed over)
-  const re = /"([A-Za-z0-9_\-\u017F\u212A]+)"[ \t\n\v\f\r]*:[ \t\n\v\f\r]*(?=["{[])/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(s)) !== null) {
-    const at = m.index + m[0].length;
-    if (s[at] === '"') {
+  let q = nextQuote(s, 0);
+  const tail = opts?.tail === true;
+  if (q !== -1 && tail && endsValue(s, q + 1)) {
+    const [v] = readString(s, 0);
+    if (/[ \t\n\v\f\r]/.test(v) && isText(v)) out.push(v);
+  }
+  let cur: DepthCursor | undefined;
+  while (q !== -1) {
+    const k = keyAt(s, q, true);
+    if (k === null) break;
+    if (k.key === undefined) {
+      q = k.at;
+      continue;
+    }
+    const at = k.at;
+    if (s[at] === '"' && keys.has(k.key)) {
       const [value, next] = readString(s, at + 1);
-      if (keys.has(fold(m[1])) && value !== "") out.push(value);
-      re.lastIndex = next;
+      if (value !== "") out.push(value);
+      q = nextQuote(s, next);
     } else {
-      const d = deep?.get(fold(m[1]));
-      if (d !== undefined && (s[at] === "{" || d === "any")) re.lastIndex = scanValue(s, at, out, false);
-      else if (found && s[at] === "[" && !found.tokens && keys.has(fold(m[1])) && holdsNumber(s, at)) found.tokens = true;
+      if (found && s[at] === "[" && !found.tokens && keys.has(k.key) && holdsNumber(s, at)) found.tokens = true;
+      const d = deep?.get(k.key);
+      let list = false;
+      if (d !== undefined && d !== "any" && s[at] === "[") {
+        cur ??= tail ? { s, depth: 0 } : { s, pos: 0, depth: 0 };
+        const depth = depthAt(cur, at);
+        list = depth !== undefined && d.has(depth);
+      }
+      if (list) {
+        listItems(s, at, out);
+        q = nextQuote(s, at);
+      } else if (d !== undefined && (s[at] === "{" || s[at] === "[")) {
+        q = nextQuote(s, scanValue(s, at, out, false, d !== "any" && s[at] === "["));
+      } else {
+        q = nextQuote(s, at);
+      }
     }
   }
   return out;
@@ -1203,12 +1729,25 @@ function typeNames(s: string, i: number): number | undefined {
   }
 }
 
+// Port of DATA_KEYS: the keys an image or a file is sent under as a data URL
+// (a Responses input_image's image_url and input_file's file_data, the url
+// of an image_url object or an AI SDK file part).
+const DATA_KEYS = new Set(["image_url", "url", "file_data"]);
+
+// Port of data_url: a base64 data URL (data:image/png;base64,iVBORw0...),
+// an image or a file, not text, when every character after "base64," is a
+// base64 one ("data:text/plain;base64,Ignore all ..." is text). ASCII only,
+// so both cores read the same strings as one.
+const DATA_URL = /^data:[A-Za-z0-9!#$&\-^_.+/=;]*;base64,[A-Za-z0-9+/=]*$/i;
+
 // Port of scan_value: every key and string of the JSON value that starts at
 // `i` (a `{` or `[`), to its end or the end of `s`; with `schema` (tool
 // definitions) a "type" key whose value is a JSON Schema type name is left
-// out with it. Returns the index after it.
-function scanValue(s: string, i: number, out: string[], schema: boolean): number {
+// out with it; with `nodata`, a base64 data URL that is the value of one of
+// DATA_KEYS is left out. Returns the index after it.
+function scanValue(s: string, i: number, out: string[], schema: boolean, nodata = false): number {
   let depth = 0;
+  let key: string | undefined;
   const re = /[{}[\]"]/g;
   for (;;) {
     re.lastIndex = i;
@@ -1219,19 +1758,24 @@ function scanValue(s: string, i: number, out: string[], schema: boolean): number
     if (c === '"') {
       const [v, next] = readString(s, j + 1);
       const k = nonSpace(s, next);
-      const skip = schema && v === "type" && k !== -1 && s[k] === ":" ? typeNames(s, k + 1) : undefined;
+      const colon = k !== -1 && s[k] === ":";
+      const skip = schema && v === "type" && colon ? typeNames(s, k + 1) : undefined;
       if (skip !== undefined) {
         i = skip;
+        key = undefined;
       } else {
-        if (v !== "") out.push(v);
+        if (v !== "" && !(nodata && !colon && key !== undefined && DATA_KEYS.has(key) && DATA_URL.test(v))) out.push(v);
         i = next;
+        key = colon ? v : undefined;
       }
     } else if (c === "{" || c === "[") {
       depth++;
       i = j + 1;
+      key = undefined;
     } else {
       depth--;
       i = j + 1;
+      key = undefined;
       if (depth <= 0) return i;
     }
   }
@@ -1244,17 +1788,21 @@ function scanValue(s: string, i: number, out: string[], schema: boolean): number
  * names left out, in the order they come.
  */
 export function scanTools(s: string, keys: Set<string>, out: string[]): string[] {
-  const re = /"([A-Za-z0-9_\-ſK]+)"[ \t\n\v\f\r]*:[ \t\n\v\f\r]*/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(s)) !== null) {
-    const at = m.index + m[0].length;
-    if (!keys.has(fold(m[1]))) continue;
-    if (s[at] === '"') {
+  let q = nextQuote(s, 0);
+  while (q !== -1) {
+    const k = keyAt(s, q, false);
+    if (k === null) break;
+    const at = k.at;
+    if (k.key === undefined) q = at;
+    else if (!keys.has(k.key)) q = nextQuote(s, at);
+    else if (s[at] === '"') {
       const [v, next] = readString(s, at + 1);
       if (v !== "") out.push(v);
-      re.lastIndex = next;
+      q = nextQuote(s, next);
     } else if (s[at] === "{" || s[at] === "[") {
-      re.lastIndex = scanValue(s, at, out, true);
+      q = nextQuote(s, scanValue(s, at, out, true));
+    } else {
+      q = nextQuote(s, at);
     }
   }
   return out;
@@ -1289,16 +1837,26 @@ export function tail(s: string, n: number): string {
 
 export const HIT_CONTEXT = 1024;
 
+/** Port of normalize.chunk_overlap: bytes two consecutive chunks share,
+ *  HIT_CONTEXT, at most a quarter of the budget, counted in each piece's budget. */
+export function chunkOverlap(budget: number): number {
+  return Math.max(0, Math.min(HIT_CONTEXT, Math.floor(budget / 4)));
+}
+
 /**
  * Port of normalize.chunks: consecutive pieces of at most `budget` UTF-8
  * bytes covering all of `text`; a cut prefers the last newline in the second
- * half of a piece (dropped) and never splits a code point. Returns the pieces
- * and each one's 1-based byte offset, as in Lua.
+ * half of a piece (dropped) and never splits a code point. With `overlap`,
+ * the piece after one that ends at e starts at e + 1 - overlap, moved
+ * forward to a character start. `hard`: no newline preference, and every
+ * piece but the last advances at least budget - overlap bytes. Returns the
+ * pieces and each one's 1-based byte offset, as in Lua.
  */
-export function chunks(text: string, budget: number): [string[], number[]] {
+export function chunks(text: string, budget: number, overlap = 0, hard = false): [string[], number[]] {
   const b = enc.encode(text);
   const n = b.length;
   const half = Math.floor(budget / 2);
+  const ov = Math.floor(Number(overlap) || 0);
   const pieces: string[] = [];
   const starts: number[] = [];
   let i = 1;
@@ -1310,11 +1868,13 @@ export function chunks(text: string, budget: number): [string[], number[]] {
     }
     let e = i + budget - 1;
     let next: number | undefined;
-    for (let j = e; j >= i + half + 1; j--) {
-      if (b[j - 1] === 10) {
-        e = j - 1;
-        next = j + 1;
-        break;
+    if (!hard) {
+      for (let j = e; j >= i + half + 1; j--) {
+        if (b[j - 1] === 10) {
+          e = j - 1;
+          next = j + 1;
+          break;
+        }
       }
     }
     if (next === undefined) {
@@ -1327,26 +1887,95 @@ export function chunks(text: string, budget: number): [string[], number[]] {
     }
     pieces.push(dec.decode(b.subarray(i - 1, e)));
     starts.push(i);
+    if (ov > 0) {
+      let nx = Math.max(i + 1, e + 1 - ov);
+      // a cut walked back to a character boundary does not eat the advance
+      if (hard) nx = Math.max(nx, Math.min(e + 1, i + budget - ov));
+      while (nx <= e && isCont(b, nx - 1)) nx++;
+      next = nx;
+    }
     i = next;
   }
   return [pieces, starts];
 }
 
-/**
- * @param from,to 1-based inclusive byte span of an always_suspect hit, or undefined
- * @returns the text to judge, and true when it was cut
- */
-export function window(text: string, values: string[], budget: number, from?: number, to?: number): [string, boolean] {
-  const tb = enc.encode(text);
-  if (tb.length <= budget) return [text, false];
-  const out: string[] = [];
-  let rem = budget;
-  if (from !== undefined && to !== undefined) {
-    const half = Math.floor(budget / 2);
+// `len` bytes at most of `tb` from byte `a` (1-based), cut back to a
+// character boundary, as normalize.head(text:sub(a), len) in Lua.
+function headAt(tb: Uint8Array, a: number, len: number): string {
+  if (len <= 0) return "";
+  const s = tb.subarray(a - 1);
+  if (s.length <= len) return dec.decode(s);
+  let e = len;
+  while (e > 0 && isCont(s, e)) e--;
+  return dec.decode(s.subarray(0, e));
+}
+
+// Port of hit_part() in core/normalize.lua: the hits' part of a window, in
+// at most `half` bytes. One span: the hit and up to HIT_CONTEXT bytes each
+// side. Several (in text order): overlapping ones are merged, and each gets
+// its match and the same context each side, which shrinks evenly toward 0
+// so that all of them fit; only when the matches alone do not fit are the
+// oldest dropped. Pieces whose context meets are joined, the others are
+// separated by a newline.
+function hitPart(tb: Uint8Array, spans: readonly (readonly [number, number])[], half: number): string {
+  const merged: [number, number][] = [];
+  for (const [f, t] of spans) {
+    const last = merged[merged.length - 1];
+    if (last && f <= last[1] + 1) {
+      if (t > last[1]) last[1] = t;
+    } else {
+      merged.push([f, t]);
+    }
+  }
+  const lastIdx = merged.length - 1;
+  let first = 0;
+  let need = 0;
+  for (;;) {
+    need = lastIdx - first;
+    for (let i = first; i <= lastIdx; i++) need += merged[i][1] - merged[i][0] + 1;
+    if (need <= half || first === lastIdx) break;
+    first++;
+  }
+  const n = tb.length;
+  if (first === lastIdx) {
+    const [from, to] = merged[first];
     const ctxb = Math.max(0, Math.min(HIT_CONTEXT, Math.floor((half - (to - from + 1)) / 2)));
     let a = Math.max(1, from - ctxb);
     while (a > 1 && isCont(tb, a - 1)) a--;
-    const piece = head(dec.decode(tb.subarray(a - 1)), Math.min(Math.min(to + ctxb, tb.length) - a + 1, half));
+    return headAt(tb, a, Math.min(Math.min(to + ctxb, n) - a + 1, half));
+  }
+  const m = lastIdx - first + 1;
+  const ctxb = Math.max(0, Math.min(HIT_CONTEXT, Math.floor((half - need) / (2 * m))));
+  const ranges: [number, number][] = [];
+  for (let i = first; i <= lastIdx; i++) {
+    const [from, to] = merged[i];
+    // forward to a character start: the context never grows past its share
+    let a = Math.max(1, from - ctxb);
+    while (a < from && isCont(tb, a - 1)) a++;
+    const b = Math.min(n, to + ctxb);
+    const last = ranges[ranges.length - 1];
+    if (last && a <= last[1] + 1) last[1] = b;
+    else ranges.push([a, b]);
+  }
+  return ranges.map(([a, b]) => headAt(tb, a, b - a + 1)).join("\n");
+}
+
+/**
+ * @param spans 1-based inclusive byte spans of always_suspect hits, in text
+ *              order, or undefined; or, as before, one span given as two
+ *              numbers (from, to)
+ * @returns the text to judge, and true when it was cut
+ */
+export function window(text: string, values: string[], budget: number,
+  spans?: readonly (readonly [number, number])[] | number, to?: number): [string, boolean] {
+  const tb = enc.encode(text);
+  if (tb.length <= budget) return [text, false];
+  if (typeof spans === "number") spans = to !== undefined ? [[spans, to]] : undefined;
+  const out: string[] = [];
+  let rem = budget;
+  if (spans && spans.length > 0) {
+    // the hits and their context, in at most half the budget
+    const piece = hitPart(tb, spans, Math.floor(budget / 2));
     out.push(piece);
     rem = rem - byteLength(piece) - 1;
   }
@@ -1416,12 +2045,15 @@ export function normalize(text: string | null | undefined, opts?: NormalizeOpts 
 }
 
 /**
- * Fingerprint = hash(normalize(text)) over the WHOLE normalized text.
- * `opts.prefix_bytes` is deliberately ignored here: a fingerprint that only
- * covers a prefix lets any text that shares the prefix reuse a cached or
- * trusted verdict (0.3.0 hashed the first 2048 bytes; fixed in 0.3.1).
- * Text that normalizes to nothing (digit runs, UUIDs) is hashed as typed, so
- * it still gets a cache entry instead of a judge call per request.
+ * Fingerprint = hash(normalize(text)) over the WHOLE normalized text, with
+ * ASCII lowercase and whitespace collapse only. `opts` is deliberately
+ * ignored: a fingerprint that only covers a prefix lets any text that shares
+ * the prefix reuse a cached or trusted verdict (0.3.0 hashed the first 2048
+ * bytes; fixed in 0.3.1), and one that drops digit runs and UUIDs lets
+ * "transfer 12345 to acct" reuse the verdict of "transfer 99999 to acct",
+ * where the digits are the payload. Only texts that are the same but for
+ * case and whitespace share a verdict. Text that is only whitespace is
+ * hashed as one space, one entry for every such body.
  *
  * `hash` is injected by the adapter and MUST be collision-resistant
  * (sha256 hex or better). The fingerprint keys the verdict cache and the
@@ -1430,14 +2062,14 @@ export function normalize(text: string | null | undefined, opts?: NormalizeOpts 
  * and djb2 are linear and let a few appended bytes hit any chosen value;
  * `djb2` below exists for the golden vectors only.
  */
+const FP_OPTS: NormalizeOpts = { strip_digits: false, strip_uuid: false, prefix_bytes: Infinity };
+
 export function fingerprint(
   text: string | null | undefined,
-  opts: NormalizeOpts | null | undefined,
+  _opts: NormalizeOpts | null | undefined,
   hash: (s: string) => string,
 ): string {
-  const o: NormalizeOpts = { strip_digits: opts?.strip_digits, strip_uuid: opts?.strip_uuid, prefix_bytes: Infinity };
-  let norm = normalize(text, o);
-  if (norm === "") norm = normalize(text, { strip_digits: false, strip_uuid: false, prefix_bytes: Infinity });
+  let norm = normalize(text, FP_OPTS);
   // whitespace-only text: one fingerprint for all of it, never none (Lua: tostring(text) ~= "")
   if (norm === "" && text !== null && text !== undefined && String(text) !== "") norm = " ";
   if (norm === "") return "";

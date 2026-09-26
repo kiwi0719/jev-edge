@@ -130,6 +130,13 @@ local function config_from(conf)
     c.jev.questions_json = nil
   end
   c.rules_json, c.log_line = nil, nil
+  -- jev.extra_body_json: core's jev.extra_body, as a JSON object in a string
+  if type(c.jev) == "table" and c.jev.extra_body_json then
+    local eb = cjson.decode(c.jev.extra_body_json)
+    if type(eb) == "table" then c.jev.extra_body = eb
+    else kong.log.err("jev-edge: jev.extra_body_json is not a JSON object, ignored") end
+    c.jev.extra_body_json = nil
+  end
   return defaults.merge(defaults.config, c)
 end
 
@@ -188,13 +195,20 @@ end
 -- request mapping
 -- ---------------------------------------------------------------------------
 
+local warned_long = false
 local function subject_ctx(rt, req)
   local scfg = rt.cfg.subject
   if not scfg or not scfg.enabled then return nil end
-  local raw = subject_m.extract(scfg, {
+  -- the raw Cookie header(s), not the cookie variable: nginx's $cookie_<name>
+  -- is the first match, compared case-insensitively, quotes kept, while the
+  -- backend may read another. Every candidate is an id (core/subject.lua
+  -- cookie_values); reputation checks and charges each, ids[1] names the
+  -- trajectory and the logs.
+  local raws, long = subject_m.extract_all(scfg, {
     ip = req.client_ip,
+    ipv6_prefix = rt.cfg.client_ip and rt.cfg.client_ip.ipv6_prefix,
     header = function(n) return req.headers[n] end,
-    cookie = function(n) return ngx.var["cookie_" .. tostring(n)] end,
+    cookie_header = req.headers["cookie"],
   })
   -- No header: an auth plugin that ran first may have removed it
   -- (key-auth, basic-auth ... with hide_credentials = true), so the
@@ -203,18 +217,25 @@ local function subject_ctx(rt, req)
   -- clients are never pooled into one reputation. Only where there would be
   -- no subject, so no existing id changes; not with `hashed`, where the
   -- header is an id another jev-edge computed.
-  if not raw and scfg.from == "header" and not scfg.hashed then
+  if #raws == 0 and not long and scfg.from == "header" and not scfg.hashed then
     local cred = kong.client.get_credential()
     if type(cred) == "table" and cred.id ~= nil and cred.id ~= null then
-      raw = "kong-credential:" .. tostring(cred.id)
+      raws = { "kong-credential:" .. tostring(cred.id) }
     end
   end
-  local id = subject_m.hash_id(scfg, raw, sha256_hex)
+  if long and not warned_long then
+    -- once per worker: a subject value past the limit names no trajectory
+    warned_long = true
+    kong.log.warn("jev-edge: ", long, ", dropped (subject.from = ", tostring(scfg.from), ")")
+  end
+  local ids = subject_m.hash_ids(scfg, raws, sha256_hex)
+  local id = ids[1]
   if not id then return nil end
   local rep_on = type(scfg.reputation) == "table" and (tonumber(scfg.reputation.block_at) or 0) > 0
   local ring, rep = cache_m.subject_stores(SUBJECT_DICT, SUBJECT_REP_DICT, rep_on)
   return {
     id = id,
+    ids = ids,
     history = subject_m.ring_load(ring, id, scfg.max_entries),
     -- never evicts: a full dict drops the new entry
     record = function(e)
@@ -257,7 +278,12 @@ local function build_req(rt)
   return req
 end
 
-local function re_find(subject, pattern)
+-- the byte span of the first match at or after byte init (from, to), which
+-- places the hit in the judging window; nil when there is none. When PCRE
+-- fails (a JIT stack or match limit, a pattern it refuses) ngx.re.find
+-- returns nil, nil, err, passed on whole: core counts the pattern as a hit.
+local function re_find(subject, pattern, init)
+  if init and init > 1 then return ngx.re.find(subject, pattern, "ijo", { pos = init }) end
   return ngx.re.find(subject, pattern, "ijo")
 end
 
@@ -272,12 +298,21 @@ local function maybe_async(rt, v, req)
     client_ip = req.client_ip })
 end
 
+-- every route's samples go into the one jev_cache ring: each names its route
+local warned_ring = false
 local function maybe_sample(rt, v, req)
   if not sampling.should_sample(rt.cfg, v, math.random) then return end
   local ok, err = pcall(function()
     local s = sampling.build(rt.cfg, v, req, rules_mod.rule_for(req, rt.rules, { json_decode = cjson.decode }),
       { rid = ngx.var.request_id, ts = ngx.now(), json_decode = cjson.decode })
-    sampling.store(rt.cfg, cache, s)
+    local route = kong.router.get_route()
+    s.route = route and (route.id or route.name) or nil
+    local _, other = sampling.store(rt.cfg, cache, s)
+    if other and not warned_ring then
+      warned_ring = true
+      kong.log.warn("jev-edge: sampling.max_samples differs from the ring's size in jev_cache; ",
+        "samples go into the ring as its first writer sized it")
+    end
     if rt.cfg.sampling.log then kong.log.info("jev-edge sample: ", cjson.encode(s)) end
   end)
   if not ok then kong.log.warn("jev-edge: sampling failed: ", err) end
@@ -352,8 +387,11 @@ function JevEdge:access(conf)
   kong.ctx.plugin.verdict = v
 
   if v.action == verdict.ACTION_BLOCK then
-    local headers = verdict.headers(v)
+    -- the client sees the verdict and the request id, never the score, the
+    -- reason or the source (verdict.client_headers): those go to the log
+    local headers = verdict.client_headers(v)
     headers["Content-Type"] = "application/json"
+    headers["X-Jev-Request-Id"] = ngx.var.request_id or ""
     return kong.response.exit(rt.cfg.policy.block_status or 403,
       rt.cfg.policy.block_body or DEFAULT_BLOCK_BODY, headers)
   end

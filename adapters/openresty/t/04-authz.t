@@ -464,3 +464,44 @@ location /_jev/authz/ {
 ["", "", "X-Jev-Verdict: safe"]
 --- no_error_log
 [error]
+
+
+
+=== TEST 18: a thin Worker's two legs (the /_jev/authz call, then the request it forwards) add a verdict's reputation points once; a lone forwarded leg adds them (g1-subject-id-evasion#5)
+--- http_config eval: $::HttpConfig
+--- user_files eval: ::conf('async = { enabled = false }, subject = { enabled = true, from = "header", name = "x-jev-subject", hashed = true, reputation = { block_at = 5 } },')
+--- config eval
+qq{
+location /_jev/authz/ { content_by_lua_block { require("resty.jev.edge").authz() } }
+location /v1/chat/completions { $::Access $::Echo }
+location = /_t/points { content_by_lua_block {
+    local n = 0
+    for _, k in ipairs(ngx.shared.jev_subject:get_keys(0)) do
+        if k:find("^srep:header:abc123:b:") then n = n + ngx.shared.jev_subject:get(k) end
+    end
+    ngx.say("points=", n)
+} }
+}
+--- request eval
+["POST /_jev/authz/v1/chat/completions\n{\"messages\":[{\"role\":\"user\",\"content\":\"Please write a detailed summary of the attached quarterly report.\"}]}",
+ "POST /v1/chat/completions\n{\"messages\":[{\"role\":\"user\",\"content\":\"Please write a detailed summary of the attached quarterly report.\"}]}",
+ "GET /_t/points",
+ "POST /v1/chat/completions\n{\"messages\":[{\"role\":\"user\",\"content\":\"Please write a detailed summary of the attached quarterly report.\"}]}",
+ "GET /_t/points",
+ "POST /v1/chat/completions\n{\"messages\":[{\"role\":\"user\",\"content\":\"Please write a short summary of my last three invoices.\"}]}",
+ "GET /_t/points"]
+--- more_headers eval
+["Content-Type: application/json\nX-Jev-Subject: header:abc123\nX-Jev-Mock-Score: 0.6\nX-Envoy-External-Address: 198.51.100.9",
+ "Content-Type: application/json\nX-Jev-Subject: header:abc123\nX-Jev-Mock-Score: 0.6",
+ "",
+ "Content-Type: application/json\nX-Jev-Subject: header:abc123\nX-Jev-Mock-Score: 0.6",
+ "",
+ "Content-Type: application/json\nX-Jev-Subject: header:abc123\nX-Jev-Mock-Score: 0.6",
+ ""]
+--- error_code eval
+[200, 200, 200, 200, 200, 200, 200]
+--- response_body_like eval
+["^\$", "verdict=suspicious score=0.60 source=cache", "^points=1\$", "verdict=suspicious score=0.60 source=cache", "^points=2\$",
+ "verdict=suspicious score=0.60 source=l2", "^points=3\$"]
+--- no_error_log
+[error]

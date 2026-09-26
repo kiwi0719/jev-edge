@@ -8,12 +8,20 @@
 --   trust       same contract, for fingerprint trust only (default: cache).
 --               Split it out to put trust somewhere shared or durable without
 --               moving the hot verdict cache too.
---   judge       { call = fn(prompt, timeout_ms) -> answers|nil, err, kind }
+--   judge       { call = fn(prompt, timeout_ms) -> answers|nil, err, kind,
+--                 call_many = fn(prompts, timeout_ms) (optional),
+--                 whole = true (optional) }
 --                 answers: { [template_name] = probability }
+--                 whole: the provider judges the whole request in one call
+--                 (a thin Worker's origin): a request judged in parts is
+--                 one prompt of all of it, and only the whole request's
+--                 cache entry is read and written
 --                 err == judge.BUSY: the adapter's own in-flight cap refused
 --                 the call; not a provider failure, not fed to the breaker
 --                 kind: judge.TRANSPORT | TIMEOUT | UNAVAILABLE (breaker
---                 failures) or REJECTED | UNUSABLE (not); none = counted
+--                 failures) or REJECTED | UNUSABLE (not); none = counted.
+--                 An L2 error verdict names it as error_kind
+--                 (judge.error_kind)
 --   breaker     object from core/breaker.lua (optional)
 --   subject     optional { id = string, history = table|nil, record = fn(entry) }
 --                 Per-subject trajectory (core/subject.lua). Absent, or absent
@@ -101,12 +109,69 @@ local function settle(ctx, failed, answered)
   elseif b.release then b:release() end
 end
 
+-- The judge endpoint as the cache scope names it: scheme and host
+-- lowercased (they are case-insensitive), trailing slashes dropped; the rest
+-- byte for byte.
+local function scope_endpoint(e)
+  e = tostring(e)
+  local scheme, auth, rest = e:match("^(%a[%w+.%-]*://)([^/?#]*)(.*)$")
+  if scheme then
+    local user, host = auth:match("^(.*@)([^@]*)$")
+    if user then auth = user .. host:lower() else auth = auth:lower() end
+    e = scheme:lower() .. auth .. rest
+  end
+  return (e:gsub("/+$", ""))
+end
+
+-- A value of jev.questions in a canonical spelling: a table as its keys
+-- sorted, each key=value, nested the same way (a list's keys are 1, 2, ...).
+local function canon(v)
+  if type(v) ~= "table" then return tostring(v) end
+  local keys = {}
+  for k in pairs(v) do keys[#keys + 1] = tostring(k) end
+  table.sort(keys)
+  local byname = {}
+  for k, x in pairs(v) do byname[tostring(k)] = x end
+  local out = {}
+  for i, k in ipairs(keys) do out[i] = k .. "=" .. canon(byname[k]) end
+  return "{" .. table.concat(out, ",") .. "}"
+end
+
+-- The question wording a provider reads for these templates
+-- (providers/jev.lua: only these fields); nil when none is overridden.
+local WORDING = { "instructions", "criteria", "instructions_ctx", "criteria_ctx" }
+local function scope_questions(qs, templates, hash)
+  if type(qs) ~= "table" then return nil end
+  -- a whole request's entry names its parts ("injection,abuse", "+untrusted")
+  local names, seen = {}, {}
+  for _, t in ipairs(templates) do
+    for n in tostring(t):gmatch("[^,+]+") do
+      if not seen[n] then seen[n] = true; names[#names + 1] = n end
+    end
+  end
+  table.sort(names)
+  local lines = {}
+  for _, n in ipairs(names) do
+    local q = qs[n]
+    if type(q) == "table" then
+      for _, k in ipairs(WORDING) do
+        if q[k] ~= nil then lines[#lines + 1] = n .. "." .. k .. "=" .. canon(q[k]) end
+      end
+    end
+  end
+  if #lines == 0 then return nil end
+  return tostring(hash(table.concat(lines, "\n")))
+end
+
 --- Verdict-cache key for a fingerprint judged under `rule`.
 -- A score is only valid for the prompt that produced it: the same text judged
--- with another rule's templates or deployment context, or by another
--- provider or model, may score differently, so each gets its own entry
--- (a lenient tenant's SAFE must not be replayed on a strict one). Trust
--- stays keyed by fingerprint alone: an operator vouches for the text.
+-- with another rule's templates or deployment context, by another provider,
+-- model or endpoint (a thin Worker's origin is its endpoint), or with other
+-- question wording (jev.questions), may score differently, so each gets its
+-- own entry (a lenient tenant's SAFE must not be replayed on a strict one).
+-- The endpoint and the wording join the scope only when set, so the keys of
+-- a config without them stay as they were. Trust stays keyed by fingerprint
+-- alone: an operator vouches for the text.
 -- @param fp   fingerprint (non-empty)
 -- @param rule the rule L1 matched
 -- @param cfg  merged config
@@ -118,14 +183,19 @@ function _M.cache_key(fp, rule, cfg, hash, over)
   local templates = over and over.templates or (rule and rule.templates) or {}
   local deployment = over and over.deployment
   if deployment == nil then deployment = rule and rule.deployment_context or jev.deployment_context or "" end
-  local scope = table.concat({
+  local fields = {
     tostring(rule and rule.id or ""),
     table.concat(templates, ","),
     tostring(deployment),
     tostring(jev.provider or ""),
     tostring(jev.model or ""),
-  }, "\n")
-  return "fp:" .. tostring(hash(scope)):sub(1, 16) .. ":" .. fp
+  }
+  if type(jev.endpoint) == "string" and jev.endpoint ~= "" then
+    fields[#fields + 1] = "endpoint=" .. scope_endpoint(jev.endpoint)
+  end
+  local q = scope_questions(jev.questions, templates, hash)
+  if q then fields[#fields + 1] = "questions=" .. q end
+  return "fp:" .. tostring(hash(table.concat(fields, "\n"))):sub(1, 16) .. ":" .. fp
 end
 
 -- Joins the whole text, the retrieved content and the tool definitions into
@@ -146,7 +216,7 @@ local function plan(req, cfg, hash, rule, text, windowed, chunks, capped, untrus
   local whole = text
   if untrusted then whole = whole .. UNTRUSTED_SEP .. untrusted.text end
   if tools then whole = whole .. TOOLS_SEP .. tools.text end
-  local p = { fp = normalize.fingerprint(whole, { prefix_bytes = cfg.cache.fp_prefix_bytes }, hash) }
+  local p = { whole = whole, fp = normalize.fingerprint(whole, { prefix_bytes = cfg.cache.fp_prefix_bytes }, hash) }
   local uspec = untrusted and defaults.untrusted_spec(cfg, rule)
   -- The whole request's entry. Judged in parts, it names the parts in its
   -- scope, so it never answers for the same text judged in one piece.
@@ -208,7 +278,11 @@ end
 -- not paid for again on every turn; the misses go to the judge together
 -- (ctx.judge.call_many, in parallel, when the adapter has it). The request's
 -- score is the highest part score. A part the judge failed on turns the
--- request into an error unless another part already blocks.
+-- request into an error unless another part already blocks. A part whose
+-- prompt cannot be built (a template judge does not know, which config
+-- validation refuses) is logged and left out, and the others are judged:
+-- the request is an error only when no part is left. Its score is then for
+-- less than the whole request, and the whole request's entry is not written.
 -- @param parts  list of { text, templates, context, over, label, rep } (over:
 --               cache_key's; label: put before the template name in the
 --               reason when this part's score decides; rep = false: not the
@@ -219,6 +293,7 @@ end
 local function judge_parts(ctx, rule, parts, suffix, fp, ckey, reason)
   local cfg = ctx.config
   local scores, tops, pending = {}, {}, {}
+  local left_out
   for i, part in ipairs(parts) do
     local cfp = normalize.fingerprint(part.text, { prefix_bytes = cfg.cache.fp_prefix_bytes }, ctx.hash)
     local ck = cfp ~= "" and _M.cache_key(cfp, rule, cfg, ctx.hash, part.over) or nil
@@ -229,15 +304,20 @@ local function judge_parts(ctx, rule, parts, suffix, fp, ckey, reason)
       scores[i], tops[i] = hit.score, tostring(hit.reason or ""):match("^(%S+)") or ""
     else
       local prompt, perr = judge.build(part.templates, part.text, part.context)
-      if not prompt then
-        log(ctx, "error", "jev-edge: " .. perr)
-        settle(ctx)
-        local action, label, async = policy.on_error()
-        return finish(ctx, verdict.new({ action = action, verdict = label, async = async,
-          source = verdict.SRC_L2, reason = perr, fingerprint = fp }))
+      if prompt then
+        pending[#pending + 1] = { i = i, prompt = prompt, ck = ck }
+      else
+        log(ctx, "error", "jev-edge: " .. perr .. " (that part is not judged)")
+        left_out = left_out or perr
       end
-      pending[#pending + 1] = { i = i, prompt = prompt, ck = ck }
     end
+  end
+  if #pending == 0 and next(scores) == nil then
+    -- no part left to judge
+    settle(ctx)
+    local action, label, async = policy.on_error()
+    return finish(ctx, verdict.new({ action = action, verdict = label, async = async,
+      source = verdict.SRC_L2, reason = left_out, fingerprint = fp, error_kind = judge.KIND_OTHER }))
   end
 
   local t0 = now_ms(ctx)
@@ -254,7 +334,7 @@ local function judge_parts(ctx, rule, parts, suffix, fp, ckey, reason)
   end
   local elapsed = now_ms(ctx) - t0
 
-  local err, failed, answered
+  local err, ekind, failed, answered
   for k, p in ipairs(pending) do
     local r = results[k] or {}
     local a, e, kind = r[1], r[2], r[3]
@@ -262,7 +342,7 @@ local function judge_parts(ctx, rule, parts, suffix, fp, ckey, reason)
     if a then s, t, n = judge.reduce(a) end
     if not a or n == 0 then
       if a then e, kind = "no scores in answer", judge.UNUSABLE end
-      err = err or judge.reason(e, kind)
+      if not err then err, ekind = judge.reason(e, kind), judge.error_kind(e, kind) end
       if judge.counts(e, kind) then failed = true end
     else
       answered = true
@@ -288,18 +368,23 @@ local function judge_parts(ctx, rule, parts, suffix, fp, ckey, reason)
     log(ctx, "warn", "jev-edge: L2 failed on a chunk: " .. err)
     local action, label, async = policy.on_error()
     return finish(ctx, verdict.new({ action = action, verdict = label, async = async,
-      source = verdict.SRC_L2, reason = err, fingerprint = fp, l2_ms = elapsed }))
+      source = verdict.SRC_L2, reason = err, fingerprint = fp, l2_ms = elapsed, error_kind = ekind }))
   end
 
   local action, label, async = policy.decide(best, cfg.policy)
   local why = top ~= "" and (top .. " " .. string.format("%.2f", best)) or reason
   if top ~= "" then why = why .. suffix end
-  if ckey and ctx.cache then
+  if ckey and ctx.cache and not left_out then
     ctx.cache:set(ckey, { score = best, reason = why, rep = rep }, cfg.cache.fp_ttl)
   end
+  -- Every part was a per-part cache hit: the judge was not asked, so the
+  -- verdict is the cache's, as on a whole-request hit (source cache, never
+  -- async, no L2 time), and the L2 latency and error counts leave it out.
+  local cached = #pending == 0
   return finish(ctx, verdict.new({
-    action = action, verdict = label, score = best, async = async,
-    source = verdict.SRC_L2, reason = why, fingerprint = fp, l2_ms = elapsed,
+    action = action, verdict = label, score = best, async = async and not cached,
+    source = cached and verdict.SRC_CACHE or verdict.SRC_L2, reason = why, fingerprint = fp,
+    l2_ms = cached and 0 or elapsed,
   }), rep)
 end
 
@@ -381,6 +466,19 @@ function _M.evaluate(req, ctx)
     end
   end
 
+  -- capped --------------------------------------------------------------
+  -- max_judge_chunks > 1 was the operator's choice to judge long text in
+  -- full; what still did not fit is unjudgeable, and policy.unjudgeable
+  -- decides as it does for any other unreadable request. An L1 decision
+  -- that needs no provider: an open breaker must not turn it into a pass.
+  if chunks and #chunks > 1 and capped and cfg.policy.unjudgeable == "block"
+     and cfg.policy.mode == "enforce" then
+    return finish(ctx, verdict.new({
+      action = verdict.ACTION_BLOCK, verdict = verdict.SKIPPED, source = verdict.SRC_L1,
+      reason = "unjudgeable: text over max_judge_chunks", fingerprint = fp,
+    }))
+  end
+
   -- breaker -------------------------------------------------------------
   if ctx.breaker and not ctx.breaker:allow() then
     local action, label, async = policy.on_skipped()
@@ -391,26 +489,26 @@ function _M.evaluate(req, ctx)
   end
 
   -- L2 ------------------------------------------------------------------
-  if chunks and #chunks > 1 then
-    -- max_judge_chunks > 1 was the operator's choice to judge long text in
-    -- full; what still did not fit is unjudgeable, and policy.unjudgeable
-    -- decides as it does for any other unreadable request
-    if capped and cfg.policy.unjudgeable == "block" and cfg.policy.mode == "enforce" then
-      settle(ctx)
-      return finish(ctx, verdict.new({
-        action = verdict.ACTION_BLOCK, verdict = verdict.SKIPPED, source = verdict.SRC_L1,
-        reason = "unjudgeable: text over max_judge_chunks", fingerprint = fp,
-      }))
-    end
+  if p.parts and not ctx.judge.whole then return judge_parts(ctx, rule, p.parts, p.suffix, fp, ckey, reason) end
+  -- One piece; or a provider that judges the whole request in one call
+  -- (ctx.judge.whole): all of it in one prompt (every chunk, the retrieved
+  -- content, the tool definitions, joined as the fingerprint joins them),
+  -- one answer, and only the whole request's entry. An answer for all of it
+  -- is never one for a part: no part's entry is written.
+  local jtext, rep = text, p.rep
+  if p.parts then
+    jtext = p.whole
+    -- its one score cannot say whether the subject's own text or the
+    -- retrieved content or tool definitions beside it made it (rep_of)
+    if untrusted or tools then rep = false end
   end
-  if p.parts then return judge_parts(ctx, rule, p.parts, p.suffix, fp, ckey, reason) end
-  local prompt, perr = judge.build(rule.templates, text, p.context)
+  local prompt, perr = judge.build(rule.templates, jtext, p.context)
   if not prompt then
     log(ctx, "error", "jev-edge: " .. perr)
     settle(ctx)
     local action, label, async = policy.on_error()
     return finish(ctx, verdict.new({ action = action, verdict = label, async = async,
-      source = verdict.SRC_L2, reason = perr, fingerprint = fp }))
+      source = verdict.SRC_L2, reason = perr, fingerprint = fp, error_kind = judge.KIND_OTHER }))
   end
 
   local t0 = now_ms(ctx)
@@ -423,7 +521,7 @@ function _M.evaluate(req, ctx)
     log(ctx, "warn", "jev-edge: L2 failed: " .. why)
     local action, label, async = policy.on_error()
     return finish(ctx, verdict.new({ action = action, verdict = label, async = async,
-      source = verdict.SRC_L2, reason = why,
+      source = verdict.SRC_L2, reason = why, error_kind = judge.error_kind(jerr, jkind),
       fingerprint = fp, l2_ms = elapsed }))
   end
 
@@ -437,23 +535,23 @@ function _M.evaluate(req, ctx)
     log(ctx, "warn", "jev-edge: L2 answer has no scores")
     local action, label, async = policy.on_error()
     return finish(ctx, verdict.new({ action = action, verdict = label, async = async,
-      source = verdict.SRC_L2, reason = why,
+      source = verdict.SRC_L2, reason = why, error_kind = judge.UNUSABLE,
       fingerprint = fp, l2_ms = elapsed }))
   end
   if ctx.breaker then ctx.breaker:success() end
   local action, label, async = policy.decide(score, cfg.policy)
   local why = top ~= "" and (top .. " " .. string.format("%.2f", score)) or reason
-  -- the score is for the window, not the whole text; say so
-  if windowed and top ~= "" then why = why .. " (window)" end
+  -- what the score covers ("(window)", "(3 chunks)"), as judged in parts
+  if top ~= "" then why = why .. p.suffix end
 
   if ckey and ctx.cache then
-    ctx.cache:set(ckey, { score = score, reason = why, rep = p.rep }, cfg.cache.fp_ttl)
+    ctx.cache:set(ckey, { score = score, reason = why, rep = rep }, cfg.cache.fp_ttl)
   end
 
   return finish(ctx, verdict.new({
     action = action, verdict = label, score = score, async = async,
     source = verdict.SRC_L2, reason = why, fingerprint = fp, l2_ms = elapsed,
-  }), p.rep)
+  }), rep)
 end
 
 -- ---------------------------------------------------------------------------
@@ -470,9 +568,12 @@ end
 -- rules, without the stores (reputation is not looked up again).
 -- @param req the request, as evaluate() had it
 -- @param ctx { config, rules, hash, json_decode, re_find, log }
--- @return nil when L1 no longer finds it suspect or a prompt cannot be
+-- @return nil when L1 no longer finds it suspect or no prompt can be
 --         built; else { fingerprint, key (the whole request's cache key, or
---         nil), reason (L1's), suffix, parts = { { prompt, key, label, rep } } }
+--         nil), reason (L1's), suffix, parts = { { prompt, key, label, rep } } }.
+--         A part of several whose prompt cannot be built is left out, as
+--         judge_parts leaves it out, and key is then nil: an answer for the
+--         rest is not one for the whole request.
 function _M.l3_job(req, ctx)
   local cfg = ctx.config
   local r, text, reason, rule, windowed, chunks, capped, untrusted, tools, retrieved = rules_mod.evaluate_all(req,
@@ -482,16 +583,20 @@ function _M.l3_job(req, ctx)
   local job = { fingerprint = p.fp, key = p.key, reason = reason, suffix = p.suffix, parts = {} }
   -- one piece: its answer is the whole request's
   local parts = p.parts or { { text = text, templates = rule.templates, context = p.context, rep = p.rep } }
-  for i, part in ipairs(parts) do
+  for _, part in ipairs(parts) do
     local prompt = judge.build(part.templates, part.text, part.context)
-    if not prompt then return nil end
-    local key = p.key
-    if p.parts then
-      local cfp = normalize.fingerprint(part.text, { prefix_bytes = cfg.cache.fp_prefix_bytes }, ctx.hash)
-      key = cfp ~= "" and _M.cache_key(cfp, rule, cfg, ctx.hash, part.over) or nil
+    if prompt then
+      local key = p.key
+      if p.parts then
+        local cfp = normalize.fingerprint(part.text, { prefix_bytes = cfg.cache.fp_prefix_bytes }, ctx.hash)
+        key = cfp ~= "" and _M.cache_key(cfp, rule, cfg, ctx.hash, part.over) or nil
+      end
+      job.parts[#job.parts + 1] = { prompt = prompt, key = key, label = part.label, rep = part.rep }
+    elseif p.parts then
+      job.key = nil
     end
-    job.parts[i] = { prompt = prompt, key = key, label = part.label, rep = part.rep }
   end
+  if #job.parts == 0 then return nil end
   return job
 end
 

@@ -8,6 +8,7 @@ local core    = require "jev.core"
 local verdict = require "jev.core.verdict"
 local judge_m = require "jev.core.judge"
 local http    = require "resty.jev.http"
+local rules_m = require "jev.core.rules"
 
 local _M = {}
 
@@ -99,7 +100,8 @@ local function handler(premature, job)
     for _, w in ipairs(res.writes) do cache:set(w[1], w[2], cfg.cache.fp_ttl) end
 
     if job.client_ip and job.client_ip ~= "" then
-      local key = "rep:" .. job.client_ip
+      -- IPv6 counted per client_ip.ipv6_prefix network, as L1 reads it
+      local key = "rep:" .. rules_m.ip_key(job.client_ip, cfg)
       local rep = cache:get(key)
       if type(rep) ~= "table" then rep = { malicious = 0 } end
       -- charged for the client's own text, as subject reputation is: a score

@@ -97,11 +97,48 @@ local path_matches = _M.path_matches
 
 -- always_suspect patterns are PCRE, matched through ctx.re_find so the same
 -- rule files work under ngx.re (OpenResty), lrexlib (tests) or JS RegExp.
--- re_find returns the 1-based inclusive byte span of the match (from, to), or
--- just a truthy value; the span places the hit inside the judging window.
--- Without an injected matcher the prefilter is skipped (fail-open) and the
--- length check alone decides.
-local warned = false
+-- re_find(subject, pattern, init) returns the 1-based inclusive byte span of
+-- the first match that starts at or after byte `init` (1 when nil), or just
+-- a truthy value; the spans place the hits inside the judging window. A
+-- matcher that ignores init returns an earlier span again, and the walk of
+-- that pattern stops there. Without an injected matcher the prefilter is
+-- skipped (fail-open) and the length check alone decides.
+--
+-- Every pattern is run and its matches walked, and the latest MAX_SPANS
+-- spans in the text are kept: the first pattern's first match alone let a
+-- harmless decoy before the attack take the window's hit half, and the
+-- attack was cut out of the judged text. After WALK matches of one pattern
+-- the walk skips halfway to the end of the text (the later matches are the
+-- ones kept), so a text full of matches costs a bounded number of calls and
+-- still one pass per pattern.
+--
+-- A matcher that fails (ngx.re.find's third value, a PCRE JIT stack or
+-- match limit on a long input, or a pattern the engine refuses; or one that
+-- throws) counts that pattern as a hit with no span, logged once per
+-- pattern: the prefilter fails toward judging, never into a silent miss.
+_M.MAX_SPANS = 8
+local WALK = 64
+
+local function by_start(a, b)
+  if a[1] ~= b[1] then return a[1] < b[1] end
+  return a[2] < b[2]
+end
+
+local warned, failed = false, {}
+
+local function matcher_failed(p, err, ctx)
+  if failed[p] then return end
+  failed[p] = true
+  if ctx and ctx.log then
+    ctx.log("warn", "jev-edge: always_suspect pattern " .. p .. " failed (" .. tostring(err)
+      .. "); it counts as a hit")
+  end
+end
+
+-- @return the first pattern in list order that matched (the reason names
+--         it), and the spans of the matches, at most MAX_SPANS, the latest
+--         in the text, in text order (nil when no match gave a span); nil
+--         when nothing matched
 local function text_matches(s, patterns, ctx)
   if not patterns or #patterns == 0 then return nil end
   local re_find = ctx and ctx.re_find
@@ -112,14 +149,33 @@ local function text_matches(s, patterns, ctx)
     end
     return nil
   end
+  local hit, all, n = nil, {}, #s
   for _, p in ipairs(patterns) do
-    local ok, from, to = pcall(re_find, s, p)
-    if ok and from then
-      if type(from) == "number" and type(to) == "number" then return p, from, to end
-      return p
+    local mine, init, walked = {}, 1, 0
+    while init <= n do
+      local ok, from, to, err = pcall(re_find, s, p, init)
+      if not ok or (not from and err ~= nil) then
+        matcher_failed(p, ok and err or from, ctx)
+        hit = hit or p
+        break
+      end
+      if not from then break end
+      hit = hit or p
+      if type(from) ~= "number" or type(to) ~= "number" or from < init then break end
+      mine[#mine + 1] = { from, to }
+      if #mine > _M.MAX_SPANS then table.remove(mine, 1) end
+      init = math.max(from, to) + 1
+      walked = walked + 1
+      if walked % WALK == 0 then init = math.max(init, math.floor((init + n) / 2)) end
     end
+    for _, sp in ipairs(mine) do all[#all + 1] = sp end
   end
-  return nil
+  if not hit then return nil end
+  if #all == 0 then return hit end
+  table.sort(all, by_start)
+  local spans = {}
+  for i = math.max(1, #all - _M.MAX_SPANS + 1), #all do spans[#spans + 1] = all[i] end
+  return hit, spans
 end
 
 --- The request's Content-Type as one string. A repeated header arrives as a
@@ -173,7 +229,7 @@ local function ct_watched(ct, rule)
   local skip = rule.skip_content_types or _M.SKIP_CONTENT_TYPES
   local any = false
   for raw in ct:gmatch("[^,]+") do
-    local v = raw:match("^%s*(.-)%s*$")
+    local v = normalize.trim(raw)
     if v ~= "" then
       any = true
       local skipped = false
@@ -265,9 +321,9 @@ end
 local function tools_part(values, cut, rule, ctx)
   local ttext = table.concat(values, "\n")
   if ttext == "" then return nil end
-  local hit, from, to = text_matches(ttext, rule.always_suspect, ctx)
+  local hit, spans = text_matches(ttext, rule.always_suspect, ctx)
   local windowed
-  ttext, windowed = normalize.window(ttext, values, rule.max_judge_bytes or _M.MAX_JUDGE_BYTES, from, to)
+  ttext, windowed = normalize.window(ttext, values, rule.max_judge_bytes or _M.MAX_JUDGE_BYTES, spans)
   return { text = ttext, windowed = (windowed or cut) and true or false, hit = hit }
 end
 
@@ -301,12 +357,16 @@ local function judged(req, rule, ctx, ct, size, ex)
   if gateway_cut and size <= max then size = max + 1 end
   if size > max then
     local head, tail = req.body_head, req.body_tail
+    -- the body fits in its head and tail: the tail starts where the head
+    -- ends, and a value cut between them is read whole
+    local joined = size <= max + _M.TAIL_BYTES
     if not head and req.body then
       -- a whole body handed over (tests, small adapters): its head, and its
-      -- tail when there is anything past the head
+      -- tail when there is anything past the head (all of it when joined)
       head = normalize.head(req.body, max)
       if #req.body > #head then
-        tail = normalize.tail(req.body:sub(#head + 1), _M.TAIL_BYTES)
+        local rest = req.body:sub(#head + 1)
+        tail = joined and rest or normalize.tail(rest, _M.TAIL_BYTES)
       end
     end
     if media and not (head and normalize.is_text(head)) then return nil, CT_NOT_WATCHED end
@@ -317,16 +377,23 @@ local function judged(req, rule, ctx, ct, size, ex)
     if gateway_cut and pol and pol.partial == "unjudgeable" then return nil, "unjudgeable: partial body" end
     local keys, deep = normalize.field_keys(rule.text_fields), normalize.deep_keys(rule.text_fields)
     local found = {}
-    values = normalize.scan_strings(head, keys, {}, deep, found)
-    if tail then normalize.scan_strings(tail, keys, values, deep, found) end
+    -- head and tail joined are one string to scan; apart, the tail starts
+    -- inside a value it has only the end of (g1-chunk-seams-window-math#6)
+    joined = joined and tail ~= nil
+    if joined then
+      values = normalize.scan_strings(head .. tail, keys, {}, deep, found)
+    else
+      values = normalize.scan_strings(head, keys, {}, deep, found)
+      if tail then normalize.scan_strings(tail, keys, values, deep, found, { tail = true }) end
+    end
     tokens = found.tokens == true
     if #values == 0 and not tokens then return nil, "unjudgeable: body too large" end
     text, partial = table.concat(values, "\n"), true
     retrieved = untrusted_on(rule, ctx)
     if has_tool_fields(rule) then
       local tkeys = normalize.field_keys(rule.tool_fields)
-      local tvalues = normalize.scan_tools(head, tkeys, {})
-      if tail then normalize.scan_tools(tail, tkeys, tvalues) end
+      local tvalues = normalize.scan_tools(joined and head .. tail or head, tkeys, {})
+      if tail and not joined then normalize.scan_tools(tail, tkeys, tvalues) end
       tools = tools_part(tvalues, true, rule, ctx)
     end
   else
@@ -340,6 +407,7 @@ local function judged(req, rule, ctx, ct, size, ex)
     tokens = ids == true
     if media and (kind == "binary" or kind == "none") then return nil, CT_NOT_WATCHED end
     if kind == "binary" then return nil, "unjudgeable: binary body" end
+    if kind == "boundaries" then return nil, "unjudgeable: multipart boundaries" end
     -- declared JSON the decoder refused, with no text-field value to scan
     if kind == "invalid" then return nil, "unjudgeable: invalid json" end
     -- a "**" field hit its bound: the text is not all there
@@ -364,27 +432,61 @@ local function judged(req, rule, ctx, ct, size, ex)
     end
   end
   if text == "" then return "", nil, nil, nil, nil, nil, untrusted, tools, bound, false, tokens end
-  local hit, from, to = text_matches(text, rule.always_suspect, ctx)
+  local hit, spans = text_matches(text, rule.always_suspect, ctx)
   local budget = rule.max_judge_bytes or _M.MAX_JUDGE_BYTES
   local maxc = math.floor(tonumber(rule.max_judge_chunks) or 1)
   if maxc > 1 and #text > budget then
-    -- judged in chunks: all of the text when it fits in max_judge_chunks
-    -- pieces; otherwise the newest max_judge_chunks - 1 pieces whole and a
-    -- window over everything older (capped: some of the text is not judged)
-    local pieces, starts = normalize.chunks(text, budget)
-    if #pieces <= maxc then
-      return table.concat(pieces, "\n"), nil, hit, partial, pieces, false, untrusted, tools, bound, retrieved, tokens
+    -- judged in chunks, consecutive ones sharing chunk_overlap bytes: all of
+    -- the text when it is no longer than budget + (maxc - 1) x (budget -
+    -- overlap) bytes, cut at newlines when that fits in maxc pieces and hard
+    -- otherwise; past that, the newest max_judge_chunks - 1 pieces whole and
+    -- a window over everything older (capped: some of the text is not judged)
+    local overlap = normalize.chunk_overlap(budget)
+    local capacity = budget + (maxc - 1) * (budget - overlap)
+    local pieces, starts = normalize.chunks(text, budget, overlap)
+    if #pieces > maxc and #text <= capacity then
+      pieces, starts = normalize.chunks(text, budget, overlap, true)
     end
-    local first_kept = #pieces - (maxc - 1) + 1
-    local older = text:sub(1, starts[first_kept] - 1):gsub("\n$", "")
-    local inside = from and to and to <= #older
-    local win = normalize.window(older, { older }, budget, inside and from or nil, inside and to or nil)
-    local out = { win }
-    for k = first_kept, #pieces do out[#out + 1] = pieces[k] end
-    return table.concat(out, "\n"), nil, hit, true, out, true, untrusted, tools, bound, retrieved, tokens
+    local out, covered, capped = pieces, {}, false
+    if #pieces <= maxc then
+      for k = 1, #pieces do covered[k] = { starts[k], starts[k] + #pieces[k] - 1 } end
+    else
+      local first_kept = #pieces - (maxc - 1) + 1
+      local older = text:sub(1, starts[first_kept] - 1):gsub("\n$", "")
+      local inside = {}
+      for _, sp in ipairs(spans or {}) do
+        if sp[2] <= #older then inside[#inside + 1] = sp end
+      end
+      local win = normalize.window(older, { older }, budget, inside)
+      out, capped = { win }, true
+      -- the window holds the hits that were inside what it covers
+      for _, sp in ipairs(inside) do covered[#covered + 1] = sp end
+      for k = first_kept, #pieces do
+        out[#out + 1] = pieces[k]
+        covered[#covered + 1] = { starts[k], starts[k] + #pieces[k] - 1 }
+      end
+    end
+    -- backstop: a hit longer than the overlap can still straddle a cut;
+    -- such hits and up to HIT_CONTEXT bytes each side are judged as a part
+    -- of their own, the way window() keeps them
+    local straddle = {}
+    for _, sp in ipairs(spans or {}) do
+      local whole = false
+      for _, c in ipairs(covered) do
+        if c[1] <= sp[1] and sp[2] <= c[2] then whole = true break end
+      end
+      if not whole then straddle[#straddle + 1] = sp end
+    end
+    if #straddle > 0 then
+      local around = normalize.window(text, {}, budget, straddle)
+      local with = { around }
+      for k = 1, #out do with[k + 1] = out[k] end
+      out = with
+    end
+    return table.concat(out, "\n"), nil, hit, capped or partial, out, capped, untrusted, tools, bound, retrieved, tokens
   end
   local windowed
-  text, windowed = normalize.window(text, values, budget, from, to)
+  text, windowed = normalize.window(text, values, budget, spans)
   return text, nil, hit, windowed or partial, nil, nil, untrusted, tools, bound, retrieved, tokens
 end
 
@@ -392,13 +494,33 @@ end
 -- lack of text: what was left unread may be what the model reads.
 local BOUND_REASON = "unjudgeable: json over the walk bounds"
 
+-- Does the evaluating config block by IP reputation (kong-apisix#5)? true
+-- when there is no config to ask (the rules-only contexts).
+local function ip_rep_on(ctx)
+  local cfg = ctx.config
+  if type(cfg) ~= "table" then return true end
+  local a = cfg.async
+  return (tonumber(type(a) == "table" and a.rep_block_after or nil) or 0) > 0
+end
+
+--- The key IP reputation counts `ip` under (rep:<key>), and subject.from =
+-- "ip" hashes: IPv6 aggregated to cfg.client_ip.ipv6_prefix bits (64 when
+-- unset), IPv4 as it is (normalize.ip_key). L1 reads and L3 writes it.
+function _M.ip_key(ip, cfg)
+  local ci = type(cfg) == "table" and cfg.client_ip
+  return normalize.ip_key(ip, type(ci) == "table" and ci.ipv6_prefix or nil)
+end
+
 --- Evaluate one rule set against a request.
 -- @param req  { method, path, headers, body, body_size, client_ip }, and
 --             where the adapter has them decoded, body_head, body_tail and
 --             body_partial (the gateway forwarded only the body's first part)
 -- @param rule rule table (see rules/*.lua)
 -- @param ctx  { cache = {get=fn}, json_decode = fn, clock = fn,
---               re_find = fn(subject, pcre) -> truthy on match (case-insensitive) }
+--               re_find = fn(subject, pcre, init) -> from, to of the first
+--               case-insensitive match at or after byte init (1 when nil),
+--               or truthy on a match, or nil; nil, nil, err when the
+--               matcher fails, which counts as a hit }
 -- @return result, text, reason, windowed, chunks, capped, untrusted ({ text,
 --         windowed } of retrieved content to judge on its own, or nil), tools
 --         ({ text, windowed, hit } of the tool definitions, or nil). `only`
@@ -424,8 +546,13 @@ function _M.evaluate(req, rule, ctx)
   --    headers-only forward-auth request can still be rejected. Reputation
   --    only ever blocks: a run of safe verdicts earns an IP nothing, or an
   --    attacker could warm one up with harmless requests and skip L2 after.
-  if ctx and ctx.cache and req.client_ip then
-    local rep = ctx.cache:get("rep:" .. req.client_ip)
+  --    Only for a config that blocks by IP (async.rep_block_after > 0): the
+  --    rep: records are shared by every route and plugin instance on the
+  --    dict, and one that keeps the default 0 (one NAT or carrier IP can hide
+  --    thousands of users) does not block on another's. Without a config (a
+  --    rules-only caller) the record decides, as it always did.
+  if ctx and ctx.cache and req.client_ip and ip_rep_on(ctx) then
+    local rep = ctx.cache:get("rep:" .. _M.ip_key(req.client_ip, ctx.config))
     if type(rep) == "table" then
       local now = ctx.clock and ctx.clock() or 0
       if rep.blocked_until and rep.blocked_until > now then
@@ -476,6 +603,9 @@ function _M.evaluate(req, rule, ctx)
   if untrusted and #untrusted.text < min_chars then untrusted = nil end
   -- so are the tool definitions, and short ones an always_suspect pattern hit
   if tools and not tools.hit and #tools.text < min_chars then tools = nil end
+  -- Token ids with nothing else to judge are unjudgeable, never "no text";
+  -- beside text (or parts) enough to judge, that is judged, and core decides
+  -- what the ids add (core/init.lua: the stricter of the two).
   if text == "" and not untrusted and not tools then
     if tokens then return _M.UNJUDGEABLE, "", _M.TOKENS, nil, nil, nil, nil, nil, nil, true end
     if bound then return _M.UNJUDGEABLE, "", BOUND_REASON end
@@ -600,6 +730,83 @@ function _M.pattern_error(p)
   return nil
 end
 
+local is_list, string_list_error = defaults.is_list, defaults.string_list_error
+
+-- A rule's methods as the uppercase map evaluate() looks methods up in:
+-- from a map { POST = true } (a false value leaves the method out) or a list
+-- { "POST" }; nil when `v` is neither, or names no method. A lowercase key
+-- would never match, and the rule would watch no request.
+local function methods_of(v)
+  if type(v) ~= "table" then return nil end
+  local out, any = {}, false
+  if is_list(v) and #v > 0 then
+    for _, m in ipairs(v) do
+      if type(m) ~= "string" or m == "" then return nil end
+      out[m:upper()], any = true, true
+    end
+  else
+    for k, on in pairs(v) do
+      if type(k) ~= "string" or k == "" or type(on) ~= "boolean" then return nil end
+      if on then out[k:upper()], any = true, true end
+    end
+  end
+  return any and out or nil
+end
+
+-- Type checks for the fields resolve() does not fill in: a mistyped one
+-- (a string for a list, a lowercase method, JSON null, a limit that is not a
+-- number) would turn judging off for the rule or fail open on every
+-- request. Normalizes methods to an uppercase map and content types to
+-- lowercase (the Content-Type they are matched against is lowercased).
+-- @return nil, or the error
+local function check_fields(out)
+  local id = out.id
+  if out.methods ~= nil then
+    local m = methods_of(out.methods)
+    if not m then
+      return "rule " .. id .. ": methods must be a list of method names, or a map of them to true"
+    end
+    out.methods = m
+  end
+  for _, k in ipairs({ "always_suspect", "skip_content_types", "content_types" }) do
+    if out[k] ~= nil then
+      local err = string_list_error(out[k], "rule " .. id .. ": " .. k)
+      if err then return err end
+    end
+  end
+  for _, k in ipairs({ "skip_content_types", "content_types" }) do
+    if out[k] ~= nil then
+      local low = {}
+      for i, v in ipairs(out[k]) do low[i] = v:lower() end
+      out[k] = low
+    end
+  end
+  for _, k in ipairs({ "max_body_bytes", "max_judge_bytes" }) do
+    local v = out[k]
+    if v ~= nil and not (type(v) == "number" and v > 0) then
+      return "rule " .. id .. ": " .. k .. " must be a number > 0"
+    end
+  end
+  -- 0 is no minimum; NaN, which every comparison fails, is not a number here
+  for _, k in ipairs({ "min_body_bytes", "min_text_chars" }) do
+    local v = out[k]
+    if v ~= nil and not (type(v) == "number" and v >= 0) then
+      return "rule " .. id .. ": " .. k .. " must be a number >= 0"
+    end
+  end
+  local c = out.max_judge_chunks
+  if c ~= nil and not (type(c) == "number" and c >= 1 and c % 1 == 0) then
+    return "rule " .. id .. ": max_judge_chunks must be an integer >= 1"
+  end
+  if out.deployment_context ~= nil and type(out.deployment_context) ~= "string" then
+    return "rule " .. id .. ": deployment_context must be a string"
+  end
+  if out.token_prompts ~= nil and out.token_prompts ~= "unjudgeable" and out.token_prompts ~= "block" then
+    return "rule " .. id .. ": token_prompts must be unjudgeable|block"
+  end
+  return nil
+end
+
 --- Resolve a rule spec into a rule table.
 -- A spec is a rule set id (string, loaded through `load`), or a table. A
 -- table with `extends = "<id>"` starts from that rule set and overrides the
@@ -617,7 +824,12 @@ function _M.resolve(spec, load)
   if type(spec) == "string" then spec = { extends = spec } end
   if type(spec) ~= "table" then return nil, "rule spec must be a string or a table" end
   local base = {}
-  if spec.extends then
+  if spec.extends ~= nil then
+    -- a loader builds a module name from it ('jev.rules.' .. id): a table
+    -- or JSON null there raises instead of reporting
+    if type(spec.extends) ~= "string" or spec.extends == "" then
+      return nil, "rule extends must be the id of a rule set (a non-empty string)"
+    end
     local b, err = load(spec.extends)
     if type(b) ~= "table" then return nil, err or ("rule set " .. tostring(spec.extends) .. " not found") end
     base = b
@@ -625,9 +837,10 @@ function _M.resolve(spec, load)
   local out = {}
   for k, v in pairs(base) do out[k] = v end
   for k, v in pairs(spec) do if k ~= "extends" then out[k] = v end end
-  if not out.id then return nil, "rule needs an id" end
-  if type(out.watch_paths) ~= "table" then return nil, "rule " .. out.id .. " needs watch_paths" end
-  if out.json_only_paths ~= nil and type(out.json_only_paths) ~= "table" then
+  if out.id == nil then return nil, "rule needs an id" end
+  if type(out.id) ~= "string" or out.id == "" then return nil, "rule id must be a non-empty string" end
+  if not is_list(out.watch_paths) then return nil, "rule " .. out.id .. " needs watch_paths" end
+  if out.json_only_paths ~= nil and not is_list(out.json_only_paths) then
     return nil, "rule " .. out.id .. ": json_only_paths must be a list of patterns"
   end
   -- watch_paths and json_only_paths are Lua patterns; a malformed one raises
@@ -644,10 +857,9 @@ function _M.resolve(spec, load)
   -- a prompt sent as token ids (TOKENS): "unjudgeable" leaves it to
   -- policy.unjudgeable, "block" refuses it in enforce mode whatever that says
   if out.token_prompts == nil then out.token_prompts = "unjudgeable" end
-  if out.token_prompts ~= "unjudgeable" and out.token_prompts ~= "block" then
-    return nil, "rule " .. out.id .. ": token_prompts must be unjudgeable|block"
-  end
-  if not out.text_fields then
+  local ferr = check_fields(out)
+  if ferr then return nil, ferr end
+  if out.text_fields == nil then
     out.text_fields = { "system", "instructions", "preamble", "system_prompt", "systemInstruction.parts",
                         "system_instruction.parts", "documents", "template",
                         "messages[*].content", "messages[*].tool_calls[*].function.arguments.**",
@@ -658,19 +870,22 @@ function _M.resolve(spec, load)
                         "prompt", "prompt.prompt_string", "prompt[*].prompt_string", "prompt.variables.**",
                         "input", "input[*].arguments.**", "input[*].input", "input[*].output",
                         "inputs", "instances[*].inputs", "instances[*].messages[*].content",
-                        "query", "text", "input_ids", "suffix", "input_prefix", "input_suffix", "input_extra[*].text" }
+                        "query", "text", "input_ids", "suffix", "input_prefix", "input_suffix",
+                        "input_extra[*].filename", "input_extra[*].text" }
   end
-  if not out.tool_fields then
+  if out.tool_fields == nil then
     out.tool_fields = { "tools", "functions", "response_format.json_schema", "text.format" }
   end
   for _, k in ipairs({ "text_fields", "tool_fields" }) do
-    if type(out[k]) ~= "table" then return nil, "rule " .. out.id .. ": " .. k .. " must be a list of paths" end
+    if not is_list(out[k]) then return nil, "rule " .. out.id .. ": " .. k .. " must be a list of paths" end
     for i, p in ipairs(out[k]) do
       local perr = normalize.path_error(p)
       if perr then return nil, "rule " .. out.id .. ": " .. k .. "[" .. i .. "] " .. perr end
     end
   end
-  if not out.templates then out.templates = { "injection" } end
+  if out.templates == nil then out.templates = { "injection" } end
+  local terr = defaults.templates_error(out.templates, "rule " .. out.id .. ": templates")
+  if terr then return nil, terr end
   return out
 end
 

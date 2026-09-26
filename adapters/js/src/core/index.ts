@@ -23,6 +23,10 @@ export interface Judge {
   call(prompt: judge.Prompt, timeoutMs: number): Promise<JudgeResult> | JudgeResult;
   /** Optional: several prompts at once (in parallel), for text judged in chunks. */
   call_many?(prompts: judge.Prompt[], timeoutMs: number): Promise<JudgeResult[]>;
+  /** Optional: the provider judges the whole request in one call (a thin
+   *  Worker's origin). A request judged in parts is then one prompt of all of
+   *  it, and only the whole request's cache entry is read and written. */
+  whole?: boolean;
 }
 
 export interface Ctx {
@@ -43,10 +47,38 @@ export interface Ctx {
   json_decode?: (s: string) => JsonValue;
   re_find?: RulesCtx["re_find"];
   log?: (level: string, msg: string) => void;
+  /** Optional: keeps a promise alive past the response (the host's
+   *  waitUntil). With it, the writes made once the verdict is decided (the
+   *  verdict cache, reputation points, breaker success, the trust renewal)
+   *  run past the response instead of on the request path, and a rejection
+   *  is logged, never raised. Without it they are awaited, in the order the
+   *  golden vectors pin. The price: a later request in the same isolate may
+   *  miss an entry still being written. */
+  defer?: (p: Promise<unknown>) => void;
 }
 
 function log(ctx: Ctx, level: string, msg: string): void {
   if (ctx.log) ctx.log(level, msg);
+}
+
+// A write made once the verdict is decided: handed to ctx.defer when the
+// host has one, awaited otherwise (and when the host refuses the promise).
+async function after(ctx: Ctx, write: () => unknown): Promise<void> {
+  if (!ctx.defer) {
+    await write();
+    return;
+  }
+  const p = Promise.resolve()
+    .then(write)
+    .then(
+      () => undefined,
+      (e) => log(ctx, "warn", "jev-edge: deferred write failed: " + (e instanceof Error ? e.message : String(e))),
+    );
+  try {
+    ctx.defer(p);
+  } catch {
+    await p;
+  }
 }
 
 function nowMs(ctx: Ctx): number {
@@ -74,7 +106,7 @@ function repOf(best: number | undefined, own: number | undefined): Rep {
 async function finish(ctx: Ctx, v: verdict.Verdict, rep?: Rep): Promise<verdict.Verdict> {
   subject.record(ctx, v);
   const charge = rep === false ? false : typeof rep === "number" ? policy.decide(rep, ctx.config.policy)[1] : undefined;
-  await subject.repRecord(ctx, v, charge);
+  if (ctx.subject) await after(ctx, () => subject.repRecord(ctx, v, charge));
   return v;
 }
 
@@ -95,14 +127,65 @@ async function settle(ctx: Ctx, failed = false, answered = false): Promise<void>
   const b = ctx.breaker;
   if (!b) return;
   if (failed) await b.failure();
-  else if (answered) await b.success();
+  else if (answered) await after(ctx, () => b.success());
   else if (b.release) await b.release();
+}
+
+// Lua's string.lower: ASCII letters only.
+const asciiLower = (s: string): string => s.replace(/[A-Z]+/g, (c) => c.toLowerCase());
+
+// Port of scope_endpoint in core/init.lua: scheme and host lowercased,
+// trailing slashes dropped, the rest byte for byte.
+function scopeEndpoint(e: unknown): string {
+  let s = String(e);
+  const m = /^([A-Za-z][A-Za-z0-9+.-]*:\/\/)([^/?#]*)([\s\S]*)$/.exec(s);
+  if (m) {
+    let auth = m[2];
+    const at = auth.lastIndexOf("@");
+    auth = at >= 0 ? auth.slice(0, at + 1) + asciiLower(auth.slice(at + 1)) : asciiLower(auth);
+    s = asciiLower(m[1]) + auth + m[3];
+  }
+  return s.replace(/\/+$/, "");
+}
+
+const byteOrder = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
+
+// Port of canon in core/init.lua: a jev.questions value in one spelling, a
+// table's keys sorted (a list's keys are 1, 2, ... as in Lua).
+function canon(v: unknown): string {
+  if (typeof v !== "object" || v === null) return String(v);
+  const entries: [string, unknown][] = Array.isArray(v)
+    ? v.map((x, i) => [String(i + 1), x] as [string, unknown])
+    : Object.entries(v as Record<string, unknown>);
+  entries.sort((a, b) => byteOrder(a[0], b[0]));
+  return "{" + entries.map(([k, x]) => k + "=" + canon(x)).join(",") + "}";
+}
+
+// Port of scope_questions in core/init.lua: the wording a provider reads for
+// these templates, hashed; undefined when none is overridden.
+const WORDING = ["instructions", "criteria", "instructions_ctx", "criteria_ctx"] as const;
+function scopeQuestions(qs: unknown, templates: string[], hash: (s: string) => string): string | undefined {
+  if (typeof qs !== "object" || qs === null) return undefined;
+  // a whole request's entry names its parts ("injection,abuse", "+untrusted")
+  const names = [...new Set(templates.flatMap((t) => String(t).match(/[^,+]+/g) ?? []))].sort(byteOrder);
+  const lines: string[] = [];
+  for (const n of names) {
+    const q = (qs as Record<string, unknown>)[n];
+    if (typeof q !== "object" || q === null) continue;
+    for (const k of WORDING) {
+      const v = (q as Record<string, unknown>)[k];
+      if (v !== undefined && v !== null) lines.push(`${n}.${k}=${canon(v)}`);
+    }
+  }
+  return lines.length ? String(hash(lines.join("\n"))) : undefined;
 }
 
 /** Port of core.cache_key: the verdict-cache key for a fingerprint judged under
  *  `rule`. A score is only valid for the prompt that produced it, so the key is
- *  scoped to the rule's templates and deployment context and to the provider
- *  and model; trust stays keyed by fingerprint alone. */
+ *  scoped to the rule's templates and deployment context, to the provider and
+ *  model, and, when set, to the judge endpoint (a thin Worker's origin) and
+ *  the question wording (jev.questions); trust stays keyed by fingerprint
+ *  alone. */
 export function cacheKey(
   fp: string, rule: Rule | undefined, cfg: Config, hash: (s: string) => string,
   over?: { templates?: string[]; deployment?: string },
@@ -110,14 +193,17 @@ export function cacheKey(
   const jev = cfg?.jev ?? {};
   const templates = over?.templates ?? rule?.templates ?? [];
   const deployment = over?.deployment ?? rule?.deployment_context ?? jev.deployment_context ?? "";
-  const scope = [
+  const fields = [
     String(rule?.id ?? ""),
     templates.join(","),
     String(deployment),
     String(jev.provider ?? ""),
     String(jev.model ?? ""),
-  ].join("\n");
-  return "fp:" + String(hash(scope)).slice(0, 16) + ":" + fp;
+  ];
+  if (typeof jev.endpoint === "string" && jev.endpoint !== "") fields.push("endpoint=" + scopeEndpoint(jev.endpoint));
+  const q = scopeQuestions(jev.questions, templates, hash);
+  if (q !== undefined) fields.push("questions=" + q);
+  return "fp:" + String(hash(fields.join("\n"))).slice(0, 16) + ":" + fp;
 }
 
 // Port of UNTRUSTED_SEP and TOOLS_SEP in core/init.lua: what the request's
@@ -142,7 +228,9 @@ interface Part {
 // Port of judge_parts in core/init.lua: each part (a chunk, the retrieved
 // content, the tool definitions) its own cache entry, the misses judged
 // together, the highest part score wins; a failed part makes the request an
-// error unless another part already blocks.
+// error unless another part already blocks. A part whose prompt cannot be
+// built is logged and left out (an error only when no part is left), and
+// the whole request's entry is then not written.
 async function judgeParts(
   ctx: Ctx, rule: Rule, parts: Part[], suffix: string, fp: string, ckey: string | undefined, reason: string,
 ): Promise<verdict.Verdict> {
@@ -150,6 +238,7 @@ async function judgeParts(
   const scores: (number | undefined)[] = [];
   const tops: string[] = [];
   const pending: { i: number; prompt: judge.Prompt; ck?: string }[] = [];
+  let leftOut: string | undefined;
   for (let i = 0; i < parts.length; i++) {
     const part = parts[i];
     const cfp = normalize.fingerprint(part.text, { prefix_bytes: cfg.cache.fp_prefix_bytes }, ctx.hash);
@@ -160,14 +249,21 @@ async function judgeParts(
       tops[i] = /^(\S+)/.exec(String(hit.reason ?? ""))?.[1] ?? "";
     } else {
       const [prompt, perr] = judge.build(part.templates, part.text, part.context);
-      if (!prompt) {
-        log(ctx, "error", "jev-edge: " + perr);
-        await settle(ctx);
-        const [action, label, async] = policy.onError();
-        return finish(ctx, verdict.newVerdict({ action, verdict: label, async, source: verdict.SRC_L2, reason: perr, fingerprint: fp }));
+      if (prompt) {
+        pending.push({ i, prompt, ck });
+      } else {
+        log(ctx, "error", "jev-edge: " + perr + " (that part is not judged)");
+        leftOut ??= perr;
       }
-      pending.push({ i, prompt, ck });
     }
+  }
+  if (pending.length === 0 && !scores.some((s) => s !== undefined)) {
+    // no part left to judge
+    await settle(ctx);
+    const [action, label, async] = policy.onError();
+    return finish(ctx, verdict.newVerdict({
+      action, verdict: label, async, source: verdict.SRC_L2, reason: leftOut!, fingerprint: fp, error_kind: judge.KIND_OTHER,
+    }));
   }
 
   const t0 = nowMs(ctx);
@@ -181,6 +277,7 @@ async function judgeParts(
   const elapsed = nowMs(ctx) - t0;
 
   let err: string | undefined;
+  let ekind: judge.VerdictErrorKind | undefined;
   let failed = false, answered = false;
   for (let k = 0; k < pending.length; k++) {
     const p = pending[k];
@@ -192,13 +289,14 @@ async function judgeParts(
     if (a) [s, t, n] = judge.reduce(a);
     if (!a || n === 0) {
       if (a) [e, kind] = ["no scores in answer", judge.UNUSABLE];
-      err ??= judge.reason(e, kind);
+      if (err === undefined) [err, ekind] = [judge.reason(e, kind), judge.errorKind(e, kind)];
       if (judge.counts(e, kind)) failed = true;
     } else {
       answered = true;
       scores[p.i] = s;
       tops[p.i] = t;
-      if (p.ck && ctx.cache) await ctx.cache.set(p.ck, { score: s, reason: `${t} ${verdict.format2(s)}` }, cfg.cache.fp_ttl);
+      const { ck } = p, cache = ctx.cache;
+      if (ck && cache) await after(ctx, () => cache.set(ck, { score: s, reason: `${t} ${verdict.format2(s)}` }, cfg.cache.fp_ttl));
     }
   }
   // only calls that reached the provider say anything about its health
@@ -221,16 +319,23 @@ async function judgeParts(
     log(ctx, "warn", "jev-edge: L2 failed on a chunk: " + err);
     const [action, label, async] = policy.onError();
     return finish(ctx, verdict.newVerdict({
-      action, verdict: label, async, source: verdict.SRC_L2, reason: err, fingerprint: fp, l2_ms: elapsed,
+      action, verdict: label, async, source: verdict.SRC_L2, reason: err, fingerprint: fp, l2_ms: elapsed, error_kind: ekind,
     }));
   }
   const score = best ?? 0;
   const [action, label, async] = policy.decide(score, cfg.policy);
   let why = top !== "" ? `${top} ${verdict.format2(score)}` : reason;
   if (top !== "") why += suffix;
-  if (ckey && ctx.cache) await ctx.cache.set(ckey, { score, reason: why, ...(rep !== undefined ? { rep } : {}) }, cfg.cache.fp_ttl);
+  const cache = ctx.cache;
+  if (ckey && cache && leftOut === undefined) {
+    await after(ctx, () => cache.set(ckey, { score, reason: why, ...(rep !== undefined ? { rep } : {}) }, cfg.cache.fp_ttl));
+  }
+  // every part was a per-part cache hit: the judge was not asked, so the
+  // verdict is the cache's, as on a whole-request hit (see core/init.lua)
+  const cached = pending.length === 0;
   return finish(ctx, verdict.newVerdict({
-    action, verdict: label, score, async, source: verdict.SRC_L2, reason: why, fingerprint: fp, l2_ms: elapsed,
+    action, verdict: label, score, async: async && !cached, source: cached ? verdict.SRC_CACHE : verdict.SRC_L2,
+    reason: why, fingerprint: fp, l2_ms: cached ? 0 : elapsed,
   }), rep);
 }
 
@@ -286,7 +391,7 @@ export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
     const now = ctx.clock ? ctx.clock() : 0;
     const rec = await trust.get(store, fp, now);
     if (rec && store) {
-      await trust.touch(store, fp, rec, now, cfg.feedback);
+      await after(ctx, () => trust.touch(store, fp, rec, now, cfg.feedback));
       return finish(ctx, verdict.newVerdict({
         action: verdict.ACTION_PASS, verdict: verdict.SAFE, score: 0,
         source: verdict.SRC_TRUST, fingerprint: fp,
@@ -323,6 +428,17 @@ export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
     }
   }
 
+  // capped ----------------------------------------------------------------
+  // max_judge_chunks > 1: what still did not fit is unjudgeable. An L1
+  // decision that needs no provider, so it comes before the breaker: an open
+  // breaker must not turn it into a pass (core/init.lua).
+  if (chunks && chunks.length > 1 && capped && cfg.policy.unjudgeable === "block" && cfg.policy.mode === "enforce") {
+    return finish(ctx, verdict.newVerdict({
+      action: verdict.ACTION_BLOCK, verdict: verdict.SKIPPED, source: verdict.SRC_L1,
+      reason: "unjudgeable: text over max_judge_chunks", fingerprint: fp,
+    }));
+  }
+
   // breaker ---------------------------------------------------------------
   if (ctx.breaker && !(await ctx.breaker.allow())) {
     const [action, label, async] = policy.onSkipped();
@@ -330,17 +446,12 @@ export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
   }
 
   // L2 --------------------------------------------------------------------
-  if (chunks && chunks.length > 1) {
-    // max_judge_chunks > 1: what still did not fit is unjudgeable
-    if (capped && cfg.policy.unjudgeable === "block" && cfg.policy.mode === "enforce") {
-      await settle(ctx);
-      return finish(ctx, verdict.newVerdict({
-        action: verdict.ACTION_BLOCK, verdict: verdict.SKIPPED, source: verdict.SRC_L1,
-        reason: "unjudgeable: text over max_judge_chunks", fingerprint: fp,
-      }));
-    }
-  }
-  if ((chunks && chunks.length > 1) || untrusted || tools) {
+  const inParts = (chunks && chunks.length > 1) || !!untrusted || !!tools;
+  // what the score covers, as the reason says it (plan() in core/init.lua)
+  let suffix = windowed ? " (window)" : "";
+  if (chunks && chunks.length > 1) suffix = capped ? " (window)" : ` (${chunks.length} chunks${windowed ? ", window" : ""})`;
+  else if (inParts && (untrusted?.windowed || tools?.windowed)) suffix = " (window)";
+  if (inParts && !ctx.judge.whole) {
     const context = {
       path: req.path ?? "", method: req.method ?? "",
       deployment: rule!.deployment_context ?? cfg.jev.deployment_context ?? "",
@@ -351,9 +462,6 @@ export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
         parts.push({ text: c, templates: rule!.templates, context, ...(textRep === false ? { rep: false as const } : {}) });
       }
     }
-    let suffix = "";
-    if (chunks && chunks.length > 1) suffix = capped ? " (window)" : ` (${chunks.length} chunks${windowed ? ", window" : ""})`;
-    else if (windowed || untrusted?.windowed || tools?.windowed) suffix = " (window)";
     if (untrusted && uspec) {
       // asked without the deployment context, the way the question was
       // measured. Not the subject's own text: not charged to it (repOf).
@@ -371,7 +479,13 @@ export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
     }
     return judgeParts(ctx, rule!, parts, suffix, fp, ckey, reason);
   }
-  const [prompt, perr] = judge.build(rule!.templates, text, {
+  // One piece; or a provider that judges the whole request in one call
+  // (ctx.judge.whole): all of it in one prompt, joined as the fingerprint
+  // joins it, one answer, and only the whole request's entry. Its one score
+  // cannot say whether the subject's own text or the retrieved content or
+  // tool definitions beside it made it (repOf).
+  const rep: Rep = inParts && (untrusted || tools) ? false : textRep;
+  const [prompt, perr] = judge.build(rule!.templates, inParts ? whole : text, {
     path: req.path ?? "",
     method: req.method ?? "",
     deployment: rule!.deployment_context ?? cfg.jev.deployment_context ?? "",
@@ -380,7 +494,9 @@ export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
     log(ctx, "error", "jev-edge: " + perr);
     await settle(ctx);
     const [action, label, async] = policy.onError();
-    return finish(ctx, verdict.newVerdict({ action, verdict: label, async, source: verdict.SRC_L2, reason: perr, fingerprint: fp }));
+    return finish(ctx, verdict.newVerdict({
+      action, verdict: label, async, source: verdict.SRC_L2, reason: perr, fingerprint: fp, error_kind: judge.KIND_OTHER,
+    }));
   }
 
   const t0 = nowMs(ctx);
@@ -394,7 +510,7 @@ export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
     const [action, label, async] = policy.onError();
     return finish(ctx, verdict.newVerdict({
       action, verdict: label, async, source: verdict.SRC_L2,
-      reason: why, fingerprint: fp, l2_ms: elapsed,
+      reason: why, error_kind: judge.errorKind(jerr, jkind), fingerprint: fp, l2_ms: elapsed,
     }));
   }
 
@@ -409,21 +525,22 @@ export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
     const [action, label, async] = policy.onError();
     return finish(ctx, verdict.newVerdict({
       action, verdict: label, async, source: verdict.SRC_L2,
-      reason: why, fingerprint: fp, l2_ms: elapsed,
+      reason: why, error_kind: judge.UNUSABLE, fingerprint: fp, l2_ms: elapsed,
     }));
   }
-  if (ctx.breaker) await ctx.breaker.success();
+  await settle(ctx, false, true);
   const [action, label, async] = policy.decide(score, cfg.policy);
-  // the score is for the window, not the whole text; say so
-  const why = top !== "" ? `${top} ${verdict.format2(score)}${windowed ? " (window)" : ""}` : reason;
+  // what the score covers ("(window)", "(3 chunks)"), as judged in parts
+  const why = top !== "" ? `${top} ${verdict.format2(score)}${suffix}` : reason;
 
-  if (ckey && ctx.cache) {
-    await ctx.cache.set(ckey, { score, reason: why, ...(textRep === false ? { rep: false } : {}) }, cfg.cache.fp_ttl);
+  const cache = ctx.cache;
+  if (ckey && cache) {
+    await after(ctx, () => cache.set(ckey, { score, reason: why, ...(rep === false ? { rep: false } : {}) }, cfg.cache.fp_ttl));
   }
 
   return finish(ctx, verdict.newVerdict({
     action, verdict: label, score, async, source: verdict.SRC_L2, reason: why, fingerprint: fp, l2_ms: elapsed,
-  }), textRep);
+  }), rep);
 }
 
 export { rulesMod as rules, normalize, judge, policy, verdict, trust, subject };

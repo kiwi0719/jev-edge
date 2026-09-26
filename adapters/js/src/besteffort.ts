@@ -44,6 +44,8 @@ function writeFailed(what: string, e: unknown): void {
 export function bestEffortStore(store: Store, name: string): Store {
   const out: Store = {
     get: (k) => store.get(k),
+    // a read, not wrapped; kept so the subject ring reads its slots in one call
+    ...(typeof store.getMany === "function" ? { getMany: (ks: string[]) => store.getMany!(ks) } : {}),
     set: async (k, v, ttl) => {
       try {
         await store.set(k, v, ttl);

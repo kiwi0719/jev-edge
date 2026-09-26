@@ -33,27 +33,33 @@
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
     },
     "./core": {
       "types": "./dist/core/index.d.ts",
-      "import": "./dist/core/index.js"
+      "import": "./dist/core/index.js",
+      "default": "./dist/core/index.js"
     },
     "./cloudflare": {
       "types": "./dist/cloudflare.d.ts",
-      "import": "./dist/cloudflare.js"
+      "import": "./dist/cloudflare.js",
+      "default": "./dist/cloudflare.js"
     },
     "./frameworks": {
       "types": "./dist/frameworks.d.ts",
-      "import": "./dist/frameworks.js"
+      "import": "./dist/frameworks.js",
+      "default": "./dist/frameworks.js"
     },
     "./aws": {
       "types": "./dist/aws.d.ts",
-      "import": "./dist/aws.js"
+      "import": "./dist/aws.js",
+      "default": "./dist/aws.js"
     },
     "./deno": {
       "types": "./dist/deno.d.ts",
-      "import": "./dist/deno.js"
+      "import": "./dist/deno.js",
+      "default": "./dist/deno.js"
     },
     "./package.json": "./package.json"
   },

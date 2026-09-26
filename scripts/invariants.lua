@@ -696,6 +696,36 @@ rule("release-on-main", function(r)
   end
 end)
 
+-- 17. @jev-edge/js loads from require() as well as import (audit packaging#6:
+--     the exports named only "import", so a CommonJS consumer got
+--     ERR_PACKAGE_PATH_NOT_EXPORTED even on a Node that can require() ESM).
+--     Each entry's last condition is "default", the file "import" names, and
+--     ci.yml's js job loads every entry both ways.
+rule("npm-exports", function(r)
+  local ex = (read("adapters/js/package.json") or ""):match('\n%s*"exports":%s*(%b{})')
+  if not ex then return fail(r, "adapters/js/package.json has no exports map") end
+  local ci = "\n" .. table.concat(code_lines(yaml_lines(read(".github/workflows/ci.yml"))), "\n") .. "\n"
+  local req = ci:match("\n[^\n]*(%[[^%]\n]*%][^\n]*require%('@jev%-edge/js' %+ s%))") or ""
+  local imp_line = ci:match("\n[^\n]*(%[[^%]\n]*%][^\n]*await import%('@jev%-edge/js' %+ s%))") or ""
+  local n = 0
+  for sub, entry in ex:gmatch('"([^"]+)":%s*(%b{})') do
+    n = n + 1
+    local keys = {}
+    for k in entry:gmatch('"([^"]+)":') do keys[#keys + 1] = k end
+    local imp = entry:match('"import":%s*"([^"]*)"')
+    local def = entry:match('"default":%s*"([^"]*)"')
+    if imp and def ~= imp then
+      fail(r, "exports " .. sub .. ': "default" is ' .. tostring(def) .. ', not the "import" file ' .. imp)
+    elseif def and keys[#keys] ~= "default" then
+      fail(r, "exports " .. sub .. ': "default" is not the last condition (Node takes the first that matches)')
+    end
+    local s = "'" .. sub:gsub("^%.", "") .. "'"
+    if not req:find(s, 1, true) then fail(r, "ci.yml does not require() exports " .. sub) end
+    if not imp_line:find(s, 1, true) then fail(r, "ci.yml does not import exports " .. sub) end
+  end
+  if n == 0 then fail(r, "adapters/js/package.json exports no conditions") end
+end)
+
 -- ---------------------------------------------------------------------------
 if #failures > 0 then
   io.stderr:write(("invariants: %d problem(s) across %d rules\n"):format(#failures, checked))

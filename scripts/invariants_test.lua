@@ -259,6 +259,29 @@ local cases = {
   { "security.yml: package_json_file with a trailing comment",
     { [SEC] = edit(sec, "(package_json_file: adapters/js/package%.json)", "%1 # the pin") } },
 
+  -- npm-exports: every export loads from require() as well (audit packaging#6)
+  { "package.json: ./core without default",
+    { [PKG] = edit(pkg, '(\n%s*"import": "%./dist/core/index%.js"),\n%s*"default": "[^"]*"', "%1") },
+    "npm-exports", 'exports ./core: "default" is nil' },
+  { "package.json: default names another file",
+    { [PKG] = edit(pkg, '"default": "%./dist/aws%.js"', '"default": "./dist/aws.cjs"') },
+    "npm-exports", 'exports ./aws: "default" is ./dist/aws.cjs, not the "import" file ./dist/aws.js' },
+  { "package.json: default before types",
+    { [PKG] = edit(pkg,
+        '(\n%s*)"types": "%./dist/deno%.d%.ts",(\n%s*"import": "%./dist/deno%.js"),\n%s*"default": "%./dist/deno%.js"',
+        '%1"default": "./dist/deno.js",%1"types": "./dist/deno.d.ts",%2') },
+    "npm-exports", 'exports ./deno: "default" is not the last condition' },
+  { "package.json: a new export CI does not load",
+    { [PKG] = edit(pkg, '(\n%s*)"%./package%.json": "%./package%.json"',
+        '%1"./node": {%1  "types": "./dist/node.d.ts",%1  "import": "./dist/node.js",'
+          .. '%1  "default": "./dist/node.js"%1},%1"./package.json": "./package.json"') },
+    "npm-exports", "ci.yml does not require() exports ./node" },
+  { "ci.yml: no require() smoke", { [CI] = edit(ci, "\n[^\n]*require%('@jev%-edge/js' %+ s%)[^\n]*", "") },
+    "npm-exports", "ci.yml does not require() exports ." },
+  { "ci.yml: require() smoke skips /frameworks",
+    { [CI] = edit(ci, "(%[''[^%]\n]*)'/frameworks', ([^%]\n]*%]%) require)", "%1%2") },
+    "npm-exports", "ci.yml does not require() exports ./frameworks" },
+
   -- rule-parity: a path watched for any body on one runtime only
   { "rules: json_only_paths emptied in the TS copy",
     { [TSRULES] = edit(tsr, 'json_only_paths: %["%^/%$"%]', "json_only_paths: []") },

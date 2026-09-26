@@ -114,13 +114,18 @@ jobs:
             const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
             let bad = 0;
             for (const [sub, t] of Object.entries(pkg.exports)) {
-              for (const f of typeof t === "string" ? [t] : [t.import, t.types]) {
+              for (const f of typeof t === "string" ? [t] : [t.import, t.default, t.types]) {
                 if (!fs.existsSync(f)) { console.log(`::error::${sub}: ${f} missing`); bad++; }
               }
               if (typeof t !== "string") await import(sub === "." ? pkg.name : pkg.name + sub.slice(1));
             }
             process.exit(bad ? 1 : 0);
           '
+
+      # the package is ESM; require() loads it on Node >= 20.19 / 22.12
+      # through the exports' "default" condition (require(esm))
+      - name: Every export loads with require()
+        run: node -e "for (const s of ['', '/core', '/cloudflare', '/frameworks', '/aws', '/deno']) require('@jev-edge/js' + s)"
 
       - name: LICENSE is the repository's
         run: cmp LICENSE ../../LICENSE

@@ -15,6 +15,18 @@ static_resources:
                 # ext_authz, so it cannot be steered at the adapter's admin endpoints
                 normalize_path: true
                 merge_slashes: true
+                # and refuse (400) an encoded slash or backslash: Envoy leaves
+                # %2F escaped by default, so "..%2F" is no dot segment to it,
+                # while nginx decodes it and resolves the ".." after
+                # path_prefix: /_jev/authz/v1/..%2F..%2F..%2F_jev/config is
+                # /_jev/config there. UNESCAPE_AND_REDIRECT is the choice for
+                # an API that needs %2F in its paths.
+                path_with_escaped_slashes_action: REJECT_REQUEST
+                # size contract of the authz hop: the whole header block, path
+                # included, is capped here (431 past it), and the nginx serving
+                # /_jev/authz must take any request under the cap (README:
+                # large_client_header_buffers 4 64k). Raise both together.
+                max_request_headers_kb: 60
                 route_config:
                   name: local
                   virtual_hosts:
@@ -24,9 +36,13 @@ static_resources:
                         - match: { prefix: "/" }
                           route: { cluster: app }
                 http_filters:
-                  # never trust a client-supplied verdict: a route-level
-                  # request_headers_to_remove runs at the router, after ext_authz has
-                  # set the real verdict; this filter runs before ext_authz instead
+                  # never trust a client-supplied verdict, subject or cut flag: a
+                  # route-level request_headers_to_remove runs at the router, after
+                  # ext_authz has set the real verdict; this filter runs before
+                  # ext_authz instead. x-jev-body-partial is the HAProxy agent's
+                  # cut flag: allowed_headers keeps a client's copy from
+                  # /_jev/authz, and this keeps it from the upstream and from a
+                  # config that forwards more headers to ext_authz.
                   - name: envoy.filters.http.header_mutation
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutation
@@ -38,6 +54,7 @@ static_resources:
                           - remove: x-jev-source
                           - remove: x-jev-request-id
                           - remove: x-jev-subject
+                          - remove: x-jev-body-partial
                   - name: envoy.filters.http.ext_authz
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz
@@ -46,16 +63,25 @@ static_resources:
                       failure_mode_allow: true
                       failure_mode_allow_header_add: true
                       # headers forwarded to the authz service (ExtAuthz.allowed_headers; the
-                      # older authorization_request.allowed_headers is deprecated)
+                      # older authorization_request.allowed_headers is deprecated). Not
+                      # x-envoy-external-address: Envoy sets it only for a request it counts
+                      # as external and passes a client's own copy through from a peer on a
+                      # private or loopback address, and jev-edge would take that copy as the
+                      # client address. use_remote_address appends the peer to
+                      # x-forwarded-for, which client_ip.trusted_hops = 1 reads.
                       allowed_headers:
                         patterns:
                           - exact: content-type
                           - exact: content-encoding
                           - exact: content-length
                           - exact: x-forwarded-for
-                          - exact: x-envoy-external-address
                           - exact: x-request-id
-                          - exact: x-jev-mock-score     # e2e only; drop in production
+                          - exact: x-e2e-mock-score     # e2e only; drop in production
+                          # subject.from = "header" or "cookie": the subject never reaches
+                          # jev-edge unless it is listed here (jev-edge logs a warning once
+                          # per worker when a request through /_jev/authz has none)
+                          # - exact: x-api-key          # subject.name for from = "header"
+                          # - exact: cookie             # from = "cookie"
                       with_request_body:
                         max_request_bytes: 1048576     # matches rules.max_body_bytes (1 MiB)
                         allow_partial_message: true    # larger bodies arrive cut, with x-envoy-auth-partial-body: true; jev-edge scans them as a head

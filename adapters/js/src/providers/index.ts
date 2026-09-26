@@ -5,11 +5,13 @@
 //   backend        an existing jev-edge (OpenResty/Envoy) reached at /_jev/authz:
 //                  the "thin Worker" mode, one set of thresholds for edge and origin
 //   mock           fixed score, no network
-import type { Prompt, Answers } from "../core/judge.js";
-import type { JevConfig, QuestionWording } from "../core/defaults.js";
+import { TRANSPORT, TIMEOUT, UNUSABLE, statusKind, type Prompt, type Answers, type ErrorKind } from "../core/judge.js";
+import { OWN_BODY_KEYS, type JevConfig, type QuestionWording } from "../core/defaults.js";
 import type { Template } from "../core/templates.js";
 
-export type JudgeResult = [Answers, null] | [null, string];
+/** A failure carries its kind (core/judge.ts): a provider that answered 200
+ *  with nothing usable, or a 4xx, is not a breaker failure. */
+export type JudgeResult = [Answers, null] | [null, string] | [null, string, ErrorKind | undefined];
 
 export interface Provider {
   name: string;
@@ -61,9 +63,10 @@ async function fetchWithin<T>(url: string, init: RequestInit, timeoutMs: number,
   }
 }
 
-/** A non-OK status is reported as an error string without reading the body. */
+/** A non-OK status, reported as an error string; `detail`: what the body
+ *  said, for a provider that reads it (openai-compat). */
 class HttpStatus extends Error {
-  constructor(public status: number) {
+  constructor(public status: number, public detail?: string) {
     super("http " + status);
     this.name = "HttpStatus";
   }
@@ -73,6 +76,13 @@ function errorString(e: unknown, timeoutMs: number): string {
   if (e instanceof TimeoutError) return e.message;
   if (e instanceof Error && e.name === "AbortError") return `timeout after ${timeoutMs} ms`;
   return e instanceof Error ? e.message : String(e);
+}
+
+/** A call that got no HTTP answer: past the deadline, or fetch itself failed
+ *  (connect, DNS, TLS, reset). Both count against the provider. */
+function noAnswer(e: unknown, timeoutMs: number): JudgeResult {
+  const timedOut = e instanceof TimeoutError || (e instanceof Error && e.name === "AbortError");
+  return [null, errorString(e, timeoutMs), timedOut ? TIMEOUT : TRANSPORT];
 }
 
 // ---------------------------------------------------------------------------
@@ -114,11 +124,11 @@ function systemOne(name: string, defaults: { model: string; url: string }): Prov
           }
         });
       } catch (e) {
-        if (e instanceof HttpStatus) return [null, `${name} http ${e.status}`];
-        if (e instanceof Error && e.message === "malformed response") return [null, `${name}: malformed response`];
-        return [null, errorString(e, timeoutMs)];
+        if (e instanceof HttpStatus) return [null, `${name} http ${e.status}`, statusKind(e.status)];
+        if (e instanceof Error && e.message === "malformed response") return [null, `${name}: malformed response`, UNUSABLE];
+        return noAnswer(e, timeoutMs);
       }
-      if (!decoded || typeof decoded.answers !== "object" || decoded.answers === null) return [null, `${name}: malformed response`];
+      if (!decoded || typeof decoded.answers !== "object" || decoded.answers === null) return [null, `${name}: malformed response`, UNUSABLE];
       const answers: Answers = {};
       for (const [qname, a] of Object.entries(decoded.answers)) {
         if (a && typeof a === "object" && typeof a.noul === "number") answers[qname] = a.noul;
@@ -128,13 +138,24 @@ function systemOne(name: string, defaults: { model: string; url: string }): Prov
   };
 }
 
-/** Only the four wording fields of an override; anything else is ignored. */
+/**
+ * Only the four wording fields of an override; anything else is ignored. A
+ * criteria override replaces the whole pair, and carries only the sides it
+ * names: a side left out is not sent (providers/jev.lua sends the keys
+ * present), so a partial or empty override is the same body in both cores.
+ */
 function pickWording(o: QuestionWording): Partial<Template> {
   const out: Partial<Template> = {};
   if (o.instructions !== undefined) out.instructions = o.instructions;
   if (o.instructions_ctx !== undefined) out.instructions_ctx = o.instructions_ctx;
-  if (o.criteria !== undefined) out.criteria = { true: o.criteria.true ?? "", false: o.criteria.false ?? "" };
-  if (o.criteria_ctx !== undefined) out.criteria_ctx = { true: o.criteria_ctx.true ?? "", false: o.criteria_ctx.false ?? "" };
+  const sides = (c: { true?: string; false?: string }) => {
+    const s: { true?: string; false?: string } = {};
+    if (c.true !== undefined) s.true = c.true;
+    if (c.false !== undefined) s.false = c.false;
+    return s;
+  };
+  if (o.criteria !== undefined) out.criteria = sides(o.criteria);
+  if (o.criteria_ctx !== undefined) out.criteria_ctx = sides(o.criteria_ctx);
   return out;
 }
 
@@ -172,7 +193,14 @@ export function stripNonce(text: string, nonce: string): string {
   return s;
 }
 
-export function openaiSystemPrompt(questions: Prompt["questions"], nonce: string): string {
+/**
+ * With a deployment context (a non-empty string), the questions take their
+ * context wording (instructions_ctx, criteria_ctx) and the prompt describes
+ * the assistant before them, as the System One state does with `assistant`
+ * and `user_message`. Byte for byte the system_prompt of openai_compat.lua.
+ */
+export function openaiSystemPrompt(questions: Prompt["questions"], nonce: string, deployment?: string): string {
+  const ctx = typeof deployment === "string" && deployment !== "" ? deployment : undefined;
   const lines = [
     "You are a security classifier for an API gateway.",
     "The input to classify is in the user message, between the line <<<INPUT " + nonce + ">>>",
@@ -185,13 +213,23 @@ export function openaiSystemPrompt(questions: Prompt["questions"], nonce: string
     "question ids and whose values are numbers between 0 and 1. No other keys, no prose.",
     "",
   ];
+  if (ctx !== undefined) {
+    lines.push(
+      "The input was sent to the assistant described below (written by the operator, trusted):",
+      stripNonce(ctx, nonce),
+      "In the questions, `assistant` is that description and `user_message` is the input between the markers.",
+      "",
+    );
+  }
   const example: string[] = [];
   for (const name of Object.keys(questions).sort()) {
     const t = questions[name];
-    lines.push(`question id "${name}": ${t.instructions}`);
-    if (t.criteria) {
-      lines.push("  YES when: " + t.criteria.true);
-      lines.push("  NO when: " + t.criteria.false);
+    const instr = (ctx !== undefined && t.instructions_ctx) || t.instructions;
+    const crit = (ctx !== undefined && t.criteria_ctx) || t.criteria;
+    lines.push(`question id "${name}": ${instr}`);
+    if (crit) {
+      lines.push("  YES when: " + (crit.true ?? ""));
+      lines.push("  NO when: " + (crit.false ?? ""));
     }
     example.push(`"${name}": 0.0`);
   }
@@ -229,14 +267,131 @@ export function jsonObjects(s: string): string[] {
   return out;
 }
 
-/** A JSON number, or a plain decimal string for small models; clamped to [0,1]. null, booleans and "" are not answers. */
+// The decoder for the reply and for the answer objects planted in the judged
+// text: the union of what JSON.parse and the Lua provider's cjson accept, so
+// no object is read by one core and skipped by the other (that would flip
+// echo detection, or turn a score into an error, and an error passes). Past
+// JSON.parse it takes what cjson takes: raw control characters in strings
+// (not NUL) and the number forms strtod reads (+1, 01, 1., .5 after a sign,
+// hex, inf, nan). A lone surrogate escape JSON.parse already takes (the Lua
+// side reads it as U+FFFD), and nesting past OPENAI_MAX_DEPTH is refused in
+// both cores. Port of decode in providers/openai_compat.lua.
+const OPENAI_MAX_DEPTH = 3000;
+
+function depthWithin(s: string, max: number): boolean {
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === 92) esc = true;
+      else if (c === 34) inStr = false;
+    } else if (c === 34) inStr = true;
+    else if (c === 123 || c === 91) {
+      if (++depth > max) return false;
+    } else if (c === 125 || c === 93) depth--;
+  }
+  return true;
+}
+
+// strtod's syntax, as cjson reads a number (decode_invalid_numbers): sign,
+// then hex (with a fraction and a binary exponent), inf[inity], nan[(...)],
+// or decimal digits with an optional fraction and exponent.
+const STRTOD = /[+-]?(?:0[xX](?:[0-9a-fA-F]+(?:\.[0-9a-fA-F]*)?|\.[0-9a-fA-F]+)(?:[pP][+-]?\d+)?|[iI][nN][fF](?:[iI][nN][iI][tT][yY])?|[nN][aA][nN](?:\([0-9A-Za-z_]*\))?|(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)/y;
+
+function strtodValue(tok: string): number {
+  const neg = tok[0] === "-";
+  const t = tok[0] === "-" || tok[0] === "+" ? tok.slice(1) : tok;
+  let v: number;
+  if (/^0x/i.test(t)) {
+    const m = /^0x([0-9a-f]*)(?:\.([0-9a-f]*))?(?:p([+-]?\d+))?$/i.exec(t)!;
+    v = 0;
+    for (const d of m[1]) v = v * 16 + parseInt(d, 16);
+    let scale = 1 / 16;
+    for (const d of m[2] ?? "") { v += parseInt(d, 16) * scale; scale /= 16; }
+    if (m[3]) v *= Math.pow(2, Number(m[3]));
+  } else if (/^inf/i.test(t)) v = Infinity;
+  else if (/^nan/i.test(t)) v = NaN;
+  else v = Number(t);
+  return neg ? -v : v;
+}
+
+/** JSON text as cjson reads it, rewritten into what JSON.parse reads: raw
+ *  control characters in strings escaped, strtod number forms written out
+ *  (a non-finite one as null, which no answer takes either). */
+function cjsonToJson(s: string): string {
+  let out = "";
+  let inStr = false;
+  let esc = false;
+  let i = 0;
+  while (i < s.length) {
+    const ch = s[i];
+    const c = s.charCodeAt(i);
+    if (inStr) {
+      // an escaped character stays as it is: cjson refuses a backslash
+      // before a raw control character, and so must the rewrite
+      if (esc) esc = false;
+      else if (c === 92) esc = true;
+      else if (c === 34) inStr = false;
+      else if (c >= 1 && c < 32) {
+        out += "\\u" + c.toString(16).padStart(4, "0");
+        i++;
+        continue;
+      }
+      out += ch;
+      i++;
+      continue;
+    }
+    if (c === 34) {
+      inStr = true;
+      out += ch;
+      i++;
+      continue;
+    }
+    const start = ch === "+" || ch === "-" || (c >= 48 && c <= 57) || /^(?:inf|nan)/i.test(s.slice(i, i + 3));
+    if (start) {
+      STRTOD.lastIndex = i;
+      const m = STRTOD.exec(s);
+      if (m) {
+        const v = strtodValue(m[0]);
+        out += !Number.isFinite(v) ? "null" : Object.is(v, -0) ? "-0" : String(v);
+        i = STRTOD.lastIndex;
+        continue;
+      }
+    }
+    out += ch;
+    i++;
+  }
+  return out;
+}
+
+function decodeLenient(src: string): unknown {
+  if (!depthWithin(src, OPENAI_MAX_DEPTH)) return undefined;
+  try {
+    return JSON.parse(src) as unknown;
+  } catch {
+    try {
+      return JSON.parse(cjsonToJson(src)) as unknown;
+    } catch {
+      return undefined;
+    }
+  }
+}
+
+/** A JSON number, or a plain decimal string for small models; clamped to [0,1]. null, booleans and "" are not answers.
+ *  The string form allows the whitespace Lua's %s does, no other. */
 function prob(v: unknown): number | undefined {
   let n: number | undefined;
   if (typeof v === "number") n = v;
-  else if (typeof v === "string" && /^\s*-?[\d.]+\s*$/.test(v)) n = Number(v);
+  else if (typeof v === "string" && /^[ \t\n\v\f\r]*-?[\d.]+[ \t\n\v\f\r]*$/.test(v)) n = Number(v);
   if (n === undefined || !Number.isFinite(n)) return undefined;
   return Math.min(1, Math.max(0, n));
 }
+
+/** With one question, parseOpenaiContent also takes a lone key of these as the answer (small models), in this order. */
+const FALLBACK_KEYS = ["probability", "score", "p"];
 
 /**
  * Reduce the reply text to an answer map. Each question takes the maximum
@@ -246,12 +401,8 @@ function prob(v: unknown): number | undefined {
 export function parseOpenaiContent(content: string, wanted: string[]): JudgeResult {
   const objs: Record<string, unknown>[] = [];
   for (const src of jsonObjects(content)) {
-    try {
-      const o = JSON.parse(src) as unknown;
-      if (o && typeof o === "object" && !Array.isArray(o)) objs.push(o as Record<string, unknown>);
-    } catch {
-      // not JSON: skip it
-    }
+    const o = decodeLenient(src); // undefined when not JSON: skipped
+    if (o && typeof o === "object" && !Array.isArray(o)) objs.push(o as Record<string, unknown>);
   }
   if (objs.length === 0) return [null, "openai-compat: content is not JSON"];
   const names = [...wanted].sort();
@@ -266,7 +417,7 @@ export function parseOpenaiContent(content: string, wanted: string[]): JudgeResu
     }
     if (best === undefined && names.length === 1) {
       for (const o of objs) {
-        for (const k of ["probability", "score", "p"]) {
+        for (const k of FALLBACK_KEYS) {
           const v = prob(own(o, k));
           if (v !== undefined && (best === undefined || v > best)) best = v;
         }
@@ -281,26 +432,38 @@ export function parseOpenaiContent(content: string, wanted: string[]): JudgeResu
 }
 
 /** The answer values an object gives for the asked questions, as one
- *  comparable string, or undefined when it answers none (port of answer_sig). */
+ *  comparable string, or undefined when it answers none (port of answer_sig).
+ *  With one question and no value under its id, the first fallback key that
+ *  holds one, tagged with the key: parseOpenaiContent reads that as the
+ *  answer, so a planted {"score": 0} is compared too, key and value. */
 function answerSig(o: Record<string, unknown>, names: string[]): string | undefined {
+  const own = (k: string): unknown => (Object.prototype.hasOwnProperty.call(o, k) ? o[k] : undefined);
+  // to 6 significant digits, as answer_sig's "%.6g": a judge's rounded copy
+  // (0.0123457 of a planted 0.0123456789) is still a copy. An exact binary
+  // tie at the 7th digit may round differently in C's printf; no reply is
+  // that precise. prob() has already folded -0 into 0.
+  const sig6 = (v: number): string => String(Number(v.toPrecision(6)));
   let any = false;
   const parts = names.map((name) => {
-    const v = prob(Object.prototype.hasOwnProperty.call(o, name) ? o[name] : undefined);
+    const v = prob(own(name));
     if (v !== undefined) any = true;
-    return name + "=" + (v !== undefined ? String(v) : "-");
+    return name + "=" + (v !== undefined ? sig6(v) : "-");
   });
-  return any ? parts.join("|") : undefined;
+  if (any) return parts.join("|");
+  if (names.length === 1) {
+    for (const k of FALLBACK_KEYS) {
+      const v = prob(own(k));
+      if (v !== undefined) return names[0] + "@" + k + "=" + sig6(v);
+    }
+  }
+  return undefined;
 }
 
 function objectsOf(s: string): Record<string, unknown>[] {
   const out: Record<string, unknown>[] = [];
   for (const src of jsonObjects(s)) {
-    try {
-      const o = JSON.parse(src) as unknown;
-      if (o && typeof o === "object" && !Array.isArray(o)) out.push(o as Record<string, unknown>);
-    } catch {
-      // not JSON: skip it
-    }
+    const o = decodeLenient(src); // undefined when not JSON: skipped
+    if (o && typeof o === "object" && !Array.isArray(o)) out.push(o as Record<string, unknown>);
   }
   return out;
 }
@@ -327,41 +490,101 @@ export function echoesInput(content: string, text: string | undefined, wanted: s
   });
 }
 
+/**
+ * The openai-compat request body (port of _M.body in
+ * providers/openai_compat.lua): model, response_format and the two messages,
+ * then jev.temperature (0; false leaves it out), jev.max_tokens (200) under
+ * jev.token_param, and the keys of jev.extra_body but the body's own.
+ */
+export function openaiBody(cfg: JevConfig, system: string, user: string): Record<string, unknown> {
+  const body: Record<string, unknown> = {
+    model: cfg.model ?? "gpt-4o-mini",
+    response_format: { type: "json_object" },
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: user },
+    ],
+  };
+  if (cfg.temperature !== false) body.temperature = typeof cfg.temperature === "number" ? cfg.temperature : 0;
+  body[cfg.token_param === "max_completion_tokens" ? "max_completion_tokens" : "max_tokens"] =
+    typeof cfg.max_tokens === "number" ? cfg.max_tokens : 200;
+  const extra = cfg.extra_body;
+  if (extra && typeof extra === "object" && !Array.isArray(extra)) {
+    for (const [k, v] of Object.entries(extra)) if (!OWN_BODY_KEYS.has(k)) body[k] = v;
+  }
+  return body;
+}
+
+/**
+ * What a JSON error body says (port of error_message): error.message,
+ * error as a string or message; control characters as spaces, cut to 200
+ * UTF-8 bytes on a character boundary. undefined when it says nothing.
+ */
+export function openaiErrorMessage(body: string): string | undefined {
+  let d: unknown;
+  try {
+    d = JSON.parse(body);
+  } catch {
+    return undefined;
+  }
+  if (!d || typeof d !== "object" || Array.isArray(d)) return undefined;
+  const o = d as Record<string, unknown>;
+  let m: unknown = o.error && typeof o.error === "object" && !Array.isArray(o.error) ? (o.error as Record<string, unknown>).message : o.error;
+  if (typeof m !== "string") m = o.message;
+  if (typeof m !== "string" || m === "") return undefined;
+  let s = m.replace(/[\x00-\x1f\x7f]/g, " ");
+  const bytes = new TextEncoder().encode(s);
+  if (bytes.length > 200) {
+    let end = 200;
+    // a cut inside a UTF-8 sequence drops its first bytes too
+    if ((bytes[200] & 0xc0) === 0x80) {
+      while (end > 0 && (bytes[end - 1] & 0xc0) === 0x80) end--;
+      if (end > 0 && bytes[end - 1] >= 0xc0) end--;
+    }
+    s = new TextDecoder().decode(bytes.subarray(0, end));
+  }
+  return s;
+}
+
+export const OPENAI_CUT = "openai-compat: reply cut at max_tokens (reasoning model? raise jev.max_tokens)";
+
 export const openaiCompat: Provider = {
   name: "openai-compat",
   async call(prompt, cfg, timeoutMs) {
     const endpoint = (cfg.endpoint ?? "http://127.0.0.1:11434/v1").replace(/\/+$/, "");
     const nonce = newNonce();
-    const body = JSON.stringify({
-      model: cfg.model ?? "gpt-4o-mini",
-      temperature: 0,
-      max_tokens: 200,
-      response_format: { type: "json_object" },
-      messages: [
-        { role: "system", content: openaiSystemPrompt(prompt.questions, nonce) },
-        { role: "user", content: openaiUserMessage(prompt.text, nonce) },
-      ],
-    });
+    const body = JSON.stringify(openaiBody(cfg, openaiSystemPrompt(prompt.questions, nonce, prompt.context.deployment), openaiUserMessage(prompt.text, nonce)));
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (cfg.api_key) headers.Authorization = "Bearer " + cfg.api_key;
-    let content: string;
+    let content: unknown;
+    let finish: unknown;
     try {
-      content = await fetchWithin(endpoint + "/chat/completions", { method: "POST", headers, body }, timeoutMs, async (res) => {
-        if (res.status !== 200) throw new HttpStatus(res.status);
+      [content, finish] = await fetchWithin(endpoint + "/chat/completions", { method: "POST", headers, body }, timeoutMs, async (res) => {
+        // the error body is read under the same deadline, for its message
+        if (res.status !== 200) throw new HttpStatus(res.status, openaiErrorMessage(await res.text().catch(() => "")));
+        let raw: string;
         try {
-          const d = (await res.json()) as { choices?: { message?: { content?: string } }[] };
-          return d.choices?.[0]?.message?.content ?? "";
+          raw = await res.text();
         } catch (e) {
           if (e instanceof Error && e.name === "AbortError") throw e;
           throw new Error("malformed response");
         }
+        // the envelope too goes through the decoder cjson's twin uses
+        const d = decodeLenient(raw) as { choices?: { message?: { content?: unknown }; finish_reason?: unknown }[] } | null | undefined;
+        if (d === undefined) throw new Error("malformed response");
+        const c = d?.choices?.[0];
+        return [c?.message?.content, c?.finish_reason] as const;
       });
     } catch (e) {
-      if (e instanceof HttpStatus) return [null, "openai-compat http " + e.status];
-      if (e instanceof Error && e.message === "malformed response") return [null, "openai-compat: malformed response"];
-      return [null, errorString(e, timeoutMs)];
+      if (e instanceof HttpStatus) {
+        return [null, "openai-compat http " + e.status + (e.detail !== undefined ? ": " + e.detail : ""), statusKind(e.status)];
+      }
+      if (e instanceof Error && e.message === "malformed response") return [null, "openai-compat: malformed response", UNUSABLE];
+      return noAnswer(e, timeoutMs);
     }
-    if (typeof content !== "string") return [null, "openai-compat: no content"];
+    // the token budget ran out before the answer (a reasoning model spends it thinking)
+    if (finish === "length" && (typeof content !== "string" || jsonObjects(content).length === 0)) return [null, OPENAI_CUT, UNUSABLE];
+    if (typeof content !== "string") return [null, "openai-compat: no content", UNUSABLE];
     const wanted = Object.keys(prompt.questions);
     // a reply that copies an answer planted in the input: the judge was
     // steered, so every asked question scores 1 (an error would fail open,
@@ -370,7 +593,10 @@ export const openaiCompat: Provider = {
       console.warn("jev-edge: openai-compat judge echoed an answer planted in the input");
       return [Object.fromEntries(wanted.map((n) => [n, 1])), null];
     }
-    return parseOpenaiContent(content, wanted);
+    // a 200 whose reply answers nothing usable: the judged text can cause
+    // that, so it is not the provider failing
+    const r = parseOpenaiContent(content, wanted);
+    return r[0] ? r : [null, r[1], UNUSABLE];
   },
 };
 
@@ -381,9 +607,29 @@ export const openaiCompat: Provider = {
  * `/_jev/authz` (the same endpoint Envoy uses) and turns its X-Jev-* answer
  * back into an answer map, so the Worker applies its own L1 and cache but the
  * judgment, thresholds and deployment context live in one place: the origin.
- * A 403 from the backend is reported as score 1 so the Worker's policy blocks
- * in enforce mode too; an X-Jev-Verdict: error answer is an error here as well.
+ * A block from the backend (any 4xx carrying X-Jev-Verdict: its
+ * policy.block_status) is reported as score 1, whatever X-Jev-Score says, so
+ * the Worker's policy blocks it too at any block_threshold and the cached 1
+ * blocks a repeat; an X-Jev-Verdict: error answer is an error here as well.
+ * With `jev.origin_token` (TS only; thinWorker's originToken or
+ * env.JEV_ORIGIN_TOKEN) every call carries it as X-Jev-Origin-Token, so an
+ * origin that must be reachable from Cloudflare can refuse everyone else's
+ * calls to /_jev/authz (example.nginx.conf).
  */
+/** The labels an origin gives a text it judged; any other answer was not judged there. */
+const JUDGED = new Set(["safe", "suspicious", "malicious"]);
+
+/** X-Jev-Reason as text (form-encoded on the wire), or a placeholder. */
+function reasonText(res: Response): string {
+  const r = res.headers.get("x-jev-reason");
+  if (r === null || r === "") return "no reason";
+  try {
+    return decodeURIComponent(r.replace(/\+/g, " "));
+  } catch {
+    return r;
+  }
+}
+
 export const backend: Provider = {
   name: "backend",
   async call(prompt, cfg, timeoutMs, info) {
@@ -391,13 +637,16 @@ export const backend: Provider = {
     if (!base) return [null, "backend: jev.endpoint (origin jev-edge URL) not set"];
     const path = info?.path ?? prompt.context.path ?? "/";
     // The decoded body when the Worker read it whole (so no Content-Encoding);
-    // otherwise the judged window, sent as what it is: plain text.
+    // otherwise the judged text, sent as what it is: plain text. The runtime
+    // sets core's judge.whole for this provider, so that text is all of what
+    // the Worker judged (every chunk, retrieved content, tool definitions).
     const whole = info?.body !== null && info?.body !== undefined;
     const headers: Record<string, string> = {
       "Content-Type": whole ? info.headers.get("content-type") ?? "application/json" : "text/plain; charset=utf-8",
     };
     if (info?.clientIp) headers["X-Forwarded-For"] = info.clientIp;
     if (info?.subjectId) headers["X-Jev-Subject"] = info.subjectId;
+    if (typeof cfg.origin_token === "string" && cfg.origin_token !== "") headers["X-Jev-Origin-Token"] = cfg.origin_token;
     // The answer is in the headers; the body (a 403's JSON) is drained so the
     // connection is reusable, still under the same deadline.
     let res: Response;
@@ -411,17 +660,31 @@ export const backend: Provider = {
         return r;
       });
     } catch (e) {
-      return [null, errorString(e, timeoutMs)];
+      return noAnswer(e, timeoutMs);
     }
     const verdict = res.headers.get("x-jev-verdict") ?? "";
     const score = Number(res.headers.get("x-jev-score"));
-    if (res.status === 403) {
+    // A block is the origin's decision, made at its own (calibrated)
+    // thresholds: its score, below the Worker's block_threshold, would pass
+    // here what the origin blocked, and cache it as passable. Any 4xx, as the
+    // origin's policy.block_status may be 429 or 451; with X-Jev-Verdict,
+    // since a 4xx without it is not jev-edge's answer (an allow/deny or a
+    // limit in front of it) and fails open like any other status.
+    if (res.status >= 400 && res.status <= 499 && res.headers.has("x-jev-verdict")) {
       const name = (res.headers.get("x-jev-reason") ?? "backend").split("+")[0] || "backend";
-      return [{ [name]: Number.isFinite(score) && score > 0 ? score : 1 }, null];
+      return [{ [name]: 1 }, null];
     }
-    if (res.status !== 200) return [null, "backend http " + res.status];
-    if (verdict === "error") return [null, "backend: " + decodeURIComponent((res.headers.get("x-jev-reason") ?? "error").replace(/\+/g, " "))];
-    if (!Number.isFinite(score)) return [null, "backend: no X-Jev-Score"];
+    if (res.status !== 200) return [null, "backend http " + res.status, statusKind(res.status)];
+    // A 200 is an answer only when the origin judged the text: a verdict it
+    // labelled from a score, with the score. `skipped` (its breaker open,
+    // the path not watched there, unjudgeable), `error` (its own L2 failed)
+    // and a 200 without X-Jev-* (a catch-all route) are not, and must not be
+    // cached here as safe. The origin itself answered, so none of them counts
+    // against the Worker's breaker: the origin's own breaker does that.
+    const raw = res.headers.get("x-jev-score");
+    if (!JUDGED.has(verdict) || raw === null || raw.trim() === "" || !Number.isFinite(score)) {
+      return [null, "backend: not judged (" + (verdict || "no X-Jev-Verdict") + ": " + reasonText(res) + ")", UNUSABLE];
+    }
     const name = (res.headers.get("x-jev-reason") ?? "backend").split("+")[0] || "backend";
     return [{ [name]: score }, null];
   },

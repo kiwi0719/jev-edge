@@ -15,6 +15,18 @@ static_resources:
                 # ext_authz, so it cannot be steered at the adapter's admin endpoints
                 normalize_path: true
                 merge_slashes: true
+                # and refuse (400) an encoded slash or backslash: Envoy leaves
+                # %2F escaped by default, so "..%2F" is no dot segment to it,
+                # while nginx decodes it and resolves the ".." after
+                # path_prefix: /_jev/authz/v1/..%2F..%2F..%2F_jev/config is
+                # /_jev/config there. UNESCAPE_AND_REDIRECT is the choice for
+                # an API that needs %2F in its paths.
+                path_with_escaped_slashes_action: REJECT_REQUEST
+                # size contract of the authz hop: the whole header block, path
+                # included, is capped here (431 past it), and the nginx serving
+                # /_jev/authz must take any request under the cap (README:
+                # large_client_header_buffers 4 64k). Raise both together.
+                max_request_headers_kb: 60
                 route_config:
                   name: local
                   virtual_hosts:
@@ -24,9 +36,13 @@ static_resources:
                         - match: { prefix: "/" }
                           route: { cluster: app }
                 http_filters:
-                  # never trust a client-supplied verdict: a route-level
-                  # request_headers_to_remove runs at the router, after ext_authz has
-                  # set the real verdict; this filter runs before ext_authz instead
+                  # never trust a client-supplied verdict, subject or cut flag: a
+                  # route-level request_headers_to_remove runs at the router, after
+                  # ext_authz has set the real verdict; this filter runs before
+                  # ext_authz instead. x-jev-body-partial is the HAProxy agent's
+                  # cut flag: the shim relays every header, and a client's copy
+                  # reaching /_jev/authz could mark a whole body cut (with
+                  # policy.partial = "unjudgeable", a request nobody judges).
                   - name: envoy.filters.http.header_mutation
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutation
@@ -38,6 +54,7 @@ static_resources:
                           - remove: x-jev-source
                           - remove: x-jev-request-id
                           - remove: x-jev-subject
+                          - remove: x-jev-body-partial
                   - name: envoy.filters.http.ext_authz
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz

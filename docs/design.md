@@ -4,7 +4,7 @@
 
 Everything past the [README](../README.md)'s five minutes. Part 1 is the operating guide: what to configure and how to decide. Part 2 is the design reference: scope, architecture, each layer, the cache, timeouts, degradation, adapters, observability, the bench numbers and the settled decisions.
 
-**Part 1, operating:** [body size and what L1 reads](#body-size-and-what-l1-reads) · [writing the deployment context](#writing-the-deployment-context) · [choosing thresholds](#choosing-thresholds) · [using Laya](#using-laya-instead-of-jev) · [false positives](#false-positives) · [subject reputation](#subject-reputation) · [retrieved content](#retrieved-content) · [what it costs](#what-it-costs) · [repository layout](#repository-layout) · [roadmap](#roadmap) · [test coverage](#test-coverage-and-operations)
+**Part 1, operating:** [body size and what L1 reads](#body-size-and-what-l1-reads) · [writing the deployment context](#writing-the-deployment-context) · [choosing thresholds](#choosing-thresholds) · [using Laya](#using-laya-instead-of-jev) · [false positives](#false-positives) · [subject reputation](#subject-reputation) · [retrieved content](#retrieved-content) · [tool definitions](#tool-definitions) · [what it costs](#what-it-costs) · [repository layout](#repository-layout) · [roadmap](#roadmap) · [test coverage](#test-coverage-and-operations)
 
 **Part 2, design:** [scope](#scope) · [architecture](#architecture) · [L1](#l1-cheap-rules) · [cache](#cache) · [L2](#l2-synchronous-judgment) · [policy](#policy) · [L3](#l3-async-side-path) · [verdict headers](#verdict-headers) · [hot reload](#configuration-and-hot-reload) · [degradation matrix](#degradation-matrix) · [adapters](#openresty-adapter) · [observability](#observability) · [bench](#bench-and-acceptance) · [decisions](#decisions)
 
@@ -15,28 +15,35 @@ Everything past the [README](../README.md)'s five minutes. Part 1 is the operati
 
 L1 reads a watched request the way the backend will: the body decides the format, a compressed body is decoded, and a body too large to parse whole is still scanned. A request it cannot read at all is reported as such, never passed silently as "no text".
 
-**`max_body_bytes` is 1 MiB** (it was 64 KB before 0.4.0), nginx's default `client_max_body_size`. Up to it the body is parsed whole. Past it, only its first `max_body_bytes` and its last 64 KiB are scanned for the values of the text fields (`content`, `prompt`, `input`, ...); the verdict's reason then ends in `(window)`. The 1 MiB covers long-context chat with pasted documents; raise it for vision or RAG traffic with inline base64 files, where requests of several MB are normal. Everything below must agree, or the smallest limit wins:
+**`max_body_bytes` is 1 MiB** (it was 64 KB before 0.4.0), nginx's default `client_max_body_size`. Up to it the body is parsed whole. Past it, only its first `max_body_bytes` and its last 64 KiB are scanned for the values of the text fields (`content`, `prompt`, `input`, ...) and the tool definitions; the verdict's reason then ends in `(window)`. The scan decodes keys written with JSON escapes, reads a value the head or the tail cuts as far as it has it, and scans a body that fits in `max_body_bytes` + 64 KiB as one string. The 1 MiB covers long-context chat with pasted documents; raise it for vision or RAG traffic with inline base64 files, where requests of several MB are normal. Everything below must agree, or the smallest limit wins:
 
 | Where | Setting | Note |
 |---|---|---|
 | `jev-edge.conf.lua` | `rules = { { id = "big", extends = "llm-endpoints", max_body_bytes = 4 * 1048576 } }` | the rule L1 applies; per tenant rule if you have several |
 | nginx / OpenResty | `client_max_body_size 4m;` | past it nginx answers 413 before jev-edge runs |
 | nginx / OpenResty | `client_body_buffer_size` | bodies above it go to a temp file; jev-edge reads head and tail from it without loading the file |
-| Envoy | `with_request_body.max_request_bytes` | past it Envoy sends a cut body with `x-envoy-auth-partial-body: true`, which jev-edge scans as a head (`allow_partial_message: true`) |
-| HAProxy | `tune.bufsize` | per-connection memory; past it the SPOE agent marks the body partial and it is scanned as a head |
+| Envoy | `with_request_body.max_request_bytes` | past it Envoy sends a cut body with `x-envoy-auth-partial-body: true`, which jev-edge scans as a head (`allow_partial_message: true`); a body that reaches `max_body_bytes` is taken as cut whatever Envoy says |
+| HAProxy | `tune.bufsize` | per-connection memory; the reference `spoe.conf` sends at most 88 KiB of body, and past it the agent marks the body partial and it is scanned as a head |
 | Traefik | no `maxBodySize` | past it Traefik denies with 401 on its own; cap sizes with a `buffering` middleware instead |
 | APISIX | plugin `rules`, and `nginx_config.http.client_max_body_size` in `config.yaml` | same as nginx |
+| Kong | plugin `rules` / `rules_json`, and `nginx_http_client_max_body_size` | same as nginx |
 | `@jev-edge/js` | `rules: [{ id: "big", extends: "llm-endpoints", max_body_bytes: 4 * 1048576 }]` | past it the runtime reads on to 4 x the limit for the tail; Workers cap request size by plan |
 
-**`max_judge_bytes` is 32 KiB**: the text fingerprinted and sent to L2. Longer text is cut to a window: the `always_suspect` hit (all of the text is scanned for it) with 1 KiB either side, then messages newest first; the one that does not fit keeps its head and tail. Chat APIs resend the history every turn, and earlier turns were judged when they were new. Raising it costs tokens on every long request; `jev_window_total` counts how often it is hit.
+**A body the gateway cut** (Envoy's partial body, HAProxy past its frame) is scanned as a head by default. `policy.partial = "unjudgeable"` reports it as `unjudgeable: partial body` instead, so `policy.unjudgeable` decides; use it with `unjudgeable = "block"` and only behind a relay that drops a client's copy of the flag (the reference Envoy configs and the HAProxy agent do; see "Bodies past `maxRequestBytes`" in the [Istio recipe](recipes.md#istio)).
 
-**Judging long text in chunks.** One window is cheap, but an instruction in the middle of a long message that no `always_suspect` pattern matches (a non-English one, say) can fall outside it. `max_judge_chunks` in the rule (default 1) judges text over `max_judge_bytes` in up to that many chunks, one judge call each, in parallel (`ngx.thread` on OpenResty, APISIX and Kong; `Promise.all` in the JS runtime), and the highest chunk score is the request's; the reason ends in `(N chunks)`. Each chunk has its own cache entry, so the unchanged history of a long conversation is not paid for again on every turn. Text longer than `max_judge_chunks × max_judge_bytes` is judged on the newest chunks plus a window over the rest (`(window)`), or blocked as `unjudgeable: text over max_judge_chunks` when `policy.unjudgeable = "block"` in enforce mode. `rules = { { id = "long", extends = "llm-endpoints", max_judge_chunks = 4 } }` judges up to 128 KiB in full, at up to four calls per long request; `jev_window_total` shows how often text is long enough to matter. L3 and the thin Worker's `backend` provider still make one call per request.
+**`max_judge_bytes` is 32 KiB**: the text fingerprinted and sent to L2. Longer text is cut to a window: every `always_suspect` hit (all of the text is scanned, every pattern's matches walked, the latest 8 kept) with an even share of up to 1 KiB of context each, then messages newest first; the one that does not fit keeps its head and tail. Chat APIs resend the history every turn, and earlier turns were judged when they were new. Raising it costs tokens on every long request; `jev_window_total` counts how often it is hit.
 
-**Content-Type is a hint.** Every type except media (`skip_content_types`: `image/`, `audio/`, `video/`, `font/`, PDF, zip, gzip) is read: a body that parses as JSON is JSON whatever the header says (Ollama and FastAPI read it that way), forms and `multipart/form-data` fields are read (text file parts too), other text is taken whole. A rule that lists `content_types` keeps the old allow list.
+**Judging long text in chunks.** One window is cheap, but an instruction in the middle of a long message that no `always_suspect` pattern matches (a non-English one, say) can fall outside it. `max_judge_chunks` in the rule (default 1) judges text over `max_judge_bytes` in up to that many chunks, one judge call each, in parallel (`ngx.thread` on OpenResty, APISIX and Kong; `Promise.all` in the JS runtime), and the highest chunk score is the request's; the reason ends in `(N chunks)`. Consecutive chunks share 1 KiB, so an instruction cut at a seam is whole in one of them, and a pattern hit no chunk holds whole is judged as a part of its own. Each chunk has its own cache entry, so the unchanged history of a long conversation is not paid for again on every turn. Text longer than the chunks hold (`max_judge_bytes` + (`max_judge_chunks` − 1) × (`max_judge_bytes` − 1 KiB)) is judged on the newest chunks plus a window over the rest (`(window)`), or blocked as `unjudgeable: text over max_judge_chunks` when `policy.unjudgeable = "block"` in enforce mode, breaker open or not. `rules = { { id = "long", extends = "llm-endpoints", max_judge_chunks = 4 } }` judges up to 125 KiB in full, at up to four calls per long request; `jev_window_total` shows how often text is long enough to matter. L3 judges the same chunks; the thin Worker's `backend` provider sends the whole request to its origin in one call.
 
-**Content-Encoding** `gzip`, `deflate` and `br` are decoded (Express's body-parser inflates them), capped at `max_body_bytes` so a small compressed body cannot expand into memory. OpenResty and APISIX use zlib (linked into nginx) and libbrotlidec through FFI: install `brotli-libs` (Alpine) or `libbrotli1` (Debian) for `br`. The JS runtime uses `DecompressionStream`, and `node:zlib` for `br` where it exists.
+**Content-Type is a hint.** Every body is read, whatever its type: a body that parses as JSON is JSON whatever the header says (Ollama, llama.cpp and FastAPI read it that way), forms and `multipart/form-data` fields are read (text file parts too, `application/octet-stream` and untyped ones included when they are text), other text is taken whole. A media type (`skip_content_types`: `image/`, `audio/`, `video/`, `font/`, PDF, zip, gzip) only marks the request: JSON or text under it is still judged, and only a body that really is binary passes as "content-type not watched". A rule that lists `content_types` keeps an allow list decided by the header.
 
-**Unjudgeable.** An encoding that cannot be decoded, a binary body, or a body over the limit with no text in its head or tail is passed as `X-Jev-Verdict: skipped` with `X-Jev-Reason: unjudgeable: <why>` and counted in `jev_unjudged_total{reason}`. Set `policy.unjudgeable = "block"` to reject these in enforce mode: normal SDKs send none of them, so once the metric is quiet in monitor mode it is the stricter choice.
+**JSON the decoder refuses** is not "no text". cjson refuses a lone surrogate escape, nesting past 1000 levels and bytes after the value, which Python, Node and Go all read. Such a body, declared JSON or one that starts with `{` or `[` under any type, has its text fields, tool-call arguments and tool definitions read by a tolerant scanner; under `text/plain` or no type the whole body is judged as well. Declared JSON with nothing to scan is `unjudgeable: invalid json`. Keys match without regard to case, as Go's `encoding/json` (Ollama) matches them.
+
+**Content-Encoding** `gzip`, `deflate` and `br` are decoded (Express's body-parser inflates them). The head is kept up to `max_body_bytes`; past it decoding goes on into a 64 KiB ring for the tail, up to 4 × `max_body_bytes` of output, so a small compressed body cannot expand into memory and its newest message is still read. Past that bound the body is `unjudgeable: body too large`. OpenResty, Kong and APISIX use zlib (linked into nginx) and libbrotlidec through FFI: install `brotli-libs` (Alpine) or `libbrotli1` (Debian) for `br`. The JS runtime uses `node:zlib` where it exists (every member of a gzip body) and `DecompressionStream` elsewhere; a runtime with neither (Next.js's edge runtime) reports "gzip decoder not available", so run such middleware on the Node runtime.
+
+**Token ids.** OpenAI completions, vLLM, SGLang and llama.cpp take a prompt as a list of token ids, which L1 cannot read. Such a request is `unjudgeable: token prompt`; beside text long enough to judge, the text is judged and the ids still count. A rule's `token_prompts = "block"` refuses them in enforce mode without making every unjudgeable request block.
+
+**Unjudgeable.** A watched request L1 cannot read is passed as `X-Jev-Verdict: skipped` with `X-Jev-Reason: unjudgeable: <why>` and counted in `jev_unjudged_total{reason}`: an encoding that cannot be decoded (`content-encoding`), a binary body (`binary`), a body over the limit with no text in its head or tail (`body`), declared JSON with nothing to scan (`invalid`), JSON past the walk's bounds with too little left to judge (`json`), a cut body under `policy.partial = "unjudgeable"` (`partial`), text over `max_judge_chunks` in enforce mode under `block` (`text`), more than 8 multipart boundaries (`multipart`), a token-id prompt (`token`). Set `policy.unjudgeable = "block"` to reject these in enforce mode: normal SDKs send none of them, so once the metric is quiet in monitor mode it is the stricter choice.
 
 ## Writing the deployment context
 
@@ -122,26 +129,28 @@ jev-edge can judge with a fine-tuned [Laya](../adapters/laya-server/README.md) m
 **No benchmark ships for Laya.** The base Laya model is not usable for this task without fine-tuning, so this repository publishes no Laya accuracy numbers, no detection or false-positive rates, and no default thresholds. Numbers for the base model would say nothing about a deployment, and the result after fine-tuning depends on your data and your training. Measure your own build (below) before you enforce anything.
 
 1. **An HTTP server.** Laya ships as a Python library or ONNX package, not as an HTTP API. `adapters/laya-server` serves it over the System One protocol (`POST /v1/systemone`), with a Dockerfile. It never truncates silently: text longer than one model window is scored in overlapping windows (all in one batch, highest score wins), and text past `LAYA_MAX_WINDOWS` windows is refused with 413.
-2. **A config profile.** [`jev-laya.conf.lua`](../adapters/laya-server/jev-laya.conf.lua) replaces the Jev-sized values: an L2 timeout floor and ceiling sized for a local model instead of Jev's 400 / 1000 ms, and `max_judge_bytes = 4096` so no text the gateway sends can exceed what the server judges (an L2 error passes the request, so a 413 must never happen in production).
+2. **A config profile.** [`jev-laya.conf.lua`](../adapters/laya-server/jev-laya.conf.lua) replaces the Jev-sized values: an L2 timeout floor and ceiling of 500 / 800 ms, sized from the worst-case text (about 2.5 × six windows on CPU) rather than a short prompt; `max_judge_bytes = 4096` so no text the gateway sends can exceed what the server judges (an L2 error passes the request, so a 413 must never happen in production); and `max_inflight = 1`, what laya-server's default pool answers within the gateway's read budget. A burst past it is refused by the gateway's own cap, which does not count against the breaker; a laya-server 503 or a timeout does. Raise it with capacity, after `make conformance` says the server holds it.
 3. **Scores and thresholds of its own.** laya-server applies a temperature fitted by `fit_temperature.py` on held-out labels, so `noul` is a calibrated probability. The access log records `provider` and `model`, and `make calibrate` refuses a log that mixes judges: run it with `PROVIDER=laya MODEL=<your build>`. Jev's 0.7 does not carry over.
 4. **Question wording to re-validate.** The bundled wording was validated against Jev (jev-sec-bench), not Laya, and the `deployment_context` form is the least likely to transfer. Fine-tune on the exact wording in [`conformance/questions.json`](../conformance/questions.json), or put your own under `jev.questions` in the profile; it applies to that provider only.
 
 "Same format as Jev" is checked, not assumed: [`conformance/`](../conformance/README.md) replays the request exactly as the gateway builds it against any server and checks fields, the answer structure, error codes, long input and timeout behaviour. Run it against every new server build:
 
 ```bash
-make conformance ENDPOINT=http://127.0.0.1:8080/v1/systemone STRICT=1 BUDGET_MS=300
+make conformance ENDPOINT=http://127.0.0.1:8080/v1/systemone STRICT=1 BUDGET_MS=500 CONCURRENCY=1
 ```
+
+`BUDGET_MS` is the gateway's `jev.timeout_ms` (500 in the profile) and must equal laya-server's `LAYA_GATEWAY_TIMEOUT_MS`; `CONCURRENCY` is `max_inflight`, summed over the gateways that share the server. The run times the worst-case text alone and at that concurrency, and prints the `timeout_ms` to set.
 
 ## False positives
 
 Someone on call decides a blocked request was legitimate. That decision has to reach two places: the gateway, now, so the same text stops being blocked; and the labels, so the next calibration knows about it. `POST /_jev/feedback` does both.
 
 ```bash
-curl -s localhost:8090/_jev/feedback -H 'X-Jev-Token: '"$JEV_FEEDBACK_TOKEN" \
+curl -s 127.0.0.1:9180/_jev/feedback -H 'X-Jev-Token: '"$JEV_FEEDBACK_TOKEN" \
      -d '{"fp":"17e77570","label":"benign","by":"alice","rid":"ab12..."}'
 ```
 
-The `fp` is the fingerprint from the log line or the alert; `label: "attack"` revokes instead, so undoing a mislabel is as cheap as making one. Turn it on with `feedback = { enabled = true, token = ... }` — a token is required, because this endpoint writes bypasses.
+The `fp` is the fingerprint from the log line or the alert; `label: "attack"` revokes instead, so undoing a mislabel is as cheap as making one. Turn it on with `feedback = { enabled = true, token = ... }` — a token is required, because this endpoint writes bypasses. The token goes in `X-Jev-Token` or `Authorization: Bearer`. Serve the endpoint on the admin listener, as `example.nginx.conf` does (`127.0.0.1:9180`): the access phase strips every client `X-Jev-*` header, so a `/_jev/feedback` location that inherits a server-level `access_by_lua` only takes the `Authorization` form.
 
 Three decisions are baked in, and they are the interesting part:
 
@@ -167,7 +176,13 @@ subject = {
 },
 ```
 
-It is off by default (`block_at = 0`). Only judged verdicts count (L2 and cache hits), never an L1 block, so a block does not extend itself; in `monitor` mode a would-be block is reported as `malicious` / `subject reputation` and passed. The counters are two keys per subject in the `jev_subject` dict (atomic `incr`); blocks are counted in `jev_subject_blocks_total`.
+It is off by default (`block_at = 0`). Only judged verdicts count (L2 and cache hits), never an L1 block, so a block does not extend itself; in `monitor` mode a would-be block is reported as `malicious` / `subject reputation` and passed. The counters are two keys per subject in the `jev_subject_rep` dict (atomic `incr`), apart from the trajectories in `jev_subject`: a flood of new subject values fills the trajectory store, which then drops new entries instead of evicting, and cannot push a running block out. Without `jev_subject_rep` the counters share `jev_subject`, with one warning per worker. Blocks are counted in `jev_subject_blocks_total`.
+
+**What is charged.** Only the subject's own text. The tool definitions and, with `untrusted` on, the retrieved content are judged as parts of their own and their score still decides the request, but it adds no points: an agent loads them from servers and pages the user may not control, and text planted there could otherwise get the users whose agents fetched it blocked. With `untrusted` on, a whole text that holds retrieved content (a `role: tool` message is in `messages[*].content`), or a body that was scanned rather than parsed, is not the subject's own either. The cost, accepted on purpose: a client that forges a tool message, or appends one byte after its JSON, is still judged on every request but builds no reputation. L3's IP reputation follows the same rule.
+
+**One subject, one key.** A subject value cannot be respelled into a fresh one. A cookie subject is every value the backend may read (a duplicate name, a case variant, a quoted value), and any blocked one blocks. An `Authorization` or `Proxy-Authorization` value is keyed on the credential, the scheme lowercased and one space after it. `from = "ip"` counts an IPv6 client by its /64 (`client_ip.ipv6_prefix`), as IP reputation does. A salted value is hashed up to 64 KiB (a long bearer token); with `hashed = true` the value is the id and must fit 512 bytes. A value dropped for its length, or a subject header a relay does not forward to `/_jev/authz` (Envoy's `allowed_headers`, Traefik's `authRequestHeaders`), is logged once per worker. On Kong, a header an auth plugin hid (`hide_credentials`) falls back to the credential Kong authenticated.
+
+**Behind a thin Worker.** The Worker hashes the subject and forwards it as `X-Jev-Subject`; the origin takes it as is (`subject = { from = "header", name = "x-jev-subject", hashed = true }`), and counts the Worker's authz call and the request it forwards once. With `hashed = true` the origin trusts that header verbatim, so a client that reaches the origin directly picks its own subject, or none. The origin must take it from the Worker only. The Worker's `/_jev/authz` calls belong on the gateway-only listener in `example.nginx.conf`, which refuses a call without the secret the thin Worker sends as `X-Jev-Origin-Token` (`originToken` or `JEV_ORIGIN_TOKEN`). The requests the Worker forwards reach the origin's ordinary server without it: admit only the Worker there (Cloudflare Authenticated Origin Pulls or mTLS, or a firewall that admits only Cloudflare's ranges). Where that is not possible, clear the header on that server before judging (`ngx.req.clear_header("X-Jev-Subject")` ahead of `access()`) and leave reputation to the authz calls. The origin still judges every request itself; only reputation depends on this.
 
 Pick `block_at` from your own traffic: run in `monitor` mode with the subject configured, then `make calibrate LOG=... [LABELS=...]` replays the log per subject with the same window and prints how many subjects each `block_at` would have blocked, benign against those that sent a labelled attack, with a recommendation. No multi-turn dataset is needed: this is reputation, not sequence scoring.
 
@@ -180,20 +195,27 @@ An assistant that calls tools or retrieves documents sends what it fetched back 
 ```lua
 untrusted = {
   enabled      = true,   -- off by default; hot-reloadable through /_jev/config
-  tool_results = true,   -- OpenAI role "tool" / "function", Anthropic tool_result, Responses function_call_output
-  fields       = { "documents[*].text" },  -- JSON paths where your app sends retrieved text outside a tool message
+  tool_results = true,   -- tool messages and results, documents, search results (list below)
+  fields       = { "context[*].text" },  -- JSON paths where your app sends retrieved text outside a tool message
 },
 ```
 
-or at runtime: `curl -X PUT localhost:8090/_jev/config -d '{"untrusted":{"enabled":true}}'`. A rule's own `untrusted` table turns it on for one route only.
+or at runtime: `curl -X PUT 127.0.0.1:9180/_jev/config -d '{"untrusted":{"enabled":true}}'`. A rule's own `untrusted` table turns it on for one route only. `tool_results` covers OpenAI `role: "tool"` / `"function"` messages (an object content read whole), Anthropic `tool_result` and `document` blocks, every Responses `*_call_output` item, `mcp_call` output and `file_search_call` results, Cohere and vLLM `documents`, Gemini function responses, and the output of AI SDK 5 tool parts. `fields` are checked and read like `text_fields` (`**` included), and a value the tool results already hold is not sent twice.
 
 On a held-out set of 1,200 tool results the question was not written against (InjecAgent, LLMail-Inject phase 1, Hermes function calling), the shipped core (0.6.1) flagged 81% of attacks at 0.5 instead of 22%, with 1 false positive in 700 benign results ([details](../bench/suite/README.md#held-out-test-the-shipped-core)).
 
 - **Cost**: one more provider call for every request that carries tool content or `fields`; nothing for the rest. L2 time moved from 271 to 288 ms at p50 in that run, the two calls running in parallel.
 - **Responses API**: before 0.6.1, `function_call_output` items were not read at all; they are part of the whole text now (`input[*].output`), as the other two shapes' tool results always were. Judged only that way, most attacks in them still pass (78% missed at 0.5 on the held-out set); `untrusted` is what catches them.
 - **What it cannot see**: retrieved text pasted into the user's own message. Send it as a tool message, or name its field in `fields`.
-- **Where it misfires**: payment and transfer requests ("please transfer $3,000 to ...") read like an ordinary email to the recipient, so only 43% of InjecAgent's financial-harm attacks were flagged at 0.5; a lower threshold on tool routes trades that against false positives (73% at 0.3 for 0.9% FP on the held-out set, chosen after the fact). Also text written for an AI to read, such as system prompts, prompt libraries or AI documentation, retrieved as content. It is judged without the deployment context, the way it was measured. L3 re-judges the whole text only.
+- **Where it misfires**: payment and transfer requests ("please transfer $3,000 to ...") read like an ordinary email to the recipient, so only 43% of InjecAgent's financial-harm attacks were flagged at 0.5; a lower threshold on tool routes trades that against false positives (73% at 0.3 for 0.9% FP on the held-out set, chosen after the fact). Also text written for an AI to read, such as system prompts, prompt libraries or AI documentation, retrieved as content. It is judged without the deployment context, the way it was measured.
+- **Reputation**: the retrieved content's score decides the request but is not charged to the subject, nor is a whole text that holds it (see [Subject reputation](#subject-reputation)). L3 judges the same parts as L2.
 - **Measured with Jev only.** With [Laya](#using-laya-instead-of-jev), validate the `untrusted` question on your build before relying on it, as for any bundled wording.
+
+## Tool definitions
+
+Chat templates render the tool definitions a client sends (`tools[].function` names, descriptions and parameter schemas, an output schema) into the model's prompt, and a client writes them. `llm-endpoints` judges them by default through the rule's `tool_fields` (`tools`, `functions`, `response_format.json_schema`, `text.format`; Gemini's `functionDeclarations` sit under `tools`): every key and string at any depth, JSON Schema included, but a `type` whose value is a schema type name. `always_suspect` scans all of it, and one `max_judge_bytes` window of it is judged as a part of its own, beside the text's window, with the rule's question (`injection`) and its own cache entry keyed by the definitions' text: a tool set sent again on the next turn is a cache hit, so an unchanged set costs one call per `cache.fp_ttl`. The request's score is the highest part's, and the reason says `tools+injection` when theirs decides. Past `max_body_bytes`, or in JSON the decoder refuses, the head and tail are scanned for them. The score is not charged to the subject: an agent loads tool definitions from servers the user may not control. `tool_fields = {}` in a rule turns it off.
+
+**What was measured, and what was not.** Before the default was chosen, a false-positive set of 30 real tool sets (reference and vendor MCP servers, coding agents, SDK examples) was committed with its decision rule, then run against the hosted judge ([bench/tools](../bench/tools/README.md)). Asked with `injection`, none reached 0.5 (highest 0.12). Asked with `untrusted`, 14 of 30 reached 0.5 and 8 reached 0.7: tool descriptions instruct the model by design, so that question is not used for them. Detection of poisoned tool definitions was not measured, so this is a way to put what the model will read in front of the judge, not a tested defence against tool poisoning.
 
 ## What it costs
 
@@ -203,7 +225,9 @@ Two numbers decide the bill: how much of your traffic reaches L2, and the provid
 monthly cost ≈ QPS × L2 share × 2.63M s/month × tokens per call × price per token
 ```
 
-One L2 call with the `injection` template is about 610 input tokens with a deployment context and 39 output tokens, measured on the live runs. With [`untrusted`](#retrieved-content) on, a request that carries tool content makes a second call. Prices change; [docs/cost.md](cost.md) has a worked table at the price published when it was written, and the two metrics that give you your real L2 share and token count after a day in `monitor` mode.
+One L2 call with the `injection` template is about 610 input tokens with a deployment context and 39 output tokens, measured on the live runs. With [`untrusted`](#retrieved-content) on, a request that carries tool content makes a second call; a request with [tool definitions](#tool-definitions) makes one more the first time its tool set is seen. Prices change; [docs/cost.md](cost.md) has a worked table at the price published when it was written, and the two metrics that give you your real L2 share and token count after a day in `monitor` mode.
+
+**Worker CPU.** L1 on an ordinary request costs microseconds, and reading an ordinary 1 MiB chat body about 15 ms. A body built to be expensive costs a few tens of milliseconds of worker CPU per request at the default `max_body_bytes`: measured under OpenResty's LuaJIT, a 1 MiB body of 250,000 short strings in JSON the decoder refuses, or past `max_body_bytes`, takes about 65 ms, one of nothing but quotes about 60 ms, and an escape-heavy one about 30 ms. The scans and pattern walks are bounded and linear, so the cost grows with the body, never faster, but a client sending such bodies can hold a worker. On routes open to anyone, lower `max_body_bytes` (the cost scales with it) and rate-limit with `limit_req` in front of jev-edge.
 
 ## Repository layout
 
@@ -215,7 +239,7 @@ adapters/
   openresty/     access_by_lua glue, /_jev/{authz,config,forward-auth,health,metrics}, providers/,
                  shared-dict cache, adaptive timeout, L3 timer; Test::Nginx in t/
   apisix/        APISIX plugin (same engine, per-route config), e2e/ against real APISIX
-  kong/          Kong Gateway plugin (same engine), e2e/ against real Kong (DB-less)
+  kong/          Kong Gateway plugin (same engine), e2e/ against real Kong (DB-less and hybrid)
   envoy/         envoy-http.yaml, envoy-grpc.yaml, grpc-shim/ (Go), e2e/ (Docker Compose)
   haproxy/       SPOE agent (Go), spoe.conf, haproxy.cfg, e2e/ against real HAProxy
   forward-auth/  traefik.yml, Caddyfile, nginx-auth-request.conf, e2e/ (Docker Compose)
@@ -223,11 +247,11 @@ adapters/
   laya-server/   a fine-tuned Laya model over the System One protocol (Python, Dockerfile), config profile, temperature fit
   js/            TypeScript port of core; Cloudflare, Next.js, Node, Hono, Lambda@Edge, Deno presets; vitest replays core/golden
 rules/           L1 rule sets (PCRE prefilter, watch paths, text fields)
-bench/           offline accuracy bench, Docker latency bench, live checks, soak, calibrate, labels-from-log, context lint, report; suite/ for Chinese, multi-turn, indirect and held-out runs
+bench/           offline accuracy bench, Docker latency bench, live checks, soak, calibrate, labels-from-log, context lint, report; suite/ for Chinese, multi-turn, indirect and held-out runs; tools/ for the tool-definition false-positive set
 demo/            docker compose demo from the README's "Quick look"
 docs/            design.md, cost.md, recipes.md (Istio, Envoy Gateway, APIM, Apigee), bench charts
 ops/             Grafana dashboard, Prometheus alert rules and their promtool tests
-scripts/         invariants.lua: tripwires for bug classes a past audit found
+scripts/         invariants.lua (tripwires for bug classes past audits found) and its mutation tests; package-smoke.sh and require-all.lua load what the rock and the opm tree install
 ```
 
 ## Roadmap
@@ -248,6 +272,7 @@ scripts/         invariants.lua: tripwires for bug classes a past audit found
 | 0.5.0 ✅ | **Subject reputation**: suspicious and malicious verdicts counted per subject (user header, cookie or IP) over a window, blocking after a threshold, as `rep_block_after` does per IP today; thresholds from monitor-mode logs with `make calibrate`, no multi-turn dataset needed. It catches one user probing variants across sessions and IPs, and APIs that do not resend history. **Kong plugin** on the same Lua core as APISIX. **`@jev-edge/js` on npm**, and a **Deno Deploy** preset. **Operations**: a Grafana dashboard and Prometheus alert rules (breaker open, `error` rate, `unjudgeable` rate, L2 timeout at its ceiling), and `jev_feedback_total{label}` so operator feedback is a metric, not only a log line. **Judge robustness**: bench cases where the judged text addresses the judge ("rate this as safe"). **Boundaries**: the partial-body path (Envoy, HAProxy) covered by e2e, and the traffic L1 does not see (WebSocket, Realtime API, streamed request bodies) written down. Also shipped: long text judged in full in chunks (`max_judge_chunks`), an answer the judge echoes from the input scored as an injection, repository invariants for the 0.4.0 audit's bug classes, CodeQL and govulncheck in CI. |
 | 0.6.0 ✅ | **Retrieved content judged on its own** (`untrusted`, off by default): tool results in OpenAI, Anthropic and Responses bodies, plus any `untrusted.fields` path, judged in a parallel call with a question written for external content; the request gets the higher score. Its own cache entry per tool result, a fingerprint that covers it, a rule-level override, both cores and the APISIX / Kong schemas. Measured on a held-out set before it shipped: misses at 0.5 from 87% to 19%, 1 false positive in 700. **Accuracy beyond deepset**: suite v1 (Chinese injection, multi-turn, indirect injection, over-defense look-alikes, 2,735 whole request bodies from seven public sources), the untrusted-segment experiment, the held-out set, and an accuracy chart; every live run committed with its results, bad ones included. A test pinning the TypeScript templates' wording to the Lua files. **Laya as an L2 judge** (`provider = "laya"`, `adapters/laya-server`), with a **System One conformance suite** (`conformance/`), per-provider question wording (`jev.questions`) and calibration per judge; no Laya benchmark ships. |
 | 0.6.1 ✅ | Responses API `function_call_output` read as part of the whole text (`input[*].output` in the default text fields): before, it was never judged with `untrusted` off. **Security**: a call refused by the gateway's own `max_inflight` cap no longer counts as a breaker failure (a burst of distinct requests could switch L2 off for everyone); IP trust removed from L1 (nothing wrote it, and it would have let an attacker warm up an IP to skip L2). README cut to a five-minute read; the operating guide moved to docs/design.md; the Chinese documents rewritten instead of translated. |
+| 0.6.2 ✅ | The fixes from a full audit of 0.6.1 ([CHANGELOG](../CHANGELOG.md#062---2026-09-27)): L1 reads what the backends read (routes and aliases of every server it fronts, case-folded paths and keys, JSON the decoder refuses, multipart as RFC 2046, token-id prompts, Bedrock Converse and Gemini tool calls and results, the tail of compressed and oversized bodies); tool-call arguments and tool definitions judged (default on after a false-positive bench; detection not measured); the breaker fed by provider failures only; only the subject's own text charges reputation; block responses tell the client the verdict and request id only; relays that fail open on what they cannot forward now refuse or mark it; Kong hybrid mode, APISIX etcd secrets and ordering, Durable Objects across requests; release-npm hardened. |
 | Possible future work | Sequence scoring on subject trajectories: a window, decay and thresholds over the ordered history, once a labelled multi-turn dataset exists (the chat history each request already carries covers most multi-turn attacks today); an `abuse` dataset of its own; Fastly Compute (JS in WASM, its own stores, no `node:zlib`); judging streaming and realtime traffic; retrieved content in Chinese and other languages, where no public indirect-injection set exists yet; telling retrieved text apart inside the user's own message; the `untrusted` question with a deployment context, which has not been measured. Untested ideas for retrieved content, each needing a fresh test set before it ships: an `untrusted` question that sees the request's tool definitions (a payment instruction matters only when the assistant can pay), measured on AgentDojo; a Chinese indirect-injection set (synthetic or translated, labelled as such); per-route thresholds for tool traffic; `make suite-heldout` against a Laya build. |
 
 ✅ means shipped in a tagged release; "planned" is the next release's scope, not a date.
@@ -256,7 +281,7 @@ scripts/         invariants.lua: tripwires for bug classes a past audit found
 
 | | |
 |---|---|
-| Test coverage | 402 busted specs including the 214 golden vectors, 393 vitest cases replaying the same vectors plus the JS hosts, 473 Test::Nginx assertions, the laya-server and conformance tests, 16 guardrail tests, 7 Go tests (gRPC shim, SPOE agent), five gateway e2e suites against real Envoy, Traefik / Caddy / nginx, APISIX, Kong and HAProxy, alert-rule unit tests, repository invariants, the latency and accuracy benches, a soak run |
+| Test coverage | 1,136 busted specs including the 717 golden vectors, 1,209 vitest cases replaying the same vectors plus the JS hosts, 1,241 Test::Nginx assertions, the laya-server and conformance tests, 185 guardrail tests (also run against real LiteLLM 1.80.11 and 1.102.1), 32 Go tests (gRPC shim, SPOE agent), five gateway e2e suites against real Envoy, Traefik / Caddy / nginx, APISIX, Kong (DB-less and hybrid) and HAProxy, alert-rule unit tests, 19 repository invariants with their mutation tests, a package check that loads what the rock and the opm tree install, the latency and accuracy benches, a soak run |
 | Providers verified live | `jev` against the TypeSafe API on the 662-sample deepset dataset, the 2,735-record [suite v1](../bench/suite/README.md) and the 1,200-record held-out set of tool results; `openai-compat` against an Ollama container; `laya` against the conformance suite (no accuracy numbers ship) |
 | Operations | Prometheus metrics at `/_jev/metrics`, a Grafana dashboard and alert rules with unit tests in [ops/](../ops/README.md) |
 | Parity | one behavioural contract, the golden vectors in [core/golden/](../core/golden/README.md), replayed by the Lua core under busted and the TypeScript core under vitest; CI fails when either drifts. What the vectors leave to each platform (cache TTL precision, breaker statistics across workers, the adaptive timeout's value) is in that README and the [JavaScript adapter's](../adapters/js/README.md#what-is-the-same-as-nginx-and-what-is-not) list |
@@ -310,7 +335,7 @@ flowchart LR
     style edge fill:transparent,stroke:#8b949e,color:#8b949e
 ```
 
-**Decision principle:** each layer can only make a request *more* suspicious or pass it. Any layer that errors degrades to pass and records `X-Jev-Verdict: error`. One deliberate exception is operator trust (below): a fingerprint an operator labelled a false positive passes as `safe` at L1.5, before the verdict cache. It is the only input that can lower a score, it always expires, and it exists because a person looked. The other exception is also an operator's choice: `policy.unjudgeable = "block"` rejects, in `enforce` mode, a watched request L1 could not read (an undecodable encoding, a binary body, an oversized body with no text in its head or tail). By default such a request passes as `skipped`, never silently as "no text".
+**Decision principle:** each layer can only make a request *more* suspicious or pass it. Any layer that errors degrades to pass and records `X-Jev-Verdict: error`. One deliberate exception is operator trust (below): a fingerprint an operator labelled a false positive passes as `safe` at L1.5, before the verdict cache. It is the only input that can lower a score, it always expires, and it exists because a person looked. The other exception is also an operator's choice: `policy.unjudgeable = "block"` rejects, in `enforce` mode, a watched request L1 could not read (an undecodable encoding, a binary body, declared JSON with nothing to scan, an oversized body with no text in its head or tail, a token-id prompt). By default such a request passes as `skipped`, never silently as "no text". A relay that cannot forward a request to jev-edge as the client sent it (a path, header or method Go cannot send, a path nginx would refuse) answers 400 instead of failing open.
 
 **One contract for every implementation.** The behaviour of `core/` is pinned by the golden vectors in [core/golden/](../core/golden/README.md): hand-authored inputs, expectations produced by the Lua core, replayed by `core/spec/golden_spec.lua` and checked for drift by `make golden-check` in CI. The TypeScript port in `adapters/js` passes the same files under vitest; that is the definition of it being a port. The vectors cover normalisation, extraction, L1, policy, verdict headers and the pipeline order; they deliberately leave cache TTL precision, cross-worker breaker statistics and the adaptive timeout's value to each platform.
 
@@ -322,17 +347,17 @@ local verdict = edge.evaluate(req, {
   config  = merged_config,
   rules   = { require "jev.rules.llm-endpoints" },
   cache   = { get = fn, set = fn },         -- shared dict in OpenResty
-  judge   = { call = fn(prompt, timeout_ms) }, -- provider-backed
+  judge   = { call = fn(prompt, timeout_ms, opts), call_many = fn(prompts, timeout_ms, opts) },
   breaker = breaker_instance,               -- optional
   clock   = now_seconds_fn,
   hash    = hash_fn,
   json_decode = decode_fn,
-  re_find = pcre_find_fn,                   -- ngx.re.find in OpenResty
+  re_find = pcre_find_fn,                   -- (subject, pattern, init): ngx.re.find in OpenResty
   log     = log_fn,
 })
 ```
 
-`req` is a plain table the adapter assembles: `method, path, headers, body, body_size, client_ip`, plus `body_head` / `body_tail` for a body past `max_body_bytes` and `decoded` once a `Content-Encoding` was decoded.
+`req` is a plain table the adapter assembles: `method, path, headers, body, body_size, client_ip`, plus `body_head` / `body_tail` for a body past `max_body_bytes`, `decoded` once a `Content-Encoding` was decoded, and `body_partial` when the gateway in front forwarded only part of the body. A failed judge call returns `nil, err, kind`, the kind saying whether the breaker counts it (see [L2](#l2-synchronous-judgment)).
 
 ## L1: cheap rules
 
@@ -347,42 +372,69 @@ Input: `req` and the configured rule sets. Output is one of:
 
 Evaluation is ordered by cost and short-circuits:
 
-1. **Path not watched** → `pass`. The default watch list is empty. jev-edge does nothing until a path is explicitly listed.
-2. **Reputation** (shared dict, one lookup): IP blocked within `block_ttl` → `block`; IP trusted after N consecutive safe verdicts → `pass`. This runs before anything that needs a body so headers-only forward-auth requests can still be rejected.
-3. **Method / Content-Type**: method not in `methods` (`POST|PUT|PATCH`) → `pass`. Content-Type is a hint, so this is a deny list: only a request whose every Content-Type value is a media type in `skip_content_types` (`image/`, `audio/`, `video/`, `font/`, `application/pdf`, `application/zip`, `application/gzip`) → `pass`; no Content-Type is watched. A rule that lists `content_types` keeps the old allow list instead.
+1. **Path not watched** → `pass`. The default watch list is empty. jev-edge does nothing until a path is explicitly listed. The path is matched the way backends route it: `;` segment parameters dropped, empty and `.` segments removed, `..` resolved, and ASCII letters folded in the path and the pattern alike (Express, Spring and ASP.NET route `/V1/Chat/Completions` to the lowercase handler); a rule with `paths_case_sensitive = true` keeps the case. A path in the rule's `json_only_paths` (TGI's `/` in `llm-endpoints`) is watched only for a JSON body; anything else passes as "path not watched: body not JSON", before the reputation checks, and the next rule may take it.
+2. **Reputation** (shared dict, one lookup each): the client's IP blocked within `async.rep_block_ttl` → `block`, read only when the evaluating config sets `async.rep_block_after > 0` (an IPv6 address counts by its /64); the subject blocked by [subject reputation](#subject-reputation) → `block`. Reputation only ever blocks: a run of safe verdicts must not let an attacker warm up an address and skip L2. This runs before anything that needs a body so headers-only forward-auth requests can still be rejected.
+3. **Method / Content-Type**: method not in `methods` (`POST|PUT|PATCH`; a map or a list) → `pass`. Content-Type is a hint and never passes a request on its own: a request whose every Content-Type value is a media type in `skip_content_types` (`image/`, `audio/`, `video/`, `font/`, `application/pdf`, `application/zip`, `application/gzip`) is only marked, and passes as "content-type not watched" at step 6 if its body is binary. A rule that lists `content_types` keeps an allow list decided here, by the header.
 4. **Body size**: no body → `pass` ("no body"); under `min_body_bytes` (8) → `pass`. The size is the larger of the declared `Content-Length` and the bytes the adapter handed over, so a wrong or missing header cannot shrink it. No size is too large to look at: past `max_body_bytes` the body is read in part (step 6).
-5. **Content-Encoding**: a coding other than `identity` that the adapter did not decode (`req.decoded`) → `unjudgeable` ("unjudgeable: content-encoding br"). Adapters decode `gzip`, `deflate` and `br`, capped at `max_body_bytes`.
-6. **Extraction**: up to `max_body_bytes` (1 MiB) the body is parsed whole and its format decided by the body (below); `binary` → `unjudgeable` ("unjudgeable: binary body"). Past it, the first `max_body_bytes` (`req.body_head`) and the last 64 KiB (`req.body_tail`) are scanned for the string values of the text-field keys, truncated JSON included; none found → `unjudgeable` ("unjudgeable: body too large"). No text → `pass` ("no text").
-7. **Regex prefilter** over all of the extracted text: any `always_suspect` pattern hits → `suspect`. Patterns are **PCRE**, matched case-insensitively through `ctx.re_find`, which returns the match's 1-based inclusive byte span (`from, to`) or just a truthy value; the span places the hit in the judging window. OpenResty injects `ngx.re.find` with `"ijo"`, specs inject lrexlib-pcre2, the JavaScript adapter injects JS RegExp with the `i` flag. Patterns therefore stay in the PCRE / JavaScript intersection (no lookbehind, no possessive quantifiers, no inline flags), and `core/golden/rules.json` carries one positive per pattern so a divergence fails a named case. One rule file serves every adapter. If no matcher is injected, this step is skipped with a single warning and the length check alone decides (fail-open).
+5. **Content-Encoding**: a coding other than `identity` that the adapter did not decode (`req.decoded`) → `unjudgeable` ("unjudgeable: content-encoding br"). Adapters decode `gzip`, `deflate` and `br`: the head up to `max_body_bytes`, the tail from a ring, reading on to 4 × `max_body_bytes`.
+6. **Extraction**: up to `max_body_bytes` (1 MiB) the body is parsed whole and its format decided by the body (below); `binary` → `unjudgeable` ("unjudgeable: binary body"), or `pass` ("content-type not watched") under a skipped media type. Past it, the first `max_body_bytes` (`req.body_head`) and the last 64 KiB (`req.body_tail`) are scanned for the values of the text-field keys and the tool definitions, truncated JSON included; none found → `unjudgeable` ("unjudgeable: body too large"). A body the gateway cut (`req.body_partial`) is scanned as a head, or is `unjudgeable: partial body` under `policy.partial = "unjudgeable"`. A token-id prompt with nothing else to judge → `unjudgeable: token prompt`, and under `token_prompts = "block"` in enforce mode it is blocked whatever else the body holds. A JSON walk that hit its bounds and left too little to judge → `unjudgeable: json over the walk bounds`. No text → `pass` ("no text").
+7. **Regex prefilter** over all of the extracted text and, apart, the tool definitions: any `always_suspect` pattern hits → `suspect`. Every pattern runs and its matches are walked (the latest 8 spans kept; after 64 matches of one pattern the walk skips ahead, so the cost is bounded), and the reason names the first pattern in list order. Patterns are **PCRE**, matched case-insensitively through `ctx.re_find(subject, pattern, init)`, which returns the match's 1-based inclusive byte span (`from, to`) or just a truthy value; the spans place the hits in the judging window. OpenResty, Kong and APISIX inject `ngx.re.find` with `"ijo"` (PCRE without UTF: `\s` is an ASCII space, `.` one byte), specs inject lrexlib-pcre2, and the JavaScript core translates each pattern to a RegExp run over the text's bytes that answers the same (non-ASCII literals as their bytes, `i` folding ASCII only). Inline options `(?i)`, `(?s)`, `(?m)` and `(?x)` translate, for the rest of a group or as `(?s:...)`; `(?-i)` needs the engine's RegExp modifiers (Node 23 and later, current Workers). Possessive quantifiers, atomic groups and `\Q...\E` do not translate, so keep patterns without them (the TS core counts a pattern it cannot compile as a hit on every text, logged once); `core/golden/rules.json` carries one positive per pattern so a divergence fails a named case. One rule file serves every adapter. A matcher that fails (PCRE's JIT stack limit, a pattern that does not compile) counts that pattern as a hit, logged once: an operator's broken pattern fails toward judging, never into a silent miss. If no matcher is injected, this step is skipped with a single warning and the length check alone decides (fail-open).
 8. **Natural-language check**: extracted text at least `min_text_chars` (20) → `suspect`, else `pass`.
 
-The text of a `suspect` is cut to `max_judge_bytes` (32 KiB) before the fingerprint and L2: the `always_suspect` hit with up to 1 KiB either side, then values newest first, the one that does not fit kept as head and tail. Chat APIs resend the history every turn; earlier turns were judged when they were new. A reason for cut or partial text ends in ` (window)`, as does the L2 reason built on it.
+The text of a `suspect` is cut to `max_judge_bytes` (32 KiB) before the fingerprint and L2: the `always_suspect` hits, overlapping ones merged, each with an even share of up to 1 KiB of context, then values newest first, the one that does not fit kept as head and tail. Chat APIs resend the history every turn; earlier turns were judged when they were new. A reason for cut or partial text ends in ` (window)`, as does the L2 reason built on it.
 
-**Format is decided by the body.** A body that parses as JSON is JSON whatever the header says (Ollama and FastAPI read it that way) and text is extracted by configurable paths (`messages[*].content`, `prompt`, `input`, `input[*].output` for Responses API tool results, `query`, `text`, content-parts arrays included); declared JSON that does not parse yields no text, as the backend rejects it too. `application/x-www-form-urlencoded`, or a form-shaped body with no Content-Type, gives its field values; `multipart/form-data` gives its fields and its text or JSON file parts. Anything else that reads as text (no NUL, under 1% control bytes) is taken whole; the rest is `binary`.
+**Format is decided by the body.** A body that parses as JSON is JSON whatever the header says (Ollama, llama.cpp and FastAPI read it that way), and text is extracted by the rule's `text_fields` (see [What the default rule reads](#what-the-default-rule-watches-and-reads)). A path key matches every object key that folds to it (ASCII case, plus U+017F and U+212A, as Go's `encoding/json` folds them), and all of them are read. A path ending in `**` reads every key and string below it, a string holding JSON decoded, bounded by 20,000 nodes and cjson's depth of 1000; a node over what is left keeps its newest part and half of the rest, so one huge value cannot starve what follows. Declared JSON the decoder refuses (a lone surrogate escape, nesting past 1000, bytes after the value, all of which Python, Node and Go read) and a body that starts with `{` or `[` under any other type are read by a tolerant scanner (kind `scan`); under `text/plain` or no type the whole body is judged as well, since a backend may read it as text; declared JSON with nothing to scan is `unjudgeable: invalid json`. `application/x-www-form-urlencoded`, or a form-shaped body with no Content-Type, gives its field values; `multipart/form-data` is read as RFC 2046 and Go read it (the delimiter only at the start of a line, every part, the `boundary` parameter by name) and gives its fields and its text file parts: typed `text/*`, JSON, `application/octet-stream` or not at all, when their bytes are text. Anything else that reads as text (no NUL, under 1% control bytes) is taken whole; the rest is `binary`.
+
+Two limits of what L1 reads, both deliberate. The keys of an object read whole (a Gemini `parts` object, a function response, `documents`) are judged in UTF-8 byte order, one per line: Lua tables keep no insertion order, so a sentence split across keys reaches the judge reordered and a regex pattern can miss a phrase split that way (L2 still sees every word). Past 20,000 keys in one extraction the keys are not sorted, and the Lua and TypeScript cores then emit them in different orders: the same strings, a different fingerprint.
 
 **`unjudgeable`** means a watched request L1 could not read. It is never judged, so the verdict is `skipped` with reason `unjudgeable: <why>`, counted in `jev_unjudged_total{reason}`. `policy.unjudgeable` decides the action: `pass` (default) forwards it, `block` rejects it in `enforce` mode.
 
-Rule sets are Lua tables, so no YAML dependency:
+Rule sets are Lua tables, so no YAML dependency. `rules.resolve` checks every field's type when a rule loads (a string where a list goes, a map for `watch_paths`, a limit that is not a number, an unknown template are refused), so a typo fails the config instead of turning judging off:
 
 ```lua
 -- rules/llm-endpoints.lua (abridged)
 return {
   id = "llm-endpoints",
-  watch_paths = { "^/v1/chat", "^/api/completions" },   -- Lua patterns, anchored prefixes
-  methods = { POST = true },
-  skip_content_types = { "image/", "audio/", "video/", "font/", "application/pdf" },
+  watch_paths = { "^/v1/chat", "^/v1/responses", "^/api/generate/?$", "^/$", ... },  -- Lua patterns
+  json_only_paths = { "^/$" },                          -- watched for a JSON body only
+  methods = { POST = true, PUT = true, PATCH = true },
+  skip_content_types = { "image/", "audio/", "video/", "font/", "application/pdf", ... },
   min_body_bytes = 8, max_body_bytes = 1048576,          -- parsed whole; head + tail past it
-  max_judge_bytes = 32768,                               -- judging window
-  text_fields = { "messages[*].content", "prompt", "input" },
+  max_judge_bytes = 32768, max_judge_chunks = 1,         -- judging window, chunks
+  text_fields = { "system", "instructions", "messages[*].content",
+                  "messages[*].tool_calls[*].function.arguments.**", "prompt", "input", ... },
+  tool_fields = { "tools", "functions", "response_format.json_schema", "text.format" },
+  token_prompts = "unjudgeable",                         -- or "block"
   min_text_chars = 20,
   always_suspect = {                                     -- PCRE
-    [[\b(ignore|disregard)\b.{0,20}\b(previous|prior|above)\b.{0,20}\binstructions?\b]],
+    [[\b(ignore|disregard|forget)\b.{0,20}\b(previous|prior|above|earlier|all)\b]]
+      .. [[.{0,20}\b(instructions?|rules?|prompts?)\b]],
     [[\byou are now\b]],
     [[<\|?(system|im_start)\|?>]],
+    ...
   },
   templates = { "injection" },                           -- questions to ask at L2
 }
 ```
+
+### What the default rule watches and reads
+
+A backend usually serves one handler under several routes, and a route left out of `watch_paths` is one a client can switch to. `llm-endpoints` watches the generation routes of the servers jev-edge fronts, the short generic ones anchored at both ends so an application's own `/completions/export` does not match. If your backend serves the same handler under another route, add it: `watch_paths` must name every alias.
+
+| Server | Routes | Where the text is |
+|---|---|---|
+| OpenAI and compatible (vLLM, llama.cpp, LiteLLM, Azure) | `/v1/chat`, `/v1/completions`, `/v1/responses`, `/v1/messages`; without `/v1` (`/chat/completions`, `/completions`, `/completion`, `/responses`); `/engines/<m>/…`, `/openai/deployments/<name>/…`, `/openai/v1/…` | `messages[*].content`, tool-call arguments, `prompt` (strings or token ids), `input` and its items' arguments and output, `instructions`, `suffix`, `text` |
+| Anthropic Messages | `/v1/messages` | `system` (string or blocks), content blocks, `tool_use` input, `tool_result` and `document` blocks |
+| Ollama | `/api/chat`, `/api/generate` | `messages`, `prompt`, `system`, `template`, `suffix` |
+| llama.cpp | `/completion`, `/infill` beside the OpenAI routes | `prompt` and `prompt_string` objects, `input_prefix`, `input_suffix`, `input_extra[*].filename` and `.text` |
+| Gemini, Vertex AI, LiteLLM | `…/models/<m>:generateContent` and `:streamGenerateContent` (`/v1beta`, `/v1`, `/v1alpha`, tuned models, Vertex AI projects, LiteLLM's `/models/<m>:…`); `/v1beta/openai/chat/completions` | `contents[*].parts` (a list or one object, read by its keys too), function responses, `systemInstruction.parts`; `tools[*].functionDeclarations` as tool definitions |
+| Cohere | `/v1/chat`, `/v2/chat`, `/v1/generate` | `preamble`, `chat_history[*].message`, `message`, `documents` (read whole), `messages`, `prompt` |
+| SGLang, TGI, vLLM, SageMaker | `/generate`, `/generate_stream`, `/vertex`, `/invocations`, and TGI's `/` for a JSON body only | `inputs`, `instances[*].inputs`, `instances[*].messages[*].content`, SGLang's `input_ids` (token ids) |
+| Open WebUI | `/api/v1/chat/completions`, `/api/message`, `/api/v1/messages`, `/ollama/…` (chat, generate, `/v1/…`), `/openai/…` (chat, completions, responses, messages) | as the server it proxies |
+| LM Studio | `/api/v0/chat/completions`, `/api/v0/completions`, `/api/v1/chat` | `messages`, `prompt`, `system_prompt` |
+| Vercel AI SDK | `/api/chat` (useChat), `/api/completion` | AI SDK 5 `messages[*].parts`: text parts, tool parts' `input` and `output` |
+
+Not watched by default, on purpose or because the body is not the prompt: embeddings, `/tokenize`, token counts (`:countTokens`, `/responses/input_tokens`), Open WebUI's chat records. **LiteLLM's provider pass-through prefixes** (`/openai/…` beyond the routes above, `/anthropic/…`, `/gemini/…`, `/vertex_ai/…`, `/cohere/…`, `/vllm/…`, `/bedrock/…`) carry the provider's own body under another prefix: watch the ones you use, with the provider's `text_fields`, or refuse them at the gateway. The stateful APIs in the next section are outside what any rule can see.
 
 ## Traffic L1 does not see
 
@@ -394,9 +446,21 @@ jev-edge judges one thing: the HTTP request the client sends, as nginx (or the g
 - **gRPC and gRPC-Web.** gRPC (`application/grpc`) and binary gRPC-Web (`application/grpc-web+proto`) bodies are length-prefixed protobuf with NUL bytes, so on a watched path they are `unjudgeable: binary body` (`skipped`, or rejected under `policy.unjudgeable = "block"`). `application/grpc-web-text` is base64 and is judged as an opaque string: L2 sees base64, not the prompt. gRPC paths (`/pkg.Service/Method`) are not in the default `watch_paths`. Mitigation: accept prompts on a JSON endpoint, or judge after decoding at the backend.
 - **Request smuggling.** jev-edge does not parse framing. Conflicting `Content-Length` / `Transfer-Encoding`, obsolete line folding and similar ambiguities are nginx's (or the gateway's) to reject; jev-edge judges the body nginx read, and nginx forwards that body with its own framing. A second proxy that re-parses the request between nginx and the backend can reopen the gap. Mitigation: keep nginx current and proxy straight to the backend.
 - **Responses and what the backend fetches.** L1 and L2 see requests only: there is no `header_filter` or `body_filter`, so model output (streamed or not) is never judged (see [Scope](#scope)). Nor is anything the backend fetches itself: retrieved documents, web pages, tool and function results. Injection planted there (indirect prompt injection) reaches the model without passing the edge; only what the client sends is judged. Mitigation: judge between the backend and the model. The LiteLLM guardrail sends every message of each model call, tool results included, to `/_jev/authz`; a custom agent loop can call `/_jev/authz` itself.
-- **Images, audio, other media.** A body whose every Content-Type value is in `skip_content_types` (`image/`, `audio/`, `video/`, `font/`, PDF, zip, gzip) passes as "content-type not watched". Inside JSON, content parts other than `text` (`image_url`, `input_audio`, data URLs) contribute nothing, and multipart file parts count only when they are text or JSON. Text drawn in an image, spoken in audio or inside a PDF is unseen. Mitigation: OCR or transcribe at the backend and judge the text, or use a multimodal judge there.
+- **Images, audio, other media.** A binary body passes: under a `skip_content_types` type (`image/`, `audio/`, `video/`, `font/`, PDF, zip, gzip) as "content-type not watched", otherwise as `unjudgeable: binary body`. Inside JSON, content parts other than `text` (`image_url`, `input_audio`, data URLs) contribute nothing, and multipart file parts count only when they are text. Text drawn in an image, spoken in audio or inside a PDF is unseen. Mitigation: OCR or transcribe at the backend and judge the text, or use a multimodal judge there.
+- **Stateful and deferred APIs.** The request that carries the prompt is not always the one the model acts on. Batch prompts (`/v1/batches`, Anthropic's `/v1/messages/batches`) run at the provider later, from a JSONL file uploaded earlier; Conversations, Threads and Assistants keep state and `file_id` references that other requests wrote, and the request that runs them carries only ids ("text too short"). L1 judges each request as it passes and no more. Mitigation: refuse the routes you do not use at the gateway; judge the uploaded batch file (an operator rule that watches the upload route reads a JSONL file part as text), or refuse `/v1/batches`; and if you serve the stateful APIs, watch the requests that write their text:
+
+  ```lua
+  rules = {
+    { id = "stateful", extends = "llm-endpoints",
+      watch_paths = { "^/v1/conversations", "^/v1/threads", "^/v1/assistants", "^/v1/messages/batches" },
+      text_fields = { "instructions", "additional_instructions", "content", "items[*].content",
+                      "additional_messages[*].content", "thread.messages[*].content",
+                      "requests[*].params.system", "requests[*].params.messages[*].content" } },
+    "llm-endpoints",
+  },
+  ```
 - **Gateways that forward headers only.** Caddy `forward_auth` and nginx `auth_request` send no body to `/_jev/forward-auth`: a watched request gets IP reputation (a blocked IP is rejected) and is otherwise `skipped` ("no body"). Mitigation: run jev-edge inline (`access_by_lua`), or use a gateway that forwards the body: Traefik ≥ 3.3 with `forwardBody: true`, Envoy ext_authz, HAProxy SPOE.
-- **Gateways that forward part of the body.** Envoy ext_authz with `allow_partial_message: true` forwards the first `max_request_bytes` with `x-envoy-auth-partial-body: true` (in the gRPC `CheckRequest` headers too, which the shim copies; Envoy overwrites a client's copy). The HAProxy agent sets `X-Jev-Body-Partial: 1` when `req.body_size` exceeds the `req.body` that fit in `tune.bufsize`, chunked bodies included. `authz()` scans such a body as a head (the reason ends in ` (window)`), dropping a UTF-8 sequence cut at the end. Everything after the cut is unseen, tail included, where inline OpenResty also reads the last 64 KiB; a compressed body that arrives cut cannot be decoded and is `unjudgeable`. Both e2e suites exercise this path with lowered limits. Mitigation: set `max_request_bytes` / `tune.bufsize` to `max_body_bytes`, or refuse larger bodies: `allow_partial_message: false` makes Envoy answer 413, and in HAProxy `http-request deny deny_status 413 if { req.body_size gt 131072 }`.
+- **Gateways that forward part of the body.** Envoy ext_authz with `allow_partial_message: true` forwards the first `max_request_bytes` with `x-envoy-auth-partial-body: true` (in the gRPC `CheckRequest` headers too, which the shim copies; Envoy overwrites a client's copy). The HAProxy agent sets `X-Jev-Body-Partial: 1` when `req.body_size` exceeds the body `spoe.conf` sent (at most 88 KiB, so every message fits one frame), chunked bodies included, and drops a client's copy of either flag. `authz()` takes `X-Jev-Body-Partial` only from a relay that sends no `x-envoy-external-address` (the agent), and takes any body that reaches `max_body_bytes` as cut whatever the flag says (`jev_authz_events_total{event="cut_at_cap"}`). It scans such a body as a head (the reason ends in ` (window)`), dropping a UTF-8 sequence cut at the end, or reports it `unjudgeable: partial body` under `policy.partial = "unjudgeable"`. Everything after the cut is unseen, tail included, where inline OpenResty also reads the last 64 KiB; a compressed body that arrives cut cannot be decoded and is `unjudgeable`. Both e2e suites exercise this path with lowered limits. Mitigation: set `max_request_bytes` to `max_body_bytes`, or refuse larger bodies: `allow_partial_message: false` makes Envoy answer 413, and in HAProxy `http-request deny deny_status 413 if { req.body_size gt 90112 }`.
 
 ## Cache
 
@@ -404,15 +468,14 @@ Three key kinds in one shared dict:
 
 | Key | Built from | Default TTL | Purpose |
 |---|---|---|---|
-| `fp:<scope>:<hash>` | normalized text, scoped to rule, templates, deployment context, provider, model (`core.cache_key`) | 300 s | exact-ish replays |
-| `rep:<ip>` | client IP | 600 s | per-IP verdict aggregate |
-| `rep:<ip>:<path>` | IP + path | 120 s | one endpoint being hammered |
+| `fp:<scope>:<hash>` | normalized text, scoped to rule, templates, deployment context, provider, model, and when set the judge endpoint and the question wording (`core.cache_key`) | 300 s | exact-ish replays; one entry per judged part (chunk, retrieved content, tool definitions) and one for the whole request |
+| `rep:<ip>` | client IP (an IPv6 address by its /64) | 600 s, or the rest of a running block if longer | per-IP verdict aggregate written by L3; blocks at L1 only under `async.rep_block_after > 0` |
 
-Normalization decides the hit rate: NFKC + lowercase, collapse whitespace, strip UUIDs and digit runs of 4+, then hash the whole normalized text with SHA-256 (0.3.0 hashed a 2048-byte prefix with `crc32_long`; either let a chosen text reuse another text's cached or trusted verdict, so 0.3.1 changed both). `fp_prefix_bytes` now only bounds sampled and logged text. The bench reports hit rate against miss rate across normalization strength.
+The fingerprint is SHA-256 over the whole text with ASCII letters lowercased and whitespace collapsed, nothing else: stripping digit runs or UUIDs (as before this release) let "transfer 12345" reuse the verdict of "transfer 99999", and no Unicode normalisation is applied, so text that differs only by NBSP, full-width forms or combining marks gets a fingerprint of its own. (0.3.0 hashed a 2048-byte prefix with `crc32_long`, which let a chosen text reuse another text's cached or trusted verdict; 0.3.1 changed both.) `fp_prefix_bytes` now only bounds sampled and logged text.
 
 ## L2: synchronous judgment
 
-**Provider abstraction.** Core only knows `judge.call(prompt, timeout_ms) -> answers | nil, err`, where `answers` maps template name to a probability. The adapter's `http.lua` owns timeouts, the breaker and concurrency; a provider owns only the wire format:
+**Provider abstraction.** Core only knows `judge.call(prompt, timeout_ms, opts) -> answers | nil, err, kind`, where `answers` maps template name to a probability and `kind` says what failed: `transport`, `timeout`, `unavailable` (5xx, 429, 401, 404, 405), `rejected` (any other non-2xx) or `unusable` (a 2xx with no answer core can use). The adapter's `http.lua` owns timeouts, the breaker and concurrency, and classifies by the provider's status and the socket error, so a custom provider needs no change; a provider owns only the wire format:
 
 ```lua
 return {
@@ -429,7 +492,7 @@ To plug in your own backend, write those two functions and set `provider = "mine
 | Provider | Wire format | Auth | Use |
 |---|---|---|---|
 | `jev` | `POST https://api.typesafe.ai/v1/systemone`, `state` + Noul questions | `Authorization: Bearer` | default, TypeSafe Jev |
-| `openai-compat` | `POST {endpoint}/chat/completions`, system = template, user = text, JSON-only output | `Authorization: Bearer` | vLLM, Ollama, any OpenAI-compatible endpoint |
+| `openai-compat` | `POST {endpoint}/chat/completions`, system = template and the deployment context, user = text, JSON-only output; `jev.max_tokens` (200), `jev.token_param` (`max_completion_tokens` for reasoning models), `jev.temperature` (0; `false` omits it), `jev.extra_body` | `Authorization: Bearer` | vLLM, Ollama, any OpenAI-compatible endpoint |
 | `laya` | the `jev` request to your own server, default `http://127.0.0.1:8080/v1/systemone` | `Authorization: Bearer` (optional) | a fine-tuned Laya model behind [laya-server](../adapters/laya-server/README.md) |
 | `mock` | no network; fixed score, delay, failure rate from config | none | tests and bench |
 
@@ -447,7 +510,9 @@ Each template is one TypeSafe **Noul** question (yes/no, returns a 0–1 probabi
 
 `answers.injection.noul` becomes the score; with several templates the maximum wins. `usage.input_tokens` is recorded for cost metrics. Keys are read only from the environment (`TYPESAFE_API_KEY`), never from config files.
 
-**Timeouts and breaker.** The L2 budget is adaptive with an operator ceiling: it starts at `timeout_ms` (400), tracks an exponentially weighted mean and variance of observed L2 latency shared across workers, and uses `timeout_headroom × (mean + 2 sd)` clamped to `[timeout_ms, timeout_max_ms]` (1000). A timeout feeds back a censored sample so the estimate can climb after a latency step; a sustained move above the ceiling is left to the breaker. The budget is split connect 30% / send 10% / read 60%. Measured from a laptop against `jev-latest`: p50 268 ms, p95 314 ms, max 355 ms, so a fixed 300 ms cut would have dropped 15% of calls. `/_jev/health` and the `jev_l2_timeout_ms` gauge show the effective value. A sliding-window breaker (60 s window, ≥20 samples, >50% failures → open for 30 s, then one half-open probe) lives in the shared dict so all workers share it. `max_inflight` (64) caps concurrent L2 calls; beyond it L2 is skipped and the request goes to L3.
+**Timeouts and breaker.** The L2 budget is adaptive with an operator ceiling: it starts at `timeout_ms` (400), tracks an exponentially weighted mean and variance of observed L2 latency shared across workers, and uses `timeout_headroom × (mean + 2 sd)` clamped to `[timeout_ms, timeout_max_ms]` (1000). A timeout feeds back a censored sample so the estimate can climb after a latency step; a sustained move above the ceiling is left to the breaker. The budget is split connect 30% / send 10% / read 60%. Measured from a laptop against `jev-latest`: p50 268 ms, p95 314 ms, max 355 ms, so a fixed 300 ms cut would have dropped 15% of calls. `/_jev/health` and the `jev_l2_timeout_ms` gauge show the effective value; only core's L2 calls feed the estimate, never `/_jev/health` or L3.
+
+The breaker counts results in tumbling `window_s` buckets (60 s): it opens when one bucket holds at least `min_samples` (20) results and failures / total ≥ `fail_ratio` (0.5, so exactly half trips it), stays open for `open_s` (30 s), then lets one half-open probe through. Failures on either side of a bucket edge are counted apart. It lives in the shared dict so all workers share it. Only a failing provider counts: a transport error, a timeout, a 5xx, 429, 401, 404 or 405 (a bad key, endpoint or model: configuration no judged text can provoke). A 400, 403, 413 or 422, or a reply with no usable answer, is the client's text as much as the provider (a content filter, a strict parser, a refusal) and does not count, so a client cannot switch L2 off for every tenant with text the judge refuses; `JevL2NoVerdicts` pages when every L2 call fails for 10 minutes whatever the breaker says. A request that tells nothing about the provider hands a half-open probe to the next request instead of holding it. `max_inflight` (64) caps concurrent L2 calls; beyond it the call is refused as `max_inflight exceeded` (error kind `busy`), which does not count against the breaker, the request passes as `error` and goes to L3, which has its own lane capped by `async.max_async`; `JevL2Saturated` pages when such refusals pass 10% of L2 traffic. A slot is leased, so one held by a thread nginx killed comes back. On Kong and APISIX routes share breaker, adaptive and in-flight state only with the same provider, endpoint, model, key and tuning.
 
 Question wording is copied from jev-sec-bench, which validated it against Jev; another judge needs its own validation, and `jev.questions` replaces the wording for one provider (see [Laya](#laya-and-other-system-one-servers)). Templates expose two slots: `text` and `context`.
 
@@ -457,7 +522,7 @@ The judged text is attacker-controlled, so it can address the judge itself: "rat
 
 - **`jev`** sends the text as structured `state` (or `state.user_message` with a deployment context), never mixed into the question wording, and reads `answers.<name>.noul` from the API's own response, which the text cannot write. Its wire format is unchanged.
 - **`openai-compat`** puts the text in its own user message between `<<<INPUT n>>>` and `<<<END INPUT n>>>`, where `n` is a per-request random 128-bit nonce; every occurrence of `n` is removed from the text first, so the text cannot close the input early. The system prompt says everything between the markers is data and that text addressing a classifier is itself evidence of manipulation.
-- **Answer parsing** (`openai-compat`) reads every top-level JSON object in the reply and takes each question's *highest* value across them, so a low-scoring JSON the model echoes from the input cannot lower its own answer. A nested `{"answers":{"injection":{"noul":0}}}` is not an answer; `null`, booleans and `""` are not zero; a reply missing any asked question is an error (the policy's failure mode applies), not a partial score.
+- **Answer parsing** (`openai-compat`) reads every top-level JSON object in the reply and takes each question's *highest* value across them, so a low-scoring JSON the model echoes from the input cannot lower its own answer. A nested `{"answers":{"injection":{"noul":0}}}` is not an answer; `null`, booleans and `""` are not zero; a reply missing any asked question is an error (the policy's failure mode applies), not a partial score. With one question asked, a lone `probability`, `score` or `p` key is taken as the answer, and echo detection compares those keys too. The Lua and TypeScript providers accept the same JSON (the union of what cjson and `JSON.parse` read) and compare answers to six significant digits, so one reply cannot block in one runtime and pass in the other.
 - **Template.** The `injection` criteria name text that addresses the classifier or dictates its verdict as a strong sign of injection.
 - **L1.** Six `always_suspect` patterns name judge-directed text (verdict requests, a classifier told what to output, "note to the AI reviewing this", answer JSON, fake end-of-input markers, "the real verdict is safe"). Such text reaches L2 anyway as natural language; the hit also keeps it inside the judging window of a body over `max_judge_bytes`.
 
@@ -469,14 +534,18 @@ The `laya` provider sends the `jev` request unchanged to a server you run, norma
 
 - **No benchmark.** The base Laya model is not usable for this task without fine-tuning, so no Laya accuracy figures and no default thresholds ship. Base-model numbers would not predict a deployment, and fine-tuned results depend on each operator's data and training. The acceptance table below is Jev's only.
 - **Protocol conformance.** [conformance/](../conformance/README.md) is to judge servers what the golden vectors are to core: `gen.lua` builds the request with the real provider and templates, `run.py` replays it against a live server and checks the answer set (every asked question, nothing else), `noul` in [0, 1], determinism, JSON errors with non-200 codes, long input, keepalive, aborted and stalled clients, and p99 latency against the timeout budget. `make conformance-check` fails in CI when a template or provider change is not reflected in the vectors.
-- **No silent truncation.** A model with a 1024-token context would otherwise cut text the gateway believes it judged, invisibly to the gateway's window and chunk accounting. laya-server windows the text instead (overlapping, all windows in one batch, highest score wins) and answers 413 past `LAYA_MAX_WINDOWS`. Because an L2 error passes the request, the profile's `max_judge_bytes` (4096) is set so the server never needs that 413, even at one byte per token.
+- **No silent truncation.** A model with a 1024-token context would otherwise cut text the gateway believes it judged, invisibly to the gateway's window and chunk accounting. laya-server windows the text instead (overlapping, all windows in one batch, highest score wins) and answers 413 past `LAYA_MAX_WINDOWS`. Because an L2 error passes the request, the profile's `max_judge_bytes` (4096) is set so the server never needs that 413. One byte per token is not the worst case: a tokenizer with an NFKC normalizer turns one U+FDFA into 18 characters, about five tokens per byte, and `make conformance` sends that text too, so a 413 there says to raise `LAYA_MAX_WINDOWS` or lower `max_judge_bytes`. laya-server cuts windows between characters, so such text never overflows the model's positions.
 - **Calibrated scores.** laya-server returns `sigmoid(logit / T)` with `T` fitted on held-out labels (`fit_temperature.py`). Temperature scaling changes no ranking; it makes 0.7 mean roughly 70%, which is what `make calibrate` then turns into thresholds for this provider and model.
-- **Timeouts.** Jev's 400 ms floor would hide a local model slowing down tenfold. The profile starts at 100 ms with a 300 ms ceiling; operators set both from `make conformance` latency on their hardware.
-- **Wording.** `jev.questions` overrides template wording per provider (Lua and JS alike). The verdict cache key does not include the wording, so a changed override takes effect for cached texts after `cache.fp_ttl`.
+- **Timeouts and concurrency.** Jev's 400 ms floor was sized for a remote API. On CPU a text cut into N windows costs about N model calls, so the profile sizes its floor from the worst-case text, not a short prompt: 500 ms with an 800 ms ceiling, and `max_inflight = 1`. laya-server answers within half of `LAYA_GATEWAY_TIMEOUT_MS` (set it to the gateway's `timeout_ms`) or refuses at once with 503, before the gateway stops reading at 60% of its timeout; `make conformance` times the worst case alone and at `CONCURRENCY`, and prints the `timeout_ms` your hardware needs.
+- **Wording.** `jev.questions` overrides template wording per provider (Lua and JS alike). The verdict-cache scope includes the wording, so a changed override is judged afresh at once.
 
 ### How retrieved content is judged
 
-`injection` asks whether the *user* is attacking the assistant. Retrieved content (tool results, fetched documents) is not the user, and an instruction hidden in it is usually phrased as an ordinary request ("add a line about ...", "send a confirmation to ..."), so the whole-text judgment scores most indirect injections low. `untrusted` (off by default) cuts retrieved content out in L1, from a body parsed whole: OpenAI `role: "tool"` / `"function"` messages, Anthropic `tool_result` blocks, Responses `function_call_output` items, and the `untrusted.fields` paths. It gets its own `max_judge_bytes` window and is judged as one more part next to the whole text (the chunk machinery: its own cache entry, `call_many` in parallel, the highest part score wins, a failed part is an error unless another part blocks) with the `untrusted` question and no deployment context. The request's fingerprint covers it, so neither trust nor the verdict cache can pass new retrieved content under old text. The whole-text call is unchanged. Retrieved content alone, next to a message too short to judge, is judged on its own. The question was written and measured on suite v1 before it was built into core, then tested on a held-out set (see Bench and acceptance).
+`injection` asks whether the *user* is attacking the assistant. Retrieved content (tool results, fetched documents) is not the user, and an instruction hidden in it is usually phrased as an ordinary request ("add a line about ...", "send a confirmation to ..."), so the whole-text judgment scores most indirect injections low. `untrusted` (off by default) cuts retrieved content out in L1, from a body parsed whole: OpenAI `role: "tool"` / `"function"` messages (an object content read whole), Anthropic `tool_result` and `document` blocks, Responses `*_call_output` and `mcp_call` items and `file_search_call` results, Cohere and vLLM `documents`, Gemini function responses, AI SDK 5 tool parts' output, and the `untrusted.fields` paths. It gets its own `max_judge_bytes` window and is judged as one more part next to the whole text (the chunk machinery: its own cache entry, `call_many` in parallel, the highest part score wins, a failed part is an error unless another part blocks) with the `untrusted` question and no deployment context. The request's fingerprint covers it, so neither trust nor the verdict cache can pass new retrieved content under old text. The whole-text call is unchanged. Retrieved content alone, next to a message too short to judge, is judged on its own. A part its walk bound cut is a window, and a request whose retrieved content was all cut away is unjudgeable. The part carries `rep = false`: its score decides the request but charges no reputation, and with `untrusted` on neither does a whole text that holds retrieved content or a scanned body. A part whose prompt cannot be built is left out and the rest judged; only then is the whole request's cache entry not written. The question was written and measured on suite v1 before it was built into core, then tested on a held-out set (see Bench and acceptance).
+
+### How tool definitions are judged
+
+A rule's `tool_fields` name where the tool definitions are (`llm-endpoints`: `tools`, `functions`, `response_format.json_schema`, `text.format`; the `default` rule set: none). From each, every key and string at any depth is read, keys in byte order, but a `type` whose value is a JSON Schema type name (`SCHEMA_TYPES`), within the walk's 20,000-node bound. `always_suspect` scans all of it; one `max_judge_bytes` window of it is judged as a part of its own in `judge_parts`, with the rule's question and cache scope and its own verdict-cache entry keyed by its text, and the reason says `tools+<question>` when that part decides. The whole request's fingerprint and cache entry cover it. The part carries `rep = false`. Past `max_body_bytes`, and for JSON the decoder refuses, `scan_tools` reads the tool keys from the head and tail and the part is a window. Invariant 10 holds `tool_fields`, the depth and node bounds and `SCHEMA_TYPES` equal across the two cores. What was measured before it was turned on by default is in [Tool definitions](#tool-definitions).
 
 ## Policy
 
@@ -485,9 +554,10 @@ policy = {
   block_threshold   = 0.7,    -- ≥ → 403 in enforce mode
   suspect_threshold = 0.5,    -- ≥ → pass with header, queue for L3
   mode = "enforce",           -- or "monitor": headers only, never block
-  block_status = 403,
-  block_body   = '{"error":"request rejected"}',
+  block_status = 403,         -- a 4xx: relays tell a block from an allow and an outage by it
+  block_body   = '{"error":"request rejected"}',  -- a string (a JSON document, encoded)
   unjudgeable  = "pass",     -- or "block": reject what L1 cannot read, enforce mode only
+  partial      = "judge",    -- or "unjudgeable": a body the gateway cut is unjudgeable
 }
 ```
 
@@ -503,14 +573,14 @@ Default is `monitor`.
 
 ## L3: async side-path
 
-Triggered by an L2 timeout, a breaker skip, or a score in `[suspect, block)`. Runs in `ngx.timer.at(0, …)` with only the normalized text and fingerprint, never the raw body:
+Triggered by an L2 timeout or error, a breaker skip, or a score in `[suspect, block)`. On the request path `core.l3_job` runs L1 again and builds, through the same plan L2 uses, each part's prompt and cache key (every chunk, the retrieved content, the tool definitions) and the whole request's key. The job runs in `ngx.timer.at(0, …)` with those prompts and keys, never the raw body:
 
-1. Call Jev with a relaxed 5 s timeout.
-2. Write `fp:<scope>:<hash>` (the key L2 reads) so the next replay hits the cache.
-3. Update `rep:<ip>`; if `rep_block_after` is set (default 0 = off), mark the IP blocked after that many malicious verdicts so L1 rejects it directly.
+1. Judge every part with the relaxed L3 timeout (5 s), in parallel, on a lane of its own that takes no L2 in-flight slot.
+2. Write each part that answered under its own key, and the whole request's `fp:<scope>:<hash>` (the key L2 reads) only when every part answered, with the highest score, so the next replay hits the cache.
+3. Update `rep:<ip>` with the score of the client's own text; if `rep_block_after` is set (default 0 = off), mark the IP blocked after that many malicious verdicts, for `rep_block_ttl`, so L1 rejects it directly under a config with `rep_block_after > 0`.
 4. On malicious, fire `on_alert` (error log by default, webhook configurable).
 
-A shared-dict counter caps in-flight timers at `max_async` (32). Beyond that, work is dropped and counted, never queued.
+A leased shared-dict counter caps in-flight jobs at `max_async` (32). Beyond that, work is dropped and counted (`jev_async_dropped_total`), never queued. Each job that ran is counted by its outcome in `jev_async_total{result}` (`ok`, `failed`, `busy`, `no_scores`, `error`), and `JevAsyncFailing` warns when most fail.
 
 ## Verdict headers
 
@@ -524,49 +594,58 @@ X-Jev-Reason:     ≤ 200 bytes, URL-encoded
 X-Jev-Request-Id: nginx $request_id, to correlate L3 results
 ```
 
-Inbound `X-Jev-*` headers are always stripped. L1 passes still get `skipped`, so the backend can tell "not checked" from "checked and safe". Nothing is exposed to the client.
+Every inbound `X-Jev-*` header is stripped before the upstream sees the request, under any name, on a pass and on a fail-open alike; only the header `subject` is configured to read stays (a thin Worker's `X-Jev-Subject`). `/_jev/authz` names in `x-envoy-auth-headers-to-remove` the ones Envoy must drop. L1 passes still get `skipped`, so the backend can tell "not checked" from "checked and safe".
+
+The client sees only what it needs: a block response carries `X-Jev-Verdict` and `X-Jev-Request-Id` (`verdict.client_headers`) with `policy.block_body`, on every adapter, the forward-auth denial and the gRPC shim's deny included. The score, reason and source go to the upstream and the log: on a block they would be an oracle to walk a prompt under the threshold. `/_jev/authz` keeps the full set on its answers, which its relays consume or filter.
 
 ## Configuration and hot reload
 
 Layers: core defaults < config file < runtime override in the shared dict.
 
-- `init_worker` runs `ngx.timer.every(2, reload)`; a changed file mtime triggers a re-`dofile` plus schema validation. Invalid config keeps the previous one and logs.
-- An internal location `/_jev/config` (127.0.0.1 only) accepts `PUT` JSON into the override dict and `DELETE` to clear it. That is the rollback path when something is being blocked wrongly: `PUT {"policy":{"mode":"monitor"}}`.
+- `init_worker` runs `ngx.timer.every(2, reload)`; a change in the file's content (its CRC-32 and length, from the one read that is also loaded) triggers a reload plus validation, rules included. A bare `touch` no longer reloads. Invalid config, a broken rule included, keeps the previous one; the refusal is logged, reported as `config_error` in `GET /_jev/config`, and `/_jev/health` answers 503 until a valid file or override is in force. At startup, when nothing is in force yet, a refused file runs the defaults with their rules, and a file with one broken rule runs without it, reported the same way.
+- An internal location `/_jev/config` (on the admin listener, `127.0.0.1:9180` in `example.nginx.conf`) accepts `PUT` JSON into the override dict and `DELETE` to clear it. That is the rollback path when something is being blocked wrongly: `PUT {"policy":{"mode":"monitor"}}`. A JSON `null` anywhere in an override is refused, naming its path; a `DELETE` that would leave the file in force invalid answers 422. The admin endpoints refuse a raw path holding `..`, `//` or an encoded `.`, `/` or `\`, which could only reach them through nginx's own decoding.
 - Each worker keeps a plain Lua table reference to the current config; the read path takes no lock.
 
 ## Degradation matrix
 
 | Failure | Behaviour | Header |
 |---|---|---|
-| Jev timeout | pass, queue L3 | `error` |
-| Jev 5xx / parse error | same, counts toward breaker | `error` |
+| Jev timeout, connection error, 5xx, 429, 401, 404, 405 | pass, queue L3, counts toward breaker | `error` |
+| Jev 400, 403, 413, 422, a reply with no usable answer | pass, queue L3, not counted | `error` |
+| `max_inflight` reached | pass, queue L3 on its own lane, not counted | `error` |
 | Breaker open | skip L2, queue L3 | `skipped`, `Source: breaker` |
-| Shared dict full | `set` fails, log only | normal |
-| Config file broken | keep previous config | normal |
+| Shared dict full | `set` fails, log only; the trajectory store refuses new entries instead of evicting | normal |
+| Config file broken | keep previous config, `config_error`, `/_jev/health` 503 | normal |
 | Body read failure | pass | `skipped` |
-| Exception in core | `pcall` wrapper passes | `error` |
+| Exception in core or the adapter | `pcall` wrapper passes, counted in `jev_adapter_errors_total{entry}` (JevAdapterErrors) | `error`, `Source: adapter` |
+| Relay cannot forward the request (shim, SPOA) | 400, whatever `-unjudged` says | `skipped`, reason `invalid path` / `invalid header` |
+| nginx refuses the relayed request, SPOE error | `-unjudged=pass` forwards, `block` refuses | `skipped`, reason `unjudgeable: ...` |
 
 ## OpenResty adapter
 
-`access()` is one `pcall` around: read body (only when a rule watches the path; whole up to `max_body_bytes`, head and tail past it, decoded by `resty.jev.body`), strip inbound headers, `core.evaluate`, set upstream headers, record metrics, `ngx.exit(403)` on block. Any error inside sets `X-Jev-Verdict: error` and returns.
+`access()` is one `pcall` around: strip the inbound verdict headers, read body (only when a rule watches the path; whole up to `max_body_bytes`, head and tail past it, decoded by `resty.jev.body`), `core.evaluate`, remove every other client `X-Jev-*`, set upstream headers, record metrics, exit with `policy.block_status` on block. Any error inside strips the client's `X-Jev-*`, sets `X-Jev-Verdict: error` and `X-Jev-Source: adapter`, counts `jev_adapter_errors_total` and returns. The example config serves the admin endpoints on their own listener (`127.0.0.1:9180`) and has a commented gateway-only listener for `/_jev/authz` and `/_jev/forward-auth`: whoever calls those chooses the path, the body and the client address reputation charges.
 
 Dependencies: OpenResty ≥ 1.21, lua-resty-http ≥ 0.17, bundled lua-cjson.
 
 ## Envoy adapter
 
-Envoy uses the OpenResty adapter as its `ext_authz` service; there is no second engine. `location /_jev/authz/` runs the same evaluation as `access()` and answers 200 with `X-Jev-*` headers or 403 with the block body. HTTP ext_authz calls it directly; gRPC ext_authz goes through a ~150-line Go shim that only converts protocol. Complete configs, the shim and a Docker Compose end-to-end against real Envoy are in [adapters/envoy](../adapters/envoy/README.md).
+Envoy uses the OpenResty adapter as its `ext_authz` service; there is no second engine. `location /_jev/authz/` runs the same evaluation as `access()` and answers 200 with `X-Jev-*` headers or 403 with the block body. HTTP ext_authz calls it directly; gRPC ext_authz goes through a small Go shim that converts protocol. The shim forwards the path nginx would read (dot segments resolved, doubled slashes merged) and answers 400 to one nginx would refuse, drops every client `X-Jev-*`, sets `x-envoy-external-address` from the source address Envoy reports, treats an answer without a verdict below 500 as unjudgeable (`-unjudged=pass|block`) and gives a blocked client no score, reason or source. The reference configs size the authz hop (60 KiB of headers), reject `%2F` and strip forged `X-Jev-*` before ext_authz. Complete configs, the shim and a Docker Compose end-to-end against real Envoy are in [adapters/envoy](../adapters/envoy/README.md).
 
 ## Forward-auth adapter
 
-Traefik ForwardAuth, Caddy `forward_auth` and nginx `auth_request` all get one endpoint, `/_jev/forward-auth`. Only Traefik (≥ 3.3, `forwardBody: true`) sends the body, so only Traefik gets L2 verdicts; Caddy and nginx get path, method and IP-reputation checks, and `skipped` otherwise. Configs and a Docker Compose e2e against all three are in [adapters/forward-auth](../adapters/forward-auth/README.md).
+Traefik ForwardAuth, Caddy `forward_auth` and nginx `auth_request` all get one endpoint, `/_jev/forward-auth`. Only Traefik (≥ 3.3, `forwardBody: true`) sends the body, so only Traefik gets L2 verdicts; Caddy and nginx get path, method and IP-reputation checks, and `skipped` otherwise. The path and method come from `X-Forwarded-Uri` and `X-Forwarded-Method`, which Traefik rebuilds only with `trustForwardHeader: false` (the shipped value, held by an invariant). A denial carries `X-Jev-Verdict` and `X-Jev-Request-Id` only, since these gateways hand it to the client unchanged. Configs and a Docker Compose e2e against all three are in [adapters/forward-auth](../adapters/forward-auth/README.md).
 
 ## APISIX adapter
 
-APISIX is OpenResty, so `adapters/apisix` is one plugin file over the same modules the nginx adapter uses: cache, provider client, breaker, L3. It adds the plugin contract (JSON-schema config, `access` at priority 2450, per-route runtimes keyed by the conf object) and maps `core.request` onto core's `req`. `$jev_log` is registered as an APISIX variable for the logger plugins. What it does not have: `/_jev/config` (the Admin API is the hot reload) and the `/_jev/*` endpoints.
+APISIX is OpenResty, so `adapters/apisix` is one plugin file over the same modules the nginx adapter uses: cache, provider client, breaker, L3. It adds the plugin contract (JSON-schema config checked by core's validation and rule resolution, `access` at priority 1000 after the access-phase gatekeepers and rate limiters, per-route runtimes keyed by the conf object) and maps `core.request` onto core's `req`. It judges a request once: `run_policy = "prefer_route"` skips a global rule's instance where the route carries the plugin, a second run in the same request reuses the first verdict, and a global rule leaves alone a request that matched no route. `jev.api_key` and `subject.salt` are `encrypt_fields` and take `$env://` and `$secret://` references. `$jev_log` is registered as an APISIX variable for the logger plugins. What it does not have: `/_jev/config` (the Admin API is the hot reload) and the `/_jev/*` endpoints.
+
+## Kong adapter
+
+The same engine as a Kong plugin at priority 905, after authentication, ACLs and rate limiting. It matches `watch_paths` on the decoded `ngx.var.uri`, picks up a rotated vault secret for the judge key and the salt, and keys a header subject an auth plugin hid on the authenticated credential. In hybrid mode a data plane that lacks a rule file keeps syncing and answers the routes naming it `verdict=error`; upgrade the control plane and every data plane together when a release adds schema fields. Details in [adapters/kong](../adapters/kong/README.md).
 
 ## HAProxy adapter
 
-HAProxy's SPOE hands the request, body included, to `adapters/haproxy/spoa`, a Go agent that calls `/_jev/authz` and sets `txn.jev.*` variables; `haproxy.cfg` turns `action=block` into a 403 and the rest into `X-Jev-*` headers. SPOE frames cap the body (`tune.bufsize`, 128 KB in the reference config). A larger body arrives truncated; the agent compares it with HAProxy's `req.body_size`, sends `X-Jev-Body-Partial: 1`, and jev-edge scans it as a head. No tail is available, the one way this adapter is weaker than Envoy's ext_authz with a matching `max_request_bytes`.
+HAProxy's SPOE hands the request, body included, to `adapters/haproxy/spoa`, a Go agent that calls `/_jev/authz` and sets `txn.jev.*` variables; `haproxy.cfg` turns `action=block` into a 403 (or 400) and the rest into `X-Jev-*` headers. SPOE frames cap the message (`tune.bufsize`, 128 KB in the reference config), so `haproxy.cfg` refuses a URI over 8 KiB and headers over 16 KiB and `spoe.conf` sends at most 88 KiB of body: every accepted message fits one frame. A larger body arrives cut; the agent compares it with HAProxy's `req.body_size`, sends `X-Jev-Body-Partial: 1`, and jev-edge scans it as a head. No tail is available, the one way this adapter is weaker than Envoy's ext_authz with a matching `max_request_bytes`. The agent forwards every Content-Type value, takes the path from the request target and resolves it as nginx does, answers 400 to a path, header value or method it cannot relay, and marks an answer nginx refused or an SPOE error as unjudgeable (`-unjudged`), so no request passes unmarked. It listens on loopback by default and caps connections and frame sizes: SPOP has no authentication.
 
 ## Recipes: Istio, Envoy Gateway, APIM, Apigee
 
@@ -574,7 +653,7 @@ Every gateway that can forward a body to a side service and act on the answer us
 
 ## LiteLLM guardrail
 
-`adapters/litellm` is a `CustomGuardrail` that sends the messages to `/_jev/authz` in `async_pre_call_hook`, annotates `metadata.jev_verdict` and raises a 403 in enforce mode. No judgment in Python; jev-edge's thresholds and context apply.
+`adapters/litellm` is a `CustomGuardrail` that sends the request's structure (messages, tool calls and results, system prompts, tool definitions unchanged, head and tail past `JEV_EDGE_MAX_BODY_BYTES`) to `/_jev/authz` in `async_pre_call_hook`, and realtime text through `apply_guardrail`. It records the verdict in the proxy's own metadata and as LiteLLM guardrail information, and raises a 403 in enforce mode whose detail is `{error, request_id}` only. It needs `default_on: true`, and nothing a request, its key or its team sets switches it off. A body it cannot see or read is unjudgeable, decided by `JEV_EDGE_UNJUDGED`. It appends the peer LiteLLM saw to `X-Forwarded-For`, so `trusted_hops` is 1 for LiteLLM exposed directly. No judgment in Python; jev-edge's thresholds and context apply. Checked against real LiteLLM 1.80.11 and 1.102.1.
 
 ## JavaScript adapter
 
@@ -588,15 +667,17 @@ The one adapter that does not run the Lua core. `adapters/js` is a TypeScript po
 | `nextMiddleware`, `nodeMiddleware`, `honoMiddleware` | the host process | memory, or a passed `Store` | memory, or a passed `Store` |
 | `lambdaEdgeHandler` | the Lambda@Edge execution environment | memory, or a passed `Store` | memory, or a passed `Store` |
 
-The thin preset exists because the most common Cloudflare deployment already has a gateway behind it, and two sets of thresholds is the failure mode to avoid: it runs L1 and the cache at the edge and leaves the score, the deployment context and the key at the origin. The `backend` provider translates the origin's `X-Jev-*` answer back into an answer map, so the Worker's own policy still applies (`enforce` at the edge blocks on the origin's score).
+The thin preset exists because the most common Cloudflare deployment already has a gateway behind it, and two sets of thresholds is the failure mode to avoid: it runs L1 and the cache at the edge and leaves the score, the deployment context and the key at the origin. The `backend` provider asks the origin about the whole request in one call and translates its answer: any 4xx carrying `X-Jev-Verdict` is the origin's block, reported as score 1 so the Worker blocks at any threshold, and a 200 is an answer only with a judged verdict and a finite score (a `skipped` while the origin's breaker is open, or no `X-Jev-*` at all, fails open and is never cached). The Worker answers 404 to the origin's `/_jev/*` paths and sends an origin token (`originToken`) the origin can require.
 
-What differs from nginx by platform, not by design: KV's 60 s minimum TTL and eventual consistency, the Durable Object hop for breaker state, no `/_jev/config` hot reload (config is code), no L3 yet. The adapter README keeps the full list.
+The Durable Object `JevState` is passed as its namespace (`env.JEV_STATE`) and a stub is made per operation: workerd binds a stub to the request that made it. A judged request makes two hops to it, subject reputation lives in one object per subject, and writes made once the verdict is known go through `waitUntil`. A store that fails never fails the request open: writes after the verdict are best effort, a failed breaker read is a closed breaker and a failed timeout read the floor.
+
+What differs from nginx by platform, not by design: KV's 60 s minimum TTL and eventual consistency, the Durable Object hop for breaker state, no `/_jev/config` hot reload (config is code), no L3 yet. `/_jev/health` answers `{ ok, adapter, core }` on the traffic path unless `health: "details"`. The adapter README keeps the full list.
 
 ## Subject trajectories
 
 A single request can look harmless and still be the sixth step of an attack assembled one message at a time. Catching that needs a score per subject over time. `core/subject.lua` (ported to `adapters/js/src/core/subject.ts`) is the half of that which can be built without traffic: the contract. `evaluate` accepts an optional `ctx.subject = { id, history, record }`; on every exit that made a decision (cache hit, breaker skip, L2, trust, L1 block; not L1 pass, which is the hot path) it hands one flat entry (`at, subject, verdict, score, source, reason, fingerprint`) to `record` and returns without waiting. `history` is read on the request path and **ignored in this version**; the golden vectors assert that a request with a subject and a non-empty history gets the same verdict as one without. No window, decay or threshold is chosen yet, because nothing exists to calibrate one against; Scoring on the recorded trajectories is possible future work, not a scheduled release. Two constraints are fixed now so adapters and vectors are written once: the subject id is the adapter's to extract and core never learns which; the write is a sink, never awaited.
 
-Extraction and storage ship with the contract. `subject = { enabled, from = "ip" | "header" | "cookie", name, salt, hashed, history_ttl, max_entries }` is the same on every adapter. The raw header or cookie value is a credential (an API key, a session id) and is **never stored, logged or sampled**: the adapter hashes `salt .. value` (SHA-256 on every adapter since 0.3.1) and everything downstream sees `<from>:<hex>`. The salt is a per-deployment secret, so a leaked log or dict is not a leaked credential; without a salt the config is rejected. `hashed = true` accepts the value as a complete id, which is how a thin Worker hands its hashed id to the origin in `X-Jev-Subject`. Trajectories live in their **own dict** (`jev_subject` on OpenResty and APISIX, `subjectStore` on the JavaScript hosts), one key per subject holding the newest `max_entries` entries for `history_ttl`: a scraper with a million sessions can fill it, and when it does only trajectories are evicted, never the verdict cache or trust. On OpenResty and APISIX the trajectory is a ring: one atomic counter per subject and one dict key per entry, so a write is two atomic operations inline (no timer, no read-modify-write that two workers could race on) and a read is `max_entries` lookups. The JavaScript hosts keep one list per subject and write it from a detached promise. The hashed id is also on every `$jev_log` line as `subject`, which is what trajectory scoring would calibrate on.
+Extraction and storage ship with the contract. `subject = { enabled, from = "ip" | "header" | "cookie", name, salt, hashed, history_ttl, max_entries }` is the same on every adapter. The raw header or cookie value is a credential (an API key, a session id) and is **never stored, logged or sampled**: the adapter hashes `salt .. value` (SHA-256 on every adapter since 0.3.1) and everything downstream sees `<from>:<hex>`. The salt is a per-deployment secret, so a leaked log or dict is not a leaked credential; without a salt the config is rejected. `hashed = true` accepts the value as a complete id, which is how a thin Worker hands its hashed id to the origin in `X-Jev-Subject` (the origin must take that header from the Worker only: see [Subject reputation](#subject-reputation)). Trajectories live in their **own dict** (`jev_subject` on OpenResty, Kong and APISIX, `subjectStore` on the JavaScript hosts), one key per subject holding the newest `max_entries` entries for `history_ttl`: a scraper with a million sessions can fill it, and when it does new entries are refused, never the verdict cache, trust or a reputation block evicted (reputation lives in `jev_subject_rep`). On OpenResty, Kong and APISIX the trajectory is a ring: one atomic counter per subject and one dict key per entry, so a write is two atomic operations inline (no timer, no read-modify-write that two workers could race on) and a read is `max_entries` lookups. The JavaScript hosts keep the same ring in their `subjectStore`, read only for a request a rule watches and all slots at once, and on Cloudflare in one Durable Object per subject. The hashed id is also on every `$jev_log` line as `subject`, which is what trajectory scoring would calibrate on.
 
 ## False-positive feedback
 
@@ -604,7 +685,7 @@ Extraction and storage ship with the contract. `subject = { enabled, from = "ip"
 
 ## Decision sampling
 
-`sampling` keeps a share of judged decisions for replay and labelling: `enabled` (off by default), `rate`, `min_verdict` (`suspicious` by default, so safe traffic is not kept), `max_samples` (a ring in the cache dict), `ttl`, `text_bytes`. Each sample is the normalized text truncated to `text_bytes`, the fingerprint, score, verdict, action, source, reason, path, client IP and request id. The raw body is never stored, and nothing is written to the access log; `sampling.log = true` additionally emits each sample as one INFO line for log shippers. `GET /_jev/samples` returns the ring newest first, `DELETE` clears it. The decision (`core/sampling.lua`, ported to `adapters/js/src/sampling.ts`) is pure; storage is the adapter's: the shared dict on OpenResty and APISIX, an `onSample` callback on the JavaScript hosts. L1 skips are never sampled; L1 reputation blocks are.
+`sampling` keeps a share of judged decisions for replay and labelling: `enabled` (off by default), `rate`, `min_verdict` (`suspicious` by default, so safe traffic is not kept), `max_samples` (a ring in the cache dict), `ttl`, `text_bytes`. Each sample is the normalized text truncated to `text_bytes`, the tool definitions read the way L1 reads them (when the request has any), the fingerprint, score, verdict, action, source, reason, rule, path, client IP and request id, and on Kong and APISIX the route. The ring keeps the size its first writer gave it (`sample:size`), so routes with different `max_samples` sharing one dict do not overwrite each other; a writer that asks for another size is warned once, and `DELETE /_jev/samples` resets it (a HUP reload does not, since the dict survives it). The raw body is never stored, and nothing is written to the access log; `sampling.log = true` additionally emits each sample as one INFO line for log shippers. `GET /_jev/samples` returns the ring newest first, `DELETE` clears it. The decision (`core/sampling.lua`, ported to `adapters/js/src/sampling.ts`) is pure; storage is the adapter's: the shared dict on OpenResty and APISIX, an `onSample` callback on the JavaScript hosts. L1 skips are never sampled; L1 reputation blocks are.
 
 ## Observability
 
@@ -618,13 +699,22 @@ Extraction and storage ship with the contract. `subject = { enabled, from = "ip"
 
 ```
 jev_requests_total{source,verdict}
+jev_actions_total{action}
 jev_cache_hits_total{kind}
-jev_l2_latency_ms_bucket{le}
+jev_l2_latency_ms_bucket{le}          25 ms .. 30 s, every bucket once L2 has been called
+jev_l2_errors_total{kind}             transport, timeout, unavailable, rejected, unusable, busy, other
+jev_l2_timeout_ms, jev_l2_timeout_max_ms
 jev_breaker_state
-jev_async_dropped_total
+jev_async_total{result}, jev_async_dropped_total
 jev_unjudged_total{reason}
 jev_window_total
+jev_subject_blocks_total
+jev_authz_events_total{event}         no_client_ip, cut_at_cap
+jev_adapter_errors_total{entry}       access, authz, forward_auth
+jev_feedback_total{label}, jev_tokens_total
 ```
+
+Each family is written in one block under its `# TYPE` line, which Prometheus 3's native-histogram conversion needs. Alert rules and their promtool tests are in [ops/](../ops/README.md).
 
 ## Bench and acceptance
 
@@ -672,13 +762,18 @@ Settled unless a PR argues otherwise with bench data.
 
 0. **The golden vectors are the definition of core.** A behaviour change is a change to `core/golden/*.json` reviewed in the same PR; an implementation that does not pass them is not a jev-edge core, whatever language it is written in.
 
-1. **Judgment backend is pluggable** via the provider interface; `jev`, `openai-compat` and `mock` ship in tree.
+1. **Judgment backend is pluggable** via the provider interface; `jev`, `openai-compat`, `laya` and `mock` ship in tree.
 2. **Templates are copied into core**, not pulled in as a submodule. Core has zero external dependencies.
 3. **Names:** repository `jev-edge`, OpenResty package `lua-resty-jev-edge`, Lua module prefix `resty.jev`.
 4. **Envoy is supported both ways with the same code.** Verdicts are flat (strings, numbers, booleans; no nesting, no nil holes) so they map losslessly to JSON and protobuf. 0.2.0 added a `/_jev/authz` location so the OpenResty adapter doubles as an Envoy **HTTP ext_authz** service at no extra logic, and a thin Go shim that forwards to that location provides **gRPC ext_authz**. Cloudflare Workers cannot run Lua and are the one adapter that reimplements core, in TypeScript, which is why core stays small and why the golden vectors exist.
-5. **L1 patterns are PCRE**, matched through injected `ctx.re_find`. Lua patterns lack alternation and do not port to the other adapters.
+5. **L1 patterns are PCRE**, matched through injected `ctx.re_find`. Lua patterns lack alternation and do not port to the other adapters. The JavaScript core translates them to run over bytes as PCRE without UTF does, rather than asking operators to write for the intersection.
 6. **Reputation blocking is opt-in** (`async.rep_block_after = 0` by default). One carrier or office NAT address can hide thousands of users; L3 still records reputation and alerts, it just does not block until you turn it on.
 7. **Deployment context is the calibration lever, not the threshold.** Measured: AUC 0.983 → 0.996 on the same texts and model.
 8. **Trust expires and is local.** An operator's false-positive label lowers a score, the only input that does; it lives `trust_ttl` with a renewal cap, in the gateway's own dict, and is replayed into calibration from the log rather than stored as a file. A permanent or fleet-wide allowlist keyed on attacker-visible text is a bypass, not a feature.
 9. **Subject trajectories are recorded before they are scored.** The contract (id from the adapter, history ignored, record as a sink) ships first; the window and thresholds wait for recorded traffic and a multi-turn dataset. A guessed default would be worse than the absent feature.
-10. **Subject ids are hashed with a per-deployment salt, and trajectories have their own bounded store.** An API key or session id is a credential and never reaches the dict, the log or a sample in the clear; a full trajectory store evicts trajectories, not verdicts or trust. No adapter may store a raw subject value, whatever it would save.
+10. **Subject ids are hashed with a per-deployment salt, and trajectories have their own bounded store.** An API key or session id is a credential and never reaches the dict, the log or a sample in the clear; a full trajectory store refuses new entries rather than evicting verdicts, trust or reputation. No adapter may store a raw subject value, whatever it would save.
+11. **The breaker measures the provider, not the client's text.** It counts transport errors, timeouts, 5xx, 429 and 401 / 404 / 405; anything the judged text can provoke (a content filter's 400, a strict parser, a reply with no score) passes the request as `error` without counting, or one client could switch L2 off for every tenant. An L2 that answers nothing pages on its own alert.
+12. **Only the subject's own text charges reputation.** Tool definitions and retrieved content decide the request but add no points, and with `untrusted` on neither does a text that holds retrieved content. The accepted cost: a client that forges a tool message builds no reputation, though every request is still judged.
+13. **The client learns the verdict, not the score.** A block carries `X-Jev-Verdict` and a request id on every adapter; score, reason and source stay with the upstream and the log.
+14. **A relay never fails open on what it could not forward.** A path, header or method the relay cannot send as the client sent it is refused with 400; an answer nginx refused before jev-edge ran is unjudgeable, for `-unjudged` to decide. Only jev-edge being unreachable or failing fails open.
+15. **Tool definitions are judged by default, with the `injection` question**, after a pre-registered false-positive bench on real tool sets (0 of 30 at 0.5). Their detection rate was not measured, so the documents make no claim of a tool-poisoning defence.

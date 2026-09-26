@@ -1,6 +1,11 @@
-// middleware.ts at the root of a Next.js project. Runs on the edge runtime on
-// Vercel and on the Node runtime elsewhere; both are V8, both are covered by
-// the golden vectors. Next calls it as `middleware(request, event)`; the
+// middleware.ts at the root of a Next.js project, run on the Node runtime
+// (`runtime: "nodejs"` in `config` below, Next 15.5 and later). On Next 16 the
+// file is proxy.ts: export the same function as `proxy` and drop `runtime`,
+// since a proxy always runs on Node. Middleware left on the edge runtime
+// (middleware.ts's default) judges plain bodies the same way, but there
+// DecompressionStream is a stub that throws, so a gzip or deflate request
+// body cannot be decoded: it is unjudgeable and policy.unjudgeable decides
+// (pass by default). Next calls it as `middleware(request, event)`; the
 // event's waitUntil keeps the subject write (config.subject) alive after the
 // response.
 import { NextResponse } from "next/server";
@@ -27,4 +32,10 @@ export const middleware = nextMiddleware(
   NextResponse,
 );
 
-export const config = { matcher: ["/api/chat/:path*", "/v1/:path*"] };
+// The AI SDK's useChat posts to /api/chat and useCompletion to /api/completion
+// by default. Next runs the middleware only on these paths: list every route
+// of the app that takes a prompt.
+export const config = {
+  runtime: "nodejs",
+  matcher: ["/api/chat/:path*", "/api/completion/:path*", "/api/completions/:path*", "/v1/:path*"],
+};

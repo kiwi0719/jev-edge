@@ -13,7 +13,7 @@
 // you pass Store implementations (DynamoDB Global Tables is the usual
 // choice; it costs a round trip per lookup). Read the API key from Secrets
 // Manager at cold start and pass it in `config.jev.api_key`.
-import { createRuntime, evaluate, markTruncated, type Options, type Runtime } from "./runtime.js";
+import { createRuntime, evaluate, markTruncated, jevHeaderNames, type Options, type Runtime } from "./runtime.js";
 import { headers as verdictHeaders, newVerdict, ERROR, SRC_ADAPTER } from "./core/verdict.js";
 
 export interface CfHeader { key?: string; value: string }
@@ -35,6 +35,17 @@ export interface CfResponse {
 
 const HEADER_NAMES = ["x-jev-verdict", "x-jev-score", "x-jev-source", "x-jev-reason", "x-jev-request-id", "x-jev-subject"];
 
+let warnedNoBody = false;
+
+/**
+ * The request to judge. Without "Include Body" on the trigger CloudFront
+ * sends no body but keeps Content-Length, and a request whose size says
+ * there is a body and whose text is empty reaches L1 as "no text". The
+ * judged request then drops Content-Length and Transfer-Encoding, so core
+ * gives it the header-only treatment ("no body", IP reputation still
+ * applies), and the first one in each execution environment is warned
+ * about. The request CloudFront forwards is untouched.
+ */
 function toRequest(cf: CfRequest): Request {
   const headers = new Headers();
   for (const [name, values] of Object.entries(cf.headers ?? {})) {
@@ -53,7 +64,19 @@ function toRequest(cf: CfRequest): Request {
     // runtime scans it as the head of a larger body instead of parsing it.
     truncated = cf.body.bodyTruncated === true || cf.body.inputTruncated === true;
   }
-  const request = new Request(url, { method: cf.method, headers, body: cf.method === "GET" || cf.method === "HEAD" ? undefined : body });
+  const bodyless = cf.method === "GET" || cf.method === "HEAD";
+  if (!bodyless && body === undefined) {
+    if (!warnedNoBody && Number(headers.get("content-length")) > 0) {
+      warnedNoBody = true;
+      console.warn(
+        "jev-edge: a " + cf.method + " with Content-Length " + headers.get("content-length") + " arrived without its body: " +
+        "Include Body is off on this trigger, so bodies are not judged (logged once)",
+      );
+    }
+    headers.delete("content-length");
+    headers.delete("transfer-encoding");
+  }
+  const request = new Request(url, { method: cf.method, headers, body: bodyless ? undefined : body });
   return truncated ? markTruncated(request) : request;
 }
 
@@ -63,8 +86,10 @@ const STATUS_TEXT: Record<number, string> = {
   500: "Internal Server Error", 503: "Service Unavailable",
 };
 
+// Every X-Jev-* header the client sent goes, whatever its name (CloudFront
+// keys the map by the lowercased name), then the verdict's own are set.
 function setJevHeaders(cf: CfRequest, hdrs: Record<string, string>, requestId: string, subjectId?: string): void {
-  for (const h of HEADER_NAMES) delete cf.headers[h];
+  for (const h of jevHeaderNames(Object.keys(cf.headers ?? {}))) delete cf.headers[h];
   for (const [k, v] of Object.entries(hdrs)) cf.headers[k.toLowerCase()] = [{ key: k, value: v }];
   cf.headers["x-jev-request-id"] = [{ key: "X-Jev-Request-Id", value: requestId }];
   if (subjectId) cf.headers["x-jev-subject"] = [{ key: "X-Jev-Subject", value: subjectId }];
@@ -80,7 +105,8 @@ export function lambdaEdgeHandler(opts: Options): (event: CfEvent) => Promise<Cf
       if (response) {
         const headers: Record<string, CfHeader[]> = {};
         response.headers.forEach((v, k) => (headers[k] = [{ key: k, value: v }]));
-        const status = rt.config.policy.block_status ?? response.status;
+        // policy.block_status, or 400 for a path that is not well formed
+        const status = response.status;
         return { status: String(status), statusDescription: STATUS_TEXT[status] ?? "Blocked", headers, body: await response.text() };
       }
       setJevHeaders(cf, verdictHeaders(verdict), requestId, subjectId);

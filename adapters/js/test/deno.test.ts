@@ -33,20 +33,37 @@ function captureUpstream(): Request[] {
 
 const tick = () => new Promise<void>((r) => setTimeout(r, 0));
 
-/** A fake Deno KV: versionstamps, expireIn recorded, atomic check-and-set. */
-function fakeKv(): DenoKvLike & { map: Map<string, { value: unknown; versionstamp: string; expireIn?: number }>; conflicts: number } {
+/** One read the fake served: the op, the keys and the consistency asked for. */
+interface Read { op: "get" | "getMany"; keys: DenoKvKey[]; consistency?: string }
+
+/** A fake Deno KV: versionstamps, expireIn recorded, atomic check-and-set,
+ *  and every read recorded (`reads`). */
+function fakeKv(): DenoKvLike & {
+  map: Map<string, { value: unknown; versionstamp: string; expireIn?: number }>; conflicts: number; reads: Read[];
+} {
   const map = new Map<string, { value: unknown; versionstamp: string; expireIn?: number }>();
   let vs = 0;
   const id = (k: DenoKvKey) => JSON.stringify(k);
   const put = (k: DenoKvKey, value: unknown, opts?: { expireIn?: number }) =>
     map.set(id(k), { value: structuredClone(value), versionstamp: String(++vs).padStart(20, "0"), expireIn: opts?.expireIn });
+  const entry = (k: DenoKvKey) => {
+    const e = map.get(id(k));
+    return e ? { value: structuredClone(e.value), versionstamp: e.versionstamp } : { value: null, versionstamp: null };
+  };
   const kv = {
     map,
     conflicts: 0,
-    async get(k: DenoKvKey) {
+    reads: [] as Read[],
+    async get(k: DenoKvKey, opts?: { consistency?: string }) {
+      kv.reads.push({ op: "get", keys: [k], consistency: opts?.consistency });
       await tick();
-      const e = map.get(id(k));
-      return e ? { value: structuredClone(e.value), versionstamp: e.versionstamp } : { value: null, versionstamp: null };
+      return entry(k);
+    },
+    async getMany(ks: DenoKvKey[], opts?: { consistency?: string }) {
+      if (ks.length > 10) throw new TypeError("Too many ranges (max 10)");
+      kv.reads.push({ op: "getMany", keys: ks, consistency: opts?.consistency });
+      await tick();
+      return ks.map(entry);
     },
     async set(k: DenoKvKey, v: unknown, opts?: { expireIn?: number }) {
       await tick();
@@ -102,6 +119,21 @@ describe("denoHandler", () => {
     expect(seen).toHaveLength(0);
   });
 
+  it("answers 400 to a path nginx would refuse and never calls the upstream", async () => {
+    const seen = captureUpstream();
+    const h = denoHandler({ upstream: UPSTREAM, config: mockConfig() });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      for (const path of ["/v1/%u0063ompletions", "/%u0063ompletion", "/v1%u002fchat/completions", "/v1/chat/completions%", "/v1/%zz"]) {
+        const res = await h(chat(ATTACK, {}, path), PEER);
+        expect({ path, status: res.status }).toEqual({ path, status: 400 });
+      }
+    } finally {
+      warn.mockRestore();
+    }
+    expect(seen).toHaveLength(0);
+  });
+
   it("forwards allowed requests to the upstream with X-Jev-* and manual redirects", async () => {
     const seen = captureUpstream();
     const h = denoHandler({ upstream: UPSTREAM + "/ignored/base", config: mockConfig() });
@@ -141,7 +173,9 @@ describe("denoHandler", () => {
     captureUpstream();
     const res = await denoHandler({ upstream: UPSTREAM, config: mockConfig() })(new Request("https://edge.example/_jev/health"), PEER);
     expect(res.status).toBe(200);
-    expect(((await res.json()) as { ok: boolean }).ok).toBe(true);
+    const j = (await res.json()) as Record<string, unknown>;
+    expect(j.ok).toBe(true);
+    expect(j.mode).toBeUndefined(); // the details only with health: "details"
   });
 
   it("puts the subject ring in Deno KV when kv is given", async () => {
@@ -157,8 +191,93 @@ describe("denoHandler", () => {
     expect(keys.some((k) => k.startsWith('["jev","cache",'))).toBe(true);
   });
 
+  it("keeps the verdict when Deno KV rejects the writes after it", async () => {
+    const seen = captureUpstream();
+    const kv = fakeKv();
+    // reads work; every plain write and every commit fails, as over a write quota
+    kv.set = async () => { throw new Error("Deno KV: write quota exceeded"); };
+    const atomic = kv.atomic.bind(kv);
+    kv.atomic = () => {
+      const op = atomic();
+      op.commit = async () => { throw new Error("Deno KV: write quota exceeded"); };
+      return op;
+    };
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const cfg = mockConfig({ jev: { provider: "mock", mock_score: 0.95, mock_delay_ms: 2, timeout_ms: 400 }, subject: { enabled: true, from: "ip", salt: "pepper" } });
+      const h = denoHandler({ upstream: UPSTREAM, config: cfg, kv });
+      const res = await h(chat(ATTACK), PEER);
+      expect(res.status).toBe(403);
+      expect(res.headers.get("x-jev-verdict")).toBe("malicious"); // judged: the adapter fails open, never blocks
+      expect(seen).toHaveLength(0);
+      for (let i = 0; i < 20; i++) await tick(); // the fire-and-forget subject write
+      const warned = warn.mock.calls.map((c) => String(c[0]));
+      expect(warned.some((m) => m.includes("cache write failed") && m.includes("write quota"))).toBe(true);
+      expect(warned.some((m) => m.includes("breaker success failed"))).toBe(true);
+      expect(warned.some((m) => m.includes("subject store incr failed"))).toBe(true);
+      expect(error).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+      error.mockRestore();
+    }
+  });
+
+  // lead-js-runtimes#11: the verdict cache reads the nearest replica; the
+  // breaker state and the subject store, whose check-and-set loops need the
+  // current versionstamp, read strong; the ring's slots come in getMany calls
+  it("reads the cache eventually consistent, state and subject strong, the ring's slots in getMany calls", async () => {
+    captureUpstream();
+    const kv = fakeKv();
+    const cfg = mockConfig({ subject: { enabled: true, from: "ip", salt: "pepper" } });
+    const h = denoHandler({ upstream: UPSTREAM, config: cfg, kv });
+    const ringN = () => [...kv.map.entries()].find(([k]) => k.startsWith('["jev","subject","subj:ip:') && k.endsWith(':n"]'))?.[1].value;
+    for (let i = 0; i < 12; i++) {
+      await h(chat(`{"messages":[{"role":"user","content":"Please summarise quarterly report number ${i} in detail."}]}`), PEER);
+      // the fire-and-forget subject write lands before the next request
+      for (let t = 0; t < 50 && (ringN() as { v?: number } | undefined)?.v !== i + 1; t++) await tick();
+    }
+    expect((ringN() as { v: number }).v).toBe(12);
+    kv.reads.length = 0;
+    await h(chat('{"messages":[{"role":"user","content":"And one more summary of the annual report, please."}]}'), PEER);
+    const under = (r: Read, part: string) => r.keys.every((k) => k[1] === part);
+    const cache = kv.reads.filter((r) => under(r, "cache"));
+    expect(cache.length).toBeGreaterThan(0);
+    expect(cache.every((r) => r.consistency === "eventual")).toBe(true);
+    const other = kv.reads.filter((r) => !under(r, "cache"));
+    expect(other.some((r) => under(r, "state"))).toBe(true);
+    expect(other.every((r) => r.consistency === undefined)).toBe(true);
+    // the ring: its counter, then 12 slots in two getMany calls (at most 10 keys each), no get per slot
+    const slots = kv.reads.filter((r) => under(r, "subject") && r.keys.some((k) => /:\d+$/.test(k[2])));
+    expect(slots.map((r) => [r.op, r.keys.length])).toEqual([["getMany", 10], ["getMany", 2]]);
+  });
+
   it("requires an upstream", () => {
     expect(() => denoHandler({ upstream: "" })).toThrow(/upstream/);
+  });
+
+  it("fails open to the upstream when the runtime cannot be built", async () => {
+    const seen = captureUpstream();
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const h = denoHandler({ upstream: UPSTREAM, config: mockConfig({ policy: { mode: "bogus" } }) });
+      for (let i = 0; i < 2; i++) {
+        const res = await h(chat(ATTACK, { "x-jev-verdict": "safe", "x-jev-subject": "header:x" }), PEER);
+        expect(res.status).toBe(200);
+      }
+      expect(seen).toHaveLength(2);
+      expect(seen[0].url).toBe(UPSTREAM + "/v1/chat/completions");
+      expect(seen[0].headers.get("x-jev-verdict")).toBe("error");
+      expect(seen[0].headers.get("x-jev-source")).toBe("adapter");
+      expect(seen[0].headers.get("x-jev-subject")).toBeNull();
+      expect(seen[0].redirect).toBe("manual");
+      expect(await seen[0].text()).toBe(ATTACK);
+      const msgs = error.mock.calls.map((c) => String(c[0]));
+      expect(msgs).toHaveLength(1); // once, not per request
+      expect(msgs[0]).toMatch(/cannot build the runtime, failing open.*mode/);
+    } finally {
+      error.mockRestore();
+    }
   });
 });
 
@@ -196,6 +315,34 @@ describe("denoKvStore", () => {
     const h = (await subject.loadHistory(s, "ip:x", 20)) as subject.Entry[];
     expect(h).toHaveLength(20);
     expect(h.map((e) => e.score).sort((a, b) => a - b)).toEqual(Array.from({ length: 20 }, (_, i) => i + 1));
+  });
+
+  it("getMany reads in batches of 10, in key order, expiry honoured; a KV without it gets each key", async () => {
+    let now = 100;
+    const kv = fakeKv();
+    const s = denoKvStore(kv, ["t"], () => now, { consistency: "eventual" });
+    for (let i = 0; i < 23; i++) await s.set("k" + i, i, i === 5 ? 10 : 0);
+    now = 111; // k5 expired
+    kv.reads.length = 0;
+    const keys = Array.from({ length: 23 }, (_, i) => "k" + i).concat(["missing"]);
+    const want = keys.map((k, i) => (k === "k5" || k === "missing" ? undefined : i));
+    expect(await s.getMany!(keys)).toEqual(want);
+    expect(kv.reads.map((r) => [r.op, r.keys.length, r.consistency])).toEqual([
+      ["getMany", 10, "eventual"], ["getMany", 10, "eventual"], ["getMany", 4, "eventual"]]);
+    expect(await s.get("k1")).toBe(1);
+    expect(kv.reads.at(-1)).toEqual({ op: "get", keys: [["t", "k1"]], consistency: "eventual" });
+    // incr's check-and-set reads strong whatever the option
+    kv.reads.length = 0;
+    await s.incr!("c", 1, 0);
+    expect(kv.reads.every((r) => r.consistency === undefined)).toBe(true);
+    // a KV-like without getMany: one get per key
+    const bare = fakeKv();
+    delete (bare as Partial<DenoKvLike>).getMany;
+    const b = denoKvStore(bare, ["t"]);
+    await b.set("a", 1, 0);
+    bare.reads.length = 0;
+    expect(await b.getMany!(["a", "b"])).toEqual([1, undefined]);
+    expect(bare.reads.map((r) => r.op)).toEqual(["get", "get"]);
   });
 
   it("incr keeps the original expiry; expire resets it", async () => {

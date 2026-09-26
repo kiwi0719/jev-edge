@@ -29,6 +29,9 @@ export interface Verdict {
   fingerprint: string;
   l2_ms: number;
   async: boolean;
+  /** What an L2 error verdict ran into (judge.errorKind: transport, timeout,
+   *  unavailable, rejected, unusable, busy, other); "" on every other one. */
+  error_kind: string;
 }
 
 export interface VerdictInit {
@@ -40,6 +43,7 @@ export interface VerdictInit {
   fingerprint?: unknown;
   l2_ms?: unknown;
   async?: unknown;
+  error_kind?: unknown;
 }
 
 function clamp01(n: unknown): number {
@@ -61,6 +65,7 @@ export function newVerdict(t?: VerdictInit | null): Verdict {
     fingerprint: String(v.fingerprint ?? ""),
     l2_ms: Number.isFinite(l2) ? l2 : 0,
     async: v.async === true,
+    error_kind: String(v.error_kind ?? ""),
   };
 }
 
@@ -103,6 +108,13 @@ export function encodeReason(s: unknown): string {
   // every char of `out` is one ASCII byte, so length is bytes
   if (out.length > REASON_MAX) out = out.slice(0, REASON_MAX).replace(/%[0-9A-Fa-f]?$/, "");
   return out;
+}
+
+/** Port of verdict.client_headers: the only verdict header a client may see
+ *  on a block response (with X-Jev-Request-Id, which the adapter adds).
+ *  Score, reason and source go to the logs and the upstream request only. */
+export function clientHeaders(v: Verdict): Record<string, string> {
+  return { "X-Jev-Verdict": v.verdict };
 }
 
 export function headers(v: Verdict): Record<string, string> {

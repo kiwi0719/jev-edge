@@ -27,7 +27,12 @@ local function clamp01(n)
 end
 
 --- Build a verdict with defaults filled in.
--- @param t table with any of: action, verdict, score, source, reason, fingerprint, l2_ms, async
+-- @param t table with any of: action, verdict, score, source, reason,
+--          fingerprint, l2_ms, async, error_kind
+-- error_kind: what an L2 error verdict ran into (judge.error_kind:
+-- transport, timeout, unavailable, rejected, unusable, busy, other); "" on
+-- every other verdict. It labels jev_l2_errors_total, so an operator can
+-- tell a provider that is down from one that refuses every call.
 function _M.new(t)
   t = t or {}
   return {
@@ -39,6 +44,7 @@ function _M.new(t)
     fingerprint = tostring(t.fingerprint or ""),
     l2_ms       = tonumber(t.l2_ms) or 0,
     async       = t.async == true,
+    error_kind  = tostring(t.error_kind or ""),
   }
 end
 
@@ -50,6 +56,15 @@ function _M.headers(v)
     ["X-Jev-Source"]  = v.source,
     ["X-Jev-Reason"]  = _M.encode_reason(v.reason),
   }
+end
+
+--- The only verdict header a client may see, on a block response (with
+--- X-Jev-Request-Id, which the adapter adds). Score, reason and source say
+--- how close a text came and which pattern or template fired: an attacker
+--- tunes a prompt against them, so they go to the logs and the upstream
+--- request (headers above), never back to the client.
+function _M.client_headers(v)
+  return { ["X-Jev-Verdict"] = v.verdict }
 end
 
 --- URL-encode and truncate a reason for header transport (<= 200 bytes of

@@ -36,7 +36,7 @@ jev-edge 是一个装在网关上的准入组件。进来的每个请求，它�
 
 | | |
 |---|---|
-| 版本 | `v0.6.1`（[更新日志](CHANGELOG.md)、[路线图](docs/design.zh-CN.md#路线图)） |
+| 版本 | `v0.6.2`（[更新日志](CHANGELOG.md)、[路线图](docs/design.zh-CN.md#路线图)） |
 | 能跑在哪里 | OpenResty、Apache APISIX、Kong；Envoy、Istio、HAProxy、Traefik、Caddy 和 nginx 通过 `/_jev/authz` 接入；Cloudflare Workers、Next.js、Node、Hono、Lambda@Edge 和 Deno Deploy 通过 [`@jev-edge/js`](https://www.npmjs.com/package/@jev-edge/js) 接入；LiteLLM proxy 里作为护栏 |
 | 判定器 | TypeSafe Jev（已实测）、自己部署的微调版 Laya、任意兼容 OpenAI 接口的对话模型 |
 | 生产使用 | 目前还没有已知的生产案例。请先用 `monitor` 模式跑 |
@@ -78,7 +78,7 @@ HTTP/1.1 403 Forbidden
 {"error":"request rejected"}
 ```
 
-compose 的日志里，每个送审的请求对应一行 JSON。`curl localhost:8090/_jev/health` 可以查看 provider 和超时的状态；`curl -X PUT localhost:8090/_jev/config -d '{"policy":{"mode":"monitor"}}'` 不用重载就能切回 monitor 模式。想换成真实模型判定，在 `docker compose up` 之前 `export TYPESAFE_API_KEY=...`，同一份配置会自动改用 `jev` provider。demo 用到的全部东西就是 [demo/](demo/) 下面的四个小文件。
+compose 的日志里，每个送审的请求对应一行 JSON。demo 把管理端点放在 8090 端口（正式安装的网关用的是 `127.0.0.1:9180`，见下文）：`curl localhost:8090/_jev/health` 可以查看 provider 和超时的状态；`curl -X PUT localhost:8090/_jev/config -d '{"policy":{"mode":"monitor"}}'` 不用重载就能切回 monitor 模式。想换成真实模型判定，在 `docker compose up` 之前 `export TYPESAFE_API_KEY=...`，同一份配置会自动改用 `jev` provider。demo 用到的全部东西就是 [demo/](demo/) 下面的四个小文件。
 
 ## 工作原理
 
@@ -102,7 +102,8 @@ L3  async side-path    never blocks the response; feeds reputation + alerts
 
 - **失败放行。** Jev 变慢或挂了，流量照常通过，只打一行日志。熔断器会在 API 不健康时停止调用，免得每个请求都白等一次超时。
 - **缓存。** 规范化后的 body 指纹在 TTL 内复用。爬虫和重放攻击的请求高度重复。
-- **判定头。** `X-Jev-Verdict` 和 `X-Jev-Score` 会传给上游，应用可以据此自己再做一次判断，而不是只能接受放行或拦截。
+- **读到后端读到的内容。** OpenAI 兼容服务、Anthropic、Ollama、Gemini、Cohere、llama.cpp、TGI、Open WebUI 和 AI SDK 的路由及其别名；工具调用参数和工具定义；压缩过的、超大的和格式有问题的请求体。读不了的会报告为无法判定，绝不会当成“没有文本”放过去（[L1 读取范围](docs/design.zh-CN.md#请求体大小与-l1-读取范围)）。
+- **判定头。** `X-Jev-Verdict` 和 `X-Jev-Score` 会传给上游，应用可以据此自己再做一次判断，而不是只能接受放行或拦截。被拦截的客户端只能看到判定结果和请求 id，看不到分数。
 - **热更新。** `enforce` / `monitor` 模式、阈值、[检索内容判定](docs/design.zh-CN.md#检索内容)都能用一个本地 PUT 切换，不用重载 nginx。
 - **判定器可替换。** 一个 provider 就是两个函数。自带 `jev`、`laya`、`openai-compat` 和 `mock`。
 
@@ -133,7 +134,7 @@ git clone https://github.com/kiwi0719/jev-edge && cd jev-edge && sudo make insta
 1. 把 TypeSafe 的 key 放进 nginx 启动时的环境变量，并在 `nginx.conf` 开头声明：`env TYPESAFE_API_KEY;`。
 2. 给 cosocket 指定 CA 证书，否则所有对 provider 的调用都会在 TLS 校验这一步失败：在 `http {}` 里加 `lua_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;`。
 3. 编辑 `/etc/nginx/jev-edge.conf.lua`。一定要写 `deployment_context`，准确率主要由它决定，写法见[写好部署上下文](docs/design.zh-CN.md#写好部署上下文)。`policy.mode` 保持 `"monitor"`。
-4. 在 `http {}` 里加上三个 shared dict 和 `init` / `init_worker` 块，再在要监控的 location 里加 `access_by_lua_block`。完整示例见 [adapters/openresty/conf/example.nginx.conf](adapters/openresty/conf/example.nginx.conf)，最少需要这些：
+4. 在 `http {}` 里加上 shared dict 和 `init` / `init_worker` 块，在要监控的 location 里加 `access_by_lua_block`，再给管理端点单独开一个监听端口。完整示例见 [adapters/openresty/conf/example.nginx.conf](adapters/openresty/conf/example.nginx.conf)，最少需要这些：
 
 ```nginx
 lua_shared_dict jev_cache  64m;
@@ -145,9 +146,17 @@ env TYPESAFE_API_KEY;
 init_by_lua_block        { require("resty.jev.edge").init("/etc/nginx/jev-edge.conf.lua") }
 init_worker_by_lua_block { require("resty.jev.edge").init_worker() }
 
+# in the server that proxies your LLM traffic
 location /v1/ {
     access_by_lua_block { require("resty.jev.edge").access() }
     proxy_pass http://llm_backend;
+}
+
+# admin endpoints: a server of their own in http {}, on loopback
+server {
+    listen 127.0.0.1:9180;
+    location = /_jev/health { content_by_lua_block { require("resty.jev.edge").health() } }
+    location = /_jev/config { content_by_lua_block { require("resty.jev.edge").config_api() } }
 }
 ```
 
@@ -166,7 +175,7 @@ return {
 5. 重载 nginx，然后在本机检查一下 provider。这条命令会真实调用一次，返回延迟、当前生效的超时和熔断器状态：
 
 ```bash
-curl -s localhost:8090/_jev/health
+curl -s 127.0.0.1:9180/_jev/health
 ```
 
 6. 发一个请求试试：
@@ -189,7 +198,7 @@ make calibrate LOG=/var/log/nginx/jev.log LABELS=labels.csv MAX_FP=0.001
 8. 一条命令切到 `enforce`，不用重载：
 
 ```bash
-curl -X PUT localhost:8090/_jev/config -d '{"policy":{"mode":"enforce"}}'
+curl -X PUT 127.0.0.1:9180/_jev/config -d '{"policy":{"mode":"enforce"}}'
 ```
 
 回滚就是同一条命令改成 `"monitor"`；也可以 `DELETE /_jev/config`，清掉所有运行时覆盖。
@@ -197,7 +206,7 @@ curl -X PUT localhost:8090/_jev/config -d '{"policy":{"mode":"enforce"}}'
 **其他网关和宿主。**
 
 - **Apache APISIX**：同一套引擎做成插件，按路由配置，配置键完全一样：[adapters/apisix](adapters/apisix/README.md)。
-- **Kong Gateway**：同一套引擎做成插件（Kong 3.x，DB-less 或带数据库都行），按路由或按服务配置：[adapters/kong](adapters/kong/README.md)。
+- **Kong Gateway**：同一套引擎做成插件（Kong 3.x，DB-less、带数据库或 hybrid 模式都行），按路由或按服务配置：[adapters/kong](adapters/kong/README.md)。
 - **Envoy** 把 OpenResty 进程当作它的 ext_authz 服务：[adapters/envoy](adapters/envoy/README.md)。**HAProxy** 通过一个小的 SPOE agent 做同样的事：[adapters/haproxy](adapters/haproxy/README.md)。**Traefik、Caddy 和 nginx `auth_request`** 共用一个 forward-auth 接口：[adapters/forward-auth](adapters/forward-auth/README.md)。
 - **Istio、Envoy Gateway、Azure API Management、Apigee**：只需要配置，对接的还是同一个 `/_jev/authz`：[docs/recipes.zh-CN.md](docs/recipes.zh-CN.md)。
 - **LiteLLM proxy**：一个护栏，每次调用模型之前先问一下 jev-edge：[adapters/litellm](adapters/litellm/README.md)。

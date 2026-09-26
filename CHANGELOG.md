@@ -6,6 +6,436 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-09-27
+
+The fixes from a full audit of 0.6.1 (correctness, security and latent bugs in
+core, the rule set, every adapter, CI, release and ops), each checked against
+a reproduction before and after. L1 now reads what the backends read in many
+more request shapes and on many more routes, judges tool-call arguments and
+tool definitions, and reads a body it used to pass as "no text" or skip as
+"not watched". A client can no longer open the breaker with text the judge
+refuses, read the score off a block, or make a relay fail open with a path,
+header or body it cannot forward. Several defaults and cache keys change, and
+some configs that used to load are refused: read **Upgrade notes** first.
+
+### Upgrade notes
+- **Tool definitions are judged by default.** `llm-endpoints` gains
+  `tool_fields` (`tools`, `functions`, `response_format.json_schema`,
+  `text.format`): a request that carries tools makes one more judge call the
+  first time a tool set is seen, and is a cache hit on the next turn. A rule
+  that extends `llm-endpoints` turns it off with `tool_fields = {}`.
+- **Cache and fingerprint keys change once.** The fingerprint keeps digit
+  runs and UUIDs; the verdict-cache scope adds `jev.endpoint` and the question
+  wording when either is set; chunks overlap by 1 KiB. Expect a cold verdict
+  cache after the upgrade. A fingerprint an operator trusted through
+  `/_jev/feedback` for a text with a digit run or a UUID must be reported
+  again.
+- **Subject ids from `Authorization` and `Proxy-Authorization` change once**
+  (the auth scheme is canonicalised). Upgrade a thin Worker and its origin
+  together.
+- **The breaker counts 401, 404 and 405** (a bad key, endpoint or model), and
+  no longer counts 400, 403, 413, 422 or a reply it cannot use: those are the
+  client's text, not the provider's health. A misconfigured judge now opens
+  the breaker and pages, where every call used to fail with it closed.
+- **IP reputation blocks at L1 only under a config with
+  `async.rep_block_after > 0`.** Kong and APISIX routes share `rep:<ip>`; a
+  route that keeps the default 0 no longer blocks the IPs a stricter route
+  flagged.
+- **A block response tells the client `X-Jev-Verdict` and
+  `X-Jev-Request-Id` only**: Kong, APISIX, every JS host, the forward-auth
+  denial, the gRPC shim's deny and the LiteLLM guardrail's exception. A
+  client or test that read `X-Jev-Score`, `X-Jev-Reason` or `X-Jev-Source`
+  off a 403 must read the log, the upstream headers or `onVerdict`.
+- **Configs that were silently wrong are refused**: `policy.block_status`
+  outside 400-499, a non-string `policy.block_body` or judge setting, JSON
+  `null` in an override, a rule field of the wrong type (a string where a list
+  goes, a map for `watch_paths`, a limit that is not a number), an unknown
+  template in a rule or in `untrusted.templates`, a malformed
+  `untrusted.fields` path, and a rule `extends` that is not a rule set id.
+  `methods` may now be a list (`["POST"]`). A refused file keeps the previous
+  config, as before, and is now reported (`config_error`, 503 from
+  `/_jev/health`).
+- **New shared dict `jev_subject_rep`** for subject reputation, apart from
+  the trajectories in `jev_subject`: declare it where you declare
+  `jev_subject` (`example.nginx.conf`, Kong's `nginx_http_lua_shared_dict`,
+  APISIX's `custom_lua_shared_dict`). Without it reputation shares
+  `jev_subject`, with one warning per worker.
+- **APISIX**: declare jev-edge's dicts under
+  `nginx_config.http.custom_lua_shared_dict`; APISIX 3.13 drops them from
+  `lua_shared_dict`, which left the plugin without a cache, breaker or
+  reputation. The plugin's priority is 1000 (was 2450), it declares
+  `run_policy = "prefer_route"`, and `check_schema` refuses a missing or
+  broken rule set, so such a route is not loaded.
+- **Kong hybrid mode**: this release adds plugin schema fields
+  (`questions_json`, `ssl_verify`, `subject.reputation`, `max_tokens`,
+  `token_param`, `temperature`, `extra_body_json`, provider `laya`). Upgrade
+  the control plane first and every data plane right after; a data plane on
+  an older version refuses every config push that uses a new field.
+- **HAProxy**: `jev-spoa` listens on `127.0.0.1:9000` by default (pass
+  `-listen :9000` in a container). Ship the new `spoe.conf` (it sends `uri`
+  and at most 88 KiB of body) and `haproxy.cfg` (a `deny_status 400` line)
+  with the new agent.
+- **Envoy**: copy three changes from the reference configs:
+  `path_with_escaped_slashes_action: REJECT_REQUEST`, `x-jev-body-partial`
+  removed with the other `X-Jev-*` before ext_authz, and `envoy-http.yaml` no
+  longer forwards `x-envoy-external-address` (`trusted_hops = 1` reads the
+  hop `use_remote_address` appends).
+- **LiteLLM guardrail**: it appends the peer LiteLLM saw to
+  `X-Forwarded-For`, so behind N appending proxies set jev-edge's
+  `trusted_hops` to N + 1 (one more than before). The `HTTPException` detail
+  is `{error, request_id}`; the verdict is on `exc.jev_verdict` and in the
+  proxy's metadata. Settings come from `JEV_EDGE_*` when no keyword is
+  given, and it warns at startup without `default_on: true`.
+- **JavaScript**: `/_jev/health` answers `{ ok, adapter, core }` unless
+  `health: "details"`; `honoMiddleware` puts only `X-Jev-Request-Id` on the
+  response; pass the Durable Object namespace (`env.JEV_STATE`) as `state`,
+  not a stub kept across requests.
+- **Laya**: the profile's L2 timeouts are 500 / 800 ms (were 100 / 300) and
+  `max_inflight = 1`. laya-server's `LAYA_GATEWAY_TIMEOUT_MS` (default 500)
+  replaces `LAYA_QUEUE_MS` and must equal the gateway's `timeout_ms`; run
+  `make conformance` with `BUDGET_MS=500` and `CONCURRENCY=<max_inflight
+  summed over gateways>`.
+
+### Security
+
+What L1 reads:
+- **Watch paths match the path the backend routes on.** `;` segment
+  parameters are dropped, empty and `.` segments removed, `..` resolved and
+  ASCII case folded, in the path and the pattern alike, on every call site
+  and both cores (`paths_case_sensitive = true` keeps the case). Express,
+  Spring and Tomcat routed `/V1/Chat/Completions` or `/v1;a=b/chat/completions`
+  to the chat handler while L1 said "path not watched". Kong matches the
+  decoded `ngx.var.uri` (`/v1%2Fchat/completions` was skipped), and the TS
+  core matches bytes, `.` across line terminators, as Lua does.
+- **The generation routes and prompt fields LLM servers accept are
+  watched.** Ollama `/api/generate`; LiteLLM and llama.cpp without `/v1`
+  (`/chat/completions`, `/completions`, `/responses`, `/completion`,
+  `/infill`); `/engines/<m>/`, Azure `/openai/deployments/<name>/` and
+  `/openai/v1/`; `/v1/responses` and `/v1/messages`; the AI SDK's
+  `/api/completion`; Gemini `generateContent` and `streamGenerateContent`
+  (the Gemini API, Vertex AI, LiteLLM's `/models/<m>:...`) and
+  `/v1beta/openai/chat/completions`; SGLang, TGI and vLLM native routes
+  (`/generate`, `/generate_stream`, `/vertex`, `/invocations`, and TGI's `/`
+  for a JSON body only, through the new `json_only_paths`); Open WebUI's
+  `/api/v1/...`, `/ollama/...` and `/openai/...`; LM Studio's `/api/v0/...`
+  and `/api/v1/chat`; Cohere `/v2/chat` and `/v1/generate`. New text fields:
+  `system`, `instructions`, `preamble`, `system_prompt`, Gemini
+  `systemInstruction`, `contents[*].parts` and function responses, Cohere
+  `chat_history` and `documents`, AI SDK 5 `messages[*].parts` (tool parts'
+  input and output), llama.cpp's `prompt_string`, `input_prefix`,
+  `input_suffix` and `input_extra` (filename and text), Responses
+  `prompt.variables`, TGI `inputs` and `instances`, and `suffix`.
+- **A media Content-Type is a hint.** A body under `image/png` (or another
+  `skip_content_types` type) is read like any other: JSON or text under it is
+  judged, and only a binary body passes as "content-type not watched".
+  Ollama, llama.cpp and FastAPI parse the JSON whatever the header says.
+- **JSON the decoder refuses is scanned, never passed as "no text".** cjson
+  refuses a lone surrogate escape, nesting past 1000 and bytes after the
+  value; Python, Node and Go read all three. Such a body, declared JSON or
+  one that starts with `{` or `[` under any type, has its text fields, tool
+  definitions and object arguments read by the scanner; under `text/plain`
+  or no type the whole body is judged too. With nothing to scan, declared
+  JSON is `unjudgeable: invalid json`.
+- **JSON keys match without regard to case**, plus U+017F and U+212A, as Go's
+  `encoding/json` (Ollama) matches them: `{"MESSAGES":[...]}` passed as "no
+  text".
+- **Tool-call arguments are judged with the text** (OpenAI, Ollama,
+  Anthropic `tool_use`, Responses `function_call` and `mcp_call`, custom tool
+  input, AI SDK tool parts): a `**` field path reads every key and string
+  below it, a string of JSON decoded, in document order with its turn.
+- **Tool definitions are judged as a part of their own**, with the rule's
+  question and their own cache entry keyed by their text: every key and
+  string of `tools`, `functions` and output schemas except JSON Schema type
+  names, scanned whole by `always_suspect`, one window judged. A
+  pre-registered false-positive bench over 30 real tool sets
+  ([bench/tools](bench/tools/README.md)) found none at 0.5 with the
+  `injection` question (highest 0.12); the `untrusted` question flagged 14 of
+  30, so it is not used for them. Detection of poisoned tools was not
+  measured: this is not a tool-poisoning defence.
+- **More model-visible shapes are read**: Anthropic `document` blocks,
+  Responses `file_search_call` results and every `*_call_output`, Cohere
+  documents, Gemini function responses, a Bedrock Converse `toolResult`
+  (its text and json blocks), a tool or function message whose content is
+  an object, a Gemini `parts` object by its keys, and, as retrieved content
+  with `untrusted` on, the same results. Converse `toolUse.input` and Gemini
+  `functionCall.args` are read as tool-call arguments.
+- **Multipart bodies are read as RFC 2046, Go and Starlette read them**: the
+  delimiter only at a line start, every part read, the `boundary` parameter
+  by name, a file only with a `filename` parameter. A file part typed
+  `application/octet-stream` or with an empty type is read when it is text.
+  More than 8 distinct boundaries is `unjudgeable: multipart boundaries`.
+- **A prompt sent as token ids is unjudgeable** (`unjudgeable: token prompt`)
+  instead of "no text"; beside text long enough to judge, the text is
+  judged and the ids still count. A rule's new `token_prompts = "block"`
+  refuses them in enforce mode without making every unjudgeable request
+  block. SGLang's `input_ids` is a text field.
+- **Past `max_body_bytes`, nothing hides behind the cut.** Keys written with
+  JSON escapes are read, a value the head or tail cuts is read whole, a body
+  that fits in `max_body_bytes` + 64 KiB is scanned as one string, and an
+  array under a `**` key is read whole with base64 data URLs left out (only
+  under `image_url`, `url` or `file_data`, and only when base64 to the end).
+- **A compressed body that inflates past `max_body_bytes` has its tail
+  scanned**, reading on to 4 x the limit; past that it is `unjudgeable: body
+  too large`.
+- **A body the gateway cut is reported, not taken as whole.** `/_jev/authz`
+  takes a body that reaches `max_body_bytes` as cut whatever the gateway
+  says (`jev_authz_events_total{event="cut_at_cap"}`), and the new
+  `policy.partial = "unjudgeable"` reports a cut body as `unjudgeable:
+  partial body`. A client's own `X-Jev-Body-Partial` or
+  `x-envoy-auth-partial-body` never reaches `/_jev/authz` from the SPOA, the
+  gRPC shim or the reference Envoys.
+- **The walk's bounds no longer starve what follows.** An object or array
+  over the node budget (now 20,000) keeps its newest part and at most half
+  of what is left; a request left with too little to judge is `unjudgeable:
+  json over the walk bounds`, and a cut part says `(window)`.
+- **Every `always_suspect` hit places the judging window**, not the first
+  pattern's first match, so a harmless decoy no longer pushes the attack out;
+  a hit that starts inside a character takes the whole character, in both
+  cores alike.
+  A matcher that fails (PCRE's JIT stack limit, a pattern that does not
+  compile) counts as a hit, logged once. The shipped base64 pattern is one
+  class run the JIT matches at any size. The TS core runs patterns as PCRE
+  without UTF over bytes (`\s` ASCII, `.` one byte, non-ASCII literals as
+  their bytes, `i` folding ASCII only), as `ngx.re` with `ijo` does, and
+  translates the inline options `(?i)`, `(?s)`, `(?m)` and `(?x)` (and
+  `(?-i)` where the engine has RegExp modifiers) instead of counting such a
+  pattern as a hit on every text.
+- **Chunks overlap by 1 KiB**, text within `max_judge_chunks` capacity is
+  judged in full by bytes, and a hit no chunk holds whole is judged as a part
+  of its own.
+- **The fingerprint keeps digit runs and UUIDs**: "transfer 12345" reused
+  the verdict of "transfer 99999".
+- **The judge is sent well-formed text only**: ill-formed UTF-8 becomes
+  U+FFFD in both cores, so a 0xFF byte cannot make a strict judge answer 400.
+- **Linear time where a client chose the input**: form bodies (a 1 MiB body
+  held a worker for an hour), a chunk cut over continuation bytes, and
+  trimming Content-Type and subject values. The scanner reads strings in
+  byte loops LuaJIT compiles: a crafted 1 MiB body costs about 65 ms of
+  worker CPU in L1, an ordinary one about 15 ms.
+
+Judging, breaker and cache:
+- **Only a failing provider counts against the breaker.** A judge error
+  carries its kind (transport, timeout, unavailable, rejected, unusable);
+  transport, timeout and unavailable (5xx, 429, 401, 404, 405) count. About
+  20 requests the judge refused (a content filter's 400, laya-server's 400
+  for a 0xFF byte, a reply with no scores) opened the breaker for every
+  tenant. A request that says nothing about the provider hands a half-open
+  probe on (`breaker.release()`).
+- **L3 judges the parts L2 judged** (chunks, retrieved content, tool
+  definitions) and writes the whole request's cache entry only when every
+  part answered: a text-only score could be served for text with tool
+  definitions. L3 takes no L2 in-flight slot, and its outcomes are counted.
+- **The verdict-cache scope names the judge endpoint and the question
+  wording**, so routes or Workers sharing a store with different judges no
+  longer replay each other's scores.
+- **Text over `max_judge_chunks` is blocked under `unjudgeable = "block"`
+  while the breaker is open**, instead of passing as "breaker open".
+- **openai-compat**: echo detection compares the fallback answer keys the
+  parser accepts (a planted `{"score": 0}` was read as the judge's answer),
+  and the Lua and TS providers read the same JSON and compare answers to 6
+  digits.
+- **A typo in `untrusted.templates` is refused at load**, and a part whose
+  prompt cannot be built is left out instead of failing every agent request
+  open; the verdict's reason then ends in "(a part not judged)".
+- **An in-flight slot a killed thread held comes back** after a lease;
+  before, `max_inflight` such calls refused every L2 call for good.
+
+Reputation and subjects:
+- **Only the subject's own text charges reputation.** Tool definitions,
+  retrieved content, and with `untrusted` on a text that holds retrieved
+  content or a body that was scanned still decide the request but add no
+  points: text planted in a page or a mailbox could get the users whose
+  agents fetched it blocked. The same applies to L3's IP reputation.
+- **Subject values cannot be respelled**: a cookie subject is every value
+  the backend may read (duplicates, case variants, quoting) and any blocked
+  one blocks; an `Authorization` subject is keyed on the credential, not its
+  scheme's spelling; an IPv6 client is counted by its /64
+  (`client_ip.ipv6_prefix`), for IP reputation and `subject.from = "ip"`.
+- **Reputation blocks survive a flood of new subject values**: the
+  trajectory store no longer evicts, and reputation lives in
+  `jev_subject_rep`.
+- **A salted subject value up to 64 KiB is hashed** (an RS256 bearer token
+  left a request with no subject), and a dropped one is logged.
+- **An IP reputation block lasts its whole `rep_block_ttl`**, not
+  `cache.rep_ttl`.
+- **A thin Worker's authz call and its forwarded request add a subject's
+  points once**, not twice.
+- **`/_jev/authz` never takes the relay's address for the client's** (no
+  `X-Forwarded-For` in a mesh, or fewer hops than `trusted_hops`), and a
+  client's `x-envoy-external-address` never reaches it through Envoy.
+
+Verdict headers, relays and admin endpoints:
+- **Block responses carry `X-Jev-Verdict` and `X-Jev-Request-Id` only**
+  (`verdict.client_headers`): the score, reason and source were an oracle to
+  walk a prompt under the threshold.
+- **No client `X-Jev-*` header reaches the upstream, under any name**, on a
+  pass or a fail-open, on every adapter; the configured subject header stays.
+  `/_jev/authz` names the ones Envoy must remove.
+- **Admin endpoints refuse `..`, `//` and encoded slashes** in the raw path,
+  and the reference Envoys reject `%2F`: `..%2F` reached a co-located
+  `/_jev/config` through `/_jev/authz/`.
+- **`example.nginx.conf` has a gateway-only listener** for `/_jev/authz` and
+  `/_jev/forward-auth`, and a thin Worker can send an origin token
+  (`originToken`, `JEV_ORIGIN_TOKEN`).
+- **Traefik's `forwardAuth` keeps `trustForwardHeader: false`**, and an
+  invariant fails on any other value.
+
+Gateways:
+- **HAProxy**: every Content-Type value is forwarded (a second `image/png`
+  skipped the request); the size contract keeps every accepted message in
+  one SPOE frame; an answer nginx refused, an SPOE error or a missing answer
+  is unjudgeable (`-unjudged=pass|block`), never an unmarked pass; the path
+  comes from the request target, dot segments and doubled slashes are
+  resolved as nginx resolves them, and a path, header value or method Go
+  cannot relay gets 400; the agent listens on loopback, caps connections and
+  frame sizes and recovers from a malformed frame; it keeps its connections
+  to jev-edge.
+- **Envoy gRPC shim**: an answer without a verdict below 500 is unjudgeable
+  (`-unjudged`), a path it cannot relay gets 400, dot segments are resolved
+  as nginx does, a deny carries no score, reason or source, and a client's
+  `X-Jev-*` is dropped. The reference configs size the authz hop (60 KiB
+  of headers).
+- **APISIX**: judges after the access-phase gatekeepers and rate limiters
+  (priority 1000), once per request when a global rule and a route both
+  carry the plugin, and not at all for a request that matched no route; keeps
+  `jev.api_key` and `subject.salt` encrypted in etcd and resolves `$env://`
+  and `$secret://` references, and never uses one that does not resolve as
+  the salt (subject tracking is off for that conf until it does); builds the
+  runtime inside the fail-open path.
+- **Kong**: picks up a rotated vault secret for the judge key and the salt;
+  shares a breaker only between routes with the same key and tuning; keys a
+  header subject an auth plugin hid on the authenticated credential; a data
+  plane missing a rule file keeps syncing and answers that route
+  `verdict=error` naming the rule, instead of refusing every push.
+- **Istio recipe** sends every body-carrying request to ext_authz and lets
+  `watch_paths` decide, strips forged `X-Jev-*`, and knows the client.
+
+JavaScript runtime:
+- **Durable Objects work across requests**: a real stub is recognised, the
+  presets and `createRuntime` take the namespace and make a stub per
+  operation, and a stub kept past its request falls back to isolate memory
+  instead of failing every later request open.
+- **A store that fails no longer fails the request open**: writes after the
+  verdict are best effort, a failed breaker read is a closed breaker and a
+  failed timeout read the floor.
+- **The judged path is the routed one**: `nodeMiddleware` uses
+  `originalUrl` on a fixed origin (a mount path hid the route, a bad Host
+  threw), Next.js judges `nextUrl.pathname` without `basePath` and locale,
+  and a path nginx would refuse (`%u0063`, `%00`) gets 400 on every host.
+- **Bodies are read as the Lua adapters read them**: every gzip member,
+  the size in bytes (0xFF padding tripled it), `NaN` and `Infinity` as cjson
+  and Python take them, and "decoder not available" instead of "corrupt"
+  where the runtime has none (Next's edge runtime).
+- **The thin Worker** blocks whatever its origin blocked (any 4xx with
+  `X-Jev-Verdict`, at any threshold), caches only what the origin judged,
+  asks it about the whole request once, answers 404 to the origin's
+  `/_jev/*` paths, and sends the origin token.
+- **`/_jev/health` says `ok`, `adapter` and `core` only**, and Hono tells the
+  client the request id only; Hono judges a body read before it.
+- **Subject reputation on Cloudflare lives in one Durable Object per
+  subject**, and KV reputation warns that it is best effort.
+
+LiteLLM guardrail:
+- **It sends the request's structure, bounded**: roles, content parts, tool
+  calls and results, system prompts as the first message, tool definitions
+  and `text.format` unchanged, tool-call arguments and Gemini function
+  responses unfiltered, head and tail past `JEV_EDGE_MAX_BODY_BYTES`, up to
+  the 1000 levels jev-edge decodes, without recursion.
+- **Nothing a request, its key or its team sets switches it off**
+  (`disable_global_guardrail` on LiteLLM 1.80, team metadata, opted-out
+  lists), and `/guardrails/apply_guardrail` can be refused
+  (`JEV_EDGE_TEST_ENDPOINT=refuse`).
+- **It trusts only the proxy's own metadata** for the client address and
+  its verdict, and appends the peer it saw to `X-Forwarded-For`.
+- **Call types as LiteLLM passes them**: realtime text through
+  `apply_guardrail`, batch files per line, Bedrock, Gemini, Gigachat and
+  generic pass-through bodies, Bedrock text documents; a pass-through with no
+  visible body, or a document it cannot read, is unjudgeable
+  (`JEV_EDGE_UNJUDGED`), and a token-id prompt is sent to jev-edge. A body
+  whose only text is under a structural key (`id`, `name`, `toolUseId`) on a
+  path jev-edge reads whole is sent, not skipped as "no text".
+
+laya-server:
+- **It takes a burst instead of dropping it** (listen backlog, connection
+  cap), answers within the gateway's read budget or refuses at once
+  (`LAYA_GATEWAY_TIMEOUT_MS`, a cost model seeded before it listens), and
+  sizes its pool from the CPUs it may use.
+- **The client cannot make it slow or wrong**: `Content-Length` of ASCII
+  digits only, at most `LAYA_MAX_QUESTIONS` questions tokenized once,
+  special-token text encoded as text, windows cut between characters (an
+  NFKC tokenizer overflowed the model), a stalled client not logged as a
+  backend fault, and `TCP_NODELAY` (40 ms per answer).
+- **The Laya profile sends one L2 call at a time**, which laya-server's
+  default pool answers in time, and sizes its timeout floor from the
+  worst-case text.
+
+CI and release:
+- **release-npm publishes only a tag on a commit `main` has**, builds without
+  the OIDC token, and publishes the packed tarball from a job that runs no
+  repository or dependency code; a manual real publish must run on a tag.
+- **pnpm is pinned** (11.9.0) in `package.json`, every workflow reads it, and
+  no dependency build script runs.
+- **The govulncheck gate fails when the scan fails**, and non-PR runs no
+  longer cancel each other.
+
+### Added
+- Config: `client_ip.ipv6_prefix`, `policy.partial`, rule `json_only_paths`,
+  `tool_fields`, `token_prompts` and `paths_case_sensitive`, openai-compat
+  `jev.max_tokens`, `jev.token_param`, `jev.temperature` (false omits it) and
+  `jev.extra_body`. The openai-compat judge is asked with the deployment
+  context, and a failed call quotes the provider's error.
+- Kong schema: provider `laya`, `jev.ssl_verify`, `jev.questions_json`,
+  `subject.reputation`, `jev.extra_body_json`; APISIX schema likewise, with
+  `encrypt_fields`.
+- Metrics and alerts: `jev_adapter_errors_total{entry}` with
+  JevAdapterErrors, `jev_async_total{result}` with JevAsyncFailing,
+  `jev_l2_errors_total{kind}` with JevL2NoVerdicts (every L2 call failing,
+  whatever the breaker says) and JevL2Saturated (`max_inflight` refusals),
+  `jev_authz_events_total{event}`; a verdict's `error_kind`; Grafana panels
+  for each.
+- `GET /_jev/config` reports `config_error`, and `/_jev/health` answers 503
+  while a config is refused.
+- JavaScript: `state: { namespace, name }`, `health: "details"`,
+  `originToken`, `denoKvStore({ consistency })` and `getMany`.
+- Golden format 2 (breaker calls and state), `utf8.json`, `client_headers`,
+  and 717 vectors in all; `make package-check` loads the installed rock and
+  opm tree; Kong hybrid-mode e2e; the tool-definition bench.
+
+### Changed
+- **Config reload** watches the file's content (CRC-32 and length), not its
+  whole-second mtime; a file edit with a broken rule is refused whole; a
+  config refused at startup runs the defaults with their rules; a refused
+  file never becomes the one overrides are checked against, and a `DELETE`
+  the file in force cannot take answers 422.
+- **Metrics**: every family in one block, the L2 latency histogram complete
+  and up to 30 s, busy refusals and cache-only verdicts out of it; only
+  core's L2 calls feed the adaptive timeout.
+- **Sampling**: the ring keeps the size its first writer gave it, and each
+  sample names its rule (and route on Kong and APISIX) and carries the tool
+  definitions.
+- **JavaScript**: default memory stores are bounded; writes after the verdict
+  go through `waitUntil`; a JevState judged request makes two hops; Deno KV
+  reads the cache eventually consistent and the ring with `getMany`;
+  `@jev-edge/js` loads with `require()` on Node >= 20.19 and 22.12.
+- `resty.jev.loader` steps aside when `jev.core` / `jev.rules` are installed.
+
+### Fixed
+- `make opm-build`, the opm package and `make install` on a clean machine;
+  the laya-server healthcheck on another port; the conformance keepalive
+  check; the starter config's openai-compat `max_judge_bytes`; the env hint
+  of a refused reload; the Grafana breaker panel (open showed as closed) and
+  the subject-blocks legend; Kong picks the L3 and sampling rule with the
+  decoder; the JS runtime picks the sampled rule as `rule_for` does; the
+  repository invariants parse the rockspec and ci.yml properly and run their
+  own mutation tests.
+
+### Documentation
+- The operating guide and design reference follow all of the above:
+  what the default rule watches and reads, stateful APIs L1 cannot see, the
+  breaker as it is, tool definitions, reputation charges, an origin that
+  trusts a Worker's subject id, and the Kong, APISIX, HAProxy, JS and ops
+  documents. Admin examples use the example config's `127.0.0.1:9180`.
+
 ## [0.6.1] - 2026-09-23
 
 Two security fixes, a gap in what L1 reads, and documentation that is quicker

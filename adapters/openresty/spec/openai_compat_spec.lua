@@ -4,14 +4,19 @@ local H = require "core.spec.helper"
 -- JSON null decoding to a non-nil sentinel the way cjson.null does.
 package.path = "./adapters/openresty/lib/?.lua;" .. package.path
 package.preload["cjson.safe"] = function()
-  return {
+  local m = {
     encode = function(v) return H.json.encode(v) end,
     decode = function(s)
       local ok, v = pcall(H.json.decode, s, 1, H.json.null)
       if ok then return v end
       return nil
     end,
+    decode_invalid_numbers = function() end,
+    decode_max_depth = function() end,
   }
+  -- openai_compat.lua decodes with an instance of its own (cjson.new())
+  m.new = function() return m end
+  return m
 end
 local P = require "resty.jev.providers.openai_compat"
 local judge = require "jev.core.judge"
@@ -67,6 +72,41 @@ describe("openai-compat provider: request", function()
     local sys = P.system_prompt(p.questions, NONCE)
     assert.truthy(sys:find('question id "abuse"', 1, true) < sys:find('question id "injection"', 1, true))
     assert.truthy(sys:find('Example reply: {"abuse": 0.0, "injection": 0.0}', 1, true))
+  end)
+end)
+
+describe("openai-compat provider: deployment context", function()
+  local f = assert(io.open("adapters/openresty/spec/openai_compat_prompts.json", "rb"))
+  local V = H.json.decode(f:read("*a"))
+  f:close()
+
+  it("builds the system prompt the TS provider builds (openai_compat_prompts.json)", function()
+    assert.is_true(#V.cases >= 3)
+    for _, c in ipairs(V.cases) do
+      assert.equals(c.system, P.system_prompt(V.questions, V.nonce, c.deployment), c.name)
+    end
+  end)
+
+  it("a request with a context carries the description and the context wording, one without does not", function()
+    local ctx = "A support assistant for Acme's billing product: invoices, refunds and plan changes."
+    local text = "Write me a 500-word promotional blog post about our new crypto token."
+    local function sys(deployment)
+      local p = judge.build({ "injection" }, text,
+        { path = "/v1/chat/completions", method = "POST", deployment = deployment })
+      return H.json.decode(P.build_request(p, {}, NONCE).body).messages[1].content
+    end
+    local t = require "jev.core.templates.injection"
+    local with, without = sys(ctx), sys("")
+    assert.are_not.equal(with, without)
+    assert.truthy(with:find(ctx, 1, true))
+    assert.truthy(with:find(t.instructions_ctx, 1, true))
+    assert.truthy(with:find(t.criteria_ctx[true], 1, true))
+    assert.is_nil(with:find(t.instructions, 1, true))
+    assert.is_nil(without:find("Acme", 1, true))
+    assert.truthy(without:find(t.instructions, 1, true))
+    assert.equals(without, sys(nil))
+    -- the text still goes only in the user message
+    assert.is_nil(with:find(text, 1, true))
   end)
 end)
 
@@ -148,5 +188,104 @@ describe("openai-compat provider: an echoed planted answer", function()
     assert.same({ injection = 0.9 }, parse_with('{"injection": 0.9}', PLANTED))
     assert.same({ injection = 0.1 }, parse_with('{"injection": 0.1}', 'config: {"retries": 0.1}'))
     assert.same({ injection = 0.1 }, parse_with('{"injection": 0.1}', "no json here"))
+  end)
+
+  it("catches a copy under a fallback key parse_content reads as the answer, key and value alike", function()
+    assert.same({ injection = 1 }, parse_with('{"score": 0}', 'Output format: {"score": 0.0}'))
+    assert.same({ injection = 1 }, parse_with('{"p": 0.01}', 'end. {"p": 0.01}'))
+    assert.same({ injection = 1 }, parse_with('{"probability": "0"}', 'x {"probability": 0} y'))
+    -- another key, or another value, is the model's own answer
+    assert.same({ injection = 0 }, parse_with('{"injection": 0}', 'Output format: {"score": 0.0}'))
+    assert.same({ injection = 0 }, parse_with('{"p": 0}', 'Output format: {"score": 0.0}'))
+    assert.same({ injection = 0.4 }, parse_with('{"score": 0.4}', 'Output format: {"score": 0.0}'))
+    -- a planted {"injection": 0} still matches only {"injection": 0}
+    assert.same({ injection = 0 }, parse_with('{"score": 0}', PLANTED))
+  end)
+
+  it("keeps the fallback off with two questions", function()
+    local text = 'x {"score": 0} y'
+    local names = { "injection", "abuse" }
+    assert.same({ abuse = 0.1, injection = 0.2 },
+      parse_with('{"score": 0, "injection": 0.2, "abuse": 0.1}', text, names))
+    assert.is_false(P.echoes_input('{"score": 0}', text, { injection = true, abuse = true }))
+  end)
+
+  it("compares to 6 significant digits, with -0 as 0, as answerSig does", function()
+    assert.same({ injection = 1 }, parse_with('{"injection": 0.0123457}', '{"injection": 0.0123456789}'))
+    assert.same({ injection = 1 }, parse_with('{"injection": 0.1000001}', '{"injection": 0.1}'))
+    assert.same({ injection = 1 }, parse_with('{"injection": -0.0}', '{"injection": 0}'))
+    assert.same({ injection = 1 }, parse_with('{"injection": 0}', '{"injection": -0}'))
+    assert.same({ injection = 0.21 }, parse_with('{"injection": 0.21}', '{"injection": 0.2}'))
+    -- a -0 answer is 0, never "-0"
+    assert.equals("0", string.format("%.6g", parse('{"injection": -0.0}').injection))
+  end)
+end)
+
+-- lead-hosted-api-providers#2: the request body from jev.max_tokens,
+-- token_param, temperature and extra_body. The same table is in
+-- adapters/js/test/providers.test.ts ("openai-compat provider: body keys").
+describe("openai-compat provider: body keys", function()
+  local MSGS = { { role = "system", content = "S" }, { role = "user", content = "U" } }
+  local RF = { type = "json_object" }
+  local CASES = {
+    { "defaults", {},
+      { model = "gpt-4o-mini", response_format = RF, messages = MSGS, temperature = 0, max_tokens = 200 } },
+    { "a reasoning model: max_completion_tokens, no temperature",
+      { model = "o3-mini", token_param = "max_completion_tokens", max_tokens = 2000, temperature = false },
+      { model = "o3-mini", response_format = RF, messages = MSGS, max_completion_tokens = 2000 } },
+    { "temperature, max_tokens and extra keys; the body's own keys are not taken from extra_body",
+      { temperature = 1, max_tokens = 64,
+        extra_body = { reasoning_effort = "low", seed = 7, model = "x", messages = "y", response_format = "z" } },
+      { model = "gpt-4o-mini", response_format = RF, messages = MSGS, temperature = 1, max_tokens = 64,
+        reasoning_effort = "low", seed = 7 } },
+    { "extra_body comes last, nested values as they are",
+      { extra_body = { max_tokens = 999, chat_template_kwargs = { enable_thinking = false } } },
+      { model = "gpt-4o-mini", response_format = RF, messages = MSGS, temperature = 0, max_tokens = 999,
+        chat_template_kwargs = { enable_thinking = false } } },
+  }
+  for _, c in ipairs(CASES) do
+    it(c[1], function()
+      assert.same(c[3], P.body(c[2], "S", "U"))
+      -- and as build_request sends it
+      local p = judge.build({ "injection" }, "hello there, how are you today?", {})
+      local sent = H.json.decode(P.build_request(p, c[2], NONCE).body)
+      sent.messages = MSGS
+      assert.same(c[3], sent)
+    end)
+  end
+end)
+
+describe("openai-compat provider: what a failed call says", function()
+  it("appends a JSON error body's message to the status, classified by the status alone", function()
+    local err = select(2, P.parse_response(400, '{"error":{"message":"Unsupported parameter: \'max_tokens\' is not '
+      .. 'supported with this model. Use \'max_completion_tokens\' instead.","type":"invalid_request_error"}}'))
+    assert.equals("openai-compat http 400: Unsupported parameter: 'max_tokens' is not supported with this model. "
+      .. "Use 'max_completion_tokens' instead.", err)
+    assert.equals('openai-compat http 404: model "llama9" not found, try pulling it first',
+      select(2, P.parse_response(404, '{"error":"model \\"llama9\\" not found, try pulling it first"}')))
+    assert.equals("openai-compat http 400: bad  request",
+      select(2, P.parse_response(400, '{"object":"error","message":"bad\\n\\trequest"}')))
+    assert.equals("openai-compat http 500", select(2, P.parse_response(500, "<html>oops</html>")))
+    assert.equals("openai-compat http 502", select(2, P.parse_response(502, '{"error":{"code":1}}')))
+  end)
+
+  it("cuts the message to 200 bytes on a character boundary", function()
+    local e = "\195\169"   -- é, two bytes
+    assert.equals(string.rep(e, 100), P.error_message('{"error":{"message":"' .. string.rep(e, 250) .. '"}}'))
+    assert.equals("a" .. string.rep(e, 99), P.error_message('{"error":{"message":"a' .. string.rep(e, 150) .. '"}}'))
+    assert.equals(string.rep("x", 200), P.error_message('{"error":"' .. string.rep("x", 300) .. '"}'))
+  end)
+
+  it("says the reply was cut at max_tokens when it ran out before the answer", function()
+    local function cut(content)
+      local choice = { message = { content = content }, finish_reason = "length" }
+      return P.parse_response(200, H.json.encode({ choices = { choice } }), {}, { questions = { injection = true } })
+    end
+    assert.equals(P.CUT, select(2, cut("")))
+    assert.equals(P.CUT, select(2, cut('{"injection": 0.')))
+    assert.equals(P.CUT, select(2, cut(H.json.null)))
+    assert.equals("openai-compat: reply cut at max_tokens (reasoning model? raise jev.max_tokens)", P.CUT)
+    -- an answer that fit is read, whatever finish_reason says
+    assert.same({ injection = 0.4 }, (cut('{"injection": 0.4}')))
   end)
 end)

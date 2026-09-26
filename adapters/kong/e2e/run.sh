@@ -7,6 +7,11 @@ cd "$(dirname "$0")"
 tmp=$(mktemp -d)
 cleanup() { docker compose down -v --remove-orphans >/dev/null 2>&1 || true; rm -rf "$tmp"; }
 trap cleanup EXIT
+# the e2efile vault's secret (kong.yml route "vault"), readable by the containers
+mkdir -p "$tmp/secrets"
+printf 'vault-key-1' > "$tmp/secrets/jevkey"
+chmod 755 "$tmp" "$tmp/secrets"; chmod 644 "$tmp/secrets/jevkey"
+export JEV_E2E_SECRETS="$tmp/secrets"
 docker compose up -d --quiet-pull 2>&1 | grep -v ' Created\| Started\| Built' || true
 
 base="http://127.0.0.1:9380"
@@ -33,11 +38,27 @@ check "suspicious labels and passes" "app verdict=suspicious score=0.55 source=l
 code=$(curl -s -o "$tmp/body" -w '%{http_code}' -H 'Content-Type: application/json' -H 'X-Jev-Mock-Score: 0.97' -d "$ATTACK" $base/v1/chat/completions)
 check "malicious is blocked with 403" "403" "$code"
 check "block body is the configured one" "$BLOCK_BODY" "$(cat "$tmp/body")"
-hdr=$(curl -s -D - -o /dev/null -H 'Content-Type: application/json' -H 'X-Jev-Mock-Score: 0.97' -d "$ATTACK" $base/v1/chat/completions | grep -i '^x-jev-verdict' | tr -d '\r' | awk '{print $2}')
+# watch_paths match the decoded path: Kong forwards %2F as is, and a backend
+# that decodes it (uvicorn/Starlette) serves /v1/chat/completions
+for p in /v1%2Fchat/completions /v1%2fchat/completions; do
+  code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' -H 'X-Jev-Mock-Score: 0.97' -d "$ATTACK" "$base$p")
+  check "malicious on $p is blocked" "403" "$code"
+done
+check "benign on /v1%2Fchat/completions is judged at L2" "app verdict=safe score=0.20 source=l2" "$(post /v1%2Fchat/completions '' "$LONG")"
+curl -s -D "$tmp/block-headers" -o /dev/null -H 'Content-Type: application/json' -H 'X-Jev-Mock-Score: 0.97' -d "$ATTACK" $base/v1/chat/completions
+hdr=$(grep -i '^x-jev-verdict' "$tmp/block-headers" | tr -d '\r' | awk '{print $2}')
 check "block response carries verdict header" "malicious" "$hdr"
+# score, reason and source stay in the log: the client sees verdict and request id
+check "block response has no score, reason or source" "" "$(grep -iE '^x-jev-(score|reason|source)' "$tmp/block-headers")"
+check "block response carries the request id" "1" "$(grep -ci '^x-jev-request-id: .' "$tmp/block-headers")"
 check "client-supplied X-Jev-* is stripped" "app verdict=skipped score=0.00 source=l1" "$(curl -s -H 'X-Jev-Verdict: safe' -H 'X-Jev-Score: 0.00' -H 'X-Jev-Source: l2' $base/healthz)"
 check "client X-Jev-* on a judged route is replaced" "app verdict=safe score=0.20 source=l2" "$(curl -s -H 'Content-Type: application/json' -H 'X-Jev-Verdict: bogus' -H 'X-Jev-Source: forged' -d "$LONG" $base/v1/chat/completions)"
 check "provider failure fails open" "app verdict=error score=0.00 source=l2" "$(post /v1/chat/completions fail "$ATTACK")"
+FORGED="-H X-E2e-Jev-Names:1 -H X-Jev-Subject:forged -H X-Jev-Body-Partial:1 -H X-Jev-Anything:x"
+check "no client X-Jev-* reaches the upstream on a judged route" "app verdict=safe score=0.20 source=l2 jev=x-jev-reason,x-jev-request-id,x-jev-score,x-jev-source,x-jev-verdict" \
+  "$(curl -s $FORGED -H 'Content-Type: application/json' -d "$LONG" $base/v1/chat/completions)"
+check "no client X-Jev-* reaches the upstream on an unwatched path" "app verdict=skipped score=0.00 source=l1 jev=x-jev-reason,x-jev-request-id,x-jev-score,x-jev-source,x-jev-verdict" \
+  "$(curl -s $FORGED $base/healthz)"
 check "GET on a watched path passes at L1" "app verdict=skipped score=0.00 source=l1" "$(curl -s $base/v1/models)"
 printf '%s' "$LONG" | gzip -c > "$tmp/long.gz"
 printf '%s' "$ATTACK" | gzip -c > "$tmp/attack.gz"
@@ -54,7 +75,69 @@ check "body spooled to disk is judged at L2" "app verdict=safe score=0.20 source
 check "inline tenant rule (rules_json) watches its path" "app verdict=safe score=0.20 source=l2" "$(post /v1/billing/ask '' "$LONG")"
 code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' -H 'X-Jev-Mock-Score: 0.97' -d "$ATTACK" $base/v1/billing/ask)
 check "inline tenant rule blocks" "403" "$code"
+# Route A's key is out of quota (the stub answers 429): A's breaker opens,
+# and route B on the same endpoint with another key is still judged
+src() { printf '%s' "$1" | sed -n 's/.* source=\([a-z0-9]*\).*/\1/p'; }
+last=""
+for i in $(seq 1 30); do
+  last=$(src "$(post /qa/chat/completions '' "$LONG")")
+  [ "$last" = "breaker" ] && break
+done
+check "route A's breaker opens on its key's 429s" "breaker" "$last"
+check "route B (same endpoint, another key) is still judged at L2" "app verdict=safe score=0.10 source=l2" "$(post /qb/chat/completions '' "$LONG")"
+check "route B still blocks an injection" "403" \
+  "$(curl -s -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' -d "$ATTACK" $base/qb/chat/completions)"
+# A rotated vault secret: Kong rewrites api_key in place on the same conf
+# table, and the next calls must carry the new key (the stub answers 401 to
+# the old one), not the one the runtime was first built with.
+check "vault key reaches the judge" "app verdict=safe score=0.10 source=l2" "$(post /vr/chat/completions '' "$LONG")"
+printf 'vault-key-2' > "$tmp/secrets/jevkey"
+last=""
+for i in $(seq 1 20); do
+  sleep 1
+  last=$(post /vr/chat/completions '' "$LONG")
+  [ "$last" = "app verdict=safe score=0.10 source=l2" ] && break
+done
+check "a rotated vault key is picked up" "app verdict=safe score=0.10 source=l2" "$last"
+# Keys the schema used to refuse (subject.reputation, provider laya,
+# ssl_verify, questions_json): the config parses, and they work.
+check "kong.yml with them parses" "yes" \
+  "$(docker compose exec -T kong kong config parse /kong/kong.yml 2>&1 | grep -q 'parse successful' && echo yes || echo no)"
+code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' -H 'X-User: alice' -H 'X-Jev-Mock-Score: 0.97' -d "$ATTACK" $base/rep/chat/completions)
+check "subject.reputation: an injection is blocked" "403" "$code"
+code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' -H 'X-User: alice' -d "$LONG" $base/rep/chat/completions)
+check "subject.reputation: that subject is then refused" "403" "$code"
+check "subject.reputation: another subject is not" "app verdict=safe score=0.20 source=l2" \
+  "$(curl -s -H 'Content-Type: application/json' -H 'X-User: bob' -d "$LONG" $base/rep/chat/completions)"
+bad='_format_version: "3.0"
+services:
+  - name: s
+    url: http://app:8081
+    routes:
+      - name: r
+        paths: ["/r"]
+        plugins:
+          - name: jev-edge
+            config:
+              jev: { provider: mock, questions_json: '"'"'{"injection":{"instructions":""}}'"'"' }'
+check "a questions_json core refuses is refused" "yes" \
+  "$(printf '%s\n' "$bad" | docker compose exec -T kong sh -c 'cat > /tmp/bad.yml; kong config parse /tmp/bad.yml' 2>&1 | grep -q 'instructions must be a non-empty string' && echo yes || echo no)"
+check "provider laya judges" "app verdict=safe score=0.10 source=l2" "$(post /laya/chat/completions '' "$LONG")"
+check "provider laya blocks an injection" "403" \
+  "$(curl -s -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' -d "$ATTACK" $base/laya/chat/completions)"
+# key-auth with hide_credentials: the X-Api-Key subject is the credential
+code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' -H 'X-Api-Key: alice-key' -H 'X-Jev-Mock-Score: 0.97' -d "$ATTACK" $base/keyed/chat/completions)
+check "hidden key: an injection is blocked" "403" "$code"
+code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' -H 'X-Api-Key: alice-key' -d "$LONG" $base/keyed/chat/completions)
+check "hidden key: that key's credential is then refused" "403" "$code"
+check "hidden key: another key is not" "app verdict=safe score=0.20 source=l2" \
+  "$(curl -s -H 'Content-Type: application/json' -H 'X-Api-Key: bob-key' -d "$LONG" $base/keyed/chat/completions)"
+check "hidden key: the decision names a subject" "yes" \
+  "$(docker compose logs kong 2>/dev/null | grep 'jev-edge: {' | grep 'keyed' | grep -q '"subject":"header:' && echo yes || echo no)"
 check "log_line writes the decision" "yes" "$(docker compose logs kong 2>/dev/null | grep -q 'jev-edge: {.*"verdict":"malicious"' && echo yes || echo no)"
 
 if [ $fail -ne 0 ]; then echo; echo "--- kong logs"; docker compose logs kong | tail -40; exit 1; fi
 echo "kong e2e: all checks passed"
+
+# hybrid mode (control plane + data plane), its own project and no host ports
+sh ./hybrid.sh

@@ -1,42 +1,74 @@
 """jev-edge as a LiteLLM proxy guardrail.
 
 LiteLLM proxy is where a lot of LLM traffic actually flows. This guardrail
-sends each request's messages to a running jev-edge (``/_jev/authz``, the same
-endpoint Envoy and the recipes use) and blocks or annotates the request with
-the verdict. No core port, no second set of thresholds: jev-edge decides,
-this file only carries the answer.
+sends each request's text, in its original structure, to a running jev-edge
+(``/_jev/authz``, the same endpoint Envoy and the recipes use) and blocks or
+annotates the request with the verdict. No core port, no second set of
+thresholds: jev-edge decides, this file only carries the answer.
 
-config.yaml::
+config.yaml (the file sits next to it; LiteLLM loads ``<file>.<Class>`` from
+the config's directory)::
 
     guardrails:
       - guardrail_name: jev-edge
         litellm_params:
           guardrail: jev_edge_guardrail.JevEdgeGuardrail
           mode: pre_call
-          jev_edge_url: http://jev-edge:8080      # or env JEV_EDGE_URL
-          # optional
-          enforce: true          # false = monitor: never block, only annotate
-          timeout: 2.0           # seconds; exceeded = fail open
-          path: /v1/chat/completions   # what jev-edge's L1 sees as the path
+          default_on: true
+
+Without ``default_on: true`` LiteLLM runs the hook only for requests and keys
+that name the guardrail; a warning is logged at startup. With it, nothing a
+request, a key or a team sets (``disable_global_guardrail(s)``,
+``opted_out_global_guardrails``) switches it off.
+
+Every setting has an environment variable. LiteLLM 1.81.0 and later also
+pass the keys under ``litellm_params`` to the class as keyword arguments,
+which win over the environment; older versions pass only ``guardrail_name``,
+``event_hook`` and ``default_on``, so there the environment is the only way:
+
+    JEV_EDGE_URL             jev-edge's base URL (required)
+    JEV_EDGE_ENFORCE         true (default) | false = monitor: never block
+    JEV_EDGE_TIMEOUT         seconds, default 2.0; exceeded = fail open
+    JEV_EDGE_PATH            the path jev-edge's L1 sees, default /v1/chat/completions
+    JEV_EDGE_MAX_BODY_BYTES  largest body sent, default 1048576 (jev-edge's
+                             max_body_bytes and nginx's client_max_body_size)
+    JEV_EDGE_EXTRA_FIELDS    comma list of top-level keys also sent, for the
+                             paths jev-edge's untrusted.fields names
+    JEV_EDGE_UNJUDGED        pass (default) | block: what a request nobody
+                             could judge gets, and a request with a part
+                             nobody could judge (a Bedrock text document
+                             the guardrail cannot read: the rest is judged,
+                             the verdict notes it as ``unjudged``)
+    JEV_EDGE_TEST_ENDPOINT   judge (default) | refuse: what a call from
+                             LiteLLM's /guardrails/apply_guardrail gets
 
 Contract: only an answer carrying ``X-Jev-Verdict`` is trusted. 200 with the
 header is a decision; any status >= 400 with the header is a block (whatever
-``policy.block_status`` is); anything else, and any error reaching jev-edge
-(connection refused, timeout, a 5xx from something that is not jev-edge),
-fails open: the request goes through with
-``metadata.jev_verdict == {"verdict": "error", ...}``.
-
-Put ``adapters/litellm`` on ``PYTHONPATH`` (or copy this file next to your
-config). Requires ``httpx``, which LiteLLM already depends on.
+``policy.block_status`` is). An answer without the header below 500 other
+than 429 (nginx refusing the request before jev-edge ran: 400, 413, 414, a
+404 from something that is not jev-edge) means nobody judged it:
+``verdict: skipped``, ``source: adapter``, reason ``unjudgeable: authz
+answered <status>``, passed or blocked as ``unjudged`` says. A judge that is
+not available (connection refused, timeout, a 5xx or a 429 without the
+header) fails open with ``jev_verdict == {"verdict": "error", ...}``,
+whatever ``unjudged`` says. Requires ``httpx``, which LiteLLM already
+depends on.
 """
 
 from __future__ import annotations
 
+import base64
+import binascii
+import contextvars
+import importlib.util
 import json
 import logging
+import math
 import os
-from typing import Any, Optional, Union
-from urllib.parse import unquote_plus
+import re
+import time
+from typing import Any, Callable, Optional, Union
+from urllib.parse import unquote_plus, urlsplit
 
 import httpx
 
@@ -58,6 +90,785 @@ log = logging.getLogger("jev_edge")
 
 HEADER_NAMES = ("x-jev-verdict", "x-jev-score", "x-jev-source", "x-jev-reason", "x-jev-request-id")
 
+MAX_BODY_BYTES = 1048576  # jev-edge's rules.max_body_bytes, nginx's default client_max_body_size
+TAIL_BYTES = 65536        # jev-edge's rules.TAIL_BYTES: the tail scanned with the head of a larger body
+
+# Tool definitions, sent first and unchanged: jev-edge judges them on their
+# own, apart from the conversation. The Responses API's `text` is one when it
+# is an object: its `format` is that API's response_format (a string `text`
+# elsewhere is text). Gemini's `tools` (functionDeclarations) share the key.
+DEFINITION_KEYS = ("tools", "functions", "response_format")
+# Top-level keys that carry text, in the order they are sent: the
+# conversation last, so the newest turn is in the tail of a body that has to
+# be cut. `messages` / `input` keep their structure (roles, content parts,
+# tool_result / tool_use blocks, function_call_output items) so jev-edge's
+# untrusted judging finds tool results exactly as it does in-line. A system
+# prompt (Anthropic's top-level `system`, the Responses API's `instructions`)
+# is sent as the first `messages` entry, with role system: every jev-edge
+# version reads messages[*].content, none reads a top-level `instructions`,
+# and not every version reads `system`.
+SYSTEM_KEYS = ("system", "instructions")
+TEXT_KEYS = ("query", "text", "prompt", "input", "messages")
+# A Gemini body (generateContent, and the /gemini and /vertex_ai
+# pass-through) is sent as it is: its system instruction after the tool
+# definitions, `contents` last. jev-edge reads systemInstruction.parts,
+# system_instruction.parts and contents[*].parts (contents.parts for one
+# content, and a `parts` that is one part object) with its default
+# text_fields. A `parts` object gets its keys added as text parts after it
+# (_gemini_contents): LiteLLM's generateContent adapter iterates it and
+# sends each key to the model as a text part.
+GEMINI_SYSTEM_KEYS = ("systemInstruction", "system_instruction")
+GEMINI_CONTENTS = "contents"
+
+# Content parts that carry media: only their `type` (and any `text` or
+# `content`, which jev-edge would read in-line too) is sent.
+MEDIA_PARTS = frozenset({"image_url", "input_image", "image", "input_audio", "audio", "file", "input_file"})
+# Keys whose values are media payloads wherever they appear (`bytes`: a
+# Bedrock Converse image, document or video source), except in tool calls
+# and tool results sent whole (SENT_WHOLE). A Converse document of a text
+# format is read first: its text goes on as a text part (_bedrock_documents).
+MEDIA_KEYS = frozenset({"image_url", "input_audio", "file_data", "inline_data", "inlineData", "bytes"})
+# Bedrock Converse document formats that are text: the model reads the
+# document's bytes as text, so they are decoded and judged. The others (pdf,
+# doc, docx, xls, xlsx) are media.
+TEXT_DOCUMENT_FORMATS = frozenset({"txt", "md", "csv", "html"})
+# Strings under these keys name structure, not text: a body with nothing else
+# is not worth a round trip. Below a path sent whole every key and string is
+# text. `toolUseId` is Bedrock Converse's tool_use_id.
+STRUCTURAL_KEYS = frozenset({"role", "type", "id", "call_id", "tool_call_id", "tool_use_id", "toolUseId", "name",
+                             "media_type", "status", "model", "cache_control"})
+# Paths from a top-level key, keys folded as jev-edge folds them, "*" for
+# each item of an array.
+# Tool-call arguments, sent whole like the tool definitions: they are
+# model-visible text, so a key the media filter drops elsewhere (`bytes`,
+# `image_url`) is text here. jev-edge's rules for tool-call arguments read
+# every key and string of OpenAI's, Anthropic's and the Responses API's
+# (messages[*].tool_calls[*].function.arguments.**,
+# messages[*].content[*].input.**, ...), Bedrock Converse's toolUse.input
+# and Gemini's functionCall.args included.
+TOOL_ARGUMENTS = frozenset({
+    ("messages", "*", "tool_calls", "*", "function", "arguments"),
+    ("messages", "*", "tool_calls", "*", "custom", "input"),
+    ("messages", "*", "function_call", "arguments"),
+    ("messages", "*", "content", "*", "input"),
+    ("messages", "*", "content", "*", "tooluse", "input"),
+    ("input", "*", "arguments"),
+    ("input", "*", "input"),
+    ("contents", "*", "parts", "*", "functioncall", "args"),
+    ("contents", "*", "parts", "*", "function_call", "args"),
+    ("contents", "parts", "*", "functioncall", "args"),
+    ("contents", "parts", "*", "function_call", "args"),
+})
+# Tool results the model reads as JSON, sent whole for the same reason:
+# Gemini's functionResponse.response (function_response in the REST API's
+# snake_case), which jev-edge reads whole, every key and string, as a tool
+# result, and a Bedrock Converse toolResult's `json` blocks. A toolResult's
+# image and video blocks, and its documents of a binary format, are media:
+# their `bytes` are left out (a text document is read, _bedrock_documents).
+TOOL_RESULTS = frozenset({
+    ("contents", "*", "parts", "*", "functionresponse", "response"),
+    ("contents", "*", "parts", "*", "function_response", "response"),
+    ("contents", "parts", "*", "functionresponse", "response"),
+    ("contents", "parts", "*", "function_response", "response"),
+    ("messages", "*", "content", "*", "toolresult", "content", "*", "json"),
+})
+SENT_WHOLE = TOOL_ARGUMENTS | TOOL_RESULTS
+_SENT_WHOLE_PREFIXES = frozenset(p[:i] for p in SENT_WHOLE for i in range(1, len(p)))
+# Paths jev-edge reads whole, every key and string (a key named `name` or
+# `id` included): the tool definitions, retrieved documents, a Responses
+# stored prompt's variables, AI SDK 5 tool parts' input and output, and a
+# Cohere v2 document part. The media filter treats them as any other path;
+# only the text check (_has_text) does not take a structural key's string
+# for no text there. A tool or function message whose content is an object
+# is read whole too (_has_text checks the role).
+READ_WHOLE = SENT_WHOLE | frozenset({
+    ("tools",), ("functions",), ("response_format", "json_schema"), ("text", "format"),
+    ("documents",), ("prompt", "variables"),
+    ("messages", "*", "parts", "*", "input"), ("messages", "*", "parts", "*", "output"),
+    ("messages", "*", "content", "*", "document"),
+})
+_READ_WHOLE_PREFIXES = frozenset(p[:i] for p in READ_WHOLE for i in range(1, len(p)))
+# Containers nested deeper than this below a top-level key are dropped:
+# jev-edge's decoder (cjson) refuses JSON nested more than 1000 levels, and
+# the body's own top-level object is the first of them. Below that, jev-edge
+# reads tool definitions and tool-call arguments to any depth its decoder
+# takes. The copy and its encoding are made without recursion, so no depth is
+# bounded by Python's recursion limit, on any Python LiteLLM runs on.
+MAX_DEPTH = 999
+
+# ---------------------------------------------------------------------------
+# call types (LiteLLM passes the route's call type to async_pre_call_hook,
+# sync and async names both seen)
+# ---------------------------------------------------------------------------
+
+# Not model input, and not watched by in-line jev-edge either: embeddings,
+# moderation, audio, rerank, media generation, and search queries (a vector
+# store's or a web search tool's; what they return reaches a model only in a
+# later request, which is judged).
+SKIP_CALLS = frozenset({
+    "embedding", "aembedding", "embeddings",
+    "moderation", "amoderation",
+    "transcription", "atranscription", "audio_transcription",
+    "speech", "aspeech",
+    "rerank", "arerank",
+    "image_generation", "aimage_generation", "image_edit", "aimage_edit",
+    "image_variation", "aimage_variation",
+    "video_generation", "avideo_generation", "create_video", "acreate_video",
+    "video_remix", "avideo_remix", "video_edit", "avideo_edit", "video_extension", "avideo_extension",
+    "vector_store_search", "avector_store_search", "search", "asearch",
+})
+
+# Calls whose prompts reach the model without passing through this hook's
+# data: nothing to judge, so the request is unjudgeable.
+NOT_VISIBLE_CALLS = {
+    "create_batch": "the prompts are in the input file",
+    "acreate_batch": "the prompts are in the input file",
+    # the realtime WebSocket: audio and the session's instructions are never
+    # judged; typed text is, one message at a time, through apply_guardrail
+    # where LiteLLM calls it (see _ApplyGuardrailBase)
+    "_arealtime": "realtime audio and session instructions are not visible to the guardrail",
+    "arealtime_calls": "realtime (WebRTC) audio is not visible to the guardrail",
+    # the Responses API's WebSocket mode: the hook runs once, as the socket
+    # opens; no frame is judged
+    "_aresponses_websocket": "the socket's messages are not visible to the guardrail",
+}
+
+# Pass-through routes. The Bedrock pass-through (/bedrock/..., call type
+# allm_passthrough_route) nests the client's body, in Bedrock's own format,
+# under `data`, next to LiteLLM's own keys; Gigachat's (/gigachat/... for a
+# model of the config) under `json`. The generic pass-through (/anthropic,
+# /openai, /gemini, /vertex_ai, /vllm, ..., and a config's
+# pass_through_endpoints; call type pass_through_endpoint) hands the client's
+# body itself with LiteLLM's logging object added (no body for a multipart
+# form on 1.102, as for a GET), and a WebSocket pass-through (Vertex AI Live)
+# an empty dict.
+NESTED_PASSTHROUGH_CALLS = frozenset({"allm_passthrough_route", "llm_passthrough_route"})
+PASSTHROUGH_CALL = "pass_through_endpoint"
+# Keys LiteLLM adds next to a generic pass-through's body (its `metadata` is
+# taken out before the body is sent on).
+LITELLM_OWN_KEYS = frozenset({"litellm_logging_obj", "litellm_call_id", "proxy_server_request", "secret_fields",
+                              "metadata", "litellm_metadata"})
+
+# LiteLLM 1.102's /guardrails/apply_guardrail runs the pre-call hooks first,
+# with this call type, then calls apply_guardrail (1.80 calls apply_guardrail
+# alone).
+TEST_ENDPOINT_CALL = "apply_guardrail"
+
+# The routes whose proxy metadata LiteLLM keeps in `litellm_metadata` (their
+# API has a `metadata` parameter of its own, which is the client's), from
+# litellm.proxy.litellm_pre_call_utils._get_metadata_variable_name.
+LITELLM_METADATA_ROUTES = ("thread", "assistant", "batches", "bedrock", "/v1/messages", "responses", "files")
+
+
+def _thread_message(data: dict) -> dict:
+    """add_message: one message, top-level role and content."""
+    return {"messages": [{"role": data.get("role") or "user", "content": data.get("content")}]}
+
+
+def _run(data: dict) -> dict:
+    """run_thread: instructions and additional_instructions (system), then
+    additional_messages."""
+    msgs: list = []
+    for key in ("instructions", "additional_instructions"):
+        if data.get(key) is not None:
+            msgs.append({"role": "system", "content": data[key]})
+    extra = data.get("additional_messages")
+    if isinstance(extra, list):
+        msgs.extend(extra)
+    return {"messages": msgs}
+
+
+def _assistant(data: dict) -> dict:
+    """create_assistants: the instructions every run of it starts with."""
+    return {"messages": [{"role": "system", "content": data.get("instructions")}]}
+
+
+_BATCH_SCAN: list = []
+
+
+def _litellm_scans_batch_files() -> bool:
+    """Whether this LiteLLM runs the pre-call guardrails over every line of a
+    batch input file after the upload's own hook (litellm 1.99 and later:
+    batch_guardrails.scan_batch_input_file). The upload's hook itself only
+    sees the file's name, type and size."""
+    if not _BATCH_SCAN:
+        try:
+            found = importlib.util.find_spec("litellm.proxy.openai_files_endpoints.batch_guardrails") is not None
+        except Exception:  # no LiteLLM, or no proxy
+            found = False
+        _BATCH_SCAN.append(found)
+    return _BATCH_SCAN[0]
+
+
+# ---------------------------------------------------------------------------
+# the body jev-edge judges
+# ---------------------------------------------------------------------------
+
+_DROP = object()
+
+
+def _fold(key: str) -> str:
+    """A key as jev-edge matches it, the way Go's encoding/json does: case
+    folded, U+017F (long s) as s (U+212A, the Kelvin sign, lower-cases to k)."""
+    return key.lower().replace("\u017f", "s")
+
+
+_WHOLE = object()
+
+
+def _step(path: Any, seg: str, whole: frozenset = SENT_WHOLE, prefixes: frozenset = _SENT_WHOLE_PREFIXES) -> Any:
+    """Where a child at `seg` is: _WHOLE below a path in `whole` (by default
+    the paths sent whole), the path while it can still lead to one, None
+    once it cannot."""
+    if path is None or path is _WHOLE:
+        return path
+    path = path + (seg,)
+    if path in whole:
+        return _WHOLE
+    return path if path in prefixes else None
+
+
+def _clean(node: Any, media: bool = True, key: Optional[str] = None) -> Any:
+    """A JSON-safe copy of `node`, the value of top-level key `key`, to
+    MAX_DEPTH, without media payloads outside the paths sent whole
+    (SENT_WHOLE; with `media` false, everything JSON can carry is kept).
+    Built with a stack of its own, so a client's nesting cannot exhaust
+    Python's recursion limit; every container is placed when its parent is
+    copied, so keys and items keep their order."""
+    stack: list = []
+
+    def start(v: Any, depth: int, media: bool, path: Optional[tuple]) -> Any:
+        """A scalar as it is sent, an empty container queued to be filled,
+        or _DROP. `path` is where `v` is while it can still lead to a path
+        sent whole, None once it cannot."""
+        if isinstance(v, str) or v is None or isinstance(v, (bool, int)):
+            return v
+        if isinstance(v, float):
+            return v if math.isfinite(v) else _DROP
+        if depth > MAX_DEPTH:
+            return _DROP
+        if not isinstance(v, (dict, list, tuple)) and callable(getattr(v, "model_dump", None)):
+            try:  # a pydantic object LiteLLM put in the request
+                v = v.model_dump()
+            except Exception:
+                return _DROP
+        if isinstance(v, dict):
+            out: Any = {}
+        elif isinstance(v, (list, tuple)):
+            out = []
+        else:
+            return _DROP
+        stack.append((v, out, depth, media, path))
+        return out
+
+    def below(media: bool, path: Optional[tuple], seg: str) -> tuple:
+        """`media` and `path` for a child at `seg` ("*" for an array item)."""
+        p = _step(path, seg)
+        return (False, None) if p is _WHOLE else (media, p)
+
+    top = (_fold(key),) if media and key is not None else None
+    root = start(node, 1, media, top if top in _SENT_WHOLE_PREFIXES else None)
+    while stack:
+        src, out, depth, media, path = stack.pop()
+        if isinstance(out, list):
+            cmedia, cpath = below(media, path, "*")
+            for v in src:
+                c = start(v, depth + 1, cmedia, cpath)
+                if c is not _DROP:
+                    out.append(c)
+            continue
+        t = src.get("type") if media else None
+        keep = None
+        if t == "base64":  # Anthropic source: the bytes are the payload
+            keep = ("type", "media_type")
+        elif isinstance(t, str) and t in MEDIA_PARTS:
+            keep = ("type", "text", "content")
+        for k, v in src.items():
+            k = str(k)
+            cmedia, cpath = below(media, path, _fold(k)) if path is not None else (media, None)
+            # a path sent whole, and the keys on the way to one, are kept
+            # whatever the part they are in: LiteLLM's generateContent
+            # adapter reads a part's functionResponse next to a `type` of
+            # "image", and jev-edge reads a part's `input` whatever its type
+            if cmedia and cpath is None and (k in MEDIA_KEYS or (keep is not None and k not in keep)):
+                continue
+            c = start(v, depth + 1, cmedia, cpath)
+            if c is not _DROP:
+                out[k] = c
+    return root
+
+
+def _dumps(node: Any) -> str:
+    """`node` (a copy _clean made) as compact JSON with non-ASCII text as it
+    is: what json.dumps(node, ensure_ascii=False, separators=(",", ":"))
+    writes, without recursion. json.dumps nests one C call per level, which
+    CPython before 3.12 counts against the recursion limit (1000), so a body
+    as deep as jev-edge's decoder takes would raise RecursionError there."""
+    enc = json.encoder.encode_basestring
+    out: list = []
+    stack: list = []
+
+    def value(v: Any) -> None:
+        if isinstance(v, str):
+            out.append(enc(v))
+        elif v is None:
+            out.append("null")
+        elif v is True:
+            out.append("true")
+        elif v is False:
+            out.append("false")
+        elif isinstance(v, int):
+            out.append(int.__repr__(v))
+        elif isinstance(v, float):
+            out.append(float.__repr__(v))
+        elif isinstance(v, dict):
+            out.append("{")
+            stack.append([iter(v.items()), True, True])
+        else:
+            out.append("[")
+            stack.append([iter(v), False, True])
+
+    value(node)
+    while stack:
+        frame = stack[-1]
+        item = next(frame[0], _DROP)
+        if item is _DROP:
+            stack.pop()
+            out.append("}" if frame[1] else "]")
+            continue
+        if not frame[2]:
+            out.append(",")
+        frame[2] = False
+        if frame[1]:
+            out.append(enc(item[0]) + ":")
+            value(item[1])
+        else:
+            value(item)
+    return "".join(out)
+
+
+def _has_text(body: dict) -> bool:
+    """Whether any string in `body` is text, not a structural name: below a
+    path jev-edge reads whole (READ_WHOLE, and a tool or function message's
+    object content) every key and string is. Without recursion, as _clean."""
+    stack: list = [(body, "", ())]
+    while stack:
+        n, key, path = stack.pop()
+        if isinstance(n, str):
+            if n != "" and (path is _WHOLE or key not in STRUCTURAL_KEYS):
+                return True
+        elif isinstance(n, dict):
+            tool_msg = path == ("messages", "*") and n.get("role") in ("tool", "function")
+            for k, v in n.items():
+                if path is _WHOLE and k != "":
+                    return True
+                if tool_msg and _fold(k) == "content" and isinstance(v, dict):
+                    stack.append((v, k, _WHOLE))
+                else:
+                    stack.append((v, k, _step(path, _fold(k), READ_WHOLE, _READ_WHOLE_PREFIXES)))
+        elif isinstance(n, list):
+            stack.extend((v, key, _step(path, "*", READ_WHOLE, _READ_WHOLE_PREFIXES)) for v in n)
+    return False
+
+
+def _has_token_ids(body: dict) -> bool:
+    """Whether a text key of `body` holds token ids: a number in a list, or
+    in a list of lists (the OpenAI completions API, vLLM and SGLang take a
+    prompt as token ids, which the model reads as the text they stand for).
+    That is no text, but not nothing: jev-edge reports it unjudgeable, and a
+    rule's token_prompts = "block" refuses it, so the body goes to jev-edge.
+    Lists only, without recursion, as _clean."""
+    stack = [v for k, v in body.items() if isinstance(v, list) and (k in TEXT_KEYS or k not in READ_KEYS)]
+    while stack:
+        for v in stack.pop():
+            if isinstance(v, list):
+                stack.append(v)
+            elif isinstance(v, (int, float)) and not isinstance(v, bool):
+                return True
+    return False
+
+
+def _system_messages(data: dict) -> list:
+    """The request's system prompt as messages: Anthropic's top-level
+    `system` (a string or text blocks) and the Responses API's
+    `instructions`, each with role system."""
+    msgs: list = []
+    for key in SYSTEM_KEYS:
+        v = data.get(key)
+        if v is not None and v != "":
+            msgs.append({"role": "system", "content": v})
+    return msgs
+
+
+class _Unreadable(ValueError):
+    """A Bedrock Converse document of a text format whose text the guardrail
+    cannot read: not base64, over the bound, or not in the request."""
+
+    def __init__(self, fmt: str) -> None:
+        super().__init__(fmt)
+        self.format = fmt
+
+
+def _document_text(doc: dict, limit: int) -> Optional[str]:
+    """The text of a Converse document block (`document`) of a text format,
+    None for any other format. source.bytes (base64 in JSON) is decoded as
+    UTF-8, bad bytes replaced, at most `limit` bytes of it; source.text and
+    source.content's text blocks are text already. _Unreadable when none of
+    them is there (an s3Location) or the bytes are not base64 or too many."""
+    fmt = doc.get("format")
+    if not isinstance(fmt, str) or fmt.lower() not in TEXT_DOCUMENT_FORMATS:
+        return None
+    src = doc.get("source")
+    src = src if isinstance(src, dict) else {}
+    raw = src.get("bytes")
+    if isinstance(raw, str):
+        b64 = "".join(raw.split())
+        if len(b64) > (limit // 3 + 1) * 4:
+            raise _Unreadable(fmt)
+        try:
+            raw = base64.b64decode(b64, validate=True)
+        except (binascii.Error, ValueError):
+            raise _Unreadable(fmt) from None
+    if isinstance(raw, (bytes, bytearray)):
+        if len(raw) > limit:
+            raise _Unreadable(fmt)
+        return bytes(raw).decode("utf-8", "replace")
+    if isinstance(src.get("text"), str):
+        text = src["text"]
+    elif isinstance(src.get("content"), list):
+        text = "\n".join(b["text"] for b in src["content"] if isinstance(b, dict) and isinstance(b.get("text"), str))
+    else:
+        raise _Unreadable(fmt)
+    if len(text.encode("utf-8", "surrogatepass")) > limit:
+        raise _Unreadable(fmt)
+    return text
+
+
+def _read_document(block: Any, limit: int, texts: list, unread: list) -> Any:
+    """`block` (a message's content block, or one of a toolResult's) as it is
+    judged. The text of its `document`, when that is a text document, goes
+    to `texts` as a {"text": ...} part. One the guardrail cannot read
+    (_Unreadable) is left out of the block, its format added to `unread`,
+    and None is returned when nothing else is left of the block. The
+    block itself is never changed."""
+    doc = block.get("document") if isinstance(block, dict) else None
+    if not isinstance(doc, dict):
+        return block
+    try:
+        text = _document_text(doc, limit)
+    except _Unreadable as e:
+        unread.append(e.format)
+        rest = {k: v for k, v in block.items() if k != "document"}
+        return rest or None
+    if text:
+        texts.append({"text": text})
+    return block
+
+
+def _bedrock_documents(msgs: list, limit: int, unread: list) -> list:
+    """`msgs` with the text of every Bedrock Converse document of a text
+    format (txt, md, csv, html) as a {"text": ...} part of its message's
+    content, right after the block that holds it: the document block, or
+    the toolResult it is in. The media filter drops a document's
+    source.bytes, and jev-edge reads a message's text parts, not a
+    document's source: a text document was sent as no text at all.
+    A document that cannot be read is left out, and its format added to
+    `unread`: the text beside it is still judged, and the caller notes
+    the document as not judged (jev-edge reads nothing of a Converse
+    document block, so leaving it out hides nothing from it). New lists;
+    the request is not changed."""
+    out = []
+    for m in msgs:
+        content = m.get("content") if isinstance(m, dict) else None
+        if not isinstance(content, list):
+            out.append(m)
+            continue
+        new, changed = [], False
+        for block in content:
+            texts: list = []
+            kept = _read_document(block, limit, texts, unread)
+            result = kept.get("toolResult") if isinstance(kept, dict) else None
+            if isinstance(result, dict) and isinstance(result.get("content"), list):
+                inner = [_read_document(b, limit, texts, unread) for b in result["content"]]
+                if any(n is not o for n, o in zip(inner, result["content"])):
+                    kept = dict(kept, toolResult=dict(result, content=[b for b in inner if b is not None]))
+            if kept is not None:
+                new.append(kept)
+            new.extend(texts)
+            changed = changed or kept is not block or bool(texts)
+        out.append(dict(m, content=new) if changed else m)
+    return out
+
+
+def _gemini_parts(content: Any) -> Any:
+    """A Gemini content whose `parts` is one part object, with `parts` as a
+    list: the object as it is (jev-edge reads it as one part, as Gemini
+    takes it), then each of its keys as a text part. LiteLLM 1.102.1's
+    generateContent adapter iterates the object, and every key is a string
+    part it sends the model as text, where jev-edge reads a part's values
+    only. A new dict: the request LiteLLM sends on is not changed."""
+    if isinstance(content, dict) and isinstance(content.get("parts"), dict):
+        parts = content["parts"]
+        return dict(content, parts=[parts] + [{"text": str(k)} for k in parts])
+    return content
+
+
+def _gemini_contents(contents: Any) -> Any:
+    """`contents` (a list, or one content) with each object `parts` in a
+    form jev-edge reads as LiteLLM reads it (_gemini_parts)."""
+    if isinstance(contents, (list, tuple)):
+        return [_gemini_parts(c) for c in contents]
+    return _gemini_parts(contents)
+
+
+def _top_key(field: str) -> str:
+    """The top-level key of a path: documents[*].text -> documents."""
+    return re.split(r"[.\[]", field.strip(), maxsplit=1)[0]
+
+
+def _parse_fields(value: Any) -> tuple:
+    if value is None:
+        return ()
+    items = value.split(",") if isinstance(value, str) else list(value)
+    out = []
+    for item in items:
+        k = _top_key(str(item))
+        if k and k not in out:
+            out.append(k)
+    return tuple(out)
+
+
+def _is_definition(key: str, value: Any) -> bool:
+    return key in DEFINITION_KEYS or (key == "text" and isinstance(value, dict))
+
+
+# Every top-level key the body is built from (with the extra fields).
+READ_KEYS = DEFINITION_KEYS + SYSTEM_KEYS + TEXT_KEYS + GEMINI_SYSTEM_KEYS + (GEMINI_CONTENTS,)
+
+
+def _body_dict(data: dict, extra_fields: tuple = (), limit: int = MAX_BODY_BYTES,
+               unread: Optional[list] = None) -> Optional[dict]:
+    """The body jev-edge judges (body_for), as a dict, or None without text.
+    limit: the most bytes of one Bedrock text document read; unread: a list
+    the format of each Bedrock text document it cannot read (not base64,
+    past `limit`, an s3Location) is added to. Such a document is left out,
+    so None means no text beside it either."""
+    body: dict[str, Any] = {}
+    for key in DEFINITION_KEYS + ("text",):
+        value = data.get(key)
+        if value is not None and _is_definition(key, value):
+            c = _clean(value, media=False)
+            if c is not _DROP:
+                body[key] = c
+    for key in GEMINI_SYSTEM_KEYS:
+        value = data.get(key)
+        if value is not None and value != "":
+            c = _clean(value, key=key)
+            if c is not _DROP:
+                body[key] = c
+    system = _system_messages(data)
+    convo = data.get("messages")
+    if convo is not None and not isinstance(convo, list):
+        convo = [convo]
+    if convo is not None:
+        convo = _bedrock_documents(convo, limit, unread if unread is not None else [])
+    if system and convo is None:
+        # no conversation under `messages` (the Responses API): the system
+        # prompt goes first, before the input
+        body["messages"] = _clean(system, key="messages")
+    taken = READ_KEYS
+    for key in tuple(k for k in extra_fields if k not in taken) + TEXT_KEYS + (GEMINI_CONTENTS,):
+        value = data.get(key)
+        if key == "messages":
+            if convo is None:
+                continue
+            value = system + convo
+        if value is None or _is_definition(key, value):
+            continue
+        if key == GEMINI_CONTENTS:
+            value = _gemini_contents(value)
+        c = _clean(value, key=key)
+        if c is not _DROP:
+            body[key] = c
+    return body if _has_text(body) or _has_token_ids(body) else None
+
+
+# JSON string tokens in compact JSON bytes
+_STRING_RE = re.compile(rb'"[^"\\]*(?:\\.[^"\\]*)*"', re.S)
+_HEX = frozenset(b"0123456789abcdefABCDEF")
+
+
+def _odd_backslashes_before(raw: bytes, i: int) -> bool:
+    n = 0
+    while i - 1 - n >= 0 and raw[i - 1 - n] == 0x5C:
+        n += 1
+    return n % 2 == 1
+
+
+def _head_cut(raw: bytes, h: int) -> int:
+    """`h` moved back to a UTF-8 character boundary that splits no JSON escape."""
+    while h > 0 and 0x80 <= raw[h] < 0xC0:
+        h -= 1
+    j = h - 1
+    while j >= max(0, h - 4) and raw[j] in _HEX:
+        j -= 1
+    if j >= 1 and raw[j] == ord("u") and h < j + 5 and _odd_backslashes_before(raw, j):
+        return j - 1  # inside \uXXXX: cut before its backslash
+    if _odd_backslashes_before(raw, h):
+        return h - 1  # right after an escape's backslash
+    return h
+
+
+def _tail_cut(raw: bytes, t: int) -> int:
+    """`t` moved forward to a UTF-8 character boundary that splits no JSON escape."""
+    n = len(raw)
+    j = t - 1
+    while j >= max(0, t - 4) and raw[j] in _HEX:
+        j -= 1
+    if j >= 1 and raw[j] == ord("u") and t < j + 5 and _odd_backslashes_before(raw, j):
+        t = j + 5  # inside \uXXXX: start after it
+    elif t < n and _odd_backslashes_before(raw, t):
+        t += 5 if raw[t] == ord("u") else 1  # the escaped character itself
+    while t < n and 0x80 <= raw[t] < 0xC0:
+        t += 1
+    return min(t, n)
+
+
+MAX_KEY_PREFIX = 64  # a longer key is sent as "text"
+
+
+def bounded(raw: bytes, limit: int) -> bytes:
+    """At most `limit` bytes of the compact JSON body `raw`, as jev-edge scans
+    a body past its max_body_bytes: the head and the last TAIL_BYTES (the
+    newest content), sent with X-Jev-Body-Partial. jev-edge's partial scanner
+    reads the string values that follow a `"key":` it can see, so the join
+    keeps that true on both sides of each cut: a string the head cuts is
+    closed, and a value the tail starts inside, at, or just before (on its
+    key or colon, or on the comma or bracket before an array element) is
+    given its key again ("text" when it has none)."""
+    tail_len = min(TAIL_BYTES, limit // 2)
+    h = _head_cut(raw, limit - tail_len - (2 + MAX_KEY_PREFIX + 4))
+    t = _tail_cut(raw, len(raw) - tail_len)
+    in_head = False
+    prev = cur = None  # the first string token that ends after t, and the one before it
+    tokens = _STRING_RE.finditer(raw)
+    for m in tokens:
+        s, e = m.span()
+        if s < h < e:
+            in_head = True
+        if e > t:
+            cur = (s, e)
+            break
+        prev = (s, e)
+    if cur is not None and cur[0] < t and raw[cur[1]:cur[1] + 1] == b":":
+        # inside a key: start after it, on its colon, and look at what follows
+        t, prev = cur[1], cur
+        m = next(tokens, None)
+        cur = m.span() if m else None
+    prefix = b""
+    if cur is not None:
+        s, e = cur
+        is_key = raw[e:e + 1] == b":"
+        keyed = prev is not None and prev[1] == s - 1 and raw[s - 1:s] == b":"
+        key = raw[prev[0]:prev[1]] if keyed and prev[1] - prev[0] <= MAX_KEY_PREFIX + 2 else b'"text"'
+        if s < t < e:             # inside a value
+            prefix = key + b':"'
+        elif t == s and keyed:    # at a value's opening quote
+            prefix = key + b":"
+        elif t == s - 1 and keyed:  # at the colon before a value
+            prefix = key
+        elif t <= s and not is_key and not keyed:
+            # at an array element's opening quote or anywhere in the
+            # punctuation before it (`:[`, `,`): an unkeyed string the
+            # scanner would not read
+            t, prefix = s, b'"text":'
+    return raw[:h] + (b'"' if in_head else b"0,") + prefix + raw[t:]
+
+
+def _setting(value: Any, env: str, default: Any) -> Any:
+    if value is not None:
+        return value
+    raw = os.environ.get(env)
+    if raw is not None and raw.strip() != "":
+        return raw.strip()
+    return default
+
+
+def _bool(name: str, value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    s = str(value).strip().lower()
+    if s in ("1", "true", "yes", "on"):
+        return True
+    if s in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"jev-edge guardrail: {name} must be true or false, got {value!r}")
+
+
+def _number(name: str, value: Any, cast: Callable[[Any], Any], minimum: float) -> Any:
+    try:
+        n = cast(value)
+    except (TypeError, ValueError):
+        n = None
+    if n is None or not math.isfinite(n) or not n >= minimum:
+        raise ValueError(f"jev-edge guardrail: {name} must be a number >= {minimum}, got {value!r}")
+    return n
+
+
+def _proxy_path(data: dict) -> Optional[str]:
+    """The path of the request as LiteLLM's proxy received it, from the
+    proxy_server_request it builds (and overwrites, so a client cannot set
+    it); None when the hook was called for something else (a batch line,
+    code calling it directly)."""
+    psr = data.get("proxy_server_request")
+    url = psr.get("url") if isinstance(psr, dict) else None
+    if not isinstance(url, str) or not url:
+        return None
+    try:
+        return urlsplit(url).path
+    except ValueError:
+        return None
+
+
+def _is_object(value: Any) -> bool:
+    """Something no JSON body decodes to: a Python object the proxy put there."""
+    return value is not None and not isinstance(value, (dict, list, tuple, str, int, float, bool))
+
+
+def _metadata_key(data: dict) -> str:
+    """Where LiteLLM keeps its own metadata for this request: the bag holding
+    the proxy's UserAPIKeyAuth object (`user_api_key_auth`, which no client
+    can send: it is not JSON). Without one, by the route, as LiteLLM decides
+    it: `litellm_metadata` on the routes whose API has a `metadata`
+    parameter (Responses, Anthropic messages, batches, files, assistants,
+    and Bedrock on 1.102.1 but not on 1.80.11), `metadata` elsewhere. Either
+    way the client's own `metadata` (sent on to the provider) or a
+    `litellm_metadata` a client put in a chat request is never taken for the
+    proxy's."""
+    for key in ("metadata", "litellm_metadata"):
+        bag = data.get(key)
+        if isinstance(bag, dict) and _is_object(bag.get("user_api_key_auth")):
+            return key
+    path = _proxy_path(data)
+    if path is not None:
+        return "litellm_metadata" if any(r in path for r in LITELLM_METADATA_ROUTES) else "metadata"
+    return "litellm_metadata" if isinstance(data.get("litellm_metadata"), dict) else "metadata"
+
+
+# an X-Forwarded-For entry as jev-edge reads one, and the hop appended for a
+# peer LiteLLM did not record
+_HOP_RE = re.compile(r"[^,\s]+")
+UNKNOWN_HOP = "unknown"
+
+# The client address of the proxy request being handled, for work LiteLLM
+# does on its behalf without the request's data: a batch file's lines,
+# realtime messages. Context-local, so it never crosses requests.
+_CLIENT_IP: contextvars.ContextVar = contextvars.ContextVar("jev_edge_client_ip", default=None)
+# Set when the pre-call hook has judged a /guardrails/apply_guardrail call
+# (LiteLLM 1.102), so the apply_guardrail call that follows it in the same
+# request does not ask jev-edge a second time.
+_TEST_CALL_JUDGED: contextvars.ContextVar = contextvars.ContextVar("jev_edge_test_call_judged", default=False)
+
 
 class JevEdgeBlocked(Exception):
     """Raised on a block when FastAPI is not installed (tests)."""
@@ -68,99 +879,250 @@ class JevEdgeBlocked(Exception):
         self.detail = detail
 
 
-class JevEdgeGuardrail(CustomGuardrail):
+class _ApplyGuardrailBase(CustomGuardrail):
+    """apply_guardrail, which LiteLLM calls with bare texts: the typed user
+    messages and tool outputs of a realtime WebSocket session (LiteLLM's
+    realtime bridge; 1.102 does, 1.80 does not) and the
+    /guardrails/apply_guardrail test endpoint. It sits here, on a base
+    class, and not on JevEdgeGuardrail itself: LiteLLM sends every hook of a
+    class whose own ``__dict__`` defines apply_guardrail through its unified
+    guardrail (the request flattened to texts, model responses judged too)
+    instead of async_pre_call_hook, and realtime skips a guardrail with
+    ``use_native_lifecycle_hooks``."""
+
+    async def apply_guardrail(self, inputs: Any, request_data: dict, input_type: Any,
+                              logging_obj: Optional[Any] = None) -> Any:
+        return await self._judge_texts(inputs, request_data, input_type)  # type: ignore[attr-defined]
+
+
+class JevEdgeGuardrail(_ApplyGuardrailBase):
     def __init__(
         self,
         jev_edge_url: Optional[str] = None,
-        enforce: bool = True,
-        timeout: float = 2.0,
-        path: str = "/v1/chat/completions",
+        enforce: Optional[Union[bool, str]] = None,
+        timeout: Optional[Union[float, str]] = None,
+        path: Optional[str] = None,
+        max_body_bytes: Optional[Union[int, str]] = None,
+        extra_fields: Optional[Union[str, list]] = None,
+        unjudged: Optional[str] = None,
+        test_endpoint: Optional[str] = None,
         transport: Optional[httpx.AsyncBaseTransport] = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
-        url = jev_edge_url or os.environ.get("JEV_EDGE_URL", "")
+        self._guardrail_name = kwargs.get("guardrail_name")
+        url = str(_setting(jev_edge_url, "JEV_EDGE_URL", ""))
         if not url:
-            raise ValueError("jev-edge guardrail: set jev_edge_url or JEV_EDGE_URL")
+            raise ValueError("jev-edge guardrail: set JEV_EDGE_URL (or jev_edge_url)")
         self.base = url.rstrip("/")
-        self.enforce = bool(enforce)
-        self.timeout = float(timeout)
-        self.path = path if path.startswith("/") else "/" + path
+        self.enforce = _bool("JEV_EDGE_ENFORCE", _setting(enforce, "JEV_EDGE_ENFORCE", True))
+        self.timeout = _number("JEV_EDGE_TIMEOUT", _setting(timeout, "JEV_EDGE_TIMEOUT", 2.0), float, 0.001)
+        p = str(_setting(path, "JEV_EDGE_PATH", "/v1/chat/completions"))
+        self.path = p if p.startswith("/") else "/" + p
+        self.max_body_bytes = _number("JEV_EDGE_MAX_BODY_BYTES",
+                                      _setting(max_body_bytes, "JEV_EDGE_MAX_BODY_BYTES", MAX_BODY_BYTES), int, 1024)
+        self.extra_fields = _parse_fields(_setting(extra_fields, "JEV_EDGE_EXTRA_FIELDS", None))
+        self.unjudged = str(_setting(unjudged, "JEV_EDGE_UNJUDGED", "pass")).lower()
+        if self.unjudged not in ("pass", "block"):
+            raise ValueError(f"jev-edge guardrail: JEV_EDGE_UNJUDGED must be pass or block, got {self.unjudged!r}")
+        self.test_endpoint = str(_setting(test_endpoint, "JEV_EDGE_TEST_ENDPOINT", "judge")).lower()
+        if self.test_endpoint not in ("judge", "refuse"):
+            raise ValueError("jev-edge guardrail: JEV_EDGE_TEST_ENDPOINT must be judge or refuse, "
+                             f"got {self.test_endpoint!r}")
         self._client = httpx.AsyncClient(timeout=self.timeout, transport=transport)
+        log.info("jev-edge guardrail: url=%s enforce=%s timeout=%s path=%s max_body_bytes=%d extra_fields=%s unjudged=%s "
+                 "test_endpoint=%s", self.base, self.enforce, self.timeout, self.path, self.max_body_bytes,
+                 ",".join(self.extra_fields) or "-", self.unjudged, self.test_endpoint)
+        if "guardrail_name" in kwargs and kwargs.get("default_on") is not True:
+            # LiteLLM built it from config.yaml without default_on: true
+            log.warning("jev-edge guardrail %s: default_on is not true, so LiteLLM runs it only for requests and keys "
+                        "that name it, and a request that leaves it out is never judged; set default_on: true "
+                        "under litellm_params to judge every request", kwargs.get("guardrail_name"))
+
+    def _own_name(self) -> Optional[str]:
+        """The guardrail_name config.yaml gives this guardrail (LiteLLM's
+        CustomGuardrail keeps it), None when code built it without one."""
+        name = getattr(self, "guardrail_name", None) or self._guardrail_name
+        return name if isinstance(name, str) and name else None
+
+    def uses_apply_guardrail_interface(self) -> bool:
+        # apply_guardrail only answers LiteLLM's direct calls (realtime text,
+        # the test endpoint); every proxy hook stays async_pre_call_hook
+        return False
+
+    # A default_on jev-edge guardrail runs for every request: LiteLLM's
+    # per-request switches are all ignored. What LiteLLM reads them from is
+    # not the proxy's alone: 1.80 takes `disable_global_guardrail` from the
+    # request body and metadata, and the key and team settings from metadata
+    # names it never overwrites (`user_api_key_team_metadata`, a bag's
+    # `disable_global_guardrails`), which a client can send; and a key's own
+    # metadata is often set by whoever holds the key.
+
+    def get_disable_global_guardrail(self, data: dict) -> Optional[bool]:
+        """Never switched off for a request, whatever its body, its metadata,
+        its key or its team says."""
+        return False
+
+    def get_opted_out_global_guardrails_from_metadata(self, data: dict) -> list:
+        """No request, key or team opts out of it (recent LiteLLM, 1.102.1
+        among them, reads `opted_out_global_guardrails` from key and team
+        metadata)."""
+        return []
 
     # ------------------------------------------------------------------
     # request -> the body jev-edge judges
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _collect(node: Any, out: list, depth: int = 1) -> None:
-        """Every string under a content value, the way core's extractor reads
-        it (core/normalize.lua `collect`): plain strings, each part's `text`
-        (chat `text`, Responses `input_text`), and `content` nested once more
-        (Anthropic `tool_result`), to a bounded depth. Images and numbers add
-        nothing, so the body stays small and under jev-edge's size cap."""
-        if isinstance(node, str):
-            out.append(node)
-            return
-        if depth > 4:
-            return
-        if isinstance(node, list):
-            for item in node:
-                JevEdgeGuardrail._collect(item, out, depth + 1)
-        elif isinstance(node, dict):
-            if isinstance(node.get("text"), str):
-                out.append(node["text"])
-            if node.get("content") is not None:
-                JevEdgeGuardrail._collect(node["content"], out, depth + 1)
+    def body_for(data: dict, extra_fields: Any = ()) -> Optional[str]:
+        """The request's text as the compact JSON body jev-edge judges, in its
+        original structure: the tool definitions (`tools`, `functions`,
+        `response_format`, the Responses API's `text` object with its
+        `format`) unchanged, Gemini's `systemInstruction`, the
+        `extra_fields`, `query`, `text`, `prompt`, `input` and `messages`,
+        with the system prompt (`system`, `instructions`) as the first
+        message, and Gemini's `contents` (a `parts` object followed by its
+        keys as text parts); media payloads removed outside the tool calls
+        and tool results sent whole, a Bedrock text document's bytes sent as
+        a text part (one it cannot read left out: plan() notes it). None
+        when no value holds any text or token ids."""
+        body = _body_dict(data, _parse_fields(extra_fields) if extra_fields else ())
+        return None if body is None else _dumps(body)
+
+    def plan(self, data: dict, call_type: Any) -> tuple:
+        """What to do with a call, by call type: ("judge", body or None),
+        ("partial", (body, reason)): the body judged and `reason` noted for
+        the part of the request nobody judged, ("skip", reason),
+        ("unjudged", reason) or ("refuse", reason)."""
+        name = str(getattr(call_type, "value", call_type) or "")
+        if name in SKIP_CALLS:
+            return "skip", f"call type {name} not judged"
+        if name in NOT_VISIBLE_CALLS:
+            return "unjudged", f"unjudgeable: call type {name}: {NOT_VISIBLE_CALLS[name]}"
+        if name == TEST_ENDPOINT_CALL:
+            # LiteLLM 1.102 runs every default_on guardrail's pre-call hook
+            # for the endpoint, whichever guardrail it names, and passes the
+            # name it was asked for: another guardrail answers that call
+            asked, own = data.get("guardrail_name"), self._own_name()
+            if isinstance(asked, str) and own and asked != own:
+                return "skip", f"call type {name}: /guardrails/apply_guardrail asked for guardrail {asked}"
+            if self.test_endpoint == "refuse":
+                return "refuse", None
+        if name in NESTED_PASSTHROUGH_CALLS:
+            # Bedrock's handlers build the data from scratch with the body
+            # under `data`; Gigachat's reads the body into the data and puts
+            # it under `json` too, the copy it sends on (a client's own
+            # `data` key would sit next to it)
+            inner = data.get("json" if "json" in data else "data")
+            if isinstance(inner, dict):
+                provider = data.get("custom_llm_provider") or "provider"
+                return self._plan_passthrough(name, inner, f"{provider} body")
+            if inner is None or inner in ("", b""):
+                return "judge", None
+            return "unjudged", f"unjudgeable: call type {name}: the body is not JSON the guardrail reads"
+        if name == PASSTHROUGH_CALL:
+            if not data:
+                # a WebSocket pass-through hands an empty dict: its messages
+                # go to the provider without passing through here
+                return "unjudged", (f"unjudgeable: call type {name}: "
+                                    "a WebSocket pass-through's messages are not visible to the guardrail")
+            client = {k: v for k, v in data.items() if k not in LITELLM_OWN_KEYS}
+            if not client:
+                # LiteLLM 1.102 does not parse a multipart form here: it
+                # hands the hook no body, as for a request without one (a
+                # GET), and the two cannot be told apart
+                return "unjudged", (f"unjudgeable: call type {name}: "
+                                    "no body visible to the guardrail (a multipart form, or none)")
+            return self._plan_passthrough(name, client, "body")
+        if name in ("create_file", "acreate_file"):
+            # LiteLLM passes the file's name, type and size, not its content
+            purpose = str(data.get("purpose") or "unknown")
+            if purpose == "batch" and _litellm_scans_batch_files():
+                return "skip", f"call type {name}: batch file lines are judged one by one as LiteLLM scans them"
+            return "unjudged", f"unjudgeable: call type {name}: file purpose {purpose}: content not visible to the guardrail"
+        # Thread messages, runs and assistants: no LiteLLM version checked
+        # (1.80, 1.102) runs pre-call guardrails on these routes, but if one
+        # does, their text is where these read it.
+        if name in ("add_message", "a_add_message"):
+            data = _thread_message(data)
+        elif name in ("run_thread", "arun_thread", "run_thread_stream", "arun_thread_stream"):
+            data = _run(data)
+        elif name in ("create_assistants", "acreate_assistants"):
+            data = _assistant(data)
+        unread: list = []
+        return self._with_unread(name, _body_dict(data, self.extra_fields, self.max_body_bytes, unread), unread)
 
     @staticmethod
-    def body_for(data: dict) -> Optional[str]:
-        """The text of the request as a small JSON body jev-edge judges:
-        chat `messages` (string or content-part contents), and `prompt` /
-        `input` (a string, a list of strings, or Responses API input items).
-        None when there is no text at all."""
-        body: dict[str, Any] = {}
-        msgs = data.get("messages")
-        if isinstance(msgs, list):
-            out = []
-            for m in msgs:
-                if not isinstance(m, dict):
-                    continue
-                parts: list = []
-                JevEdgeGuardrail._collect(m.get("content"), parts)
-                text = "\n".join(p for p in parts if p)
-                if text:
-                    out.append({"role": m.get("role", "user"), "content": text})
-            if out:
-                body["messages"] = out
-        for key in ("prompt", "input"):
-            parts = []
-            JevEdgeGuardrail._collect(data.get(key), parts)
-            text = "\n".join(p for p in parts if p)
-            if text:
-                body[key] = text
-        return json.dumps(body) if body else None
+    def _with_unread(name: str, body: Optional[dict], unread: list) -> tuple:
+        """("judge", body) when the guardrail read every Bedrock text
+        document; with one it cannot read (`unread`, their formats), the
+        text beside it is judged all the same, ("partial", (body, reason)),
+        so attaching such a document hides nothing. Only a request with no
+        text beside it is unjudgeable, ("unjudged", reason)."""
+        if not unread:
+            return "judge", body
+        formats = ", ".join(dict.fromkeys(unread))
+        what = f"bedrock document {formats}" if len(unread) == 1 else f"{len(unread)} bedrock documents ({formats})"
+        reason = f"unjudgeable: call type {name}: {what} not readable"
+        return ("unjudged", reason) if body is None else ("partial", (body, reason))
+
+    def _plan_passthrough(self, name: str, body: dict, what: str) -> tuple:
+        """A pass-through client's body, in the provider's own format: judged
+        like any request's. One with none of the fields the guardrail reads
+        (Titan's `inputText`, Cohere's `message`, a batch's `requests`, ...)
+        is unjudgeable, not "no text": the format is not one it knows. An
+        empty one (a Bedrock GET) has no text."""
+        unread: list = []
+        judged = _body_dict(body, self.extra_fields, self.max_body_bytes, unread)
+        if judged is not None or unread:
+            return self._with_unread(name, judged, unread)
+        read = READ_KEYS + self.extra_fields
+        if any(body.get(k) is not None for k in read):
+            return "judge", None  # the fields it reads, holding no text (an image)
+        if any(v is not None for v in body.values()):
+            return "unjudged", f"unjudgeable: call type {name}: no field the guardrail reads in the {what}"
+        return "judge", None
+
+    @classmethod
+    def _refused(cls) -> dict[str, Any]:
+        """A call from /guardrails/apply_guardrail with the endpoint refused."""
+        return dict(cls._adapter("skipped", "refused: /guardrails/apply_guardrail is off (JEV_EDGE_TEST_ENDPOINT=refuse)"),
+                    action="block", status=403)
 
     @staticmethod
     def client_ip(data: dict) -> Optional[str]:
-        """What jev-edge gets as X-Forwarded-For: the request's whole
-        X-Forwarded-For chain when it has one, else LiteLLM's
-        ``requester_ip_address``. The chain wins because with LiteLLM's
-        ``use_x_forwarded_for`` on, requester_ip_address is the chain's
-        leftmost entry, which is whatever the client sent; jev-edge's
-        ``client_ip.trusted_hops`` picks the real hop from the whole chain."""
-        psr = data.get("proxy_server_request") or {}
-        headers = psr.get("headers") or {}
+        """What jev-edge gets as X-Forwarded-For: the X-Forwarded-For chain
+        LiteLLM's proxy received (from the proxy_server_request the proxy
+        builds; never a field of the body or of the client's metadata) with
+        the peer LiteLLM saw appended, as nginx appends $remote_addr; the
+        bare peer when no chain came in. The peer is the proxy's own
+        ``requester_ip_address``, read from its own metadata bag only.
+        Exactly one hop is appended, so jev-edge's ``client_ip.trusted_hops``
+        is 1 when clients reach LiteLLM directly and N+1 behind N proxies
+        that append: it never lands on an entry the client wrote. With no
+        usable peer (1.80 records none without a premium licence; with
+        ``use_x_forwarded_for`` on, it is the client's own header, which may
+        hold several entries) the hop appended is ``unknown``. Before, the
+        chain went as it came, and a client that reached LiteLLM directly
+        chose the address jev-edge judged."""
+        psr = data.get("proxy_server_request")
+        if not isinstance(psr, dict):
+            return None
+        headers = psr.get("headers")
+        headers = headers if isinstance(headers, dict) else {}
         xff = next((v for k, v in headers.items() if str(k).lower() == "x-forwarded-for"), None)
         chain = ", ".join(p.strip() for p in str(xff).split(",") if p.strip()) if xff else ""
+        md = data.get(_metadata_key(data))
+        ip = md.get("requester_ip_address") if isinstance(md, dict) else None
+        # one entry as jev-edge splits the header (on commas and spaces)
+        entries = _HOP_RE.findall(str(ip)) if ip else []
+        peer = entries[0] if len(entries) == 1 else None
         if chain:
-            return chain
-        md = data.get("metadata") or {}
-        ip = md.get("requester_ip_address")
-        return str(ip) if ip else None
+            return chain + ", " + (peer or UNKNOWN_HOP)
+        return peer
 
     # ------------------------------------------------------------------
-    # LiteLLM hook
+    # LiteLLM hooks
     # ------------------------------------------------------------------
 
     async def async_pre_call_hook(
@@ -168,38 +1130,175 @@ class JevEdgeGuardrail(CustomGuardrail):
         user_api_key_dict: Any,
         cache: Any,
         data: dict,
-        call_type: str,
+        call_type: Any,
     ) -> Optional[Union[Exception, str, dict]]:
-        body = self.body_for(data)
+        started = time.time()
+        name = str(getattr(call_type, "value", call_type) or "")
+        if name == PASSTHROUGH_CALL:
+            # the data is the client's own body: a proxy_server_request in it
+            # is the client's too, and LiteLLM recorded no address
+            ip = None
+        elif isinstance(data.get("proxy_server_request"), dict):
+            ip = self.client_ip(data)
+            _CLIENT_IP.set(ip)
+        else:  # a batch file's line: the upload's client
+            ip = _CLIENT_IP.get()
+        kind, arg = self.plan(data, call_type)
         verdict: dict[str, Any]
-        if body is None:
-            verdict = {"verdict": "skipped", "score": "0.00", "source": "l1", "reason": "no text"}
+        if kind == "refuse":
+            verdict = self._refused()
+        elif kind == "skip":
+            verdict = self._adapter("skipped", arg)
+        elif kind == "unjudged":
+            verdict = self._unjudged(arg)
+        elif kind == "partial":
+            verdict = self._partial(await self.judge(arg[0], ip), arg[1])
+        elif arg is None:
+            verdict = self._adapter("skipped", "no text")
         else:
-            verdict = await self.judge(body, self.client_ip(data))
+            verdict = await self.judge(arg, ip)
+        if name == TEST_ENDPOINT_CALL and kind != "skip":
+            _TEST_CALL_JUDGED.set(True)
 
-        data.setdefault("metadata", {})["jev_verdict"] = verdict
-
-        if verdict.get("action") == "block" and self.enforce:
-            status = int(verdict.get("status") or 403)
-            detail = {"error": "request rejected", "jev": verdict}
-            if HTTPException is not None:
-                raise HTTPException(status_code=status, detail=detail)
-            raise JevEdgeBlocked(status, detail)
+        key = _metadata_key(data)
+        md = data.get(key)
+        if not isinstance(md, dict):
+            md = data[key] = {}
+        md["jev_verdict"] = verdict
+        # a refusal is the operator's setting, not a verdict: monitor mode
+        # does not lift it
+        blocks = verdict.get("action") == "block" and (self.enforce or kind == "refuse")
+        self._log_verdict(key, md, data, verdict, started, blocks)
+        if blocks:
+            self._raise(verdict)
         return data
 
-    async def judge(self, body: str, client_ip: Optional[str]) -> dict[str, Any]:
+    async def _judge_texts(self, inputs: Any, request_data: Any, input_type: Any) -> Any:
+        """apply_guardrail: each text judged as a user message; only requests,
+        jev-edge judges input. A call that is not LiteLLM's realtime bridge
+        (which passes the session's UserAPIKeyAuth object, something no
+        request body can hold) comes from the /guardrails/apply_guardrail
+        test endpoint: refused with JEV_EDGE_TEST_ENDPOINT=refuse, and not
+        judged twice when LiteLLM's pre-call hook judged it already."""
+        realtime = isinstance(request_data, dict) and _is_object(request_data.get("user_api_key_dict"))
+        if not realtime:
+            if self.test_endpoint == "refuse":
+                self._raise(self._refused())
+            if _TEST_CALL_JUDGED.get():
+                return inputs
+        if str(getattr(input_type, "value", input_type)) != "request" or not isinstance(inputs, dict):
+            return inputs
+        texts = [t for t in (inputs.get("texts") or []) if isinstance(t, str) and t]
+        if texts:
+            verdict = await self.judge({"messages": [{"role": "user", "content": t} for t in texts]}, _CLIENT_IP.get())
+            if verdict.get("action") == "block" and self.enforce:
+                self._raise(verdict)
+        return inputs
+
+    @staticmethod
+    def _raise(verdict: dict) -> None:
+        """The client learns that the request was refused and the id to quote,
+        never the score, the reason or the source: they tell an attacker how
+        close a prompt came and which pattern fired. The verdict stays in the
+        proxy's metadata (`jev_verdict`), the guardrail log and the
+        exception's `jev_verdict` attribute, which no response serializes."""
+        status = int(verdict.get("status") or 403)
+        detail = {"error": "request rejected", "request_id": verdict.get("request_id")}
+        exc: Exception
+        if HTTPException is not None:
+            exc = HTTPException(status_code=status, detail=detail)
+        else:
+            exc = JevEdgeBlocked(status, detail)
+        exc.jev_verdict = verdict  # type: ignore[attr-defined]
+        raise exc
+
+    def _log_verdict(self, key: str, md: dict, data: dict, verdict: dict, started: float, blocks: bool) -> None:
+        """The verdict in LiteLLM's standard guardrail logging too, so it
+        reaches callbacks and the spend logs' `guardrail_information`. Handed
+        the proxy's own metadata only: LiteLLM 1.80 writes it to a request's
+        `metadata` whenever there is one, the client's on the routes that
+        send `metadata` on to the provider."""
+        add = getattr(self, "add_standard_logging_guardrail_information_to_request_data", None)
+        if add is None:
+            return
+        status = ("guardrail_intervened" if blocks else
+                  "guardrail_failed_to_respond" if verdict.get("verdict") == "error" else "success")
+        ended = time.time()
+        try:
+            add(guardrail_json_response=dict(verdict), request_data={key: md, "litellm_logging_obj": data.get("litellm_logging_obj")},
+                guardrail_status=status, start_time=started, end_time=ended, duration=ended - started)
+        except Exception as e:  # logging never costs a request
+            log.debug("jev-edge: guardrail information not logged: %s", e)
+
+    @staticmethod
+    def _adapter(verdict: str, reason: str) -> dict[str, Any]:
+        return {"verdict": verdict, "score": "0.00", "source": "adapter", "reason": reason, "action": "pass"}
+
+    def _unjudged(self, reason: str) -> dict[str, Any]:
+        """Nobody judged the request: skipped, passed or blocked as `unjudged`
+        says (keep it equal to jev-edge's policy.unjudgeable)."""
+        log.warning("jev-edge: %s (unjudged: %s)", reason, self.unjudged)
+        v = self._adapter("skipped", reason)
+        if self.unjudged == "block":
+            v["action"] = "block"
+            v["status"] = 403
+        return v
+
+    def _partial(self, verdict: dict, reason: str) -> dict[str, Any]:
+        """The verdict on the text that was judged, with the part nobody
+        judged (a Bedrock text document the guardrail cannot read) noted as
+        `unjudged`: `reason`. That part is passed or blocked as `unjudged`
+        says, as a request nobody judged is: with block, a request the rest
+        of which passed (or could not be judged: the judge unavailable) is
+        blocked with 403; a block stays jev-edge's."""
+        log.warning("jev-edge: %s (unjudged: %s)", reason, self.unjudged)
+        v = dict(verdict, unjudged=reason)
+        if self.unjudged == "block" and v.get("action") != "block":
+            v["action"] = "block"
+            v["status"] = 403
+        return v
+
+    def encode(self, body: dict) -> tuple:
+        """The UTF-8 compact JSON body and whether it had to be cut."""
+        raw = _dumps(body).encode("utf-8", "replace")
+        if len(raw) <= self.max_body_bytes:
+            return raw, False
+        log.info("jev-edge: body of %d bytes sent as head and tail (%d max)", len(raw), self.max_body_bytes)
+        return bounded(raw, self.max_body_bytes), True
+
+    async def judge(self, body: Union[dict, str, bytes], client_ip: Optional[str]) -> dict[str, Any]:
         headers = {"Content-Type": "application/json"}
+        if isinstance(body, dict):
+            content, partial = self.encode(body)
+        else:
+            content = body.encode("utf-8", "replace") if isinstance(body, str) else body
+            partial = len(content) > self.max_body_bytes
+            if partial:
+                content = bounded(content, self.max_body_bytes)
+        if partial:
+            # jev-edge scans it as the head of a larger body, as it does for
+            # Envoy's allow_partial_message; the reason ends in "(window)"
+            headers["X-Jev-Body-Partial"] = "1"
         if client_ip:
             headers["X-Forwarded-For"] = client_ip
         try:
-            res = await self._client.post(self.base + "/_jev/authz" + self.path, content=body, headers=headers)
+            res = await self._client.post(self.base + "/_jev/authz" + self.path, content=content, headers=headers)
         except httpx.HTTPError as e:  # connection refused, timeout, ...
             log.warning("jev-edge unreachable, failing open: %s", e)
             return {"verdict": "error", "score": "0.00", "source": "adapter", "reason": str(e), "action": "pass"}
 
-        if "x-jev-verdict" not in res.headers or res.status_code not in (200, *range(400, 600)):
-            log.warning("jev-edge answered %s%s, failing open", res.status_code,
-                        "" if "x-jev-verdict" in res.headers else " without X-Jev-Verdict")
+        if "x-jev-verdict" not in res.headers:
+            if res.status_code >= 500 or res.status_code == 429:
+                # the judge is not available: the server, or a proxy or rate
+                # limiter in front of it, failing or shedding load
+                log.warning("jev-edge answered %s without X-Jev-Verdict, failing open", res.status_code)
+                return {"verdict": "error", "score": "0.00", "source": "adapter",
+                        "reason": f"http {res.status_code}", "action": "pass"}
+            # refused before jev-edge ran (413 past client_max_body_size, 400
+            # or 431 for headers, 414, a 404 from something else)
+            return self._unjudged(f"unjudgeable: authz answered {res.status_code}")
+        if res.status_code != 200 and res.status_code < 400:
+            log.warning("jev-edge answered %s, failing open", res.status_code)
             return {"verdict": "error", "score": "0.00", "source": "adapter", "reason": f"http {res.status_code}", "action": "pass"}
 
         v = {k[6:].replace("-", "_"): res.headers.get(k, "") for k in HEADER_NAMES if res.headers.get(k) is not None}

@@ -14,9 +14,14 @@ import { resolve as resolveRule, type RuleSpec } from "./rules/index.js";
 import { shouldSample, buildSample, type Sample } from "./sampling.js";
 import * as subjectMod from "./core/subject.js";
 import { load as loadProvider, type Provider, type ProviderRequestInfo } from "./providers/index.js";
-import { kvStore, memoryStore, durableStore, durableBreaker, durableAdaptive, type KVLike, type DOStubLike } from "./cf/stores.js";
-import { Adaptive, type AdaptiveLike } from "./cf/adaptive.js";
+import {
+  kvStore, memoryStore, durableStore, durableBreaker, durableAdaptive, durableRequest, durableSubjectStore, isStateTarget,
+  isNamespace, isNamed, stateStub,
+  type KVLike, type StateTarget, type SubjectSession,
+} from "./cf/stores.js";
+import { Adaptive, tuning, type AdaptiveLike } from "./cf/adaptive.js";
 import type { Store, BreakerLike } from "./core/breaker.js";
+import { bestEffortStore, bestEffortBreaker, bestEffortAdaptive, bestEffortRead } from "./besteffort.js";
 
 type DeepPartial<T> = { [K in keyof T]?: T[K] extends object ? DeepPartial<T[K]> : T[K] };
 
@@ -27,13 +32,34 @@ export interface Options {
   rules?: RuleSpec[];
   /** Overrides config.jev.provider with an instance. */
   provider?: Provider;
-  /** KV namespace for the fingerprint / reputation cache. Memory (per isolate) if absent. */
-  cache?: KVLike | Store;
-  /** Durable Object stub (JevState) or any Store for breaker + adaptive timeout. Memory (per isolate) if absent.
-   *  With a stub the breaker and adaptive read-modify-write run inside the Durable Object, one fetch per operation. */
-  state?: DOStubLike | Store;
-  /** Store for per-subject trajectories (KV or memory). Memory (per isolate) if absent. Only used with config.subject.enabled. */
-  subjectStore?: KVLike | Store;
+  /** KV namespace for the fingerprint / reputation cache. Memory (per isolate, the 20000 most recently used
+   *  entries) if absent. The JevState Durable Object (namespace, `{ namespace, name }` or stub, as for `state`) is taken too, as
+   *  durableStore: one object for every lookup, and entries kept until overwritten. */
+  cache?: KVLike | StateTarget | Store;
+  /** Breaker + adaptive timeout state: the JevState Durable Object namespace (env.JEV_STATE), the namespace
+   *  and an object name (`{ namespace: env.JEV_STATE, name: "staging" }`), a stub, or any Store. Memory (per
+   *  isolate) if absent. With the Durable Object the breaker and adaptive read-modify-write run inside it:
+   *  a judged request makes one fetch before the judge (allow and timeout) and one after (the samples and
+   *  the breaker's record, through waitUntil when the host has it). A failed read before the judge is the
+   *  breaker closed and the timeout floor, never a fail-open (besteffort.ts).
+   *  Pass the namespace: the runtime makes a stub per operation (`idFromName("jev-edge")`, or the name
+   *  given), so it can be kept at module scope. workerd binds a stub to the request that created it; a
+   *  runtime kept across requests with a stub logs that once per stub and isolate, and from then on keeps
+   *  breaker and adaptive state in that isolate's memory, one operation at a time (cf/stores.ts). Anything
+   *  with a `fetch` method is taken for a stub, idFromName + get without one for a namespace, and an object
+   *  with a `namespace` key and no `get` for `{ namespace, name }`, so a Store must have no `fetch` and not
+   *  both idFromName and get. */
+  state?: StateTarget | Store;
+  /** Store for per-subject trajectories and reputation: KV, the JevState Durable Object or any Store. Memory
+   *  (per isolate, the 50000 most recently used entries) if absent; the Cloudflare presets pass their Durable
+   *  Object when config.subject.reputation is on. Only used with config.subject.enabled. The JevState
+   *  namespace (or `{ namespace, name }`) keeps each subject in an object of its own (durableSubjectStore:
+   *  `jev-subject:<id>`, atomic and consistent everywhere), and a judged request makes one hop to it before
+   *  the judge (trajectory and reputation read together) and one or two after (the points, and the
+   *  trajectory entry through waitUntil when the host has it); a failed read there judges without them. A
+   *  stub keeps every subject in that one object. KV loses concurrent increments, so reputation counted
+   *  there is best effort (logged once). */
+  subjectStore?: KVLike | StateTarget | Store;
   /** Header carrying the client IP, set by a proxy you trust to overwrite it.
    *  Default: cf-connecting-ip on Cloudflare (a preset, or a request with the
    *  platform's `cf` object), none elsewhere, where it is a client header.
@@ -44,8 +70,9 @@ export interface Options {
   onVerdict?: (v: core.Verdict, req: Request) => void;
   /** Receives sampled decisions (normalized text, fingerprint, score, verdict) when config.sampling.enabled; storage is yours. */
   onSample?: (s: Sample, req: Request) => void;
-  /** Serve GET /_jev/health from the Worker (default true). */
-  health?: boolean;
+  /** Serve GET /_jev/health (default true): `{ ok, adapter, core }`. "details" adds provider, model, mode and
+   *  endpoint (the thin Worker's origin), which any caller can read; false leaves the path to the app. */
+  health?: boolean | "details";
   /** Set by the Cloudflare presets. Only then is `cf-ray` trusted as the request id; elsewhere it is a client header like any other. */
   platform?: "cloudflare";
 }
@@ -59,19 +86,82 @@ export interface Runtime {
   subjectStore: Store;
   breaker: BreakerLike;
   adaptive: AdaptiveLike;
+  /** With `state` a JevState: the breaker and adaptive one judged request
+   *  uses, one hop to the object before the judge and one after it (the
+   *  second through waitUntil when the host has it). Absent otherwise, and a
+   *  request uses `breaker` and `adaptive`. */
+  perRequest?: (rctx?: RequestCtx) => { breaker: BreakerLike; adaptive: AdaptiveLike };
+  /** With `subjectStore` the JevState namespace: one subject's trajectory and
+   *  the reputation keys a judged request reads, in one hop to its object
+   *  (durableSubjectStore); null when that read failed, logged once per
+   *  outage. Absent otherwise, and a request reads `subjectStore` per key. */
+  subjectSession?: (id: string) => Promise<SubjectSession | null>;
   opts: Options;
 }
 
-/** Per-request host facilities. `waitUntil` (Workers, Pages) keeps the subject write alive after the response is sent. */
+/** Per-request host facilities. `waitUntil` (Workers, Pages) keeps the
+ *  writes made once the verdict is decided (subject trajectory and
+ *  reputation, verdict cache, breaker and adaptive bookkeeping) alive after
+ *  the response is sent, so the response does not wait for them. */
 export interface RequestCtx {
   waitUntil?: (p: Promise<unknown>) => void;
+}
+
+/** Hand `p` to the host's waitUntil. false when there is none or it refused
+ *  the promise: the caller then awaits it, or lets it run on its own. */
+function keepAlive(rctx: RequestCtx | undefined, p: Promise<unknown>): boolean {
+  if (!rctx?.waitUntil) return false;
+  try {
+    rctx.waitUntil(p);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function isKV(x: unknown): x is KVLike {
   return typeof x === "object" && x !== null && "put" in x && typeof (x as KVLike).put === "function";
 }
-function isStub(x: unknown): x is DOStubLike {
-  return typeof x === "object" && x !== null && "fetch" in x && !("get" in x);
+
+/**
+ * The Store behind a cache or subjectStore option. The Durable Object is
+ * tested first: a workerd stub answers every property name, `put` included,
+ * and would pass for KV; a namespace has `get` and would pass for a Store,
+ * and fail on every request.
+ */
+function storeOption(x: KVLike | StateTarget | Store | undefined, clock: () => number, maxEntries: number): Store {
+  if (isStateTarget(x)) return durableStore(x);
+  if (isKV(x)) return kvStore(x);
+  return (x as Store | undefined) ?? memoryStore(clock, { maxEntries });
+}
+
+/** Caps of the default memory stores (least recently used out past them):
+ *  one cache entry per judged text, and a subject's ring takes max_entries
+ *  + 1 keys. `state` has none, so breaker and adaptive keys stay. */
+const MEMORY_CACHE_ENTRIES = 20000;
+const MEMORY_SUBJECT_ENTRIES = 50000;
+
+const warnedKv = new WeakSet<object>();
+
+/**
+ * Subject reputation counts with the store's incr. KV has none: kvStore's
+ * incr is a get and a put, a put takes seconds to land and KV takes about one
+ * write a second per key, so concurrent increments for one subject are mostly
+ * lost (19 of 20 in a live test) and block_at may never be reached. Warned
+ * once per KV binding in each isolate, not refused: such a config keeps
+ * working as it did, best effort.
+ */
+function warnKvReputation(config: core.Config, store: unknown): void {
+  const s = config.subject;
+  if (!s?.enabled || !(Number(s.reputation?.block_at) > 0)) return;
+  if (isStateTarget(store) || !isKV(store) || warnedKv.has(store)) return;
+  warnedKv.add(store);
+  console.warn(
+    "jev-edge: subject.reputation with a KV subjectStore is best effort, not enforcement: KV has no atomic " +
+    "increment (a get and a put, about one write a second per key), so concurrent increments for one subject " +
+    "are lost and block_at may never be reached. Pass subjectStore: env.JEV_STATE (the JevState Durable " +
+    "Object), whose increment is atomic.",
+  );
 }
 
 export function createRuntime(opts: Options): Runtime {
@@ -81,24 +171,81 @@ export function createRuntime(opts: Options): Runtime {
   const rules = ((opts.rules ?? config.rules) as RuleSpec[]).map(resolveRule);
   const provider = opts.provider ?? loadProvider(config.jev.provider ?? "jev");
   const clock = () => Date.now() / 1000;
-  const cache: Store = isKV(opts.cache) ? kvStore(opts.cache) : (opts.cache as Store | undefined) ?? memoryStore(clock);
-  const subjectStore: Store = isKV(opts.subjectStore) ? kvStore(opts.subjectStore, "jev:") : (opts.subjectStore as Store | undefined) ?? memoryStore(clock);
+  const cache = storeOption(opts.cache, clock, MEMORY_CACHE_ENTRIES);
+  // reads that fail (besteffort.ts) are logged once per outage, per runtime
+  const failing = new Set<string>();
+  // the JevState namespace: an object per subject, not the one every
+  // isolate's breaker already queues on
+  const subjects = isNamespace(opts.subjectStore) || isNamed(opts.subjectStore) ? durableSubjectStore(opts.subjectStore) : undefined;
+  const subjectStore = subjects ?? storeOption(opts.subjectStore, clock, MEMORY_SUBJECT_ENTRIES);
+  warnKvReputation(config, opts.subjectStore);
+  let subjectSession: Runtime["subjectSession"];
+  if (subjects) {
+    const scfg = config.subject;
+    subjectSession = (id) =>
+      bestEffortRead<SubjectSession | null>(
+        failing, "subject read",
+        () => subjects.session(id, { max: scfg.max_entries, ttl: scfg.history_ttl ?? 3600, keys: reputationKeys(config, id, clock()) }),
+        null, "no subject history and reputation read per key",
+      );
+  }
   let state: Store;
   let breaker: BreakerLike;
   let adaptive: AdaptiveLike;
-  if (isStub(opts.state)) {
-    // One hop per operation: the Durable Object runs the same Breaker and
-    // Adaptive classes against its own storage, so the read-modify-write is
-    // atomic there instead of three or four round trips from here.
-    state = durableStore(opts.state);
-    breaker = durableBreaker(opts.state, config.breaker);
-    adaptive = durableAdaptive(opts.state, config.jev);
+  const floor = tuning(config.jev).floor;
+  let perRequest: Runtime["perRequest"];
+  if (isStateTarget(opts.state)) {
+    // The Durable Object runs the same Breaker and Adaptive classes against
+    // its own storage, so each read-modify-write is atomic there instead of
+    // three or four round trips from here: one hop per operation, and two
+    // per judged request (durableRequest). The stub is made per call from a
+    // namespace (and name); a stub given as is is guarded against use past
+    // its request (cf/stores.ts), one guard for all of them.
+    const stub = stateStub(opts.state);
+    state = durableStore(stub);
+    breaker = durableBreaker(stub, config.breaker);
+    adaptive = durableAdaptive(stub, config.jev);
+    const session = durableRequest(stub, config.breaker, config.jev);
+    perRequest = (rctx) => {
+      const s = session();
+      const defer = rctx?.waitUntil
+        ? (p: Promise<void>): boolean => {
+            try {
+              rctx.waitUntil!(p);
+              return true;
+            } catch {
+              return false; // a host that refuses it: awaited instead
+            }
+          }
+        : undefined;
+      return { breaker: bestEffortBreaker(s.breaker, { failing, defer }), adaptive: bestEffortAdaptive(s.adaptive, { failing, floor }) };
+    };
   } else {
     state = (opts.state as Store | undefined) ?? memoryStore(clock);
     breaker = new core.breaker.Breaker(state, clock, config.breaker);
     adaptive = new Adaptive(state, config.jev);
   }
-  return { config, rules, provider, cache, state, subjectStore, breaker, adaptive, opts };
+  return {
+    config, rules, provider, state, opts, perRequest, subjectSession,
+    cache: bestEffortStore(cache, "cache"),
+    subjectStore: bestEffortStore(subjectStore, "subject store"),
+    breaker: bestEffortBreaker(breaker, { failing }),
+    adaptive: bestEffortAdaptive(adaptive, { failing, floor }),
+  };
+}
+
+/**
+ * The reputation keys a judged request reads (core/subject.ts): the block
+ * (repBlocked, at L1) and the previous window's points (repRecord). Loaded
+ * with the trajectory, so neither costs a hop of its own; a key named here
+ * that core does not read, or one it reads that is not here, only costs or
+ * saves a read.
+ */
+function reputationKeys(config: core.Config, id: string, now: number): string[] {
+  const r = config.subject?.reputation;
+  if (!r || !(Number(r.block_at) > 0)) return [];
+  const k = subjectMod.REP_PREFIX + id;
+  return [k + ":until", k + ":b:" + (Math.floor(now / (r.window_s ?? 600)) - 1)];
 }
 
 const HEADER_NAMES = ["X-Jev-Verdict", "X-Jev-Score", "X-Jev-Source", "X-Jev-Reason", "X-Jev-Request-Id"];
@@ -110,7 +257,20 @@ function consumesSubjectHeader(cfg: core.Config): boolean {
   return !!(s?.enabled && s.from === "header" && typeof s.name === "string" && s.name.toLowerCase() === SUBJECT_HEADER);
 }
 
-/** Does any rule watch this path and method? Decides whether the body is worth reading at all. */
+/**
+ * Is this a path nginx would take? Every '%' must start a two-digit hex
+ * escape and none may be %00: nginx answers anything else with 400 before
+ * jev-edge runs. The runtime cannot tell what the origin makes of such a
+ * path (cpp-httplib, under llama.cpp, reads the IIS-style %u0063 as 'c', so
+ * /v1/%u0063ompletions is /v1/completions there), so evaluate() refuses it
+ * with 400 as nginx does, never passes it unjudged. An escape of a byte
+ * that is not UTF-8 (%FF, the overlong %C0%AE) is well formed: nginx takes
+ * it, and normalizePath keeps it as sent.
+ */
+export function wellFormedPath(pathname: string): boolean {
+  return !/%(?![0-9A-Fa-f]{2})|%00/.test(pathname);
+}
+
 /**
  * The path the origin will route on, the way nginx builds $uri: %XX decoded,
  * duplicate slashes collapsed, `.` / `..` resolved. Watch patterns anchored at
@@ -121,7 +281,8 @@ export function normalizePath(pathname: string): string {
   try {
     decoded = decodeURIComponent(pathname);
   } catch {
-    // malformed escapes: decode the valid ASCII ones, leave the rest
+    // escapes that are not UTF-8 (or malformed ones, which evaluate()
+    // refuses before this): decode the valid ASCII ones, leave the rest
     decoded = pathname.replace(/%([0-7][0-9a-fA-F])/g, (_, h: string) => String.fromCharCode(parseInt(h, 16)));
   }
   const out: string[] = [];
@@ -135,9 +296,10 @@ export function normalizePath(pathname: string): string {
   return p;
 }
 
+/** Does any rule watch this path and method? Decides whether the body is worth reading at all. */
 function isCandidate(rt: Runtime, path: string, method: string): boolean {
   const m = method.toUpperCase();
-  return rt.rules.some((r) => core.rules.pathMatches(path, r.watch_paths) && (!r.methods || r.methods[m]));
+  return rt.rules.some((r) => core.rules.pathMatches(path, r.watch_paths, r.paths_case_sensitive) && (!r.methods || r.methods[m]));
 }
 
 /** Requests an adapter built from a body it only had the start of
@@ -214,7 +376,22 @@ async function readBounded(request: Request, maxBytes: number): Promise<BodyRead
 
 const utf8 = new TextDecoder("utf-8", { fatal: false });
 
-async function readReq(request: Request, rt: Runtime): Promise<[core.Req, ProviderRequestInfo]> {
+/**
+ * The first `max` bytes of `b` cut back to a character boundary (the
+ * normalize.head of resty/jev/body.lua): `b` carries one byte past `max`,
+ * which says whether `max` falls inside a character.
+ */
+function wholeChars(b: Uint8Array, max: number): Uint8Array {
+  if (b.byteLength <= max) return b;
+  let end = max;
+  // back off continuation bytes to the start of the character at `max`
+  while (end > 0 && (b[end] & 0xc0) === 0x80) end--;
+  return b.subarray(0, end);
+}
+
+/** The request as core sees it, what the provider may use of it, and
+ *  whether a rule watches its path and method (isCandidate). */
+async function readReq(request: Request, rt: Runtime): Promise<[core.Req, ProviderRequestInfo, boolean]> {
   const url = new URL(request.url);
   const path = normalizePath(url.pathname);
   const headers: Record<string, string> = {};
@@ -230,9 +407,14 @@ async function readReq(request: Request, rt: Runtime): Promise<[core.Req, Provid
   const len = lenHeader === null ? NaN : Number(lenHeader);
   const req: core.Req = { method: request.method, path, headers, client_ip: clientIp, body_size: Number.isFinite(len) ? len : 0 };
   let body: string | null = null;
+  // the body's length in bytes as read (or decoded): TextDecoder turns each
+  // invalid byte into U+FFFD, three bytes once re-encoded, so the decoded
+  // string's UTF-8 length is not the body's size (Lua's #body is)
+  let bodyBytes = 0;
+  const candidate = isCandidate(rt, path, request.method);
   // The body is only read for a request some rule would judge; everything
   // else passes at L1 on path or method without touching the stream.
-  if (request.body && isCandidate(rt, path, request.method)) {
+  if (request.body && candidate) {
     const r = await readBounded(request, maxBytes);
     const whole = r.complete && r.size <= maxBytes && !truncatedBodies.has(request);
     req.body_size = Math.max(req.body_size ?? 0, r.size, truncatedBodies.has(request) ? maxBytes + 1 : 0);
@@ -240,20 +422,37 @@ async function readReq(request: Request, rt: Runtime): Promise<[core.Req, Provid
     if (ce !== "") {
       // decode only a body read whole: a cut compressed stream is corrupt
       if (whole) {
-        const d = await decodeBody(r.head, ce, maxBytes);
+        // past maxBytes, decoded on to SCAN_FACTOR x maxBytes looking for the
+        // end, where the newest message is (resty/jev/body.lua does the same)
+        const d = await decodeBody(r.head, ce, maxBytes, { tail: core.rules.TAIL_BYTES, scan: SCAN_FACTOR * maxBytes });
         if (d[0]) {
           req.decoded = true;
           if (d[1]) {
-            req.body_head = utf8.decode(d[0].subarray(0, maxBytes));
-            req.body_size = maxBytes + 1;
+            const info = d[2];
+            if (info?.complete) {
+              req.body_head = utf8.decode(wholeChars(d[0].subarray(0, maxBytes + 1), maxBytes));
+              if (info.tail) {
+                let skip = 0;
+                while (skip < info.tail.byteLength && (info.tail[skip] & 0xc0) === 0x80) skip++;
+                if (skip < info.tail.byteLength) req.body_tail = utf8.decode(info.tail.subarray(skip));
+              }
+              req.body_size = info.size;
+            } else {
+              // the scan bound came before the end: nothing to judge it on, and
+              // core reports it unjudgeable (body too large)
+              req.body_size = Math.max(info?.size ?? 0, maxBytes + 1);
+            }
           } else {
             body = utf8.decode(d[0]);
-            req.body_size = d[0].byteLength;
+            bodyBytes = d[0].byteLength;
           }
+        } else {
+          warnDecoder(d[1], rt);
         }
       }
     } else if (whole) {
       body = utf8.decode(r.head);
+      bodyBytes = r.head.byteLength;
     } else {
       req.body_head = utf8.decode(r.head);
       if (r.tail) req.body_tail = utf8.decode(r.tail);
@@ -261,41 +460,103 @@ async function readReq(request: Request, rt: Runtime): Promise<[core.Req, Provid
   }
   if (body !== null) {
     req.body = body;
-    req.body_size = core.normalize.byteLength(body);
+    req.body_size = bodyBytes;
+    req.body_bytes = bodyBytes;
   }
-  return [req, { method: request.method, path, headers: request.headers, body, clientIp }];
+  return [req, { method: request.method, path, headers: request.headers, body, clientIp }, candidate];
 }
 
-/** Subject context for this request, or undefined: hashed id, one history read, a sink that writes without being awaited. */
-async function subjectCtx(rt: Runtime, request: Request, clientIp: string, rctx?: RequestCtx): Promise<subjectMod.SubjectCtx | undefined> {
+const decodersMissing = new Set<string>();
+
+/**
+ * A coding this runtime has no decoder for (decode.ts: br without node:zlib;
+ * gzip and deflate where DecompressionStream is missing or a stub, as on
+ * Next's edge runtime, and node:zlib too) makes every body sent in it
+ * unjudgeable, and the verdict's reason names only the coding. Said once per
+ * coding and isolate.
+ */
+function warnDecoder(reason: string, rt: Runtime): void {
+  if (!reason.includes("not available") || decodersMissing.has(reason) || decodersMissing.size >= 8) return;
+  decodersMissing.add(reason);
+  console.warn(
+    "jev-edge: " + reason + " on this runtime: request bodies sent with that Content-Encoding are unjudgeable, " +
+    "and policy.unjudgeable (" + (rt.config.policy.unjudgeable ?? "pass") + ") decides them. gzip and deflate need " +
+    "DecompressionStream or node:zlib, br needs node:zlib (Next.js: the Node runtime; Workers: nodejs_compat).",
+  );
+}
+
+let warnedLong = false;
+
+/** Subject context for this request, or undefined: hashed id, the history
+ *  (read only for a request a rule watches), a sink that writes without being
+ *  awaited. */
+async function subjectCtx(
+  rt: Runtime, request: Request, clientIp: string, candidate: boolean, rctx?: RequestCtx,
+): Promise<subjectMod.SubjectCtx | undefined> {
   const scfg = rt.config.subject;
   if (!scfg?.enabled) return undefined;
-  const raw = subjectMod.extract(scfg, {
+  // every candidate value (a cookie sent twice, quoted or not): reputation
+  // checks and charges each id, the first one names the trajectory
+  const raws = subjectMod.extractAll(scfg, {
     ip: clientIp,
+    ipv6Prefix: rt.config.client_ip?.ipv6_prefix,
     header: (n) => request.headers.get(n),
-    cookie: (n) => subjectMod.cookieValue(request.headers.get("cookie"), n),
+    cookieHeader: request.headers.get("cookie"),
+  }, (why) => {
+    // once per isolate: a subject value past the limit names no trajectory
+    if (warnedLong) return;
+    warnedLong = true;
+    console.warn(`jev-edge: ${why}, dropped (subject.from = ${scfg.from ?? "ip"})`);
   });
-  const id = await subjectMod.hashId(scfg, raw, subjectMod.sha256Hex);
+  const ids = await subjectMod.hashIds(scfg, raws, subjectMod.sha256Hex);
+  const id = ids[0];
   if (!id) return undefined;
+  if (rt.subjectSession) {
+    // The subject's own object: one hop for the trajectory and the reputation
+    // keys, and only for a request some rule would judge (any other passes L1
+    // on its path or method, and core records nothing for it).
+    const s = candidate ? await rt.subjectSession(id) : null;
+    return {
+      id,
+      history: s?.history ?? null,
+      store: s ? bestEffortStore(s.store, "subject store") : rt.subjectStore,
+      record: (e) => {
+        const write = s ? s.append(e) : subjectMod.appendHistory(rt.subjectStore, id, e, scfg.max_entries, scfg.history_ttl ?? 3600);
+        // On Workers the isolate may be torn down right after the response;
+        // waitUntil keeps the write alive. Elsewhere (or refused) it is plain
+        // fire-and-forget.
+        keepAlive(rctx, write.catch(() => {}));
+      },
+    };
+  }
   const store = rt.subjectStore;
+  // Core ignores the history in this version, and a request no rule watches
+  // passes at L1 before it could look: only a candidate pays the read (one
+  // counter get, then the slots at once). A read that fails is no history,
+  // never an adapter error that fails the request open.
+  let history: unknown;
+  if (candidate) {
+    try {
+      history = await subjectMod.loadHistory(store, id, scfg.max_entries);
+    } catch (e) {
+      console.warn("jev-edge: subject history read failed: " + describe(e));
+      history = null;
+    }
+  }
   return {
     id,
+    ids,
     // ring layout (incr + one key per entry) when the store has incr, so
     // concurrent requests do not lose entries; the one-list layout otherwise
-    history: await subjectMod.loadHistory(store, id, scfg.max_entries),
+    history,
     // reputation counters (subject.reputation); atomic where the store has incr
     store,
     record: (e) => {
       const p = subjectMod.appendHistory(store, id, e, scfg.max_entries, scfg.history_ttl ?? 3600).catch(() => {});
       // On Workers the isolate may be torn down right after the response;
-      // waitUntil keeps the write alive. Elsewhere it is plain fire-and-forget.
-      if (rctx?.waitUntil) {
-        try {
-          rctx.waitUntil(p);
-        } catch {
-          /* a host that refuses the promise still gets the fire-and-forget write */
-        }
-      }
+      // waitUntil keeps the write alive. Elsewhere (or refused) it is plain
+      // fire-and-forget.
+      keepAlive(rctx, p);
     },
   };
 }
@@ -344,8 +605,29 @@ function describe(e: unknown): string {
 }
 
 /**
+ * A path that is not well formed (wellFormedPath): refused with 400 and the
+ * block body, whatever policy.mode and policy.unjudgeable say, as nginx
+ * answers it inline and the Envoy shim and HAProxy agent do. It is the
+ * client's error, not a verdict, so it never fails open. The client sees
+ * X-Jev-Verdict: skipped and the request id (clientHeaders); the log says
+ * why.
+ */
+function badPath(rt: Runtime, requestId: string, pathname: string): Evaluation {
+  console.warn("jev-edge: refusing malformed path " + JSON.stringify(pathname.slice(0, 256)) + " with 400");
+  const verdict = core.verdict.newVerdict({
+    action: core.verdict.ACTION_BLOCK, verdict: core.verdict.SKIPPED, source: core.verdict.SRC_ADAPTER, reason: "invalid path",
+  });
+  const response = new Response(rt.config.policy.block_body ?? '{"error":"request rejected"}', {
+    status: 400,
+    headers: { "Content-Type": "application/json", ...core.verdict.clientHeaders(verdict), "X-Jev-Request-Id": requestId },
+  });
+  return { verdict, response, requestId };
+}
+
+/**
  * Evaluate one request. Never throws: any failure in the pipeline yields a
  * pass with verdict "error" and source "adapter" (see the header comment).
+ * A path that is not well formed is refused with 400 (badPath), never passed.
  */
 export async function evaluate(request: Request, rt: Runtime, rctx?: RequestCtx): Promise<Evaluation> {
   let requestId: string;
@@ -355,6 +637,8 @@ export async function evaluate(request: Request, rt: Runtime, rctx?: RequestCtx)
     requestId = String(Date.now());
   }
   try {
+    const pathname = new URL(request.url).pathname;
+    if (!wellFormedPath(pathname)) return badPath(rt, requestId, pathname);
     return await evaluateInner(request, rt, requestId, rctx);
   } catch (e) {
     console.error("jev-edge: adapter error, failing open: " + describe(e));
@@ -363,44 +647,57 @@ export async function evaluate(request: Request, rt: Runtime, rctx?: RequestCtx)
 }
 
 async function evaluateInner(request: Request, rt: Runtime, requestId: string, rctx?: RequestCtx): Promise<Evaluation> {
-  const [req, info] = await readReq(request, rt);
-  const subject = await subjectCtx(rt, request, info.clientIp, rctx);
+  const [req, info, candidate] = await readReq(request, rt);
+  const subject = await subjectCtx(rt, request, info.clientIp, candidate, rctx);
   if (subject?.id) info.subjectId = subject.id;
+  const { breaker, adaptive } = rt.perRequest?.(rctx) ?? rt;
   const judgeOnce = async (prompt: core.Prompt): Promise<core.JudgeResult> => {
-    const timeoutMs = await rt.adaptive.current();
+    const timeoutMs = await adaptive.current();
     const t0 = Date.now();
     const r = await rt.provider.call(prompt, rt.config.jev, timeoutMs, info);
     const elapsed = Date.now() - t0;
-    if (r[0]) await rt.adaptive.success(elapsed);
-    else if (String(r[1]).includes("timeout")) await rt.adaptive.timeout(timeoutMs);
+    if (r[0]) {
+      // the sample only serves later requests: past the response where the host can keep it alive
+      const p = adaptive.success(elapsed).catch(() => {});
+      if (!keepAlive(rctx, p)) await p;
+    }
+    // a timeout by its kind: an HTTP error whose message says "timeout"
+    // (openai-compat quotes the provider's) is not one; the error string
+    // only for a provider that gives no kind
+    else if (r[2] === core.judge.TIMEOUT || (r[2] === undefined && String(r[1]).includes("timeout"))) {
+      await adaptive.timeout(timeoutMs);
+    }
     return r;
   };
   const ctx: core.Ctx = {
     config: rt.config,
     rules: rt.rules,
     cache: rt.cache,
-    breaker: rt.breaker,
+    breaker,
     subject,
     clock: () => Date.now() / 1000,
     // sha256, not djb2: the fingerprint keys the verdict cache and the trust
     // store, and a linear hash lets a few appended bytes hit a chosen value.
     hash: core.sha256Hex,
-    json_decode: (s) => JSON.parse(s),
+    // JSON.parse, and NaN, Infinity and -Infinity as Python's json.loads
+    // and cjson take them (normalize.jsonDecode)
+    json_decode: core.normalize.jsonDecode,
     re_find: core.rules.reFind,
     judge: {
       call: judgeOnce,
-      // chunks judged in parallel. The backend provider sends the whole body
-      // to the origin, which chunks it itself: one call answers for all.
-      call_many: async (prompts) => {
-        if (rt.provider.name === "backend") {
-          const r = await judgeOnce(prompts[0]);
-          return prompts.map(() => r);
-        }
-        return Promise.all(prompts.map((p) => judgeOnce(p)));
-      },
+      // chunks and other parts judged in parallel
+      call_many: (prompts) => Promise.all(prompts.map((p) => judgeOnce(p))),
+      // The backend provider asks the origin about the whole request: the
+      // body when it was read whole, else every chunk and part in one text,
+      // which the origin chunks itself. One call, and its answer is kept
+      // under the whole request's key only, never a part's.
+      whole: rt.provider.name === "backend",
     },
     log: (level, msg) => console[level === "error" ? "error" : "warn"](msg),
   };
+  // the writes core makes once the verdict is decided go past the response
+  // where the host keeps promises alive; awaited everywhere else
+  if (rctx?.waitUntil) ctx.defer = (p) => rctx.waitUntil!(p);
   let verdict: core.Verdict;
   try {
     verdict = await core.evaluate(req, ctx);
@@ -424,36 +721,124 @@ async function evaluateInner(request: Request, rt: Runtime, requestId: string, r
   }
   const out: Evaluation = { verdict, requestId, subjectId: subject?.id };
   if (verdict.action === core.verdict.ACTION_BLOCK) {
+    // the client sees the verdict and the request id, never the score, the
+    // reason or the source (core.verdict.clientHeaders): those go to logs
     out.response = new Response(rt.config.policy.block_body ?? '{"error":"request rejected"}', {
       status: rt.config.policy.block_status ?? 403,
-      headers: { "Content-Type": "application/json", ...core.verdict.headers(verdict), "X-Jev-Request-Id": requestId },
+      headers: { "Content-Type": "application/json", ...core.verdict.clientHeaders(verdict), "X-Jev-Request-Id": requestId },
     });
   }
   return out;
 }
 
 /**
+ * Every X-Jev-* name among `names`, lowercased: what a client sent under
+ * jev-edge's prefix, whatever it is called (X-Jev-Subject,
+ * X-Jev-Body-Partial, the mock score header, ...), for the hosts to drop
+ * before they set the verdict's own.
+ */
+export function jevHeaderNames(names: Iterable<string>): string[] {
+  const out: string[] = [];
+  for (const k of names) {
+    const n = k.toLowerCase();
+    if (n.startsWith("x-jev-")) out.push(n);
+  }
+  return out;
+}
+
+/**
  * The request to forward upstream: original plus X-Jev-* headers. Every
- * client-supplied X-Jev-* header is dropped, including X-Jev-Subject; when
- * this runtime computed a subject id it is forwarded as X-Jev-Subject so an
- * origin jev-edge configured with `hashed = true` sees the same trajectory.
+ * client-supplied X-Jev-* header is dropped, X-Jev-Subject and any other
+ * X-Jev-* name included; when this runtime computed a subject id it is
+ * forwarded as X-Jev-Subject so an origin jev-edge configured with
+ * `hashed = true` sees the same trajectory.
  */
 export function withVerdictHeaders(request: Request, verdict: core.Verdict, requestId: string, subjectId?: string): Request {
   const headers = new Headers(request.headers);
-  for (const h of HEADER_NAMES) headers.delete(h);
-  headers.delete(SUBJECT_HEADER);
+  for (const h of jevHeaderNames(headers.keys())) headers.delete(h);
   for (const [k, v] of Object.entries(core.verdict.headers(verdict))) headers.set(k, v);
   headers.set("X-Jev-Request-Id", requestId);
   if (subjectId) headers.set("X-Jev-Subject", subjectId);
+  // new Request(request) throws on a body something already read; the
+  // headers must still be stripped and set, so that copy goes without it
+  if (request.bodyUsed) return copyRequest(request, headers);
   return new Request(request, { headers });
 }
 
+/**
+ * `request`'s URL and method with these headers and, when given (and the
+ * method takes one), this body: for a request whose own body something
+ * already read, which `new Request(request)` refuses. The platform's `cf`
+ * object goes along where there is one (workerd takes it in the init), so
+ * the copy is still a Cloudflare request to clientIpOf and requestIdFor.
+ */
+export function copyRequest(request: Request, headers: HeadersInit, body?: BodyInit): Request {
+  const init: RequestInit = { method: request.method, headers };
+  if (body !== undefined && request.method !== "GET" && request.method !== "HEAD") init.body = body;
+  if ("cf" in request) (init as { cf?: unknown }).cf = (request as { cf?: unknown }).cf;
+  return new Request(request.url, init);
+}
+
+/**
+ * GET /_jev/health, on the traffic path and open to anyone: liveness and
+ * versions only. The provider, model, policy mode and endpoint (a thin
+ * Worker's origin URL, an internal judge address) tell a caller how to aim
+ * at the judge or where the origin is, so they come only with
+ * `health: "details"`.
+ */
 export function healthResponse(rt: Runtime): Response {
-  return Response.json({
-    ok: true, adapter: rt.opts.platform ?? "js", core: core.VERSION,
-    provider: rt.provider.name, model: rt.config.jev.model ?? null, mode: rt.config.policy.mode,
-    endpoint: rt.config.jev.endpoint ?? null,
-  });
+  const body: Record<string, unknown> = { ok: true, adapter: rt.opts.platform ?? "js", core: core.VERSION };
+  if (rt.opts.health === "details") {
+    Object.assign(body, {
+      provider: rt.provider.name, model: rt.config.jev.model ?? null, mode: rt.config.policy.mode,
+      endpoint: rt.config.jev.endpoint ?? null,
+    });
+  }
+  return Response.json(body);
+}
+
+/**
+ * The request to forward when the adapter failed: X-Jev-Verdict: error /
+ * X-Jev-Source: adapter, every client-supplied X-Jev-* gone. Never throws:
+ * when even that copy cannot be made, the request itself, its X-Jev-*
+ * deleted where its headers allow it.
+ */
+export function errorForward(request: Request): Request {
+  let rid: string;
+  try {
+    rid = crypto.randomUUID();
+  } catch {
+    rid = String(Date.now());
+  }
+  try {
+    return withVerdictHeaders(request, errorVerdict(), rid);
+  } catch {
+    /* the last resort below */
+  }
+  try {
+    for (const h of [...HEADER_NAMES, SUBJECT_HEADER]) request.headers.delete(h);
+  } catch {
+    /* immutable headers: forwarded as they came */
+  }
+  return request;
+}
+
+const buildFailures = new Set<string>();
+
+/**
+ * A host whose runtime cannot be built (a config createRuntime refuses, a
+ * preset missing its origin) fails open like any other adapter error:
+ * `next` gets the request with X-Jev-Verdict: error / X-Jev-Source: adapter.
+ * Each distinct error is logged once per isolate, not per request; a failed
+ * build is never cached, so the next request tries again.
+ */
+export function failOpen(request: Request, next: (req: Request) => Promise<Response>, err: unknown): Promise<Response> {
+  const key = err instanceof Error ? err.message : String(err);
+  if (!buildFailures.has(key) && buildFailures.size < 32) {
+    buildFailures.add(key);
+    console.error("jev-edge: cannot build the runtime, failing open (logged once): " + describe(err));
+  }
+  return next(errorForward(request));
 }
 
 /**
@@ -472,17 +857,7 @@ export async function handle(request: Request, rt: Runtime, next: (req: Request)
     forwarded = withVerdictHeaders(request, verdict, requestId, subjectId);
   } catch (e) {
     console.error("jev-edge: handle error, failing open: " + describe(e));
-    let rid = "";
-    try {
-      rid = crypto.randomUUID();
-    } catch {
-      rid = String(Date.now());
-    }
-    try {
-      forwarded = withVerdictHeaders(request, errorVerdict(), rid);
-    } catch {
-      forwarded = request;
-    }
+    forwarded = errorForward(request);
   }
   return next(forwarded);
 }

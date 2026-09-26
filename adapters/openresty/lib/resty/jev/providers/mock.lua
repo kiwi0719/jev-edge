@@ -8,6 +8,11 @@
 --                   mock_score (used by Test::Nginx cases)
 --   mock_scores     table: a score per question name ({ untrusted = 0.9 }),
 --                   over mock_score, for cases that tell the questions apart
+--   mock_match      table: { ["plain substring"] = score }: a prompt whose
+--                   text holds one gets the highest such score, over
+--                   mock_score and the header, for cases that tell the parts
+--                   of one request apart (L3 judges them in a timer, where
+--                   there is no header)
 
 local _M = { name = "mock", local_only = true }
 
@@ -36,6 +41,15 @@ function _M.call(prompt, cfg, timeout_ms)
     if h == "slow" then ngx.sleep(1) end
     local n = tonumber(h)
     if n then score = n end
+  end
+
+  if type(cfg.mock_match) == "table" then
+    local best
+    for sub, sc in pairs(cfg.mock_match) do
+      sc = tonumber(sc)
+      if sc and (prompt.text or ""):find(sub, 1, true) and (not best or sc > best) then best = sc end
+    end
+    if best then score = best end
   end
 
   local answers = {}

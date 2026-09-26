@@ -108,4 +108,14 @@ end
 function _M.success(self) record(self, true) end
 function _M.failure(self) record(self, false) end
 
+--- The admitted request ended saying nothing about the provider's health
+-- (an error that does not count, or no call at all). Counts nothing; in
+-- half-open it gives the probe back, so the next request probes instead of
+-- L2 staying off until the claim expires, and the request cannot re-trip.
+function _M.release(self)
+  if self:state() == _M.HALF_OPEN then
+    self.store:set(cfg(self, "key_prefix") .. "probe", nil, 0)
+  end
+end
+
 return _M

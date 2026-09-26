@@ -15,12 +15,13 @@ interface Doc { format_version: number; suite: string; cases: Case[] }
 
 function load(name: string): Doc {
   const doc = JSON.parse(readFileSync(resolve(GOLDEN, name + ".json"), "utf8")) as Doc;
-  expect(doc.format_version).toBe(1);
+  expect(doc.format_version).toBe(2);
   return doc;
 }
 
 const reFind = core.rules.reFind;
-const jsonDecode = (s: string) => JSON.parse(s);
+// what H.body_decode takes (core/spec/helper.lua): NaN, Infinity and -Infinity too
+const jsonDecode = core.normalize.jsonDecode;
 
 function storeFrom(map: Record<string, unknown>) {
   const s = memoryStore();
@@ -40,8 +41,16 @@ describe("golden: normalize", () => {
 describe("golden: extract", () => {
   for (const c of load("extract").cases) {
     it(c.name, () => {
-      const [text, kind] = core.normalize.extract(c.input.body, c.input.content_type, c.input.fields, jsonDecode);
-      expect({ text, kind }).toEqual(c.expect);
+      const [text, kind, , decoded, cut, tokens] = core.normalize.extract(c.input.body, c.input.content_type, c.input.fields, jsonDecode);
+      // expect.cut is there only when a "**" walk hit a bound, expect.tokens
+      // only when a text field holds token ids; expect.tools only when the
+      // case names tool_fields
+      let tools: { text: string; capped?: true } | undefined;
+      if (c.input.tool_fields) {
+        const [values, capped] = core.normalize.extractTools(decoded, c.input.tool_fields, jsonDecode);
+        tools = { text: values.join("\n"), ...(capped ? { capped } : {}) };
+      }
+      expect({ text, kind, ...(cut ? { cut } : {}), ...(tokens ? { tokens } : {}), ...(tools ? { tools } : {}) }).toEqual(c.expect);
     });
   }
 });
@@ -50,8 +59,11 @@ describe("golden: rules", () => {
   for (const c of load("rules").cases) {
     it(c.name, async () => {
       const ctx = { cache: storeFrom(c.input.cache), clock: () => c.input.clock, json_decode: jsonDecode, re_find: reFind };
-      const [result, text, reason] = await core.rules.evaluate(c.input.req, loadRule(c.input.rule), ctx);
-      expect({ result, text, reason }).toEqual(c.expect);
+      // a rule set id, or an inline spec resolved the way a config's `rules` list is
+      const rule = typeof c.input.rule === "string" ? loadRule(c.input.rule) : resolveRule(c.input.rule);
+      const [result, text, reason, , , , , t, , tokens] = await core.rules.evaluate(c.input.req, rule, ctx);
+      const tools = t && { text: t.text, windowed: t.windowed, ...(t.hit ? { hit: t.hit } : {}), ...(t.only ? { only: t.only } : {}) };
+      expect({ result, text, reason, ...(tokens ? { tokens } : {}), ...(tools ? { tools } : {}) }).toEqual(c.expect);
     });
   }
 });
@@ -72,7 +84,7 @@ describe("golden: verdict", () => {
   for (const c of load("verdict").cases) {
     it(c.name, () => {
       const v = core.verdict.newVerdict(c.input);
-      expect({ verdict: v, headers: core.verdict.headers(v) }).toEqual(c.expect);
+      expect({ verdict: v, headers: core.verdict.headers(v), client_headers: core.verdict.clientHeaders(v) }).toEqual(c.expect);
     });
   }
 });
@@ -85,11 +97,22 @@ describe("golden: evaluate", () => {
       const writes: Record<string, { value: unknown; ttl: number }> = {};
       let calls = 0;
       let seen: core.Prompt | undefined;
-      let breaker: Breaker | undefined;
+      // every call core makes on the breaker is recorded, with its state after
+      let brk: Breaker | undefined;
+      let breaker: core.Ctx["breaker"];
+      const brkCalls: string[] = [];
       if (inp.breaker) {
         const bstore = memoryStore();
-        bstore.set("brk:state", { state: inp.breaker === "open" ? OPEN : CLOSED, until_ts: inp.clock + 30 }, 0);
-        breaker = new Breaker(bstore, () => inp.clock, {});
+        const until = inp.breaker === "half-open" ? inp.clock : inp.clock + 30;
+        bstore.set("brk:state", { state: inp.breaker === "closed" ? CLOSED : OPEN, until_ts: until }, 0);
+        const b = new Breaker(bstore, () => inp.clock, {});
+        brk = b;
+        const rec = <T>(m: string, f: () => Promise<T>) => () => { brkCalls.push(m); return f(); };
+        breaker = {
+          state: () => b.state(), trip: (now?: number) => b.trip(now),
+          allow: rec("allow", () => b.allow()), success: rec("success", () => b.success()),
+          failure: rec("failure", () => b.failure()), release: rec("release", () => b.release()),
+        };
       }
       let recorded: core.SubjectEntry | null = null;
       const swrites: Record<string, { value: unknown; ttl: number }> | null = inp.subject ? {} : null;
@@ -98,7 +121,7 @@ describe("golden: evaluate", () => {
         config: core.defaults.merge(core.defaults.config, inp.config),
         subject: inp.subject
           ? {
-            id: inp.subject.id, history: inp.subject.history, record: (e) => { recorded = e; },
+            id: inp.subject.id, ids: inp.subject.ids, history: inp.subject.history, record: (e) => { recorded = e; },
             store: {
               get: (k) => sstore.get(k),
               set: (k, v, ttl) => { swrites![k] = { value: v, ttl }; sstore.set(k, v, ttl); },
@@ -126,7 +149,7 @@ describe("golden: evaluate", () => {
           call: (prompt) => {
             calls++;
             seen = prompt;
-            if (inp.judge.error) return [null, inp.judge.error];
+            if (inp.judge.error) return [null, inp.judge.error, inp.judge.kind];
             if (inp.judge.by_question) {
               // answers only the questions this prompt asked, as a provider does
               const a: Record<string, unknown> = {};
@@ -137,6 +160,7 @@ describe("golden: evaluate", () => {
             }
             return [inp.judge.answers, null];
           },
+          whole: inp.judge.whole,
         },
         log: () => {},
       };
@@ -145,7 +169,20 @@ describe("golden: evaluate", () => {
       expect({
         verdict: v, headers: core.verdict.headers(v), judge_calls: calls, prompt,
         cache_writes: writes, subject_record: recorded, subject_store_writes: swrites,
+        breaker: brk ? { calls: brkCalls, state: await brk.state() } : null,
       }).toEqual(c.expect);
+    });
+  }
+});
+
+describe("golden: utf8", () => {
+  // the bytes as an adapter hands them to core: decoded with TextDecoder
+  for (const c of load("utf8").cases) {
+    it(c.name, () => {
+      const bytes = new Uint8Array((c.input.hex.match(/../g) ?? []).map((h: string) => parseInt(h, 16)));
+      const text = new TextDecoder().decode(bytes);
+      const [prompt] = core.judge.build(["injection"], text, { path: "", method: "", deployment: "" });
+      expect({ text: prompt!.text }).toEqual(c.expect);
     });
   }
 });

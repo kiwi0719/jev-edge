@@ -52,10 +52,81 @@ local function code(path)
   return table.concat(out, "\n")
 end
 
+-- run Lua source in an empty environment and return that environment
+-- (Lua 5.1 and LuaJIT: loadstring + setfenv; 5.2+: load with an env)
+local function eval(src, name)
+  local env, chunk, err = {}
+  if setfenv then
+    chunk, err = loadstring(src, "=" .. name)
+    if chunk then setfenv(chunk, env) end
+  else
+    chunk, err = load(src, "=" .. name, "t", env)
+  end
+  if not chunk then return nil, err end
+  local ok, e = pcall(chunk)
+  if not ok then return nil, e end
+  return env
+end
+
 local function rule(name, fn)
   checked = checked + 1
   local ok, err = pcall(fn, name)
   if not ok then fail(name, "check raised: " .. tostring(err)) end
+end
+
+-- a GitHub workflow's lines, CRLF read as LF
+local function yaml_lines(src)
+  local out = {}
+  for l in ((src or ""):gsub("\r\n?", "\n") .. "\n"):gmatch("([^\n]*)\n") do out[#out + 1] = l end
+  return out
+end
+
+-- a workflow's top-level jobs: their ids in order, and each one's lines
+local function workflow_jobs(src)
+  local jobs, body, cur, injobs = {}, {}, nil, false
+  for _, l in ipairs(yaml_lines(src)) do
+    if not injobs then
+      injobs = l:match("^jobs:%s*$") or l:match("^jobs:%s*#")
+    elseif l:match("^[^%s#]") then
+      break
+    else
+      local name = l:match("^  ([%w_%-]+):")
+      if name then
+        jobs[#jobs + 1], cur, body[name] = name, name, {}
+      elseif cur then
+        table.insert(body[cur], l)
+      end
+    end
+  end
+  return jobs, body
+end
+
+-- the steps of a workflow (or of one job's lines) whose `uses:` matches the
+-- Lua pattern pat, each as "\n<its lines>\n" without comments
+local function steps_using(ls, pat)
+  local code_ls = {}
+  for _, l in ipairs(ls) do
+    if not l:match("^%s*#") then code_ls[#code_ls + 1] = (l:gsub("%s+#.*$", "")) end
+  end
+  local out = {}
+  for i, l in ipairs(code_ls) do
+    if l:match("^%s*%-?%s*uses:%s*[\"']?" .. pat) then
+      local s, ui = i, #l:match("^(%s*)")
+      if not l:match("^%s*%- ") then -- `uses:` under `- name:`: back to that line
+        s = i - 1
+        while s > 0 and not (code_ls[s]:match("^%s*%- ") and #code_ls[s]:match("^(%s*)") + 2 == ui) do
+          s = s - 1
+        end
+        if s == 0 then s = i end
+      end
+      local ind, e = #code_ls[s]:match("^(%s*)"), i
+      while code_ls[e + 1] and (code_ls[e + 1]:match("^%s*$") or #code_ls[e + 1]:match("^(%s*)") > ind) do
+        e = e + 1
+      end
+      out[#out + 1] = "\n" .. table.concat(code_ls, "\n", s, e) .. "\n"
+    end
+  end
+  return out
 end
 
 -- 1. One version everywhere --------------------------------------------------
@@ -81,14 +152,40 @@ rule("version", function(r)
 end)
 
 -- 2. The rockspec ships every module (0.4.0 nearly shipped without decode.lua)
+--    under the name its path gives it. The rockspec is loaded, as LuaRocks
+--    loads it, so a commented-out line or a duplicate key is not "listed".
+local function module_name(file)
+  for _, root in ipairs({ { "adapters/openresty/lib/", "" }, { "adapters/kong/", "" },
+                          { "core/", "jev.core." }, { "rules/", "jev.rules." } }) do
+    local rest = file:sub(1, #root[1]) == root[1] and file:sub(#root[1] + 1):match("^(.+)%.lua$")
+    if rest then return ((root[2] .. rest:gsub("/", ".")):gsub("%.init$", "")) end
+  end
+end
+
 rule("rockspec-modules", function(r)
   local specs = tracked(".", "^[^/]+%.rockspec$")
   local s = specs[1] and read(specs[1])
   if not s then return fail(r, "no rockspec") end
+  local env, err = eval(s, specs[1])
+  if not env then return fail(r, specs[1] .. " does not load: " .. tostring(err)) end
+  local modules = type(env.build) == "table" and env.build.modules
+  if type(modules) ~= "table" then return fail(r, specs[1] .. " has no build.modules table") end
+  local names = {}
+  for name in pairs(modules) do names[#names + 1] = name end
+  table.sort(names, function(a, b) return tostring(a) < tostring(b) end)
   local listed = {}
-  for file in s:gmatch('=%s*"([^"]+%.lua)"') do
-    listed[file] = true
-    if not read(file) then fail(r, "listed but missing: " .. file) end
+  for _, name in ipairs(names) do
+    local file = modules[name]
+    if type(name) ~= "string" or type(file) ~= "string" then
+      fail(r, "build.modules[" .. tostring(name) .. "] is not a module name mapped to a file path")
+    else
+      listed[file] = (listed[file] or 0) + 1
+      if not read(file) then fail(r, "listed but missing: " .. file) end
+      local want_name = module_name(file)
+      if want_name ~= name then
+        fail(r, ('["%s"] = "%s": the module name for that file is %s'):format(name, file, tostring(want_name)))
+      end
+    end
   end
   local want = {}
   for _, f in ipairs(tracked("adapters/openresty/lib", "%.lua$")) do want[#want + 1] = f end
@@ -97,7 +194,8 @@ rule("rockspec-modules", function(r)
   for _, f in ipairs(tracked("rules", "%.lua$")) do want[#want + 1] = f end
   for _, f in ipairs(tracked("adapters/kong/kong", "%.lua$")) do want[#want + 1] = f end
   for _, f in ipairs(want) do
-    if not listed[f] then fail(r, "not in the rockspec: " .. f) end
+    if not listed[f] then fail(r, "not in the rockspec: " .. f)
+    elseif listed[f] > 1 then fail(r, "listed " .. listed[f] .. " times: " .. f) end
   end
 end)
 
@@ -209,8 +307,25 @@ rule("gateway-headers", function(r)
   if traefik:find("\n%s*maxBodySize:") then
     fail(r, "traefik.yml sets maxBodySize (Traefik denies past it instead of letting jev-edge judge)")
   end
+  -- trustForwardHeader true relays the client's X-Forwarded-Uri/Method from
+  -- a trusted peer, and jev-edge judges that path (audit openresty-edge#8)
+  for v in traefik:gmatch("\n%s*trustForwardHeader:%s*([^\n#]-)%s*[\n#]") do
+    if v ~= "false" then
+      fail(r, "traefik.yml sets trustForwardHeader: " .. v .. " (the client's X-Forwarded-Uri is judged)")
+    end
+  end
   local envoy = read("adapters/envoy/envoy-http.yaml") or ""
   if not envoy:find("exact:%s*content%-encoding") then fail(r, "envoy-http.yaml does not forward content-encoding") end
+  -- Envoy relays a client's own copy from a peer it counts as internal, and
+  -- authz() takes the header as the client address
+  local allowed = envoy:match("\n%s*allowed_headers:%s*\n(.-)\n%s*with_request_body:") or ""
+  local xea = "x-envoy-external-address"
+  for l in (allowed .. "\n"):gmatch("([^\n]*)\n") do
+    local kind, v = l:lower():match("^%s*%-?%s*(%a+):%s*[\"']?([^%s\"'#]+)")
+    local hit = (kind == "exact" and v == xea) or (kind == "prefix" and xea:sub(1, #v) == v)
+      or (kind == "suffix" and xea:sub(-#v) == v) or (kind == "contains" and xea:find(v, 1, true))
+    if hit then fail(r, "envoy-http.yaml forwards a client's x-envoy-external-address to /_jev/authz") end
+  end
   for _, f in ipairs({ "adapters/envoy/envoy-http.yaml", "adapters/envoy/envoy-grpc.yaml" }) do
     local n = tonumber((read(f) or ""):match("max_request_bytes:%s*(%d+)"))
     if not n or n < 1048576 then fail(r, f .. ": max_request_bytes below rules.max_body_bytes (1 MiB)") end
@@ -221,6 +336,56 @@ end)
 --    that only works on case-insensitive filesystems)
 rule("makefile", function(r)
   if (read("Makefile") or ""):find("%$%$%(PWD%)") then fail(r, "Makefile uses $$(PWD); use $(CURDIR)") end
+end)
+
+-- 9b. A Grafana state timeline with value mappings colours by them: with
+--     color mode "thresholds" it turns values into threshold ranges before
+--     the mappings, and the Breaker state panel drew closed, open and
+--     half-open as one green "-inf..+inf" bar (audit lead-github-ops#33)
+rule("grafana-state-timeline", function(r)
+  local f = "ops/grafana/jev-edge.json"
+  local n = 0
+  for panel in (read(f) or ""):gmatch("\n    {\n(.-)\n    }") do
+    if panel:find('"type"%s*:%s*"state%-timeline"') then
+      n = n + 1
+      if panel:find('"mappings"%s*:%s*%[%s*{') and panel:find('"color"%s*:%s*{%s*"mode"%s*:%s*"thresholds"') then
+        fail(r, f .. ": state timeline " .. (panel:match('"title"%s*:%s*"([^"]*)"') or "?")
+          .. " has value mappings and color mode thresholds; use fixed")
+      end
+    end
+  end
+  if n == 0 then fail(r, f .. ": no state-timeline panel found") end
+end)
+
+-- 9c. A legend's {{label}} is a label the query keeps: an aggregation
+--     without `by` drops every label, and the Subject reputation blocks
+--     legend read "Value" under {{instance}} (audit lead-github-ops#34)
+rule("grafana-legend", function(r)
+  local f = "ops/grafana/jev-edge.json"
+  local s = read(f) or ""
+  local aggs = { sum = true, max = true, min = true, avg = true, count = true, group = true,
+                 stddev = true, stdvar = true }
+  local n, seen = 0, 0
+  for _ in s:gmatch('"legendFormat"%s*:') do n = n + 1 end
+  for raw, legend in s:gmatch('"expr"%s*:%s*"(.-[^\\])"%s*,%s*"legendFormat"%s*:%s*"([^"]*)"') do
+    seen = seen + 1
+    local expr = raw:gsub('\\"', '"')
+    local agg, by = expr:match("^%s*(%a+)%s+by%s*(%b())")
+    if not agg then
+      agg = expr:match("^%s*(%a+)%s*%(")
+      by = agg and aggs[agg] and (expr:match("%)%s*by%s*(%b())%s*$") or "()")
+    end
+    if agg and aggs[agg] and by then
+      local kept = {}
+      for l in by:gmatch("[%w_]+") do kept[l] = true end
+      for l in legend:gmatch("{{%s*([%w_]+)%s*}}") do
+        if not kept[l] then
+          fail(r, f .. ": legend " .. legend .. " names " .. l .. ", which " .. agg .. " drops in " .. expr)
+        end
+      end
+    end
+  end
+  if seen ~= n then fail(r, f .. ": read " .. seen .. " of " .. n .. " targets with a legend") end
 end)
 
 -- 10. The shipped rule set is the same in Lua and TypeScript
@@ -245,10 +410,60 @@ rule("rule-parity", function(r)
   if lua:find("\n%s*content_types%s*=") then
     fail(r, "llm-endpoints lists content_types again (the allow list L1 used to pass requests on)")
   end
+  -- token_prompts: a token prompt refused on one runtime and left to
+  -- policy.unjudgeable on the other
+  local ltp = lua:match('\n%s*token_prompts%s*=%s*"([^"]*)"')
+  local ttp = tsrule:match('token_prompts:%s*"([^"]*)"')
+  if not ltp or ltp ~= ttp then
+    fail(r, "token_prompts: Lua " .. tostring(ltp) .. " vs TS " .. tostring(ttp))
+  end
   -- always_suspect: the same patterns, in the same order (the golden rules
   -- cases name the first pattern that fires)
   local chunk = loadfile("rules/llm-endpoints.lua")
-  local luapats = chunk and chunk().always_suspect or {}
+  local luarule = chunk and chunk() or {}
+  local luapats = luarule.always_suspect or {}
+  -- watch_paths, json_only_paths, text_fields and tool_fields: the same
+  -- entries in the same order (a route left out of one copy is "path not
+  -- watched" on that runtime only; the order of the fields is the order of
+  -- the judged text). resolve() fills in the same text_fields and
+  -- tool_fields for an inline rule that lists none.
+  local function strings(s)
+    local out = {}
+    for v in (s or ""):gmatch('"([^"]*)"') do out[#out + 1] = v end
+    return out
+  end
+  for _, k in ipairs({ "watch_paths", "json_only_paths", "text_fields", "tool_fields" }) do
+    if table.concat(luarule[k] or {}, ",") ~= table.concat(strings(tsrule:match(k .. ":%s*(%b[])")), ",") then
+      fail(r, k .. " differ between rules/llm-endpoints.lua and src/rules/index.ts")
+    end
+  end
+  for _, k in ipairs({ "text_fields", "tool_fields" }) do
+    local want = table.concat(luarule[k] or {}, ",")
+    if want == ""
+       or table.concat(strings((read("core/rules.lua") or ""):match("out%." .. k .. " = (%b{})")), ",") ~= want
+       or table.concat(strings(ts:match("out%." .. k .. " %?%?= (%b[])")), ",") ~= want then
+      fail(r, "resolve() default " .. k .. " differ from llm-endpoints (core/rules.lua, src/rules/index.ts)")
+    end
+  end
+  -- the walk over tool-call arguments and tool definitions: the same bounds
+  -- (a cut is "(window)" or unjudgeable in one core only otherwise) and the
+  -- same JSON Schema type names left out of a tool definition
+  local nlua, nts = code("core/normalize.lua"), code("adapters/js/src/core/normalize.ts")
+  local depth, nodes, count = nts:match("export const DEEP = { depth: (%d+), nodes: (%d+), count: (%d+) }")
+  if not depth or nlua:match("\n_M%.DEEP_DEPTH = (%d+)") ~= depth
+     or nlua:match("\n_M%.DEEP_NODES = (%d+)") ~= nodes
+     or nlua:match("\n_M%.DEEP_COUNT = (%d+)") ~= count then
+    fail(r, "DEEP_DEPTH / DEEP_NODES / DEEP_COUNT differ between core/normalize.lua and src/core/normalize.ts")
+  end
+  local function sorted_words(s)
+    local out = {}
+    for w in (s or ""):gmatch("[%a_]+") do out[#out + 1] = w end
+    table.sort(out)
+    return table.concat(out, ",")
+  end
+  local lt = sorted_words((nlua:match("\n_M%.SCHEMA_TYPES = (%b{})") or ""):gsub("= true", ""))
+  local tt = sorted_words(nts:match("SCHEMA_TYPES: ReadonlySet<string> = new Set%((%b[])%)"))
+  if lt == "" or lt ~= tt then fail(r, "SCHEMA_TYPES differ between core/normalize.lua and src/core/normalize.ts") end
   local tspats = {}
   for p in (tsrule:match("always_suspect:%s*%[(.-)\n%s*%],") or ""):gmatch("String%.raw`([^`]*)`") do
     tspats[#tspats + 1] = p
@@ -300,21 +515,289 @@ rule("template-parity", function(r)
 end)
 
 -- 12. The ruleset's one required check covers every CI job: `ci-ok` needs
---     all of them (a job left out could fail and still let a PR merge)
+--     all of them, runs whatever they did, and fails unless all succeeded (a
+--     job left out could fail and still let a PR merge; a skipped ci-ok
+--     counts as passing, so its `if:` is exactly always(): !cancelled() skips
+--     it in a cancelled run, `!cancelled() && !failure()` when a job failed)
 rule("ci-ok", function(r)
-  local ci = read(".github/workflows/ci.yml") or ""
-  local jobs_block = ci:match("\njobs:\n(.*)$") or ""
-  local jobs = {}
-  for name in jobs_block:gmatch("\n  ([%w_%-]+):") do jobs[#jobs + 1] = name end
-  local first = jobs_block:match("^  ([%w_%-]+):")
-  if first then table.insert(jobs, 1, first) end
-  local needs = ci:match("\n  ci%-ok:.-\n    needs:%s*%[([^%]]*)%]")
-  if not needs then return fail(r, "ci.yml has no ci-ok job with a needs list") end
+  -- the top-level jobs mapping: job ids at two spaces, each with its lines
+  local jobs, body = workflow_jobs(read(".github/workflows/ci.yml"))
+  if #jobs < 2 then return fail(r, "found " .. #jobs .. " jobs in ci.yml") end
+  if not body["ci-ok"] then return fail(r, "ci.yml has no ci-ok job") end
+  local ok_job = "\n" .. table.concat(body["ci-ok"], "\n")
+  local needs = ok_job:match("\n    needs:%s*%[([^%]]*)%]")
+  if not needs then return fail(r, "ci-ok has no needs: [...] list") end
   local listed = {}
   for n in needs:gmatch("[%w_%-]+") do listed[n] = true end
   for _, j in ipairs(jobs) do
     if j ~= "ci-ok" and not listed[j] then fail(r, "ci-ok does not need job " .. j) end
   end
+  -- the job's if:, without a trailing comment, quotes or ${{ }}
+  local raw = ok_job:match("\n    if:([^\n]*)")
+  local cond = (raw or ""):gsub("%s+#.*$", ""):match("^%s*(.-)%s*$")
+  cond = cond:match('^"(.*)"$') or cond:match("^'(.*)'$") or cond
+  cond = cond:match("^%${{%s*(.-)%s*}}$") or cond
+  if cond ~= "always()" then
+    fail(r, "ci-ok has no `if: always()`" .. (raw and " (it has `if:" .. raw .. "`)" or "")
+      .. ": any other condition skips it in some run where a job did not succeed")
+  end
+  local tested = false
+  for l in ok_job:gmatch("[^\n]+") do
+    if not l:match("^%s*#") and l:find("jq -e", 1, true)
+       and l:find([['all(.[]; .result == "success")']], 1, true) then
+      tested = true
+    end
+  end
+  if not tested then
+    fail(r, [[ci-ok does not run jq -e 'all(.[]; .result == "success")' on its needs]])
+  end
+end)
+
+-- 13. Only a provider that is failing counts against the breaker: core
+--     reports through settle(), with judge.counts deciding, and the Lua HTTP
+--     client classifies by status (a 200 the judged text made unusable, or a
+--     4xx it provoked, let a client switch L2 off for every tenant)
+rule("breaker-failures", function(r)
+  local core_files = { ["core/init.lua"] = true, ["adapters/js/src/core/index.ts"] = true }
+  for f in pairs(core_files) do
+    local s = code(f)
+    local n = select(2, s:gsub("[:%.]failure%(%)", ""))
+    if n ~= 1 then fail(r, f .. ": " .. n .. " breaker failure() calls; report through settle() only") end
+    if not s:find("judge%.counts%(") then fail(r, f .. ": failed calls are not classified with judge.counts") end
+  end
+  local own = { ["core/breaker.lua"] = true, ["adapters/js/src/core/breaker.ts"] = true,
+                ["adapters/js/src/cf/stores.ts"] = true,   -- the breaker and its Durable Object proxy
+                ["adapters/js/src/besteffort.ts"] = true } -- the runtime's forwarding wrapper around them
+  local files = tracked("adapters/openresty/lib", "%.lua$")
+  for _, f in ipairs(tracked("adapters/js/src", "%.ts$")) do files[#files + 1] = f end
+  files[#files + 1] = "adapters/apisix/apisix/plugins/jev-edge.lua"
+  files[#files + 1] = "adapters/kong/kong/plugins/jev-edge/handler.lua"
+  for _, f in ipairs(files) do
+    if not core_files[f] and not own[f] and code(f):find("[:%.]failure%(%)") then
+      fail(r, f .. ": feeds the breaker outside core")
+    end
+  end
+  if not code("adapters/openresty/lib/resty/jev/http.lua"):find("judge%.status_kind%(res%.status%)") then
+    fail(r, "resty/jev/http.lua: a failed parse is not classified by the provider's status")
+  end
+end)
+
+-- 14. One pnpm, pinned exactly by "packageManager" in adapters/js/package.json,
+--     and every workflow's pnpm/action-setup reads it (audit ci-release#10: CI
+--     pinned pnpm 9 while a local pnpm 11 wrote a pnpm-workspace.yaml that
+--     pnpm 9 rejects, and CI ran the dependency build scripts local installs
+--     block). pnpm-workspace.yaml records a decision for each dependency
+--     build script, and none of them runs.
+rule("pnpm-pin", function(r)
+  local pm = (read("adapters/js/package.json") or ""):match('\n%s*"packageManager":%s*"([^"]*)"')
+  if not pm then
+    fail(r, 'adapters/js/package.json has no "packageManager"')
+  elseif not (pm:match("^pnpm@%d+%.%d+%.%d+$") or pm:match("^pnpm@%d+%.%d+%.%d+%+sha%d+%.%x+$")) then
+    fail(r, 'adapters/js/package.json "packageManager" is ' .. pm .. ", not an exact pnpm@X.Y.Z")
+  end
+  for _, wf in ipairs(tracked(".github/workflows", "%.ya?ml$")) do
+    for _, step in ipairs(steps_using(yaml_lines(read(wf)), "pnpm/action%-setup@")) do
+      if not step:find("\n%s*package_json_file:%s*adapters/js/package%.json%s*\n") then
+        fail(r, wf .. ": pnpm/action-setup does not read the version from adapters/js/package.json")
+      end
+      if step:find("\n%s*version:") then fail(r, wf .. ": pnpm/action-setup sets a pnpm version of its own") end
+    end
+  end
+  local ws = read("adapters/js/pnpm-workspace.yaml")
+  if not ws then
+    return fail(r, "adapters/js/pnpm-workspace.yaml is missing (the dependency build-script decisions)")
+  end
+  local inblock, n = false, 0
+  for _, l in ipairs(yaml_lines(ws)) do
+    local t = l:gsub("%s+#.*$", ""):gsub("^#.*$", "")
+    if t:match("^allowBuilds:%s*$") then
+      inblock = true
+    elseif t:match("^%S") then
+      inblock = false
+      if t:match("^dangerouslyAllowAllBuilds:%s*true") then
+        fail(r, "pnpm-workspace.yaml: dangerouslyAllowAllBuilds runs every dependency build script")
+      end
+    elseif inblock and t:match("%S") then
+      n = n + 1
+      local name, v = t:match("^%s+[\"']?([^\"':]+)[\"']?:%s*(.-)%s*$")
+      if v ~= "false" then
+        fail(r, "pnpm-workspace.yaml: allowBuilds " .. tostring(name) .. " is " .. tostring(v)
+          .. ", not false (no dependency build script runs)")
+      end
+    end
+  end
+  if n == 0 then fail(r, "pnpm-workspace.yaml has no allowBuilds decisions") end
+end)
+
+-- 15. Only the publish job of release-npm.yml holds the npm-publishing OIDC
+--     token, and it runs no code from the repository or its dependencies: no
+--     checkout, no install, a pinned npm publishing the tarball the build job
+--     packed, in the `npm` environment npm's Trusted Publisher names (audit
+--     ci-release#1: the token was granted to the whole workflow, so a
+--     dependency's install script or test-time code could publish).
+local function code_lines(ls)
+  local out = {}
+  for _, l in ipairs(ls) do
+    if not l:match("^%s*#") then out[#out + 1] = (l:gsub("%s+#.*$", "")) end
+  end
+  return out
+end
+
+rule("release-token", function(r)
+  local WF = ".github/workflows/release-npm.yml"
+  local src = read(WF)
+  if not src then return fail(r, WF .. " missing") end
+  local perms, inperms = {}, false
+  for _, l in ipairs(code_lines(yaml_lines(src))) do
+    if l:match("^permissions:") then
+      inperms = true
+      local inline = l:match("^permissions:%s*(%S.-)%s*$")
+      if inline then perms[#perms + 1] = inline end
+    elseif l:match("^%S") then
+      inperms = false
+    elseif inperms and l:match("%S") then
+      perms[#perms + 1] = l:match("^%s*(.-)%s*$")
+    end
+  end
+  if #perms ~= 1 or perms[1] ~= "contents: read" then
+    fail(r, WF .. ": workflow-level permissions are not just `contents: read` ("
+      .. table.concat(perms, ", ") .. "); the publish job adds id-token itself")
+  end
+  local jobs, body = workflow_jobs(src)
+  local holders = {}
+  for _, j in ipairs(jobs) do
+    local ls = code_lines(body[j])
+    local text = "\n" .. table.concat(ls, "\n") .. "\n"
+    if text:find("\n%s+id%-token:%s*write%s*\n") then
+      holders[#holders + 1] = j
+      local env = text:match("\n    environment:([^\n]*)\n") or ""
+      local envname = text:match("\n    environment:%s*\n%s+name:([^\n]*)\n") or env
+      if not (envname:match("^%s*npm%s*$") or envname:find("'npm'", 1, true)) then
+        fail(r, "job " .. j .. " holds the OIDC token outside the npm environment")
+      end
+      if text:find("actions/checkout", 1, true) then
+        fail(r, "job " .. j .. " holds the OIDC token and checks out the repository")
+      end
+      for _, l in ipairs(ls) do
+        if l:find("pnpm", 1, true) or l:match("%f[%w]npx%f[^%w]") or l:match("npm%s+ci%f[^%w]")
+           or l:match("npm%s+run%f[^%w]") or l:match("npm%s+exec%f[^%w]")
+           or ((l:match("npm%s+install%f[^%w]") or l:match("npm%s+i%s")) and not l:match("npm install %-g npm@")) then
+          fail(r, "job " .. j .. " holds the OIDC token and installs or runs packages: " .. l:match("^%s*(.-)$"))
+        end
+        local npmv = l:match("npm install %-g [\"']?npm@([^%s\"']*)")
+        if npmv and not npmv:match("^%d+%.%d+%.%d+$") then
+          fail(r, "job " .. j .. " publishes with npm@" .. npmv .. ", not an exact version")
+        end
+      end
+      local pub = text:match("\n[^\n]*npm publish([^\n]*)\n")
+      if not pub then
+        fail(r, "job " .. j .. " holds the OIDC token and runs no npm publish")
+      else
+        if not pub:match("^%s+[\"']?%./%S+") then
+          fail(r, "job " .. j .. ": npm publish is not given the packed tarball")
+        end
+        if not pub:find("--ignore-scripts", 1, true) then
+          fail(r, "job " .. j .. ": npm publish runs lifecycle scripts")
+        end
+      end
+    else
+      for _, l in ipairs(ls) do
+        if l:match("pnpm install") and not l:find("--ignore-scripts", 1, true) then
+          fail(r, "job " .. j .. ": pnpm install runs dependency scripts (--ignore-scripts)")
+        end
+      end
+    end
+  end
+  if #holders ~= 1 then
+    fail(r, WF .. ": " .. #holders .. " jobs hold the OIDC token (" .. table.concat(holders, ", ") .. "), not one")
+  end
+end)
+
+-- 16. A release comes from a commit already on main, checked by both jobs of
+--     release-npm.yml on every tag run (lead-github-ops#32: a v* tag pushed
+--     on an unmerged commit published it with provenance). The build job
+--     asks git, with main's history fetched; the publish job, which checks
+--     nothing out, asks GitHub's compare API.
+local function job_steps(ls)
+  local steps, cur, ind = {}, nil, nil
+  for _, l in ipairs(code_lines(ls)) do
+    local sp = l:match("^(%s*)steps:%s*$")
+    if sp then
+      ind, cur = #sp, nil
+    elseif ind then
+      local lead = #l:match("^(%s*)")
+      if l:match("%S") and lead <= ind then
+        ind, cur = nil, nil
+      elseif l:match("^%s*%- ") and (lead == ind + 2 or lead == ind) then
+        cur = { l }
+        steps[#steps + 1] = cur
+      elseif cur then
+        cur[#cur + 1] = l
+      end
+    end
+  end
+  return steps
+end
+
+rule("release-on-main", function(r)
+  local WF = ".github/workflows/release-npm.yml"
+  local jobs, body = workflow_jobs(read(WF))
+  if #jobs == 0 then return fail(r, WF .. ": no jobs found") end
+  for _, j in ipairs(jobs) do
+    local found = false
+    for _, st in ipairs(job_steps(body[j])) do
+      local t = "\n" .. table.concat(st, "\n") .. "\n"
+      local git = t:find('git merge-base --is-ancestor "$GITHUB_SHA" origin/main', 1, true)
+      local api = t:find("compare/main...$GITHUB_SHA", 1, true) and t:find("ahead_by", 1, true)
+      if git or api then
+        found = true
+        local cond = t:match("\n[%s%-]*if:%s*([^\n]-)%s*\n")
+        if cond then
+          cond = cond:match("^%${{%s*(.-)%s*}}$") or cond
+          if cond ~= "github.ref_type == 'tag'" then
+            fail(r, "job " .. j .. ": the check that a tag's commit is on main runs only if " .. cond)
+          end
+        end
+        if git then
+          local co = steps_using(body[j], "actions/checkout@")[1] or ""
+          if not co:find("\n%s*fetch%-depth:%s*0%s*\n") then
+            fail(r, "job " .. j .. ": checks main's history without fetching it (checkout fetch-depth: 0)")
+          end
+        end
+      end
+    end
+    if not found then fail(r, "job " .. j .. " does not check that a tag's commit is on main") end
+  end
+end)
+
+-- 17. @jev-edge/js loads from require() as well as import (audit packaging#6:
+--     the exports named only "import", so a CommonJS consumer got
+--     ERR_PACKAGE_PATH_NOT_EXPORTED even on a Node that can require() ESM).
+--     Each entry's last condition is "default", the file "import" names, and
+--     ci.yml's js job loads every entry both ways.
+rule("npm-exports", function(r)
+  local ex = (read("adapters/js/package.json") or ""):match('\n%s*"exports":%s*(%b{})')
+  if not ex then return fail(r, "adapters/js/package.json has no exports map") end
+  local ci = "\n" .. table.concat(code_lines(yaml_lines(read(".github/workflows/ci.yml"))), "\n") .. "\n"
+  local req = ci:match("\n[^\n]*(%[[^%]\n]*%][^\n]*require%('@jev%-edge/js' %+ s%))") or ""
+  local imp_line = ci:match("\n[^\n]*(%[[^%]\n]*%][^\n]*await import%('@jev%-edge/js' %+ s%))") or ""
+  local n = 0
+  for sub, entry in ex:gmatch('"([^"]+)":%s*(%b{})') do
+    n = n + 1
+    local keys = {}
+    for k in entry:gmatch('"([^"]+)":') do keys[#keys + 1] = k end
+    local imp = entry:match('"import":%s*"([^"]*)"')
+    local def = entry:match('"default":%s*"([^"]*)"')
+    if imp and def ~= imp then
+      fail(r, "exports " .. sub .. ': "default" is ' .. tostring(def) .. ', not the "import" file ' .. imp)
+    elseif def and keys[#keys] ~= "default" then
+      fail(r, "exports " .. sub .. ': "default" is not the last condition (Node takes the first that matches)')
+    end
+    local s = "'" .. sub:gsub("^%.", "") .. "'"
+    if not req:find(s, 1, true) then fail(r, "ci.yml does not require() exports " .. sub) end
+    if not imp_line:find(s, 1, true) then fail(r, "ci.yml does not import exports " .. sub) end
+  end
+  if n == 0 then fail(r, "adapters/js/package.json exports no conditions") end
 end)
 
 -- ---------------------------------------------------------------------------

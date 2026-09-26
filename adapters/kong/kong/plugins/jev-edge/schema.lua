@@ -5,12 +5,18 @@
 -- unset and core's defaults (core/defaults.lua) fill it, so the three
 -- adapters cannot drift on a default.
 --
--- One deviation: Kong's typedefs cannot express "a string or a table" in one
--- array, so rules come in two fields:
+-- Two deviations, where Kong's typedefs cannot express the value:
 --   rules       array of rule set ids under rules/ ("llm-endpoints", ...)
 --   rules_json  the full rules list as JSON, ids and inline rules mixed,
 --               exactly the APISIX / Lua-config `rules` value; when set it
---               replaces `rules`.
+--               replaces `rules` ("a string or a table" in one array).
+--   jev.questions_json
+--               jev.questions (per-template question wording, a map of maps)
+--               as a JSON object.
+-- For the same reason jev.extra_body (a JSON object merged into the
+-- openai-compat request) is jev.extra_body_json, a JSON object as a string,
+-- and jev.temperature is a number only (no false: set 1 for a model that
+-- takes only its default temperature).
 
 require("resty.jev.loader")()
 
@@ -46,17 +52,54 @@ local function decode_rules_json(s)
   return specs
 end
 
+-- A data plane validates every config its control plane pushes, and one
+-- invalid plugin conf refuses the whole push: no route or plugin anywhere
+-- changes after it. The rule files are each node's own, so a DP missing one
+-- would stop syncing altogether. There a rule set that is not on disk is
+-- taken as found (its own fields are still checked), and the plugin answers
+-- verdict=error on the routes that name it (handler.lua). Traditional and
+-- control plane nodes check the disk.
+local function on_data_plane()
+  local k = rawget(_G, "kong")
+  local c = type(k) == "table" and k.configuration
+  return type(c) == "table" and c.role == "data_plane"
+end
+
+local function load_rule_to_check(id)
+  local r, err = load_rule(id)
+  if r or not on_data_plane() then return r, err end
+  return { id = id, watch_paths = {} }
+end
+
 local function check_rules_json(s)
   local specs, err = decode_rules_json(s)
   if not specs then return nil, err end
-  local _, rerr = rules_mod.resolve_all(specs, load_rule)
+  local _, rerr = rules_mod.resolve_all(specs, load_rule_to_check)
   if rerr then return nil, rerr end
   return true
 end
 
+-- jev.extra_body_json: a JSON object, checked as core checks jev.extra_body
+local function check_extra_body_json(s)
+  local eb = cjson.decode(s)
+  if type(eb) ~= "table" then return nil, "jev.extra_body_json must be a JSON object" end
+  return defaults.validate_extra_body(eb)
+end
+
 local function check_rule_ids(ids)
-  local _, err = rules_mod.resolve_all(ids, load_rule)
+  local _, err = rules_mod.resolve_all(ids, load_rule_to_check)
   if err then return nil, err end
+  return true
+end
+
+local function check_questions_json(s)
+  local qs, err = cjson.decode(s)
+  if type(qs) ~= "table" or qs[1] ~= nil then
+    return nil, "questions_json must be a JSON object" .. (err and (": " .. err) or "")
+  end
+  local merged = defaults.merge(defaults.config, { jev = { questions = qs } })
+  local ok, verr = defaults.validate(merged)
+  if not ok then return nil, verr end
   return true
 end
 
@@ -72,7 +115,7 @@ return {
         { jev = {
           type = "record",
           fields = {
-            { provider           = { type = "string", one_of = { "jev", "openai-compat", "mock" } } },
+            { provider           = { type = "string", one_of = { "jev", "laya", "openai-compat", "mock" } } },
             { endpoint           = { type = "string" } },
             { model              = { type = "string" } },
             -- a {vault://env/...} reference works here too
@@ -83,6 +126,15 @@ return {
             { timeout_max_ms     = { type = "integer", gt = 0 } },
             { timeout_adaptive   = { type = "boolean" } },
             { max_inflight       = { type = "integer", gt = 0 } },
+            { ssl_verify         = { type = "boolean" } },
+            -- jev.questions as JSON: { "<template>": { "instructions": ..., ... } }
+            { questions_json     = { type = "string", custom_validator = check_questions_json } },
+            -- the openai-compat request: the reply's token budget and the
+            -- parameter that carries it, the temperature, extra body keys
+            { max_tokens         = { type = "integer", gt = 0 } },
+            { token_param        = { type = "string", one_of = { "max_tokens", "max_completion_tokens" } } },
+            { temperature        = { type = "number", between = { 0, 2 } } },
+            { extra_body_json    = { type = "string", custom_validator = check_extra_body_json } },
             -- mock provider knobs, for tests
             { mock_score         = { type = "number", between = unit } },
             { mock_header        = { type = "string" } },
@@ -106,6 +158,16 @@ return {
             { hashed      = { type = "boolean" } },
             { history_ttl = { type = "number", gt = 0 } },
             { max_entries = { type = "integer", gt = 0 } },
+            { reputation  = {
+              type = "record",
+              fields = {
+                { block_at   = { type = "number", between = { 0, 1e9 } } },
+                { window_s   = { type = "number", gt = 0 } },
+                { block_ttl  = { type = "number", gt = 0 } },
+                { suspicious = { type = "number", between = { 0, 1e9 } } },
+                { malicious  = { type = "number", between = { 0, 1e9 } } },
+              },
+            } },
           },
         } },
         { sampling = {
@@ -126,7 +188,7 @@ return {
             { mode              = { type = "string", one_of = { "monitor", "enforce" } } },
             { block_threshold   = { type = "number", between = unit } },
             { suspect_threshold = { type = "number", between = unit } },
-            { block_status      = { type = "integer", between = { 200, 599 } } },
+            { block_status      = { type = "integer", between = { 400, 499 } } },
             { block_body        = { type = "string" } },
             { unjudgeable       = { type = "string", one_of = { "pass", "block" } } },
           },
@@ -181,6 +243,15 @@ return {
       field_sources = { "config" },
       fn = function(entity)
         local conf = strip_nulls(entity.config)
+        -- as the handler hands it to core: questions_json is jev.questions
+        if type(conf.jev) == "table" and conf.jev.questions_json then
+          conf.jev.questions = cjson.decode(conf.jev.questions_json)
+          conf.jev.questions_json = nil
+        end
+        -- and extra_body_json is jev.extra_body
+        if type(conf.jev) == "table" and conf.jev.extra_body_json then
+          conf.jev.extra_body, conf.jev.extra_body_json = cjson.decode(conf.jev.extra_body_json), nil
+        end
         local merged = defaults.merge(defaults.config, conf)
         local ok, err = defaults.validate(merged)
         if not ok then return nil, err end

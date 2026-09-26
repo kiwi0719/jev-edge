@@ -3,10 +3,23 @@
 // only the request shape and the stores differ (memory per process unless you
 // pass a Store).
 import { Buffer } from "node:buffer";
-import { createRuntime, evaluate, withVerdictHeaders, healthResponse, type Options, type Runtime } from "./runtime.js";
+import {
+  createRuntime, evaluate, withVerdictHeaders, copyRequest, healthResponse, failOpen, errorForward, jevHeaderNames, type Options, type Runtime,
+} from "./runtime.js";
 import { headers as verdictHeaders, newVerdict, ERROR, SRC_ADAPTER, type Verdict } from "./core/verdict.js";
+import { contentEncoding } from "./core/rules.js";
 
-const HEADERS = ["x-jev-verdict", "x-jev-score", "x-jev-source", "x-jev-reason", "x-jev-request-id", "x-jev-subject"];
+function adapterError(): Verdict {
+  return newVerdict({ verdict: ERROR, source: SRC_ADAPTER, reason: "adapter error" });
+}
+
+function newRequestId(): string {
+  try {
+    return crypto.randomUUID();
+  } catch {
+    return String(Date.now());
+  }
+}
 
 function runtimeOnce(opts: Options): () => Runtime {
   let rt: Runtime | undefined;
@@ -27,28 +40,76 @@ export interface NextFetchEventLike {
   waitUntil(p: Promise<unknown>): void;
 }
 
+/** The subset of NextRequest's `nextUrl` this module reads: the path Next
+ *  routes on, with next.config's basePath and the locale taken off. */
+export interface NextUrlLike {
+  pathname: string;
+  search?: string;
+}
+
+/**
+ * The request to judge. `request.url` keeps next.config's basePath (and the
+ * i18n locale): under basePath "/docs" a call to /v1/chat/completions arrives
+ * as /docs/v1/chat/completions, which no rule watches, and would pass as
+ * "path not watched". A NextRequest's `nextUrl.pathname` is the path Next
+ * routes on, without them, so the judged request carries that path, the
+ * original method and headers, and a clone of the body (Next buffers it).
+ * Built as a string on the request's origin, never resolved as a reference:
+ * `//v1/...` stays a path. A plain Request (no nextUrl) is judged as is.
+ */
+function nextJudged(request: Request, url: URL): Request {
+  const nu = (request as Request & { nextUrl?: NextUrlLike }).nextUrl;
+  if (!nu || typeof nu.pathname !== "string" || !nu.pathname.startsWith("/")) return request;
+  const search = typeof nu.search === "string" ? nu.search : url.search;
+  if (nu.pathname === url.pathname && search === url.search) return request;
+  const init: RequestInit & { duplex?: "half" } = { method: request.method, headers: request.headers };
+  if (request.body && request.method !== "GET" && request.method !== "HEAD") {
+    init.body = request.clone().body;
+    init.duplex = "half"; // a stream body, as Node's fetch requires
+  }
+  return new Request(url.origin + nu.pathname + search, init);
+}
+
 /**
  * middleware.ts:
  *
  *   import { NextResponse } from "next/server";
  *   import { nextMiddleware } from "@jev-edge/js";
  *   export const middleware = nextMiddleware({ config: { ... } }, NextResponse);
- *   export const config = { matcher: ["/api/chat/:path*", "/v1/:path*"] };
+ *   export const config = { runtime: "nodejs", matcher: ["/api/chat/:path*", "/api/completion/:path*", "/api/completions/:path*", "/v1/:path*"] };
  *
- * Allowed requests continue with X-Jev-* on the request headers (read them in
- * the route handler); blocked ones get the 403 from the middleware. Next
- * buffers the body for middleware, so `request.text()` works on the edge and
- * Node runtimes alike. Next passes a `NextFetchEvent` as the second
+ * (Next 16: proxy.ts, `export const proxy = ...`, and no `runtime`: a proxy
+ * always runs on Node.) Allowed requests continue with X-Jev-* on the request
+ * headers (read them in the route handler); blocked ones get the 403 from the
+ * middleware. Next buffers the body for middleware, so `request.text()` works
+ * on the edge and Node runtimes alike, but on the edge runtime
+ * DecompressionStream is a stub that throws: a gzip or deflate body is
+ * unjudgeable there (decode.ts), so run it on the Node runtime. Next passes a `NextFetchEvent` as the second
  * argument; its `waitUntil` keeps the subject write alive after the response.
+ * The path judged (and matched against /_jev/health) is `nextUrl.pathname`,
+ * without next.config's basePath and locale, as Next routes it.
  */
 export function nextMiddleware(opts: Options, NextResponse: NextResponseLike) {
   const rt = runtimeOnce(opts);
   return async (request: Request, event?: NextFetchEventLike): Promise<Response> => {
-    const r = rt();
-    const url = new URL(request.url);
+    const pass = async (fwd: Request) => NextResponse.next({ request: { headers: fwd.headers } });
+    let r: Runtime;
+    try {
+      r = rt();
+    } catch (e) {
+      return failOpen(request, pass, e);
+    }
+    let judged: Request;
+    try {
+      judged = nextJudged(request, new URL(request.url));
+    } catch (e) {
+      console.error("jev-edge: next middleware error, failing open: " + (e instanceof Error ? e.message : String(e)));
+      return pass(errorForward(request));
+    }
+    const url = new URL(judged.url);
     if (r.opts.health !== false && url.pathname === "/_jev/health" && request.method === "GET") return healthResponse(r);
     // the event is a RequestCtx as is: evaluate calls event.waitUntil(p)
-    const { verdict, response, requestId, subjectId } = await evaluate(request, r, event); // never throws: fails open
+    const { verdict, response, requestId, subjectId } = await evaluate(judged, r, event); // never throws: fails open
     if (response) return response;
     const forwarded = withVerdictHeaders(request, verdict, requestId, subjectId);
     return NextResponse.next({ request: { headers: forwarded.headers } });
@@ -62,10 +123,15 @@ export function nextMiddleware(opts: Options, NextResponse: NextResponseLike) {
 export interface NodeRequestLike {
   method?: string;
   url?: string;
+  /** Express / Connect: the whole request-target. Under a mount path
+   *  (`app.use("/v1", ...)`, a Router) `url` has the prefix cut off. */
+  originalUrl?: string;
   headers: Record<string, string | string[] | undefined>;
   socket?: { remoteAddress?: string };
   /** set by express.json() / body-parser; used instead of the stream when present */
   body?: unknown;
+  /** Set by nodeMiddleware when it read the stream itself: the bytes as they came. */
+  rawBody?: Buffer;
   on(event: "data" | "end" | "error", cb: (arg?: any) => void): unknown;
   /** node:http IncomingMessage flags: when the stream is already finished (a
    *  previous middleware consumed it) there is nothing to read and waiting
@@ -96,6 +162,25 @@ function text(b: Buffer): string {
   return utf8.decode(b);
 }
 
+const strictUtf8 = new TextDecoder("utf-8", { fatal: true });
+
+/**
+ * What later middleware gets as `req.body` for a stream this middleware
+ * read itself: the UTF-8 string when the body is plain UTF-8 text, else the
+ * bytes as they came, as express.raw() hands them. A compressed body (any
+ * Content-Encoding) or a binary one (an upload in a multipart body) decoded
+ * to a string with U+FFFD in place of what is not UTF-8 could not be
+ * inflated or saved again.
+ */
+function handedOn(b: Buffer, headers: NodeRequestLike["headers"]): string | Buffer {
+  if (contentEncoding(headers) !== "") return b;
+  try {
+    return strictUtf8.decode(b);
+  } catch {
+    return b;
+  }
+}
+
 function isEmptyObject(v: unknown): boolean {
   return typeof v === "object" && v !== null && !Buffer.isBuffer(v) && Object.keys(v).length === 0;
 }
@@ -115,6 +200,9 @@ function reencode(body: object, contentType: string): string {
   return JSON.stringify(body);
 }
 
+/** Requests whose stream nodeMiddleware read itself, and the bytes it read. */
+const ownReads = new WeakMap<object, Buffer>();
+
 /**
  * The request body as text plus its size in bytes. From `req.body` when a
  * parser actually read the stream (body-parser sets `req._body`; any parser
@@ -130,6 +218,12 @@ function reencode(body: object, contentType: string): string {
  * a stream something else already consumed.
  */
 async function readNodeBody(req: NodeRequestLike): Promise<[string | Buffer | null, number, boolean]> {
+  // This middleware read the stream already (mounted twice, app and
+  // router): req.body and req._body are its own, not a parser's, so the
+  // bytes as they came, still to decode. Never req.rawBody, which the
+  // common express.json({ verify }) pattern sets to the inflated bytes.
+  const own = ownReads.get(req);
+  if (own) return [own, own.length, false];
   // `complete` is not "consumed": node sets it once the whole body has
   // arrived, often before anyone reads it. Only an ended stream is gone.
   const streamGone = typeof req.on !== "function" || req.readableEnded === true || req.readable === false;
@@ -161,12 +255,44 @@ async function readNodeBody(req: NodeRequestLike): Promise<[string | Buffer | nu
 }
 
 /**
+ * A request-target as origin-form (path and query). An absolute-form target
+ * (`http://host/v1/...`, what a client talking to a proxy sends) keeps only
+ * its path, which is what Express routes on; `*` and authority-form are "/".
+ */
+function originForm(target: string): string {
+  if (target.startsWith("/")) return target;
+  const m = /^[a-z][a-z0-9+.-]*:\/\/[^/?#]*/i.exec(target);
+  if (!m) return "/";
+  const rest = target.slice(m[0].length);
+  return rest.startsWith("/") ? rest : "/" + rest;
+}
+
+/**
+ * The URL the runtime judges: the whole path the app routes on
+ * (`originalUrl`, not the mount-relative `url`) under a fixed origin. Never
+ * the client's Host header as the base, which the URL parser can reject
+ * (`a b`, `x:99999`), and never the target resolved as a reference, where
+ * `//v1/chat/completions` would make `v1` the host. The runtime then
+ * normalizes the path (`//v1/...` -> `/v1/...`) as on every other host.
+ */
+function judgedUrl(req: NodeRequestLike): URL {
+  return new URL("http://localhost" + originForm(req.originalUrl ?? req.url ?? "/"));
+}
+
+/**
  * app.use(nodeMiddleware({ config: { ... } }))
  *
- * Mount before the routes that carry natural language. If you use
+ * Mount before the routes that carry natural language. Under a mount path
+ * (`app.use("/v1", ...)`, a Router) the whole path is still what is judged,
+ * `req.originalUrl`, since that is what the rules' watch_paths name. If you use
  * express.json() first, the parsed body is re-serialised for evaluation; if
  * not, the stream is read here (whole, see readNodeBody) and re-exposed as
- * `req.body` (string) and `req.jev` (the verdict). X-Jev-* are set on
+ * `req.rawBody` (the bytes) and `req.body`: the string for plain UTF-8, the
+ * bytes for a compressed or binary body (handedOn). It then sets
+ * `req._body`, body-parser's "already parsed" flag, so a parser mounted
+ * after this one passes that string or those bytes on instead of failing on
+ * the spent stream: mount express.json() before nodeMiddleware to get an
+ * object. `req.jev` is the verdict. X-Jev-* are set on
  * `req.headers` for the handlers; client-supplied ones are removed first.
  * Any error fails open with x-jev-verdict: error, x-jev-source: adapter.
  */
@@ -175,8 +301,7 @@ export function nodeMiddleware(opts: Options) {
   return async (req: NodeRequestLike & { jev?: Verdict }, res: NodeResponseLike, next: (err?: unknown) => void): Promise<void> => {
     try {
       const r = rt();
-      const host = (req.headers.host as string) ?? "localhost";
-      const url = new URL(req.url ?? "/", "http://" + host);
+      const url = judgedUrl(req);
       const headers = new Headers();
       for (const [k, v] of Object.entries(req.headers)) {
         if (v === undefined) continue;
@@ -190,10 +315,18 @@ export function nodeMiddleware(opts: Options) {
       }
       const method = req.method ?? "GET";
       const [body, , fromParser] = method === "GET" || method === "HEAD" ? [null, 0, false] : await readNodeBody(req);
-      if (body !== null && (req.body === undefined || (req._body !== true && isEmptyObject(req.body)))) {
-        const b = asBuffer(body);
-        req.body = b ? text(b) : body;
+      const raw = fromParser ? undefined : asBuffer(body);
+      if (raw) {
+        ownReads.set(req, raw);
+        req.rawBody = raw;
       }
+      if (body !== null && (req.body === undefined || (req._body !== true && isEmptyObject(req.body)))) {
+        req.body = raw ? handedOn(raw, req.headers) : body;
+      }
+      // the stream is spent: body-parser (1.x checks req._body) and the
+      // like, mounted after this, must take the body as read, not answer
+      // 500 "stream is not readable"
+      if (raw) req._body = true;
       // a parser already decoded it: the runtime must not try again
       if (fromParser) headers.delete("content-encoding");
       // The whole body goes to the runtime, which reads it as it reads any
@@ -201,7 +334,9 @@ export function nodeMiddleware(opts: Options) {
       const request = new Request(url.toString(), {
         method, headers, body: body === null ? undefined : (asBuffer(body) ? new Uint8Array(asBuffer(body)!) : body) as BodyInit,
       });
-      if (r.opts.health !== false && url.pathname === "/_jev/health" && method === "GET") {
+      // the middleware's own route, so under the mount path like any other
+      const own = new URL("http://localhost" + originForm(req.url ?? "/")).pathname;
+      if (r.opts.health !== false && own === "/_jev/health" && method === "GET") {
         const h = healthResponse(r);
         res.statusCode = 200;
         res.setHeader("Content-Type", "application/json");
@@ -217,15 +352,15 @@ export function nodeMiddleware(opts: Options) {
         return;
       }
       const forwarded = withVerdictHeaders(request, verdict, requestId, subjectId);
-      for (const h of HEADERS) delete req.headers[h];
+      for (const h of jevHeaderNames(Object.keys(req.headers))) delete req.headers[h];
       forwarded.headers.forEach((v, k) => {
         if (k.startsWith("x-jev-")) req.headers[k] = v;
       });
       next();
     } catch (e) {
       console.error("jev-edge: middleware error, failing open: " + (e instanceof Error ? e.message : String(e)));
-      for (const h of HEADERS) delete req.headers[h];
-      const v = newVerdict({ verdict: ERROR, source: SRC_ADAPTER, reason: "adapter error" });
+      for (const h of jevHeaderNames(Object.keys(req.headers))) delete req.headers[h];
+      const v = adapterError();
       for (const [k, val] of Object.entries(verdictHeaders(v))) req.headers[k.toLowerCase()] = val;
       req.jev = v;
       next();
@@ -238,9 +373,23 @@ export function nodeMiddleware(opts: Options) {
 // ---------------------------------------------------------------------------
 
 export interface HonoContextLike {
-  req: { raw: Request };
+  /** `arrayBuffer` is HonoRequest's: the body from Hono's cache when another
+   *  middleware already read it (c.req.json(), c.req.text()). */
+  req: { raw: Request; arrayBuffer?: () => Promise<ArrayBuffer> };
   set(key: string, value: unknown): void;
   header(name: string, value: string): void;
+}
+
+/**
+ * The request to judge: `c.req.raw`, or, when a middleware before this one
+ * read its body through HonoRequest (which consumes raw and caches the
+ * body for the handler), a copy of it with Hono's cached body. Judging raw
+ * then would fail open on every request.
+ */
+async function honoRequest(c: HonoContextLike): Promise<Request> {
+  const raw = c.req.raw;
+  if (!raw.bodyUsed || typeof c.req.arrayBuffer !== "function") return raw;
+  return copyRequest(raw, raw.headers, await c.req.arrayBuffer());
 }
 
 /**
@@ -249,8 +398,14 @@ export interface HonoContextLike {
  * `c.get("jev")` is the verdict in handlers. The request handlers see is
  * `c.req.raw` with every client-supplied X-Jev-* removed and the verdict's
  * X-Jev-* set (Hono's `raw` is a plain property, so it is replaced in
- * place); the same X-Jev-* are set on the response. Blocked requests return
- * the 403 from the middleware; an adapter error fails open.
+ * place). The response gets X-Jev-Request-Id only: the verdict, score,
+ * reason, source and subject are for the handlers and the log, never the
+ * client, which could otherwise map the judge one request at a time (in
+ * monitor mode too) and see when the breaker is open. A body a middleware
+ * before this one already read through HonoRequest is judged from Hono's
+ * cached copy. Blocked requests return the block response from the
+ * middleware; an adapter error fails open, with the client's X-Jev-*
+ * replaced by x-jev-verdict: error, x-jev-source: adapter as on a pass.
  */
 export function honoMiddleware(opts: Options) {
   const rt = runtimeOnce(opts);
@@ -261,16 +416,23 @@ export function honoMiddleware(opts: Options) {
       const r = rt();
       const url = new URL(c.req.raw.url);
       if (r.opts.health !== false && url.pathname === "/_jev/health" && c.req.raw.method === "GET") return healthResponse(r);
-      const ev = await evaluate(c.req.raw, r);
+      const request = await honoRequest(c);
+      const ev = await evaluate(request, r);
       verdict = ev.verdict;
       if (ev.response) {
         c.set("jev", verdict);
         return ev.response;
       }
-      forwarded = withVerdictHeaders(c.req.raw, verdict, ev.requestId, ev.subjectId);
+      forwarded = withVerdictHeaders(request, verdict, ev.requestId, ev.subjectId);
     } catch (e) {
       console.error("jev-edge: hono middleware error, failing open: " + (e instanceof Error ? e.message : String(e)));
-      verdict = newVerdict({ verdict: ERROR, source: SRC_ADAPTER, reason: "adapter error" });
+      verdict = adapterError();
+      // the handlers must not see the client's X-Jev-* on this path either
+      try {
+        forwarded = withVerdictHeaders(c.req.raw, verdict, newRequestId());
+      } catch {
+        /* the original request, as the last resort */
+      }
     }
     c.set("jev", verdict);
     if (forwarded) {
@@ -280,12 +442,10 @@ export function honoMiddleware(opts: Options) {
         /* a context with a read-only raw keeps the original request */
       }
     }
-    const outHeaders: Record<string, string> = {};
-    if (forwarded) forwarded.headers.forEach((v, k) => { if (k.startsWith("x-jev-")) outHeaders[k] = v; });
-    else Object.assign(outHeaders, verdictHeaders(verdict));
-    for (const [k, v] of Object.entries(outHeaders)) {
+    const rid = forwarded?.headers.get("x-jev-request-id");
+    if (rid) {
       try {
-        c.header(k, v);
+        c.header("X-Jev-Request-Id", rid);
       } catch {
         /* response headers are best effort */
       }

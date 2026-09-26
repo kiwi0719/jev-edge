@@ -81,6 +81,12 @@ tests:
                 content-encoding: a compressed body this build could not decode
                 (zlib/libbrotlidec missing, corrupt, too big). binary: a
                 non-text body on an LLM route; check the rule's path match.
+                invalid: declared JSON the decoder refused with nothing to scan.
+                json: JSON past the walk's bounds, too little left to judge.
+                partial: a body the gateway cut, with policy.partial =
+                "unjudgeable". text: text over max_judge_chunks under "block";
+                raise max_judge_chunks or max_judge_bytes. multipart: more than 8
+                boundaries. token: a prompt sent as token ids.
 
   # Adaptive timeout: gw1 pinned at its 1000 ms ceiling, gw2 adapting below it.
   - interval: 1m
@@ -175,11 +181,18 @@ tests:
                 10 minutes. Failed calls pass (verdict=error) and are queued for
                 async re-judging, so protection is degraded, not traffic.
               runbook: >-
-                Read the error log for "jev-edge: L2 failed: <reason>". Timeouts:
+                Break it down: sum by (kind) (rate(jev_l2_errors_total[5m])), and
+                read the error log for "jev-edge: L2 failed: <reason>". timeout:
                 compare jev_l2_latency_ms quantiles with jev_l2_timeout_ms and
                 raise jev.timeout_max_ms if the provider is slow but healthy.
-                401/403: rotate the key. 5xx: provider incident. Past fail_ratio
-                the breaker opens (JevBreakerOpen).
+                unavailable: 5xx or 429 is a provider incident, 401 a bad key,
+                404/405 a wrong endpoint or model; these count, and past
+                fail_ratio the breaker opens (JevBreakerOpen). rejected (another
+                4xx) and unusable (no scores) never open it, as the judged text
+                can provoke them: near 100% usually means a model parameter, the
+                key's permissions or a WAF (JevL2NoVerdicts). busy ("max_inflight
+                exceeded"): jev.max_inflight was full and no call was made; see
+                JevL2Saturated.
 
   # Async drops: gw1 drops a job once at minute 5; no drops afterwards.
   - interval: 1m
@@ -211,3 +224,176 @@ tests:
       - eval_time: 25m
         alertname: JevAsyncDropped
         exp_alerts: []
+
+  # Async results: gw1's re-judges fail 3 times for every one that answers;
+  # gw2's fail 1 in 10.
+  - interval: 1m
+    input_series:
+      - series: 'jev_async_total{job="jev",instance="gw1",result="ok"}'
+        values: '0+1x30'
+      - series: 'jev_async_total{job="jev",instance="gw1",result="failed"}'
+        values: '0+3x30'
+      - series: 'jev_async_total{job="jev",instance="gw2",result="ok"}'
+        values: '0+9x30'
+      - series: 'jev_async_total{job="jev",instance="gw2",result="failed"}'
+        values: '0+1x30'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: JevAsyncFailing
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: JevAsyncFailing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: jev
+              instance: gw1
+            exp_annotations:
+              summary: "jev-edge async re-judges failing (75%) on gw1"
+              description: >-
+                More than half of the async re-judge jobs that ran on
+                gw1 in the last 10 minutes got no answer.
+                Suspicious and errored requests are not getting their second look:
+                no cached verdict, and reputation blocking does not learn from them.
+              runbook: >-
+                Break down by result: sum by (result) (increase(jev_async_total[10m])).
+                failed: read the error log for "L3 judge failed" (provider errors,
+                or async.timeout_ms too short for the provider). no_scores: the
+                provider answers without the scores asked for (model, template).
+                busy: a custom judge's own cap. error: "L3 error" in the error log,
+                a bug.
+
+  # Adapter errors: gw1's access handler fails 3 requests a minute from minute
+  # 6 to 10 and then stops; gw2 never fails.
+  - interval: 1m
+    input_series:
+      - series: 'jev_adapter_errors_total{job="jev",instance="gw1",entry="access"}'
+        values: '0x5 3+3x4 15x15'
+      - series: 'jev_adapter_errors_total{job="jev",instance="gw2",entry="authz"}'
+        values: '0x20'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: JevAdapterErrors
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: JevAdapterErrors
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: jev
+              instance: gw1
+              entry: access
+            exp_annotations:
+              summary: "jev-edge failing requests open on adapter errors on gw1 (access)"
+              description: >-
+                15 requests through access on
+                gw1 passed unjudged in the last 5 minutes
+                because judging threw (verdict=error, source=adapter).
+              runbook: >-
+                Read the error log for "jev-edge: access error,
+                failing open". After a config change: GET /_jev/config, then
+                DELETE /_jev/config to drop the override, or fix the rule in the
+                config file. Otherwise it is a bug: report the log line.
+      - eval_time: 20m
+        alertname: JevAdapterErrors
+        exp_alerts: []
+
+  # No verdicts: gw1's provider refuses every call (rejected, the breaker
+  # stays closed and nothing reaches source=breaker); gw2 fails most calls
+  # but still gets some verdicts; gw3 has no L2 traffic at all.
+  - interval: 1m
+    input_series:
+      - series: 'jev_requests_total{job="jev",instance="gw1",source="l2",verdict="error"}'
+        values: '0+20x30'
+      - series: 'jev_l2_errors_total{job="jev",instance="gw1",kind="rejected"}'
+        values: '0+20x30'
+      - series: 'jev_requests_total{job="jev",instance="gw2",source="l2",verdict="error"}'
+        values: '0+20x30'
+      - series: 'jev_requests_total{job="jev",instance="gw2",source="l2",verdict="safe"}'
+        values: '0+1x30'
+      - series: 'jev_requests_total{job="jev",instance="gw3",source="l1",verdict="skipped"}'
+        values: '0+50x30'
+    promql_expr_test:
+      - expr: sum by (kind) (rate(jev_l2_errors_total[5m]))
+        eval_time: 20m
+        exp_samples:
+          - labels: '{kind="rejected"}'
+            value: 0.3333333333333333
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: JevL2NoVerdicts
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: JevL2NoVerdicts
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: jev
+              instance: gw1
+            exp_annotations:
+              summary: "jev-edge L2 calls all fail on gw1"
+              description: >-
+                For 10 minutes every L2 call on gw1 has failed
+                and none has given a verdict. Those requests pass with
+                verdict=error: only L1, the verdict cache and trusted fingerprints
+                are protecting traffic, and the breaker may still be closed.
+              runbook: >-
+                Break it down: sum by (kind) (rate(jev_l2_errors_total[5m])), and
+                read "jev-edge: L2 failed: <reason>" in the error log. rejected:
+                the provider refuses every call (a parameter the model does not
+                take, the key's permissions, a WAF). unusable: it answers, but
+                not in the judge's format (a wrong model or template). busy:
+                jev.max_inflight is full. unavailable, transport or timeout: see
+                JevBreakerOpen.
+      - eval_time: 20m
+        alertname: JevL2Starved
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: JevBreakerOpen
+        exp_alerts: []
+
+  # Saturated: gw1 turns away 20 of 60 L2-stage requests at max_inflight
+  # (33%); gw2 3 of 100 (3%), under the line; gw3 has none. The per-part
+  # cache hits of gw3 (source=cache) are not L2-stage requests.
+  - interval: 1m
+    input_series:
+      - series: 'jev_requests_total{job="jev",instance="gw1",source="l2",verdict="safe"}'
+        values: '0+40x30'
+      - series: 'jev_requests_total{job="jev",instance="gw1",source="l2",verdict="error"}'
+        values: '0+20x30'
+      - series: 'jev_l2_errors_total{job="jev",instance="gw1",kind="busy"}'
+        values: '0+20x30'
+      - series: 'jev_requests_total{job="jev",instance="gw2",source="l2",verdict="safe"}'
+        values: '0+97x30'
+      - series: 'jev_requests_total{job="jev",instance="gw2",source="l2",verdict="error"}'
+        values: '0+3x30'
+      - series: 'jev_l2_errors_total{job="jev",instance="gw2",kind="busy"}'
+        values: '0+3x30'
+      - series: 'jev_requests_total{job="jev",instance="gw3",source="cache",verdict="safe"}'
+        values: '0+50x30'
+      - series: 'jev_requests_total{job="jev",instance="gw3",source="l2",verdict="safe"}'
+        values: '0+10x30'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: JevL2Saturated
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: JevL2Saturated
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: jev
+              instance: gw1
+            exp_annotations:
+              summary: "jev-edge L2 saturated at max_inflight on gw1"
+              description: >-
+                33.33% of the requests reaching L2 on
+                gw1 have been refused by jev.max_inflight for
+                5 minutes: they pass unjudged (verdict=error, reason "max_inflight
+                exceeded"), with no call made and the breaker closed.
+              runbook: >-
+                Raise jev.max_inflight if the provider has headroom (its rate
+                limits, the L2 latency panel), or scale the provider. A slow
+                provider holds each slot longer: check jev_l2_latency_ms and
+                JevL2TimeoutAtCeiling first, since a higher cap on a provider
+                that is timing out only moves the errors to timeout.

@@ -2,6 +2,8 @@
 -- L2 abstraction. Builds a provider-neutral prompt table from templates and
 -- reduces a provider's answers to a single score.
 
+local normalize = require "jev.core.normalize"
+
 local _M = {}
 
 local templates = {}
@@ -12,6 +14,69 @@ local templates = {}
 -- count it as a breaker failure. Counting it let a burst of concurrent
 -- requests trip the breaker and switch L2 off for everyone for open_s.
 _M.BUSY = "max_inflight exceeded"
+
+--- What a failed call ran into: the third value of a judge call that
+-- returns no answers (`nil, err, kind`). The breaker measures the provider's
+-- health, and the judged text is the client's: a 200 whose answer the text
+-- made unusable (a refusal, other keys), or a 4xx the text provoked (a
+-- provider's content filter, a strict parser), would let a client switch L2
+-- off for every tenant. So only the first three kinds count (counts()).
+_M.TRANSPORT   = "transport"    -- no HTTP answer: connect, DNS, TLS, reset
+_M.TIMEOUT     = "timeout"
+_M.UNAVAILABLE = "unavailable"  -- HTTP 5xx, 429, 401, 404 or 405
+_M.REJECTED    = "rejected"     -- any other non-2xx status: this call was refused
+_M.UNUSABLE    = "unusable"     -- 2xx, but no answer core can use
+
+-- 401 (the key), 404 (the endpoint or the model) and 405 (the route): the
+-- gateway's configuration, which no judged text can provoke. They count, so
+-- a provider misconfigured for good opens the breaker and its alerts fire,
+-- where as REJECTED every request would pass as an L2 error for ever. A 400,
+-- 403, 413 or 422 stays REJECTED: a content filter, a WAF or a strict parser
+-- answers those to the text.
+local CONFIG_STATUS = { [401] = true, [404] = true, [405] = true }
+
+--- The kind of a failed call the provider answered with this HTTP status.
+function _M.status_kind(status)
+  status = tonumber(status) or 0
+  if status >= 500 or status == 429 or CONFIG_STATUS[status] then return _M.UNAVAILABLE end
+  if status >= 200 and status < 300 then return _M.UNUSABLE end
+  return _M.REJECTED
+end
+
+-- The kinds an L2 error verdict names (verdict.error_kind): the five above,
+-- "busy" for BUSY (the gateway's own cap, no call made) and "other" for a
+-- judge that gives no kind or one core does not know, or a prompt that could
+-- not be built. A fixed set: it labels a metric, and a provider must not be
+-- able to mint label values.
+_M.KIND_BUSY  = "busy"
+_M.KIND_OTHER = "other"
+local KINDS = {
+  [_M.TRANSPORT] = true, [_M.TIMEOUT] = true, [_M.UNAVAILABLE] = true,
+  [_M.REJECTED] = true, [_M.UNUSABLE] = true,
+}
+
+--- The error kind an L2 error verdict carries for a failed call.
+function _M.error_kind(err, kind)
+  if err == _M.BUSY then return _M.KIND_BUSY end
+  if KINDS[kind] then return kind end
+  return _M.KIND_OTHER
+end
+
+--- Does a failed call count against the provider (a breaker failure)?
+-- A judge that gives no kind is counted, as every error was before kinds.
+function _M.counts(err, kind)
+  if err == _M.BUSY then return false end
+  if kind == nil then return true end
+  return kind == _M.TRANSPORT or kind == _M.TIMEOUT or kind == _M.UNAVAILABLE
+end
+
+--- The verdict reason for a failed call: the error, led by its kind when
+-- the breaker did not count it, so the reason says why it did not.
+function _M.reason(err, kind)
+  err = tostring(err or "error")
+  if kind == _M.REJECTED or kind == _M.UNUSABLE then return kind .. ": " .. err end
+  return err
+end
 
 --- Register a template. Ships with core/templates/*.lua.
 -- @param name string
@@ -26,7 +91,9 @@ end
 
 --- Build the prompt table sent to a provider.
 -- @param names  list of template names
--- @param text   extracted text
+-- @param text   extracted text; invalid UTF-8 in it is sent as U+FFFD
+--               (normalize.valid_utf8): a strict judge server refuses the
+--               call otherwise, and an L2 error passes the request
 -- @param context { path, method } (flat strings)
 -- @return { text = ..., context = ..., questions = { [name] = template } }
 function _M.build(names, text, context)
@@ -43,7 +110,7 @@ function _M.build(names, text, context)
     return nil, "no templates registered for: " .. table.concat(names or {}, ",")
   end
   return {
-    text = text,
+    text = type(text) == "string" and normalize.valid_utf8(text) or text,
     context = context or {},
     questions = qs,
   }

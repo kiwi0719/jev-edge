@@ -1,4 +1,4 @@
-.PHONY: test lint check invariants luajit-check golden golden-check calibrate labels context-lint test-js test-openresty bench bench-offline bench-judge bench-judge-live bench-chart dist opm-build rock-lint rock-pack rock-upload install live-check live-full live-openai soak shim e2e-envoy e2e-forward-auth e2e-apisix e2e-kong e2e-haproxy test-litellm suite-fetch suite-build suite-live suite-report suite-tooldocs-build suite-untrusted suite-untrusted-report suite-heldout-build suite-heldout suite-heldout-report conformance conformance-vectors conformance-check test-laya
+.PHONY: test lint check invariants luajit-check golden golden-check calibrate labels context-lint test-js test-openresty bench bench-offline bench-judge bench-judge-live bench-chart dist opm-build rock-lint rock-pack rock-upload install package-check live-check live-full live-openai soak shim e2e-envoy e2e-forward-auth e2e-apisix e2e-kong e2e-haproxy test-litellm suite-fetch suite-build suite-live suite-report suite-tooldocs-build suite-untrusted suite-untrusted-report suite-heldout-build suite-heldout suite-heldout-report tools-fp-fetch tools-fp-build tools-fp tools-fp-report conformance conformance-vectors conformance-check test-laya
 
 test:
 	busted
@@ -19,9 +19,11 @@ luajit-check:
 
 check: lint invariants luajit-check golden-check conformance-check test
 
-# Tripwires for bug classes a past audit found (scripts/invariants.lua).
+# Tripwires for bug classes a past audit found (scripts/invariants.lua), then
+# their mutation tests: each edit a rule guards against must still trip it.
 invariants:
 	lua scripts/invariants.lua
+	lua scripts/invariants_test.lua
 
 # Golden vectors: the cross-implementation contract for core (core/golden/README.md).
 # `golden` regenerates them from the Lua core after a deliberate behaviour change;
@@ -39,13 +41,14 @@ golden-check:
 # Protocol conformance for judge servers (conformance/gen.lua): the System One
 # request as the gateway builds it, checked against a live server.
 #   make conformance ENDPOINT=http://127.0.0.1:8080/v1/systemone [API_KEY=...] [MODEL=laya]
-#                    [STRICT=1] [MOCK=1] [BUDGET_MS=250]
+#                    [STRICT=1] [MOCK=1] [BUDGET_MS=500] [CONCURRENCY=1]
+# CONCURRENCY is the gateways' jev.max_inflight, summed (1 in the Laya profile).
 # `conformance-vectors` regenerates the vectors after a template or provider
 # change; `conformance-check` fails when the committed ones are stale.
 conformance:
 	python3 conformance/run.py --endpoint $${ENDPOINT:?set ENDPOINT=<judge url>} \
 	  $${API_KEY:+--api-key $$API_KEY} $${MODEL:+--model $$MODEL} $${BUDGET_MS:+--budget-ms $$BUDGET_MS} \
-	  $(if $(STRICT),--strict) $(if $(MOCK),--mock)
+	  $${CONCURRENCY:+--concurrency $$CONCURRENCY} $(if $(STRICT),--strict) $(if $(MOCK),--mock)
 
 conformance-vectors:
 	lua conformance/gen.lua
@@ -59,9 +62,11 @@ conformance-check:
 	    echo "conformance vectors are stale: run 'make conformance-vectors' and commit conformance/*.json"; rm -rf $$tmp; exit 1; fi
 
 # laya-server (adapters/laya-server): unit tests, and the whole conformance
-# suite in process against its mock backend. Standard library only.
+# suite in process against its mock backend; then run.py's own transport
+# checks against stub servers (conformance/test_run.py). Standard library only.
 test-laya:
 	cd adapters/laya-server && python3 -m unittest -v test_laya_server
+	cd conformance && python3 -m unittest -v test_run
 
 # JavaScript adapter: the TypeScript core replays the same golden vectors (needs pnpm).
 test-js:
@@ -182,6 +187,25 @@ suite-heldout:
 suite-heldout-report:
 	lua bench/suite/heldout_report.lua > bench/suite/heldout-report.md
 
+# False positives of tool-definition judging (bench/tools/README.md): 30 real
+# tool sets, the tools part alone, `injection` and `untrusted`. At most 66 calls.
+tools-fp-fetch:
+	sh bench/tools/fetch.sh
+
+tools-fp-build:
+	python3 bench/tools/build.py --raw bench/tools/raw
+
+tools-fp:
+	docker run --rm --env-file .env -v "$(CURDIR)":/work jev-edge-test sh -c \
+	  'resty --http-conf "lua_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt; lua_ssl_verify_depth 5;" \
+	   -I /work/adapters/openresty/lib -I /work /work/bench/tools/run.lua'
+
+# the generated tables, then everything from the "<!-- notes" line of the old report on
+tools-fp-report:
+	lua bench/tools/report.lua > bench/tools/report.md.tmp
+	if [ -f bench/tools/report.md ]; then sed -n '/^<!-- notes/,$$p' bench/tools/report.md >> bench/tools/report.md.tmp; fi
+	mv bench/tools/report.md.tmp bench/tools/report.md
+
 # openai-compat provider against an Ollama container on the jev-net network:
 #   docker network create jev-net; docker run -d --rm --name ollama --network jev-net ollama/ollama
 #   docker exec ollama ollama pull qwen2.5:0.5b
@@ -232,26 +256,45 @@ DIST      := dist/lua-resty-jev-edge-$(VERSION)
 LUA_LIB_DIR ?= /usr/local/openresty/lualib
 PREFIX_CONF ?= /etc/nginx
 
+# `opm build` packs only lib/**.lua, the Markdown under doc/, and README.md
+# from the root (it means to take COPYING too, but its root scan globs *.md
+# only). So the license and the starter config also go into doc/ as Markdown:
+# that is how they reach an `opm get` user. conf/ is for `make install`.
 dist:
 	rm -rf $(DIST) && mkdir -p $(DIST)/lib/jev/core $(DIST)/lib/jev/rules $(DIST)/lib/resty
 	cp -R adapters/openresty/lib/resty/jev $(DIST)/lib/resty/
 	cp core/*.lua $(DIST)/lib/jev/core/ && cp -R core/templates $(DIST)/lib/jev/core/
 	cp rules/*.lua $(DIST)/lib/jev/rules/
 	mkdir -p $(DIST)/doc && cp dist.ini LICENSE README.md $(DIST)/ && cp README.md CHANGELOG.md $(DIST)/doc/
+	cp LICENSE $(DIST)/COPYING
+	{ printf '# License\n\n````text\n'; cat LICENSE; printf '````\n'; } > $(DIST)/doc/LICENSE.md
+	{ printf '# Configuration\n\nThe starter config and an example nginx.conf, as `make install` installs them.\n'; \
+	  printf 'Copy the first to /etc/nginx/jev-edge.conf.lua (or wherever init() points) and edit it.\n\n'; \
+	  printf '## jev-edge.conf.lua\n\n````lua\n'; cat adapters/openresty/conf/jev-edge.conf.lua; \
+	  printf '````\n\n## example.nginx.conf\n\n````nginx\n'; cat adapters/openresty/conf/example.nginx.conf; \
+	  printf '````\n'; } > $(DIST)/doc/configuration.md
 	cp -R adapters/openresty/conf $(DIST)/conf
 	@echo "assembled $(DIST)"
 
 # opm build/upload run from the assembled tree (opm needs lib/ next to dist.ini).
 # `opm build` only works inside a full OpenResty install (it looks for
 # <prefix>/site); a Homebrew opm alone cannot. Without one, build in the
-# official image instead: same command, same output under dist/.
+# official image instead: same command, same output under dist/. The image
+# gets your ~/.opmrc (OPMRC=) when there is one, else a throwaway rc with the
+# fields opm checks (building needs no token); nothing is written to $HOME.
+OPMRC ?= $(HOME)/.opmrc
 opm-build: dist
 	@if [ -d "$$(dirname $$(dirname $$(command -v opm 2>/dev/null || echo /x/x)))/site" ]; then \
 	  cd $(DIST) && opm build; \
 	else \
 	  echo "no local OpenResty install; running opm build in openresty/openresty:alpine-fat"; \
-	  test -f "$$HOME/.opmrc" || printf 'github_account=%s\n' "$$(sed -n 's/^author = //p' dist.ini)" > "$$HOME/.opmrc"; \
-	  docker run --rm -v "$(CURDIR)/$(DIST)":/pkg -v "$$HOME/.opmrc":/root/.opmrc:ro -w /pkg openresty/openresty:alpine-fat opm build; \
+	  rc="$(OPMRC)"; \
+	  if [ ! -f "$$rc" ]; then \
+	    rc=$$(mktemp) && trap 'rm -f "$$rc"' EXIT && \
+	    printf 'github_account=%s\ngithub_token=\nupload_server=https://opm.openresty.org\ndownload_server=https://opm.openresty.org\n' \
+	      "$$(sed -n 's/^author = //p' dist.ini)" > "$$rc"; \
+	  fi; \
+	  docker run --rm -v "$(CURDIR)/$(DIST)":/pkg -v "$$rc":/root/.opmrc:ro -w /pkg openresty/openresty:alpine-fat opm build; \
 	fi
 
 # ---------------------------------------------------------------------------
@@ -272,9 +315,17 @@ rock-pack: rock-lint
 rock-upload: rock-lint
 	luarocks upload $(ARGS) $(ROCKSPEC)
 
+# What actually installs: the rock (luarocks make) and the `make dist` tree,
+# each loaded on its own in the test image, every module required from it
+# (scripts/package-smoke.sh). Run it after a rockspec or dist change.
+package-check:
+	docker build -q -t jev-edge-test -f adapters/openresty/Dockerfile.test adapters/openresty
+	docker run --rm -v "$(CURDIR)":/work:ro -w /tmp jev-edge-test sh /work/scripts/package-smoke.sh
+
 install: dist
 	mkdir -p $(LUA_LIB_DIR)/jev $(LUA_LIB_DIR)/resty
 	cp -R $(DIST)/lib/jev $(LUA_LIB_DIR)/
 	cp -R $(DIST)/lib/resty/jev $(LUA_LIB_DIR)/resty/
+	mkdir -p $(PREFIX_CONF)
 	@test -f $(PREFIX_CONF)/jev-edge.conf.lua || cp $(DIST)/conf/jev-edge.conf.lua $(PREFIX_CONF)/jev-edge.conf.lua
 	@echo "installed to $(LUA_LIB_DIR); config at $(PREFIX_CONF)/jev-edge.conf.lua"

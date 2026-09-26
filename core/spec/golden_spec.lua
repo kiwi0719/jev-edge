@@ -16,7 +16,7 @@ local function load(name)
   local f = assert(io.open("core/golden/" .. name .. ".json", "rb"), "missing golden file " .. name)
   local doc = assert(json.decode(f:read("*a")))
   f:close()
-  assert.equals(1, doc.format_version, "unknown golden format version")
+  assert.equals(2, doc.format_version, "unknown golden format version")
   return doc
 end
 
@@ -52,8 +52,14 @@ end)
 describe("golden: extract", function()
   for _, c in ipairs(load("extract").cases) do
     it(c.name, function()
-      local text, kind = normalize.extract(c.input.body, c.input.content_type, c.input.fields, H.body_decode)
-      same(c.expect, { text = text, kind = kind })
+      local text, kind, _, decoded, cut, tokens = normalize.extract(c.input.body, c.input.content_type,
+        c.input.fields, H.body_decode)
+      local tools
+      if c.input.tool_fields then
+        local ttext, _, capped = normalize.extract_tools(decoded, c.input.tool_fields, H.body_decode)
+        tools = { text = ttext, capped = capped or nil }
+      end
+      same(c.expect, { text = text, kind = kind, cut = cut or nil, tokens = tokens or nil, tools = tools })
     end)
   end
 end)
@@ -61,13 +67,17 @@ end)
 describe("golden: rules", function()
   for _, c in ipairs(load("rules").cases) do
     it(c.name, function()
-      local rule = require("jev.rules." .. c.input.rule)
+      -- a rule set id, or an inline spec resolved the way a config's `rules` list is
+      local rule = type(c.input.rule) == "table"
+        and assert(rules_mod.resolve(c.input.rule, function(x) return require("jev.rules." .. x) end))
+        or require("jev.rules." .. c.input.rule)
       local ctx = {
         cache = store_from(c.input.cache), clock = function() return c.input.clock end,
         json_decode = H.body_decode, re_find = H.re_find,
       }
-      local r, text, reason = rules_mod.evaluate(c.input.req, rule, ctx)
-      same(c.expect, { result = r, text = text, reason = reason })
+      local r, text, reason, _, _, _, _, tools, _, tokens = rules_mod.evaluate(c.input.req, rule, ctx)
+      same(c.expect, { result = r, text = text, reason = reason, tokens = tokens or nil,
+        tools = tools and { text = tools.text, windowed = tools.windowed, hit = tools.hit, only = tools.only } })
     end)
   end
 end)
@@ -88,7 +98,7 @@ describe("golden: verdict", function()
   for _, c in ipairs(load("verdict").cases) do
     it(c.name, function()
       local v = verdict.new(c.input)
-      same(c.expect, { verdict = v, headers = verdict.headers(v) })
+      same(c.expect, { verdict = v, headers = verdict.headers(v), client_headers = verdict.client_headers(v) })
     end)
   end
 end)
@@ -107,18 +117,22 @@ describe("golden: evaluate", function()
           rules[#rules + 1] = require("jev.rules." .. spec)
         end
       end
-      local breaker
+      local breaker, brk, brk_calls
       if inp.breaker then
         local bstore = H.store()
-        local st = inp.breaker == "open" and breaker_m.OPEN or breaker_m.CLOSED
-        bstore:set("brk:state", { state = st, until_ts = inp.clock + 30 })
-        breaker = breaker_m.new(bstore, function() return inp.clock end, {})
+        local st = inp.breaker == "closed" and breaker_m.CLOSED or breaker_m.OPEN
+        bstore:set("brk:state", { state = st, until_ts = inp.breaker == "half-open" and inp.clock or inp.clock + 30 })
+        brk = breaker_m.new(bstore, function() return inp.clock end, {})
+        brk_calls, breaker = {}, {}
+        for _, m in ipairs({ "allow", "success", "failure", "release" }) do
+          breaker[m] = function() brk_calls[#brk_calls + 1] = m; return brk[m](brk) end
+        end
       end
       local recorded, subject_ctx, swrites
       if inp.subject then
         local sstore = store_from(inp.subject.store)
         swrites = {}
-        subject_ctx = { id = inp.subject.id, history = inp.subject.history,
+        subject_ctx = { id = inp.subject.id, ids = inp.subject.ids, history = inp.subject.history,
                         record = function(e) recorded = e end,
                         store = {
                           get = function(_, k) return sstore:get(k) end,
@@ -141,14 +155,14 @@ describe("golden: evaluate", function()
         hash = normalize.djb2, json_decode = H.body_decode, re_find = H.re_find,
         judge = { call = function(prompt)
           calls = calls + 1; seen = prompt
-          if inp.judge.error then return nil, inp.judge.error end
+          if inp.judge.error then return nil, inp.judge.error, inp.judge.kind end
           if inp.judge.by_question then
             local a = {}
             for n in pairs(prompt.questions) do a[n] = inp.judge.by_question[n] end
             return a
           end
           return inp.judge.answers
-        end },
+        end, whole = inp.judge.whole },
         log = function() end,
       }
       local v = core.evaluate(inp.req, ctx)
@@ -160,7 +174,18 @@ describe("golden: evaluate", function()
         prompt = { text = seen.text, context = seen.context, questions = names }
       end
       same(c.expect, { verdict = v, headers = verdict.headers(v), judge_calls = calls,
-        prompt = prompt, cache_writes = writes, subject_record = recorded, subject_store_writes = swrites })
+        prompt = prompt, cache_writes = writes, subject_record = recorded, subject_store_writes = swrites,
+        breaker = brk and { calls = brk_calls, state = brk:state() } })
+    end)
+  end
+end)
+
+describe("golden: utf8", function()
+  local judge = require "jev.core.judge"
+  for _, c in ipairs(load("utf8").cases) do
+    it(c.name, function()
+      local bytes = c.input.hex:gsub("%x%x", function(h) return string.char(tonumber(h, 16)) end)
+      same(c.expect, { text = judge.build({ "injection" }, bytes, {}).text })
     end)
   end
 end)

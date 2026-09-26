@@ -17,6 +17,7 @@
 import { Breaker, type Store, type BreakerLike, type BreakerConfig, type State } from "../core/breaker.js";
 import { Adaptive, tuning, type AdaptiveLike } from "./adaptive.js";
 import type { JevConfig } from "../core/defaults.js";
+import { KEY_PREFIX, REP_PREFIX, ringLoad, ringAppend, loadHistory, appendHistory, type Entry as SubjectEntry } from "../core/subject.js";
 
 export interface KVLike {
   get(key: string, type: "json"): Promise<unknown>;
@@ -51,43 +52,84 @@ export function kvStore(kv: KVLike, prefix = "jev:"): Store {
 
 interface Entry { v: unknown; exp: number }
 
-export function memoryStore(clock: () => number = () => Date.now() / 1000): Store {
+export interface MemoryStoreOptions {
+  /** Most entries kept; past it the least recently used goes. Unbounded (sweep only) when absent. */
+  maxEntries?: number;
+}
+
+/** How many of the oldest entries each write looks at for expired ones. */
+const SWEEP = 8;
+
+/**
+ * A Store in this isolate's (or process's) memory. A Map kept in use
+ * order: a read of a live entry and every write move it to the end, so the
+ * first entries are the least recently used. Each write deletes the expired
+ * ones among the SWEEP oldest, so a key never read again does not stay
+ * forever, and with `maxEntries` evicts the oldest past it: a flood of
+ * distinct texts cannot grow the map without bound. The runtime caps its
+ * default cache and subject store and leaves `state` uncapped, so breaker
+ * and adaptive keys are never evicted.
+ */
+export function memoryStore(clock: () => number = () => Date.now() / 1000, opts: MemoryStoreOptions = {}): Store & { readonly size: number } {
   const m = new Map<string, Entry>();
+  const max = typeof opts.maxEntries === "number" && opts.maxEntries >= 1 ? Math.floor(opts.maxEntries) : Infinity;
+  const dead = (e: Entry, now: number) => e.exp !== 0 && e.exp <= now;
+  const put = (k: string, e: Entry) => {
+    m.delete(k); // to the end: the most recently used
+    m.set(k, e);
+    const now = clock();
+    let seen = 0;
+    for (const [key, old] of m) {
+      if (++seen > SWEEP) break;
+      if (key !== k && dead(old, now)) m.delete(key);
+    }
+    while (m.size > max) {
+      const oldest = m.keys().next().value as string;
+      if (oldest === k) break;
+      m.delete(oldest);
+    }
+  };
   return {
     get: (k) => {
       const e = m.get(k);
       if (!e) return undefined;
-      if (e.exp && e.exp <= clock()) {
+      if (dead(e, clock())) {
         m.delete(k);
         return undefined;
       }
+      m.delete(k);
+      m.set(k, e);
       return e.v;
     },
     set: (k, v, ttl) => {
       if (v === null || v === undefined) m.delete(k);
-      else m.set(k, { v, exp: ttl > 0 ? clock() + ttl : 0 });
+      else put(k, { v, exp: ttl > 0 ? clock() + ttl : 0 });
     },
     // synchronous, so atomic within the isolate; the ttl applies on creation only
     incr: (k, by, ttl) => {
       const e = m.get(k);
-      const live = e !== undefined && !(e.exp && e.exp <= clock());
+      const live = e !== undefined && !dead(e, clock());
       const n = (live ? Number(e.v) || 0 : 0) + by;
-      m.set(k, { v: n, exp: live ? e.exp : ttl > 0 ? clock() + ttl : 0 });
+      put(k, { v: n, exp: live ? e.exp : ttl > 0 ? clock() + ttl : 0 });
       return n;
     },
     expire: (k, ttl) => {
       const e = m.get(k);
-      if (e && !(e.exp && e.exp <= clock())) e.exp = ttl > 0 ? clock() + ttl : 0;
+      if (e && !dead(e, clock())) e.exp = ttl > 0 ? clock() + ttl : 0;
+    },
+    /** Entries held, expired ones not swept yet included. */
+    get size() {
+      return m.size;
     },
   };
 }
 
 /**
  * A Durable Object holding breaker and adaptive state for every isolate. One
- * instance per deployment (`idFromName("jev-edge")`). Export it from your
- * Worker and bind it as JEV_STATE.
+ * instance per deployment (`idFromName("jev-edge")`, or the name passed as
+ * `{ namespace, name }`). Export it from your Worker and bind it as JEV_STATE.
  *
- * Two kinds of endpoint:
+ * Three kinds of endpoint:
  *   /get, /set, /incr, /expire  the plain Store interface (durableStore);
  *                               /incr is atomic for the same reason as below
  *   /breaker/<op>, /adaptive/<op>  the operation runs HERE, against this
@@ -96,6 +138,14 @@ export function memoryStore(clock: () => number = () => Date.now() / 1000): Stor
  *                               One fetch per operation, and atomic: a
  *                               Durable Object delivers one request at a time
  *                               while the handler only awaits its own storage.
+ *   /pre, /post                 what one judged request needs, in two hops
+ *                               (durableRequest): before the judge, allow()
+ *                               and the timeout; after it, the adaptive
+ *                               samples and the breaker's record together.
+ *   /subject                    one subject's object (durableSubjectStore):
+ *                               "load" reads its trajectory and the
+ *                               reputation keys a request reads, "append"
+ *                               adds to the trajectory, each in one hop.
  */
 export interface DOStateLike {
   storage: {
@@ -133,8 +183,13 @@ function storeOver(state: DOStateLike, clock: () => number): Store {
   };
 }
 
-interface BreakerOp { op: "allow" | "state" | "trip" | "success" | "failure"; cfg?: BreakerConfig; now?: number }
+interface BreakerOp { op: "allow" | "state" | "trip" | "success" | "failure" | "release"; cfg?: BreakerConfig; now?: number }
 interface AdaptiveOp { op: "current" | "success" | "timeout"; cfg: JevConfig; ms?: number }
+
+/** An adaptive sample carried by /post: a success in ms, or a timeout (the ms it fired at, null for the floor). */
+type Sample = ["success", number] | ["timeout", number | null];
+/** The breaker's record carried by /post, from core's settle; null records nothing. */
+type Settled = "success" | "failure" | "release" | null;
 
 export class JevState {
   private store: Store;
@@ -147,7 +202,11 @@ export class JevState {
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     if (request.method !== "POST") return new Response("method not allowed", { status: 405 });
-    const body = (await request.json()) as { key?: string; value?: unknown; ttl?: number; by?: number; op?: string; cfg?: unknown; now?: number; ms?: number };
+    const body = (await request.json()) as {
+      key?: string; value?: unknown; ttl?: number; by?: number; op?: string; cfg?: unknown; now?: number; ms?: number;
+      breaker?: unknown; jev?: unknown; samples?: unknown; result?: unknown;
+      id?: unknown; max?: unknown; keys?: unknown; entry?: unknown;
+    };
     if (url.pathname === "/get") {
       const v = await this.store.get(String(body.key));
       return Response.json({ value: v ?? null });
@@ -172,6 +231,7 @@ export class JevState {
         case "trip": await b.trip(typeof body.now === "number" ? body.now : undefined); return Response.json({ ok: true });
         case "success": await b.success(); return Response.json({ ok: true });
         case "failure": await b.failure(); return Response.json({ ok: true });
+        case "release": await b.release(); return Response.json({ ok: true });
         default: return new Response("bad breaker op", { status: 400 });
       }
     }
@@ -184,29 +244,240 @@ export class JevState {
         default: return new Response("bad adaptive op", { status: 400 });
       }
     }
+    if (url.pathname === "/pre") {
+      const b = new Breaker(this.store, this.clock, (body.breaker as BreakerConfig | undefined) ?? {});
+      const allow = await b.allow();
+      const a = new Adaptive(this.store, (body.jev as JevConfig | undefined) ?? { timeout_ms: 400 });
+      return Response.json({ value: { allow, timeout_ms: allow ? await a.current() : null } });
+    }
+    if (url.pathname === "/post") {
+      const result = body.result ?? null;
+      if (result !== null && result !== "success" && result !== "failure" && result !== "release") {
+        return new Response("bad breaker result", { status: 400 });
+      }
+      const a = new Adaptive(this.store, (body.jev as JevConfig | undefined) ?? { timeout_ms: 400 });
+      for (const s of Array.isArray(body.samples) ? (body.samples as unknown[]) : []) {
+        if (!Array.isArray(s)) continue;
+        if (s[0] === "success") await a.success(Number(s[1]) || 0);
+        else if (s[0] === "timeout") await a.timeout(typeof s[1] === "number" ? s[1] : undefined);
+      }
+      if (result !== null) {
+        const b = new Breaker(this.store, this.clock, (body.breaker as BreakerConfig | undefined) ?? {});
+        await b[result]();
+      }
+      return Response.json({ ok: true });
+    }
+    if (url.pathname === "/subject") {
+      if (typeof body.id !== "string" || body.id === "") return new Response("bad subject id", { status: 400 });
+      const max = typeof body.max === "number" ? body.max : undefined;
+      switch (body.op) {
+        case "load": {
+          const values: Record<string, unknown> = {};
+          const keys = Array.isArray(body.keys) ? body.keys.slice(0, MAX_LOAD_KEYS) : [];
+          for (const k of keys) if (typeof k === "string") values[k] = (await this.store.get(k)) ?? null;
+          return Response.json({ value: { history: await ringLoad(this.store, body.id, max), values } });
+        }
+        case "append":
+          if (typeof body.entry !== "object" || body.entry === null) return new Response("bad subject entry", { status: 400 });
+          await ringAppend(this.store, body.id, body.entry as SubjectEntry, max, typeof body.ttl === "number" ? body.ttl : undefined);
+          return Response.json({ ok: true });
+        default:
+          return new Response("bad subject op", { status: 400 });
+      }
+    }
     return new Response("not found", { status: 404 });
   }
 }
+
+/** Keys one /subject load reads besides the trajectory. */
+const MAX_LOAD_KEYS = 8;
 
 export interface DOStubLike {
   fetch(input: string | Request, init?: RequestInit): Promise<Response>;
 }
 
-function caller(stub: DOStubLike) {
+/** The Durable Object namespace binding (env.JEV_STATE), not a stub made from it. */
+export interface DONamespaceLike {
+  idFromName(name: string): unknown;
+  get(id: unknown): DOStubLike;
+}
+
+/** The JevState object a namespace given as is resolves to: `idFromName` of this. */
+export const STATE_OBJECT = "jev-edge";
+
+/**
+ * A namespace and the name of the JevState object to use in it, for more
+ * than one breaker and adaptive timeout on one binding (a Worker per
+ * environment or per upstream sharing the class): `{ namespace:
+ * env.JEV_STATE, name: "staging" }`. Without `name`, STATE_OBJECT.
+ */
+export interface DONamed {
+  namespace: DONamespaceLike;
+  name?: string;
+}
+
+/** Where the durable* helpers find JevState: a namespace, a namespace and a name, or a stub. */
+export type StateTarget = DONamespaceLike | DONamed | DOStubLike;
+
+/**
+ * A Durable Object stub, told apart from a Store by the one thing it always
+ * has and a Store never does: a `fetch` method. Not by what it lacks: a
+ * workerd stub answers every property name (each one an RPC method on
+ * compatibility dates from 2024-04-03, the old Fetcher get / put / delete
+ * before that), so `"get" in stub` is true for every real one.
+ */
+export function isStub(x: unknown): x is DOStubLike {
+  return (typeof x === "object" || typeof x === "function") && x !== null && typeof (x as DOStubLike).fetch === "function";
+}
+
+/** A namespace binding: idFromName and get, and no `fetch`, which every stub has. */
+export function isNamespace(x: unknown): x is DONamespaceLike {
+  if (typeof x !== "object" || x === null || isStub(x)) return false;
+  const n = x as DONamespaceLike;
+  return typeof n.idFromName === "function" && typeof n.get === "function";
+}
+
+/**
+ * `{ namespace, name }`: an object with a `namespace` key and no `get`
+ * method. Not a stub, which has every key, nor a Store, which always has
+ * `get` and may well carry a `namespace` of its own (a key prefix, say).
+ */
+export function isNamed(x: unknown): x is DONamed {
+  return typeof x === "object" && x !== null && !isStub(x) && "namespace" in x && typeof (x as { get?: unknown }).get !== "function";
+}
+
+/** A namespace, `{ namespace, name }` or a stub: what createRuntime runs through JevState. */
+export function isStateTarget(x: unknown): x is StateTarget {
+  return isStub(x) || isNamespace(x) || isNamed(x);
+}
+
+// A stub is an I/O object of the request that made it: workerd refuses it in
+// any later one. A namespace is not, so a runtime given one (and kept at
+// module scope, or across requests by a preset) makes its stub per call;
+// idFromName is a hash and get() no round trip.
+//
+// workerd's refusal is raised in the calling isolate, before anything is
+// sent: an Error with this message and no `remote` property. An exception
+// thrown inside the Durable Object reaches the caller with `remote: true`
+// (checked in Miniflare 4.20260714 / workerd 1.20260714, fetch stubs on
+// compatibility dates before and after RPC), whatever its message, and is the
+// caller's to handle like any other.
+const CROSS_REQUEST = /Cannot perform I\/O on behalf of a different request/;
+const STALE_STUB =
+  "jev-edge: a Durable Object stub made in one request was used in a later one, which workerd refuses " +
+  '("Cannot perform I/O on behalf of a different request"). From now on this isolate keeps the breaker, ' +
+  "adaptive timeout and any durableStore on this stub in its own memory, apart from every other isolate; " +
+  "logged once per stub and isolate. Fix: pass the namespace, createRuntime({ state: env.JEV_STATE }) or " +
+  "durableStore(env.JEV_STATE), which makes a stub per call; or build the runtime per request.";
+
+/** workerd's refusal of a stub used past its request, and nothing else. */
+function isCrossRequest(e: unknown): boolean {
+  if (typeof e === "object" && e !== null && (e as { remote?: unknown }).remote === true) return false;
+  return CROSS_REQUEST.test(e instanceof Error ? e.message : String(e));
+}
+
+const resolved = new WeakSet<object>();
+const guards = new WeakMap<object, DOStubLike>();
+
+/**
+ * A stub kept past its request answers every call with the cross-request
+ * error, which would fail open every request after the first. Instead the
+ * first such error is logged (once per stub, in each isolate that hits it)
+ * and this stub's calls go from then on to a JevState over isolate memory.
+ * That state is per isolate, like a runtime's without a binding, and the
+ * JevState takes one request at a time, as the Durable Object's input gate
+ * would: an incr, a breaker record or a half-open probe claim is atomic
+ * within the isolate, though no longer across isolates. Any other error,
+ * including one thrown inside the object, is the caller's, as before.
+ */
+function guarded(stub: DOStubLike): DOStubLike {
+  const known = guards.get(stub);
+  if (known) return known;
+  let local: ((req: Request) => Promise<Response>) | undefined;
+  const g: DOStubLike = {
+    fetch: async (input, init) => {
+      if (local) return local(new Request(input, init));
+      try {
+        return await stub.fetch(input, init);
+      } catch (e) {
+        if (!isCrossRequest(e)) throw e;
+        if (!local) {
+          console.error(STALE_STUB);
+          local = isolateState();
+        }
+        return local(new Request(input, init));
+      }
+    },
+  };
+  guards.set(stub, g);
+  resolved.add(g);
+  return g;
+}
+
+/** A JevState over this isolate's memory, one request at a time. */
+function isolateState(): (req: Request) => Promise<Response> {
+  const m = new Map<string, unknown>();
+  const d = new JevState({ storage: { get: async (k) => m.get(k), put: async (k, v) => { m.set(k, v); }, delete: async (k) => m.delete(k) } });
+  let queue: Promise<unknown> = Promise.resolve();
+  return (req) => {
+    const p = queue.then(() => d.fetch(req));
+    queue = p.catch(() => {});
+    return p;
+  };
+}
+
+/**
+ * What the durable* helpers call: for a namespace, a stub made per call
+ * (`idFromName(STATE_OBJECT)`, or the name given with it); for a stub, the
+ * stub guarded against use past its request. Idempotent. Throws on anything
+ * else, and on a `{ namespace, name }` whose namespace is not one (a binding
+ * missing from this environment) or whose name is not a non-empty string.
+ */
+export function stateStub(target: StateTarget): DOStubLike {
+  if (resolved.has(target)) return target as DOStubLike;
+  if (isStub(target)) return guarded(target);
+  let ns: DONamespaceLike;
+  let name = STATE_OBJECT;
+  if (isNamespace(target)) {
+    ns = target;
+  } else if (isNamed(target)) {
+    if (!isNamespace(target.namespace)) {
+      throw new TypeError("jev-edge: { namespace, name }: namespace is not a Durable Object namespace (idFromName and get); is the binding configured?");
+    }
+    if (target.name !== undefined && (typeof target.name !== "string" || target.name === "")) {
+      throw new TypeError("jev-edge: { namespace, name }: name must be a non-empty string");
+    }
+    ns = target.namespace;
+    name = target.name ?? STATE_OBJECT;
+  } else {
+    throw new TypeError("jev-edge: not a Durable Object namespace, { namespace, name } or stub");
+  }
+  const s: DOStubLike = { fetch: (input, init) => ns.get(ns.idFromName(name)).fetch(input, init) };
+  resolved.add(s);
+  return s;
+}
+
+function caller(target: StateTarget) {
+  const stub = stateStub(target);
   return async (path: string, payload: unknown): Promise<{ value?: unknown; ok?: boolean }> => {
     const res = await stub.fetch("https://jev-state" + path, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
-    if (!res.ok) throw new Error(`jev-state ${path}: http ${res.status}`);
+    if (!res.ok) throw Object.assign(new Error(`jev-state ${path}: http ${res.status}`), { status: res.status });
     return (await res.json()) as { value?: unknown; ok?: boolean };
   };
 }
 
-/** The plain Store interface over a JevState stub: two hops per read-modify-write, one (atomic) per incr. */
-export function durableStore(stub: DOStubLike): Store {
-  const call = caller(stub);
+/** A JevState of a build before this endpoint answers 404 "not found". */
+function missingEndpoint(e: unknown): boolean {
+  return typeof e === "object" && e !== null && (e as { status?: unknown }).status === 404;
+}
+
+/** The plain Store interface over JevState (a namespace, `{ namespace, name }` or a stub): two hops per read-modify-write, one (atomic) per incr. */
+export function durableStore(target: StateTarget): Store {
+  const call = caller(target);
   return {
     get: async (k) => (await call("/get", { key: k })).value ?? undefined,
     set: async (k, v, ttl) => {
@@ -219,9 +490,128 @@ export function durableStore(stub: DOStubLike): Store {
   };
 }
 
+/** Where durableSubjectStore keeps a subject: the object `jev-subject:<id>` (`jev-subject:<name>:<id>` with a name). */
+export const SUBJECT_OBJECT = "jev-subject";
+
+/** The subject a subject-store key is about: `subj:<id>...` (trajectory) and `srep:<id>...` (reputation), an id being `<from>:<hex>` (core/subject.ts). */
+const SUBJECT_KEY = new RegExp("^(?:" + KEY_PREFIX + "|" + REP_PREFIX + ")([a-z]+:[0-9a-f]+)(?::|$)");
+
+/** What a judged request needs of its subject's object, loaded in one hop. */
+export interface SubjectSession {
+  /** The subject's trajectory, oldest first (ringLoad), or null. */
+  history: unknown;
+  /** The subject's keys for this request: a key loaded with the history is
+   *  answered from that load until this request writes it, any other is read
+   *  from the object. */
+  store: Store;
+  /** Adds one entry to the trajectory inside the object: one hop, atomic. */
+  append(e: SubjectEntry): Promise<void>;
+}
+
+/** durableSubjectStore: a Store over one object per subject, and the session one request uses. */
+export interface SubjectObjects extends Store {
+  /** One hop to the subject's object: its trajectory (the newest `max`) and
+   *  `keys`, read together. `ttl` is the trajectory's (subject.history_ttl). */
+  session(id: string, o?: { max?: number; ttl?: number; keys?: string[] }): Promise<SubjectSession>;
+}
+
+/**
+ * Subject trajectories and reputation in the JevState namespace, one object
+ * per subject (`idFromName("jev-subject:" + id)`, or
+ * `"jev-subject:<name>:" + id` for `{ namespace, name }`): each subject's
+ * counters are atomic, as in the one object, and strongly consistent across
+ * isolates and locations, and no subject's traffic queues behind another's
+ * or the breaker's in the global jev-edge object. As a Store it routes each
+ * key to its subject's object (a key naming no subject goes to
+ * `jev-subject`), one hop per operation. `session` is what the runtime uses
+ * for a judged request: the trajectory and the reputation keys L1 and the
+ * record read, in one hop before the judge; the points and the trajectory
+ * entry one each after it. A JevState of an older build (404 on /subject) is
+ * read and written per key instead. A stub is made per call, as the other
+ * durable helpers make theirs from a namespace: a stub is bound to the
+ * request that made it.
+ */
+export function durableSubjectStore(target: DONamespaceLike | DONamed): SubjectObjects {
+  let ns: DONamespaceLike;
+  let prefix = SUBJECT_OBJECT;
+  if (isNamespace(target)) {
+    ns = target;
+  } else if (isNamed(target) && isNamespace(target.namespace)) {
+    if (target.name !== undefined && (typeof target.name !== "string" || target.name === "")) {
+      throw new TypeError("jev-edge: { namespace, name }: name must be a non-empty string");
+    }
+    ns = target.namespace;
+    if (target.name !== undefined) prefix = SUBJECT_OBJECT + ":" + target.name;
+  } else {
+    throw new TypeError("jev-edge: durableSubjectStore takes a Durable Object namespace or { namespace, name }; is the binding configured?");
+  }
+  const objectOf = (id: string) => ({ namespace: ns, name: prefix + ":" + id });
+  const forKey = (k: string): Store => {
+    const m = SUBJECT_KEY.exec(k);
+    return durableStore(m ? objectOf(m[1]) : { namespace: ns, name: prefix });
+  };
+  const routed: Store = {
+    get: (k) => forKey(k).get(k),
+    set: (k, v, ttl) => forKey(k).set(k, v, ttl),
+    incr: (k, by, ttl) => forKey(k).incr!(k, by, ttl),
+    expire: (k, ttl) => forKey(k).expire!(k, ttl),
+  };
+  let legacy = false;
+  return {
+    ...routed,
+    session: async (id, o = {}) => {
+      const one = durableStore(objectOf(id));
+      const max = o.max;
+      const keys = (o.keys ?? []).slice(0, MAX_LOAD_KEYS);
+      if (!legacy) {
+        const call = caller(objectOf(id));
+        try {
+          const v = (await call("/subject", { op: "load", id, max, keys })).value as { history?: unknown; values?: Record<string, unknown> } | undefined;
+          return {
+            history: v?.history ?? null,
+            store: loaded(routed, keys, v?.values ?? {}),
+            append: async (e) => {
+              await call("/subject", { op: "append", id, entry: e, max, ttl: o.ttl });
+            },
+          };
+        } catch (e) {
+          if (!missingEndpoint(e)) throw e;
+          legacy = true;
+        }
+      }
+      return {
+        history: await loadHistory(one, id, max),
+        store: routed,
+        append: (e) => appendHistory(one, id, e, max, o.ttl),
+      };
+    },
+  };
+}
+
+/** `base`, with the keys read in a load answered from it until written here. */
+function loaded(base: Store, keys: string[], values: Record<string, unknown>): Store {
+  const got = new Map<string, unknown>();
+  for (const k of keys) if (Object.prototype.hasOwnProperty.call(values, k)) got.set(k, values[k] ?? undefined);
+  return {
+    get: async (k) => (got.has(k) ? got.get(k) : base.get(k)),
+    set: async (k, v, ttl) => {
+      got.delete(k);
+      await base.set(k, v, ttl);
+    },
+    incr: async (k, by, ttl) => {
+      got.delete(k);
+      return base.incr!(k, by, ttl);
+    },
+    expire: async (k, ttl) => {
+      got.delete(k);
+      await base.expire!(k, ttl);
+    },
+  };
+}
+
 /** A breaker whose every operation is one fetch, executed inside the Durable Object. */
-export function durableBreaker(stub: DOStubLike, cfg: BreakerConfig = {}): BreakerLike {
-  const call = caller(stub);
+export function durableBreaker(target: StateTarget, cfg: BreakerConfig = {}): BreakerLike {
+  const call = caller(target);
   const op = (o: BreakerOp["op"], extra: Record<string, unknown> = {}) => call("/breaker", { op: o, cfg, ...extra });
   return {
     state: async () => (await op("state")).value as State,
@@ -229,17 +619,103 @@ export function durableBreaker(stub: DOStubLike, cfg: BreakerConfig = {}): Break
     trip: async (now?: number) => { await op("trip", now === undefined ? {} : { now }); },
     success: async () => { await op("success"); },
     failure: async () => { await op("failure"); },
+    release: async () => { await op("release"); },
   };
 }
 
 /** Adaptive timeout whose observe() runs inside the Durable Object: one fetch, atomic. */
-export function durableAdaptive(stub: DOStubLike, cfg: JevConfig): AdaptiveLike {
-  const call = caller(stub);
+export function durableAdaptive(target: StateTarget, cfg: JevConfig): AdaptiveLike {
+  const call = caller(target);
   const t = tuning(cfg);
   const op = (o: AdaptiveOp["op"], extra: Record<string, unknown> = {}) => call("/adaptive", { op: o, cfg, ...extra });
   return {
     current: async () => (t.enabled ? Number((await op("current")).value) || t.floor : t.floor),
     success: async (ms) => { if (t.enabled && ms > 0) await op("success", { ms }); },
     timeout: async (firedMs) => { if (t.enabled) await op("timeout", firedMs === undefined ? {} : { ms: firedMs }); },
+  };
+}
+
+/**
+ * Breaker and adaptive timeout for one judged request over JevState, in two
+ * hops instead of one per operation: allow() asks /pre, which answers the
+ * timeout with it, so current() makes no call; the adaptive samples wait in
+ * the request, and core's settle (success, failure or release, one per
+ * request allow() let through) sends them to /post with the breaker's record.
+ * The factory is made once per runtime, its result once per request. A
+ * JevState that answers 404 to /pre or /post (an older build of the class,
+ * bound from another script) is asked per operation from then on, as
+ * durableBreaker and durableAdaptive do.
+ */
+export function durableRequest(
+  target: StateTarget, bcfg: BreakerConfig, jcfg: JevConfig,
+): () => { breaker: BreakerLike; adaptive: AdaptiveLike } {
+  const call = caller(target);
+  const perOp = { breaker: durableBreaker(target, bcfg), adaptive: durableAdaptive(target, jcfg) };
+  const t = tuning(jcfg);
+  let legacy = false;
+  return () => {
+    let timeout: number | undefined;
+    const samples: Sample[] = [];
+    const post = async (result: Settled): Promise<void> => {
+      const batch = samples.splice(0);
+      if (!legacy) {
+        try {
+          await call("/post", { breaker: bcfg, jev: jcfg, samples: batch, result });
+          return;
+        } catch (e) {
+          if (!missingEndpoint(e)) throw e;
+          legacy = true;
+        }
+      }
+      // each record on its own, as the runtime's wrappers kept them: a
+      // rejected sample does not drop the breaker's record
+      let first: unknown;
+      const each = async (op: () => Promise<void>) => {
+        try {
+          await op();
+        } catch (e) {
+          first ??= e;
+        }
+      };
+      for (const [kind, ms] of batch) {
+        await each(() => (kind === "success" ? perOp.adaptive.success(ms) : perOp.adaptive.timeout(ms ?? undefined)));
+      }
+      if (result !== null) await each(() => perOp.breaker[result]!());
+      if (first !== undefined) throw first;
+    };
+    const breaker: BreakerLike = {
+      state: () => perOp.breaker.state(),
+      allow: async () => {
+        if (!legacy) {
+          try {
+            const v = (await call("/pre", { breaker: bcfg, jev: jcfg })).value as { allow?: unknown; timeout_ms?: unknown } | undefined;
+            timeout = Number(v?.timeout_ms) || t.floor;
+            return v?.allow === true;
+          } catch (e) {
+            if (!missingEndpoint(e)) {
+              // the state is unreachable: current() must not ask it again
+              timeout = t.floor;
+              throw e;
+            }
+            legacy = true;
+          }
+        }
+        return perOp.breaker.allow();
+      },
+      trip: (now) => perOp.breaker.trip(now),
+      success: () => post("success"),
+      failure: () => post("failure"),
+      release: () => post("release"),
+    };
+    const adaptive: AdaptiveLike = {
+      current: async () => timeout ?? perOp.adaptive.current(),
+      success: async (ms) => {
+        if (t.enabled && ms > 0) samples.push(["success", ms]);
+      },
+      timeout: async (firedMs) => {
+        if (t.enabled) samples.push(["timeout", firedMs ?? null]);
+      },
+    };
+    return { breaker, adaptive };
   };
 }

@@ -46,24 +46,187 @@ function H.clock(start)
 end
 
 H.json = require "dkjson"
--- Request bodies decode JSON null to a non-nil value, as cjson (cjson.null)
--- does in production: `[null, {...}]` must not end the array at the hole
--- dkjson would otherwise leave.
-function H.body_decode(s) return H.json.decode(s, 1, H.json.null) end
+
+-- Deepest array/object nesting in JSON text, strings skipped.
+local function json_depth(s)
+  local depth, max, i = 0, 0, 1
+  while true do
+    local j, _, c = s:find('(["%[%]{}])', i)
+    if not j then return max end
+    if c == '"' then
+      -- to the closing quote, past escapes
+      local k = j + 1
+      while true do
+        local q = s:find('["\\]', k)
+        if not q then return max end
+        if s:sub(q, q) == '"' then j = q break end
+        k = q + 2
+      end
+    elseif c == "[" or c == "{" then
+      depth = depth + 1
+      if depth > max then max = depth end
+    else
+      depth = depth - 1
+    end
+    i = j + 1
+  end
+end
+
+-- True when JSON text has a \uD800-\uDFFF escape that is not half of a
+-- pair (cjson refuses it; raw bytes of an encoded surrogate it passes on).
+local function lone_surrogate_escape(s)
+  local i = 1
+  while true do
+    local j = s:find("\\", i, true)
+    if not j then return false end
+    local hex = s:sub(j + 1, j + 1) == "u" and s:match("^%x%x%x%x", j + 2)
+    if not hex then
+      i = j + 2
+    else
+      local cp = tonumber(hex, 16)
+      i = j + 6
+      if cp >= 0xD800 and cp <= 0xDFFF then
+        local lo = cp <= 0xDBFF and tonumber(s:match("^\\u(%x%x%x%x)", i) or "", 16)
+        if not (lo and lo >= 0xDC00 and lo <= 0xDFFF) then return true end
+        i = i + 6
+      end
+    end
+  end
+end
+
+-- True when the commas and colons of JSON text are where RFC 8259 puts them.
+-- dkjson reads `[1,2,]`, `{"a":1,}`, `[1 2]` and `{"a":1 "b":2}`; cjson and
+-- JSON.parse refuse all four. Strings are skipped, scalars taken as a run of
+-- the characters they are made of (dkjson has already checked them).
+local function well_formed(s)
+  -- what may come next: "v" a value, "v]" a value or "]", "k" a key,
+  -- "k}" a key or "}", ":" a colon, "," a comma or the closer (after a value)
+  local want, stack, i = "v", {}, 1
+  while true do
+    i = s:find("[^ \t\n\r]", i)
+    if not i then return want == "," and #stack == 0 end
+    local c = s:sub(i, i)
+    local top = stack[#stack]
+    if c == '"' then
+      if want ~= "v" and want ~= "v]" and want ~= "k" and want ~= "k}" then return false end
+      local k = i + 1
+      while true do
+        local q = s:find('["\\]', k)
+        if not q then return false end
+        if s:sub(q, q) == '"' then i = q break end
+        k = q + 2
+      end
+      want = (want == "k" or want == "k}") and ":" or ","
+    elseif c == "{" or c == "[" then
+      if want ~= "v" and want ~= "v]" then return false end
+      stack[#stack + 1] = c
+      want = c == "{" and "k}" or "v]"
+    elseif c == "}" or c == "]" then
+      local open = c == "}" and "{" or "["
+      if top ~= open or not (want == "," or want == (c == "}" and "k}" or "v]")) then return false end
+      stack[#stack] = nil
+      want = ","
+    elseif c == ":" then
+      if want ~= ":" then return false end
+      want = "v"
+    elseif c == "," then
+      if want ~= "," or not top then return false end
+      want = top == "{" and "k" or "v"
+    else
+      if want ~= "v" and want ~= "v]" then return false end
+      i = (s:find("[^%w%.%+%-]", i) or #s + 1) - 1
+      want = ","
+    end
+    if #stack == 0 and want == "," then
+      -- the value is complete: only white space may follow
+      return s:find("^[ \t\n\r]*$", i + 1) ~= nil
+    end
+    i = i + 1
+  end
+end
+H.well_formed = well_formed
+
+-- The text with each bare NaN, Infinity and -Infinity token outside strings
+-- read as 0, or nil when it has none. A token stands alone, as Python reads
+-- it: after the start, JSON white space, '[', ',' or ':' ("-" for
+-- -Infinity), and before the end, white space, ',', ']' or '}'; so "-NaN"
+-- and "1NaN" are left as they are. As normalize.ts nonFinite.
+local function non_finite(s)
+  local out, from, i, n, found = {}, 1, 1, #s, false
+  local function before(k) return k < 1 or (" \t\n\r[,:"):find(s:sub(k, k), 1, true) ~= nil end
+  local function after(k) return k > n or (" \t\n\r,]}"):find(s:sub(k, k), 1, true) ~= nil end
+  while true do
+    local j = s:find('["NI]', i)
+    if not j then break end
+    local c = s:sub(j, j)
+    if c == '"' then
+      -- skip the string: a backslash escapes the byte after it
+      local k = j + 1
+      while true do
+        local q = s:find('["\\]', k)
+        if not q then k = n break end
+        if s:sub(q, q) == '"' then k = q break end
+        k = q + 2
+      end
+      i = k + 1
+    elseif c == "N" and s:sub(j, j + 2) == "NaN" and before(j - 1) and after(j + 3) then
+      out[#out + 1] = s:sub(from, j - 1) .. "0"
+      from, i, found = j + 3, j + 3, true
+    elseif c == "I" and s:sub(j, j + 7) == "Infinity" and after(j + 8)
+       and (before(j - 1) or (s:sub(j - 1, j - 1) == "-" and before(j - 2))) then
+      out[#out + 1] = s:sub(from, j - 1) .. "0"
+      from, i, found = j + 8, j + 8, true
+    else
+      i = j + 1
+    end
+  end
+  if not found then return nil end
+  out[#out + 1] = s:sub(from)
+  return table.concat(out)
+end
+
+local function strict_decode(s)
+  local v, pos = H.json.decode(s, 1, H.json.null)
+  if v == nil or not s:find("^[ \t\n\r]*$", pos) or json_depth(s) > 1000 or lone_surrogate_escape(s)
+     or not well_formed(s) then
+    return nil
+  end
+  return v
+end
+
+-- Request bodies are decoded the way cjson.safe decodes them in production:
+-- JSON null is a non-nil value (cjson.null), so `[null, {...}]` does not end
+-- the array at the hole dkjson would otherwise leave; and what cjson refuses
+-- and dkjson accepts (anything after the value, nesting past 1000, a lone
+-- surrogate escape, a trailing or missing comma) is refused, returning nil.
+-- NaN, Infinity and -Infinity, which cjson (decode_invalid_numbers, on by
+-- default) and Python's json.loads take, are read as 0, as the JS runtime's
+-- normalize.jsonDecode reads them: a number carries no text. cjson's other
+-- extras (hex, a leading +, inf, nan) are not: no backend a golden vector
+-- pins takes them.
+function H.body_decode(s)
+  local v = strict_decode(s)
+  if v == nil then
+    local t = non_finite(s)
+    if t then v = strict_decode(t) end
+  end
+  return v
+end
 
 -- PCRE matcher with the same contract the OpenResty adapter gives core:
--- re_find(subject, pattern) -> truthy on a case-insensitive match.
+-- re_find(subject, pattern, init) -> the byte span of the first
+-- case-insensitive match at or after byte init (1 when nil), or nil.
 do
   local rex = require "rex_pcre2"
   local CASELESS = rex.flags().CASELESS
   local compiled = {}
-  function H.re_find(subject, pattern)
+  function H.re_find(subject, pattern, init)
     local re = compiled[pattern]
     if not re then
       re = rex.new(pattern, CASELESS)
       compiled[pattern] = re
     end
-    return re:find(subject)   -- from, to (1-based, inclusive) or nil
+    return re:find(subject, init)   -- from, to (1-based, inclusive) or nil
   end
 end
 

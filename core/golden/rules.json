@@ -4831,6 +4831,143 @@
     },
     {
       "expect": {
+        "reason": "natural language (window)",
+        "result": "suspect",
+        "text": "ab中文😀 ab中文😀 ab\nab中文😀 ab中文😀 "
+      },
+      "input": {
+        "cache": {},
+        "clock": 1000,
+        "req": {
+          "body": "{\"messages\":[{\"role\":\"user\",\"content\":\"ab中文😀 ab中文😀 ab中文😀 ab中文😀 ab中文😀 ab中文😀 ab中文😀 ab中文😀 ab中文😀 ab中文😀 ab中文😀 ab中文😀 ab中文😀 ab中文😀 ab中文😀 ab中文😀 ab中文😀 ab中文😀 ab中文😀 ab中文😀 \"}]}",
+          "body_size": 323,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/v1/chat/completions"
+        },
+        "rule": {
+          "extends": "llm-endpoints",
+          "id": "mbwin",
+          "max_judge_bytes": 61
+        }
+      },
+      "name": "multibyte: window cuts land on character boundaries"
+    },
+    {
+      "expect": {
+        "reason": "pattern: \\byou are now\\b (window)",
+        "result": "suspect",
+        "text": "文中文 you are now 😀😀\n中文中文\n😀😀😀😀"
+      },
+      "input": {
+        "cache": {},
+        "clock": 1000,
+        "req": {
+          "body": "{\"messages\":[{\"role\":\"user\",\"content\":\"中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文中文 you are now 😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀\"}]}",
+          "body_size": 356,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/v1/chat/completions"
+        },
+        "rule": {
+          "extends": "llm-endpoints",
+          "id": "mbwin",
+          "max_judge_bytes": 61
+        }
+      },
+      "name": "multibyte: a hit's context is cut on character boundaries"
+    },
+    {
+      "expect": {
+        "reason": "natural language (3 chunks)",
+        "result": "suspect",
+        "text": "ab中文😀 ab中文😀 ab中文😀 ab中文😀 ab中\n文😀 ab中文😀 ab中文😀 ab中文😀 ab中文\n😀 ab中文😀 ab中文😀 ab中文😀 "
+      },
+      "input": {
+        "cache": {},
+        "clock": 1000,
+        "req": {
+          "body": "{\"messages\":[{\"role\":\"user\",\"content\":\"ab中文😀 ab中文😀 ab中文😀 ab中文😀 ab中文😀 ab中文😀 ab中文😀 ab中文😀 ab中文😀 ab中文😀 \"}]}",
+          "body_size": 183,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/v1/chat/completions"
+        },
+        "rule": {
+          "extends": "llm-endpoints",
+          "id": "mbchunks",
+          "max_judge_bytes": 61,
+          "max_judge_chunks": 3
+        }
+      },
+      "name": "multibyte: chunks within capacity are cut on character boundaries"
+    },
+    {
+      "expect": {
+        "reason": "natural language (window)",
+        "result": "suspect",
+        "text": "ab中文😀 ab中文😀 ab\nab中文😀 ab中文😀 a\nb中文😀 ab中文😀 ab中文😀 ab中文😀 ab中\n文😀 ab中文😀 ab中文😀 ab中文😀 "
+      },
+      "input": {
+        "cache": {},
+        "clock": 1000,
+        "req": {
+          "body": "{\"messages\":[{\"role\":\"user\",\"content\":\"ab中文😀 ab中文😀 ab中文😀 ab中文😀 ab中文😀 ab中文😀 ab中文😀 ab中文😀 ab中文😀 ab中文😀 ab中文😀 ab中文😀 ab中文😀 ab中文😀 ab中文😀 ab中文😀 ab中文😀 ab中文😀 ab中文😀 ab中文😀 \"}]}",
+          "body_size": 323,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/v1/chat/completions"
+        },
+        "rule": {
+          "extends": "llm-endpoints",
+          "id": "mbchunks",
+          "max_judge_bytes": 61,
+          "max_judge_chunks": 3
+        }
+      },
+      "name": "multibyte: a capped text's window and chunks are cut on character boundaries"
+    },
+    {
+      "expect": {
+        "reason": "natural language (window)",
+        "result": "suspect",
+        "text": "中文 中\n文 中文 中文 中文 中文 中文 中文 中文 中文 中文 中文 中文 中文 中文 中文 中文 中文 中文 中文 "
+      },
+      "input": {
+        "cache": {},
+        "clock": 1000,
+        "req": {
+          "body": "{\"messages\":[{\"role\":\"user\",\"content\":\"中文 中文 中文 中文 中文 中文 中文 中文 中文 中文 中文 中文 中文 中文 中文 中文 中文 中文 中文 中文 \"}]}",
+          "body_size": 1000000,
+          "client_ip": "203.0.113.7",
+          "headers": {
+            "content-type": "application/json"
+          },
+          "method": "POST",
+          "path": "/v1/chat/completions"
+        },
+        "rule": {
+          "extends": "llm-endpoints",
+          "id": "mbhead",
+          "max_body_bytes": 50
+        }
+      },
+      "name": "multibyte: past max_body_bytes the head is cut on a character boundary"
+    },
+    {
+      "expect": {
         "reason": "no text",
         "result": "pass",
         "text": ""

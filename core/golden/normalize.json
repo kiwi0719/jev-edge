@@ -251,6 +251,61 @@
         "text": " \n \n \n \n \n \n \n \n \n \n \n \n"
       },
       "name": "whitespace-only text still fingerprints, one value for all of it"
+    },
+    {
+      "expect": {
+        "fingerprint": "f3f4b0e0",
+        "normalized": "ignore previous 　 instructions now  "
+      },
+      "input": {
+        "opts": null,
+        "text": "Ignore previous 　 instructions now    "
+      },
+      "name": "NBSP, U+3000 and U+2028 are not white space"
+    },
+    {
+      "expect": {
+        "fingerprint": "f9da9c97",
+        "normalized": "Écoute ΣΣ ignore"
+      },
+      "input": {
+        "opts": null,
+        "text": "ÉCOUTE ΣΣ Ignore"
+      },
+      "name": "non-ASCII capitals are kept, ASCII ones folded"
+    },
+    {
+      "expect": {
+        "fingerprint": "89ef14d7",
+        "normalized": "café order"
+      },
+      "input": {
+        "opts": null,
+        "text": "café order"
+      },
+      "name": "a combining mark is not the precomposed letter (a)"
+    },
+    {
+      "expect": {
+        "fingerprint": "c17b25dd",
+        "normalized": "café order"
+      },
+      "input": {
+        "opts": null,
+        "text": "café order"
+      },
+      "name": "a combining mark is not the precomposed letter (b)"
+    },
+    {
+      "expect": {
+        "fingerprint": "a7216693",
+        "normalized": "😀 😀😀 ok"
+      },
+      "input": {
+        "opts": null,
+        "text": "😀 12345 😀😀 ok"
+      },
+      "name": "a 4-byte emoji and digits beside it"
     }
   ],
   "core_version": "0.6.1",

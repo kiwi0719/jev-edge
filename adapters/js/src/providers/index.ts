@@ -403,7 +403,9 @@ export const backend: Provider = {
     if (!base) return [null, "backend: jev.endpoint (origin jev-edge URL) not set"];
     const path = info?.path ?? prompt.context.path ?? "/";
     // The decoded body when the Worker read it whole (so no Content-Encoding);
-    // otherwise the judged window, sent as what it is: plain text.
+    // otherwise the judged text, sent as what it is: plain text. The runtime
+    // sets core's judge.whole for this provider, so that text is all of what
+    // the Worker judged (every chunk, retrieved content, tool definitions).
     const whole = info?.body !== null && info?.body !== undefined;
     const headers: Record<string, string> = {
       "Content-Type": whole ? info.headers.get("content-type") ?? "application/json" : "text/plain; charset=utf-8",

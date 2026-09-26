@@ -8,8 +8,14 @@
 --   trust       same contract, for fingerprint trust only (default: cache).
 --               Split it out to put trust somewhere shared or durable without
 --               moving the hot verdict cache too.
---   judge       { call = fn(prompt, timeout_ms) -> answers|nil, err, kind }
+--   judge       { call = fn(prompt, timeout_ms) -> answers|nil, err, kind,
+--                 call_many = fn(prompts, timeout_ms) (optional),
+--                 whole = true (optional) }
 --                 answers: { [template_name] = probability }
+--                 whole: the provider judges the whole request in one call
+--                 (a thin Worker's origin): a request judged in parts is
+--                 one prompt of all of it, and only the whole request's
+--                 cache entry is read and written
 --                 err == judge.BUSY: the adapter's own in-flight cap refused
 --                 the call; not a provider failure, not fed to the breaker
 --                 kind: judge.TRANSPORT | TIMEOUT | UNAVAILABLE (breaker
@@ -199,7 +205,7 @@ local function plan(req, cfg, hash, rule, text, windowed, chunks, capped, untrus
   local whole = text
   if untrusted then whole = whole .. UNTRUSTED_SEP .. untrusted.text end
   if tools then whole = whole .. TOOLS_SEP .. tools.text end
-  local p = { fp = normalize.fingerprint(whole, { prefix_bytes = cfg.cache.fp_prefix_bytes }, hash) }
+  local p = { whole = whole, fp = normalize.fingerprint(whole, { prefix_bytes = cfg.cache.fp_prefix_bytes }, hash) }
   local uspec = untrusted and defaults.untrusted_spec(cfg, rule)
   -- The whole request's entry. Judged in parts, it names the parts in its
   -- scope, so it never answers for the same text judged in one piece.
@@ -457,8 +463,20 @@ function _M.evaluate(req, ctx)
       }))
     end
   end
-  if p.parts then return judge_parts(ctx, rule, p.parts, p.suffix, fp, ckey, reason) end
-  local prompt, perr = judge.build(rule.templates, text, p.context)
+  if p.parts and not ctx.judge.whole then return judge_parts(ctx, rule, p.parts, p.suffix, fp, ckey, reason) end
+  -- One piece; or a provider that judges the whole request in one call
+  -- (ctx.judge.whole): all of it in one prompt (every chunk, the retrieved
+  -- content, the tool definitions, joined as the fingerprint joins them),
+  -- one answer, and only the whole request's entry. An answer for all of it
+  -- is never one for a part: no part's entry is written.
+  local jtext, rep = text, p.rep
+  if p.parts then
+    jtext = p.whole
+    -- its one score cannot say whether the subject's own text or the
+    -- retrieved content or tool definitions beside it made it (rep_of)
+    if untrusted or tools then rep = false end
+  end
+  local prompt, perr = judge.build(rule.templates, jtext, p.context)
   if not prompt then
     log(ctx, "error", "jev-edge: " .. perr)
     settle(ctx)
@@ -497,17 +515,17 @@ function _M.evaluate(req, ctx)
   if ctx.breaker then ctx.breaker:success() end
   local action, label, async = policy.decide(score, cfg.policy)
   local why = top ~= "" and (top .. " " .. string.format("%.2f", score)) or reason
-  -- the score is for the window, not the whole text; say so
-  if windowed and top ~= "" then why = why .. " (window)" end
+  -- what the score covers ("(window)", "(3 chunks)"), as judged in parts
+  if top ~= "" then why = why .. p.suffix end
 
   if ckey and ctx.cache then
-    ctx.cache:set(ckey, { score = score, reason = why, rep = p.rep }, cfg.cache.fp_ttl)
+    ctx.cache:set(ckey, { score = score, reason = why, rep = rep }, cfg.cache.fp_ttl)
   end
 
   return finish(ctx, verdict.new({
     action = action, verdict = label, score = score, async = async,
     source = verdict.SRC_L2, reason = why, fingerprint = fp, l2_ms = elapsed,
-  }), p.rep)
+  }), rep)
 end
 
 -- ---------------------------------------------------------------------------

@@ -506,15 +506,13 @@ async function evaluateInner(request: Request, rt: Runtime, requestId: string, r
     re_find: core.rules.reFind,
     judge: {
       call: judgeOnce,
-      // chunks judged in parallel. The backend provider sends the whole body
-      // to the origin, which chunks it itself: one call answers for all.
-      call_many: async (prompts) => {
-        if (rt.provider.name === "backend") {
-          const r = await judgeOnce(prompts[0]);
-          return prompts.map(() => r);
-        }
-        return Promise.all(prompts.map((p) => judgeOnce(p)));
-      },
+      // chunks and other parts judged in parallel
+      call_many: (prompts) => Promise.all(prompts.map((p) => judgeOnce(p))),
+      // The backend provider asks the origin about the whole request: the
+      // body when it was read whole, else every chunk and part in one text,
+      // which the origin chunks itself. One call, and its answer is kept
+      // under the whole request's key only, never a part's.
+      whole: rt.provider.name === "backend",
     },
     log: (level, msg) => console[level === "error" ? "error" : "warn"](msg),
   };

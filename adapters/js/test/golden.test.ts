@@ -159,6 +159,7 @@ describe("golden: evaluate", () => {
             }
             return [inp.judge.answers, null];
           },
+          whole: inp.judge.whole,
         },
         log: () => {},
       };

@@ -162,7 +162,7 @@ describe("golden: evaluate", function()
             return a
           end
           return inp.judge.answers
-        end },
+        end, whole = inp.judge.whole },
         log = function() end,
       }
       local v = core.evaluate(inp.req, ctx)

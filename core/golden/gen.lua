@@ -1278,7 +1278,7 @@ local function eval_case(name, spec)
         return a
       end
       return spec.judge.answers
-    end },
+    end, whole = spec.judge.whole },
     log = function() end,
   }
 
@@ -1968,6 +1968,24 @@ eval_case("tools: a whole-request cache hit charges what its entry says", {
     defaults.merge(defaults.config, {}), normalize.djb2, { templates = { "injection", "+tools" } })] =
     { score = 0.95, reason = "tools+injection 0.95", rep = 0.1 } },
   judge = { answers = { injection = 0.9 } } })
+-- judge.whole: a provider that judges the whole request in one call (a thin
+-- Worker's origin, js-hosts#9). A request judged in parts is one prompt of
+-- all of it, one call, and only the whole request's entry is read and
+-- written, so no part's entry holds a score for more than that part.
+eval_case("judge.whole: chunks are one call of all of them, only the whole entry written", {
+  req = req(FITS), rules = { CHUNKED }, judge = { answers = { injection = 0.3 }, whole = true } })
+eval_case("judge.whole: a cached chunk is not read", {
+  req = req(FITS), rules = { CHUNKED }, config = { policy = { mode = "enforce" } },
+  cache = { [chunk_key(FITS, 2)] = { score = 0.95, reason = "injection 0.95" } },
+  judge = { answers = { injection = 0.1 }, whole = true } })
+eval_case("judge.whole: over max_judge_chunks the reason still says window", {
+  req = req(OVER), rules = { CHUNKED }, judge = { answers = { injection = 0.2 }, whole = true } })
+eval_case("judge.whole: tool definitions beside the text are one call, and no part is charged", {
+  req = T_BOTH, config = REP_ENF, subject = { id = "u-6" }, judge = { answers = { injection = 0.95 }, whole = true } })
+eval_case("judge.whole: a malicious tool set leaves no entry under the text's own key", {
+  req = raw_req(tools_body(LONG, ATTACK)), config = ENF, judge = { answers = { injection = 0.95 }, whole = true } })
+eval_case("judge.whole: one piece is judged as before", {
+  req = req(ATTACK), config = ENF, judge = { answers = { injection = 0.95 }, whole = true } })
 eval_case("tools: retrieved content, tool definitions and the text are three parts", {
   req = raw_req(U_TOOL:sub(1, -2) .. ',"tools":' .. oai_tools(T_DESC) .. '}'), config = U_ON, judge = U_SCORES })
 eval_case("tools: a huge tool set is capped, the reason says window", {

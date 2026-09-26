@@ -23,6 +23,10 @@ export interface Judge {
   call(prompt: judge.Prompt, timeoutMs: number): Promise<JudgeResult> | JudgeResult;
   /** Optional: several prompts at once (in parallel), for text judged in chunks. */
   call_many?(prompts: judge.Prompt[], timeoutMs: number): Promise<JudgeResult[]>;
+  /** Optional: the provider judges the whole request in one call (a thin
+   *  Worker's origin). A request judged in parts is then one prompt of all of
+   *  it, and only the whole request's cache entry is read and written. */
+  whole?: boolean;
 }
 
 export interface Ctx {
@@ -416,7 +420,12 @@ export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
       }));
     }
   }
-  if ((chunks && chunks.length > 1) || untrusted || tools) {
+  const inParts = (chunks && chunks.length > 1) || !!untrusted || !!tools;
+  // what the score covers, as the reason says it (plan() in core/init.lua)
+  let suffix = windowed ? " (window)" : "";
+  if (chunks && chunks.length > 1) suffix = capped ? " (window)" : ` (${chunks.length} chunks${windowed ? ", window" : ""})`;
+  else if (inParts && (untrusted?.windowed || tools?.windowed)) suffix = " (window)";
+  if (inParts && !ctx.judge.whole) {
     const context = {
       path: req.path ?? "", method: req.method ?? "",
       deployment: rule!.deployment_context ?? cfg.jev.deployment_context ?? "",
@@ -427,9 +436,6 @@ export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
         parts.push({ text: c, templates: rule!.templates, context, ...(textRep === false ? { rep: false as const } : {}) });
       }
     }
-    let suffix = "";
-    if (chunks && chunks.length > 1) suffix = capped ? " (window)" : ` (${chunks.length} chunks${windowed ? ", window" : ""})`;
-    else if (windowed || untrusted?.windowed || tools?.windowed) suffix = " (window)";
     if (untrusted && uspec) {
       // asked without the deployment context, the way the question was
       // measured. Not the subject's own text: not charged to it (repOf).
@@ -447,7 +453,13 @@ export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
     }
     return judgeParts(ctx, rule!, parts, suffix, fp, ckey, reason);
   }
-  const [prompt, perr] = judge.build(rule!.templates, text, {
+  // One piece; or a provider that judges the whole request in one call
+  // (ctx.judge.whole): all of it in one prompt, joined as the fingerprint
+  // joins it, one answer, and only the whole request's entry. Its one score
+  // cannot say whether the subject's own text or the retrieved content or
+  // tool definitions beside it made it (repOf).
+  const rep: Rep = inParts && (untrusted || tools) ? false : textRep;
+  const [prompt, perr] = judge.build(rule!.templates, inParts ? whole : text, {
     path: req.path ?? "",
     method: req.method ?? "",
     deployment: rule!.deployment_context ?? cfg.jev.deployment_context ?? "",
@@ -490,17 +502,17 @@ export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
   }
   await settle(ctx, false, true);
   const [action, label, async] = policy.decide(score, cfg.policy);
-  // the score is for the window, not the whole text; say so
-  const why = top !== "" ? `${top} ${verdict.format2(score)}${windowed ? " (window)" : ""}` : reason;
+  // what the score covers ("(window)", "(3 chunks)"), as judged in parts
+  const why = top !== "" ? `${top} ${verdict.format2(score)}${suffix}` : reason;
 
   const cache = ctx.cache;
   if (ckey && cache) {
-    await after(ctx, () => cache.set(ckey, { score, reason: why, ...(textRep === false ? { rep: false } : {}) }, cfg.cache.fp_ttl));
+    await after(ctx, () => cache.set(ckey, { score, reason: why, ...(rep === false ? { rep: false } : {}) }, cfg.cache.fp_ttl));
   }
 
   return finish(ctx, verdict.newVerdict({
     action, verdict: label, score, async, source: verdict.SRC_L2, reason: why, fingerprint: fp, l2_ms: elapsed,
-  }), textRep);
+  }), rep);
 }
 
 export { rulesMod as rules, normalize, judge, policy, verdict, trust, subject };

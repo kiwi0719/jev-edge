@@ -264,6 +264,37 @@ describe("nodeMiddleware", () => {
     expect(Buffer.compare(r2.rawBody as Buffer, utf8)).toBe(0);
   });
 
+  it("a body parser mounted after it (body-parser 1.x) takes the body as read, not the spent stream", async () => {
+    const req = streamed([Buffer.from(BENIGN)]);
+    await nodeMiddleware(opts())(req as never, nodeRes(), () => {});
+    // body-parser 1.x json()/text(): skip when req._body says a parser ran,
+    // else read the stream, which this middleware already consumed
+    const bodyParser1 = (r: typeof req, _res: unknown, next: (err?: unknown) => void) => {
+      if (r._body) return next();
+      next(Object.assign(new Error("stream is not readable"), { status: 500 }));
+    };
+    let err: unknown = "not called";
+    bodyParser1(req, nodeRes(), (e?: unknown) => { err = e; });
+    expect(err).toBeUndefined();
+    expect(req._body).toBe(true);
+    expect(req.body).toBe(BENIGN);
+  });
+
+  it("mounted twice, the second one judges the bytes that came, not its own req.body as a parser's", async () => {
+    const { gzipSync } = await import("node:zlib");
+    const keyword = { name: "kw", call: async (p: { text: string }) => [{ injection: p.text.includes("Ignore all previous") ? 0.95 : 0.05 }, null] as never };
+    const cfg = { jev: { timeout_ms: 400 } };
+    const req = streamed([gzipSync(Buffer.from(ATTACK))], { "content-encoding": "gzip" });
+    await nodeMiddleware({ provider: keyword, config: { ...cfg, policy: { mode: "monitor" as const } } })(req as never, nodeRes(), () => {});
+    expect((req.headers as Record<string, string>)["x-jev-verdict"]).toBe("malicious");
+    req.readableEnded = true; // as node:http sets it once the stream was read
+    const res = nodeRes();
+    let nexted = false;
+    await nodeMiddleware({ provider: keyword, config: { ...cfg, policy: { mode: "enforce" as const } } })(req as never, res, () => { nexted = true; });
+    expect(nexted).toBe(false);
+    expect(res.statusCode).toBe(403);
+  });
+
   it("judges a body a parser already inflated, despite its content-encoding header", async () => {
     const mw = nodeMiddleware(opts());
     const req = nodeReq(ATTACK, { "content-encoding": "gzip", "x-jev-mock-score": "0.95" }, "/v1/chat/completions", JSON.parse(ATTACK));

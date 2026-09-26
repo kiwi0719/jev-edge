@@ -187,6 +187,9 @@ function reencode(body: object, contentType: string): string {
   return JSON.stringify(body);
 }
 
+/** Requests whose stream nodeMiddleware read itself, and the bytes it read. */
+const ownReads = new WeakMap<object, Buffer>();
+
 /**
  * The request body as text plus its size in bytes. From `req.body` when a
  * parser actually read the stream (body-parser sets `req._body`; any parser
@@ -202,6 +205,12 @@ function reencode(body: object, contentType: string): string {
  * a stream something else already consumed.
  */
 async function readNodeBody(req: NodeRequestLike): Promise<[string | Buffer | null, number, boolean]> {
+  // This middleware read the stream already (mounted twice, app and
+  // router): req.body and req._body are its own, not a parser's, so the
+  // bytes as they came, still to decode. Never req.rawBody, which the
+  // common express.json({ verify }) pattern sets to the inflated bytes.
+  const own = ownReads.get(req);
+  if (own) return [own, own.length, false];
   // `complete` is not "consumed": node sets it once the whole body has
   // arrived, often before anyone reads it. Only an ended stream is gone.
   const streamGone = typeof req.on !== "function" || req.readableEnded === true || req.readable === false;
@@ -266,8 +275,11 @@ function judgedUrl(req: NodeRequestLike): URL {
  * express.json() first, the parsed body is re-serialised for evaluation; if
  * not, the stream is read here (whole, see readNodeBody) and re-exposed as
  * `req.rawBody` (the bytes) and `req.body`: the string for plain UTF-8, the
- * bytes for a compressed or binary body (handedOn). `req.jev` is the
- * verdict. X-Jev-* are set on
+ * bytes for a compressed or binary body (handedOn). It then sets
+ * `req._body`, body-parser's "already parsed" flag, so a parser mounted
+ * after this one passes that string or those bytes on instead of failing on
+ * the spent stream: mount express.json() before nodeMiddleware to get an
+ * object. `req.jev` is the verdict. X-Jev-* are set on
  * `req.headers` for the handlers; client-supplied ones are removed first.
  * Any error fails open with x-jev-verdict: error, x-jev-source: adapter.
  */
@@ -290,11 +302,18 @@ export function nodeMiddleware(opts: Options) {
       }
       const method = req.method ?? "GET";
       const [body, , fromParser] = method === "GET" || method === "HEAD" ? [null, 0, false] : await readNodeBody(req);
-      const raw = asBuffer(body);
-      if (raw) req.rawBody = raw;
+      const raw = fromParser ? undefined : asBuffer(body);
+      if (raw) {
+        ownReads.set(req, raw);
+        req.rawBody = raw;
+      }
       if (body !== null && (req.body === undefined || (req._body !== true && isEmptyObject(req.body)))) {
         req.body = raw ? handedOn(raw, req.headers) : body;
       }
+      // the stream is spent: body-parser (1.x checks req._body) and the
+      // like, mounted after this, must take the body as read, not answer
+      // 500 "stream is not readable"
+      if (raw) req._body = true;
       // a parser already decoded it: the runtime must not try again
       if (fromParser) headers.delete("content-encoding");
       // The whole body goes to the runtime, which reads it as it reads any

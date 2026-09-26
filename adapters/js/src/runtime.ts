@@ -14,7 +14,10 @@ import { resolve as resolveRule, type RuleSpec } from "./rules/index.js";
 import { shouldSample, buildSample, type Sample } from "./sampling.js";
 import * as subjectMod from "./core/subject.js";
 import { load as loadProvider, type Provider, type ProviderRequestInfo } from "./providers/index.js";
-import { kvStore, memoryStore, durableStore, durableBreaker, durableAdaptive, type KVLike, type DOStubLike } from "./cf/stores.js";
+import {
+  kvStore, memoryStore, durableStore, durableBreaker, durableAdaptive, isStateTarget, stateStub,
+  type KVLike, type StateTarget,
+} from "./cf/stores.js";
 import { Adaptive, type AdaptiveLike } from "./cf/adaptive.js";
 import type { Store, BreakerLike } from "./core/breaker.js";
 import { bestEffortStore, bestEffortBreaker, bestEffortAdaptive } from "./besteffort.js";
@@ -28,16 +31,26 @@ export interface Options {
   rules?: RuleSpec[];
   /** Overrides config.jev.provider with an instance. */
   provider?: Provider;
-  /** KV namespace for the fingerprint / reputation cache. Memory (per isolate) if absent. */
-  cache?: KVLike | Store;
-  /** Durable Object stub (JevState) or any Store for breaker + adaptive timeout. Memory (per isolate) if absent.
-   *  With a stub the breaker and adaptive read-modify-write run inside the Durable Object, one fetch per operation.
-   *  Anything with a `fetch` method is taken for a stub, so a Store must not have one. workerd binds a stub to
-   *  the request that created it: a runtime kept across requests needs `{ fetch }` that gets a fresh stub per
-   *  call, which is what the Cloudflare presets pass. */
-  state?: DOStubLike | Store;
-  /** Store for per-subject trajectories (KV or memory). Memory (per isolate) if absent. Only used with config.subject.enabled. */
-  subjectStore?: KVLike | Store;
+  /** KV namespace for the fingerprint / reputation cache. Memory (per isolate) if absent. The JevState
+   *  Durable Object (namespace, `{ namespace, name }` or stub, as for `state`) is taken too, as
+   *  durableStore: one object for every lookup, and entries kept until overwritten. */
+  cache?: KVLike | StateTarget | Store;
+  /** Breaker + adaptive timeout state: the JevState Durable Object namespace (env.JEV_STATE), the namespace
+   *  and an object name (`{ namespace: env.JEV_STATE, name: "staging" }`), a stub, or any Store. Memory (per
+   *  isolate) if absent. With the Durable Object the breaker and adaptive read-modify-write run inside it,
+   *  one fetch per operation.
+   *  Pass the namespace: the runtime makes a stub per operation (`idFromName("jev-edge")`, or the name
+   *  given), so it can be kept at module scope. workerd binds a stub to the request that created it; a
+   *  runtime kept across requests with a stub logs that once per stub and isolate, and from then on keeps
+   *  breaker and adaptive state in that isolate's memory, one operation at a time (cf/stores.ts). Anything
+   *  with a `fetch` method is taken for a stub, idFromName + get without one for a namespace, and an object
+   *  with a `namespace` key and no `get` for `{ namespace, name }`, so a Store must have no `fetch` and not
+   *  both idFromName and get. */
+  state?: StateTarget | Store;
+  /** Store for per-subject trajectories: KV, the JevState Durable Object (namespace, `{ namespace, name }`
+   *  or stub, as for `state`; its incr is atomic) or any Store. Memory (per isolate) if absent. Only used
+   *  with config.subject.enabled. */
+  subjectStore?: KVLike | StateTarget | Store;
   /** Header carrying the client IP, set by a proxy you trust to overwrite it.
    *  Default: cf-connecting-ip on Cloudflare (a preset, or a request with the
    *  platform's `cf` object), none elsewhere, where it is a client header.
@@ -74,17 +87,18 @@ export interface RequestCtx {
 function isKV(x: unknown): x is KVLike {
   return typeof x === "object" && x !== null && "put" in x && typeof (x as KVLike).put === "function";
 }
-/**
- * A Durable Object stub, told apart from a Store by the one thing it always
- * has and a Store never does: a `fetch` method. Not by what it lacks: a
- * workerd stub answers every property name (each one an RPC method on
- * compatibility dates from 2024-04-03, the old Fetcher get / put / delete
- * before that), so `"get" in stub` is true for every real one.
- */
-function isStub(x: unknown): x is DOStubLike {
-  return (typeof x === "object" || typeof x === "function") && x !== null && typeof (x as DOStubLike).fetch === "function";
-}
 
+/**
+ * The Store behind a cache or subjectStore option. The Durable Object is
+ * tested first: a workerd stub answers every property name, `put` included,
+ * and would pass for KV; a namespace has `get` and would pass for a Store,
+ * and fail on every request.
+ */
+function storeOption(x: KVLike | StateTarget | Store | undefined, clock: () => number): Store {
+  if (isStateTarget(x)) return durableStore(x);
+  if (isKV(x)) return kvStore(x);
+  return (x as Store | undefined) ?? memoryStore(clock);
+}
 export function createRuntime(opts: Options): Runtime {
   const config = core.defaults.merge(core.defaults.config, opts.config ?? {});
   const [ok, err] = core.defaults.validate(config);
@@ -92,18 +106,22 @@ export function createRuntime(opts: Options): Runtime {
   const rules = ((opts.rules ?? config.rules) as RuleSpec[]).map(resolveRule);
   const provider = opts.provider ?? loadProvider(config.jev.provider ?? "jev");
   const clock = () => Date.now() / 1000;
-  const cache: Store = isKV(opts.cache) ? kvStore(opts.cache) : (opts.cache as Store | undefined) ?? memoryStore(clock);
-  const subjectStore: Store = isKV(opts.subjectStore) ? kvStore(opts.subjectStore, "jev:") : (opts.subjectStore as Store | undefined) ?? memoryStore(clock);
+  const cache = storeOption(opts.cache, clock);
+  const subjectStore = storeOption(opts.subjectStore, clock);
   let state: Store;
   let breaker: BreakerLike;
   let adaptive: AdaptiveLike;
-  if (isStub(opts.state)) {
+  if (isStateTarget(opts.state)) {
     // One hop per operation: the Durable Object runs the same Breaker and
     // Adaptive classes against its own storage, so the read-modify-write is
-    // atomic there instead of three or four round trips from here.
-    state = durableStore(opts.state);
-    breaker = durableBreaker(opts.state, config.breaker);
-    adaptive = durableAdaptive(opts.state, config.jev);
+    // atomic there instead of three or four round trips from here. The stub
+    // is made per call from a namespace (and name); a stub given as is is
+    // guarded against use past its request (cf/stores.ts), one guard for all
+    // three.
+    const stub = stateStub(opts.state);
+    state = durableStore(stub);
+    breaker = durableBreaker(stub, config.breaker);
+    adaptive = durableAdaptive(stub, config.jev);
   } else {
     state = (opts.state as Store | undefined) ?? memoryStore(clock);
     breaker = new core.breaker.Breaker(state, clock, config.breaker);

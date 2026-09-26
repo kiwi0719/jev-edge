@@ -84,8 +84,8 @@ export function memoryStore(clock: () => number = () => Date.now() / 1000): Stor
 
 /**
  * A Durable Object holding breaker and adaptive state for every isolate. One
- * instance per deployment (`idFromName("jev-edge")`). Export it from your
- * Worker and bind it as JEV_STATE.
+ * instance per deployment (`idFromName("jev-edge")`, or the name passed as
+ * `{ namespace, name }`). Export it from your Worker and bind it as JEV_STATE.
  *
  * Two kinds of endpoint:
  *   /get, /set, /incr, /expire  the plain Store interface (durableStore);
@@ -193,7 +193,169 @@ export interface DOStubLike {
   fetch(input: string | Request, init?: RequestInit): Promise<Response>;
 }
 
-function caller(stub: DOStubLike) {
+/** The Durable Object namespace binding (env.JEV_STATE), not a stub made from it. */
+export interface DONamespaceLike {
+  idFromName(name: string): unknown;
+  get(id: unknown): DOStubLike;
+}
+
+/** The JevState object a namespace given as is resolves to: `idFromName` of this. */
+export const STATE_OBJECT = "jev-edge";
+
+/**
+ * A namespace and the name of the JevState object to use in it, for more
+ * than one breaker and adaptive timeout on one binding (a Worker per
+ * environment or per upstream sharing the class): `{ namespace:
+ * env.JEV_STATE, name: "staging" }`. Without `name`, STATE_OBJECT.
+ */
+export interface DONamed {
+  namespace: DONamespaceLike;
+  name?: string;
+}
+
+/** Where the durable* helpers find JevState: a namespace, a namespace and a name, or a stub. */
+export type StateTarget = DONamespaceLike | DONamed | DOStubLike;
+
+/**
+ * A Durable Object stub, told apart from a Store by the one thing it always
+ * has and a Store never does: a `fetch` method. Not by what it lacks: a
+ * workerd stub answers every property name (each one an RPC method on
+ * compatibility dates from 2024-04-03, the old Fetcher get / put / delete
+ * before that), so `"get" in stub` is true for every real one.
+ */
+export function isStub(x: unknown): x is DOStubLike {
+  return (typeof x === "object" || typeof x === "function") && x !== null && typeof (x as DOStubLike).fetch === "function";
+}
+
+/** A namespace binding: idFromName and get, and no `fetch`, which every stub has. */
+export function isNamespace(x: unknown): x is DONamespaceLike {
+  if (typeof x !== "object" || x === null || isStub(x)) return false;
+  const n = x as DONamespaceLike;
+  return typeof n.idFromName === "function" && typeof n.get === "function";
+}
+
+/**
+ * `{ namespace, name }`: an object with a `namespace` key and no `get`
+ * method. Not a stub, which has every key, nor a Store, which always has
+ * `get` and may well carry a `namespace` of its own (a key prefix, say).
+ */
+export function isNamed(x: unknown): x is DONamed {
+  return typeof x === "object" && x !== null && !isStub(x) && "namespace" in x && typeof (x as { get?: unknown }).get !== "function";
+}
+
+/** A namespace, `{ namespace, name }` or a stub: what createRuntime runs through JevState. */
+export function isStateTarget(x: unknown): x is StateTarget {
+  return isStub(x) || isNamespace(x) || isNamed(x);
+}
+
+// A stub is an I/O object of the request that made it: workerd refuses it in
+// any later one. A namespace is not, so a runtime given one (and kept at
+// module scope, or across requests by a preset) makes its stub per call;
+// idFromName is a hash and get() no round trip.
+//
+// workerd's refusal is raised in the calling isolate, before anything is
+// sent: an Error with this message and no `remote` property. An exception
+// thrown inside the Durable Object reaches the caller with `remote: true`
+// (checked in Miniflare 4.20260714 / workerd 1.20260714, fetch stubs on
+// compatibility dates before and after RPC), whatever its message, and is the
+// caller's to handle like any other.
+const CROSS_REQUEST = /Cannot perform I\/O on behalf of a different request/;
+const STALE_STUB =
+  "jev-edge: a Durable Object stub made in one request was used in a later one, which workerd refuses " +
+  '("Cannot perform I/O on behalf of a different request"). From now on this isolate keeps the breaker, ' +
+  "adaptive timeout and any durableStore on this stub in its own memory, apart from every other isolate; " +
+  "logged once per stub and isolate. Fix: pass the namespace, createRuntime({ state: env.JEV_STATE }) or " +
+  "durableStore(env.JEV_STATE), which makes a stub per call; or build the runtime per request.";
+
+/** workerd's refusal of a stub used past its request, and nothing else. */
+function isCrossRequest(e: unknown): boolean {
+  if (typeof e === "object" && e !== null && (e as { remote?: unknown }).remote === true) return false;
+  return CROSS_REQUEST.test(e instanceof Error ? e.message : String(e));
+}
+
+const resolved = new WeakSet<object>();
+const guards = new WeakMap<object, DOStubLike>();
+
+/**
+ * A stub kept past its request answers every call with the cross-request
+ * error, which would fail open every request after the first. Instead the
+ * first such error is logged (once per stub, in each isolate that hits it)
+ * and this stub's calls go from then on to a JevState over isolate memory.
+ * That state is per isolate, like a runtime's without a binding, and the
+ * JevState takes one request at a time, as the Durable Object's input gate
+ * would: an incr, a breaker record or a half-open probe claim is atomic
+ * within the isolate, though no longer across isolates. Any other error,
+ * including one thrown inside the object, is the caller's, as before.
+ */
+function guarded(stub: DOStubLike): DOStubLike {
+  const known = guards.get(stub);
+  if (known) return known;
+  let local: ((req: Request) => Promise<Response>) | undefined;
+  const g: DOStubLike = {
+    fetch: async (input, init) => {
+      if (local) return local(new Request(input, init));
+      try {
+        return await stub.fetch(input, init);
+      } catch (e) {
+        if (!isCrossRequest(e)) throw e;
+        if (!local) {
+          console.error(STALE_STUB);
+          local = isolateState();
+        }
+        return local(new Request(input, init));
+      }
+    },
+  };
+  guards.set(stub, g);
+  resolved.add(g);
+  return g;
+}
+
+/** A JevState over this isolate's memory, one request at a time. */
+function isolateState(): (req: Request) => Promise<Response> {
+  const m = new Map<string, unknown>();
+  const d = new JevState({ storage: { get: async (k) => m.get(k), put: async (k, v) => { m.set(k, v); }, delete: async (k) => m.delete(k) } });
+  let queue: Promise<unknown> = Promise.resolve();
+  return (req) => {
+    const p = queue.then(() => d.fetch(req));
+    queue = p.catch(() => {});
+    return p;
+  };
+}
+
+/**
+ * What the durable* helpers call: for a namespace, a stub made per call
+ * (`idFromName(STATE_OBJECT)`, or the name given with it); for a stub, the
+ * stub guarded against use past its request. Idempotent. Throws on anything
+ * else, and on a `{ namespace, name }` whose namespace is not one (a binding
+ * missing from this environment) or whose name is not a non-empty string.
+ */
+export function stateStub(target: StateTarget): DOStubLike {
+  if (resolved.has(target)) return target as DOStubLike;
+  if (isStub(target)) return guarded(target);
+  let ns: DONamespaceLike;
+  let name = STATE_OBJECT;
+  if (isNamespace(target)) {
+    ns = target;
+  } else if (isNamed(target)) {
+    if (!isNamespace(target.namespace)) {
+      throw new TypeError("jev-edge: { namespace, name }: namespace is not a Durable Object namespace (idFromName and get); is the binding configured?");
+    }
+    if (target.name !== undefined && (typeof target.name !== "string" || target.name === "")) {
+      throw new TypeError("jev-edge: { namespace, name }: name must be a non-empty string");
+    }
+    ns = target.namespace;
+    name = target.name ?? STATE_OBJECT;
+  } else {
+    throw new TypeError("jev-edge: not a Durable Object namespace, { namespace, name } or stub");
+  }
+  const s: DOStubLike = { fetch: (input, init) => ns.get(ns.idFromName(name)).fetch(input, init) };
+  resolved.add(s);
+  return s;
+}
+
+function caller(target: StateTarget) {
+  const stub = stateStub(target);
   return async (path: string, payload: unknown): Promise<{ value?: unknown; ok?: boolean }> => {
     const res = await stub.fetch("https://jev-state" + path, {
       method: "POST",
@@ -205,9 +367,9 @@ function caller(stub: DOStubLike) {
   };
 }
 
-/** The plain Store interface over a JevState stub: two hops per read-modify-write, one (atomic) per incr. */
-export function durableStore(stub: DOStubLike): Store {
-  const call = caller(stub);
+/** The plain Store interface over JevState (a namespace, `{ namespace, name }` or a stub): two hops per read-modify-write, one (atomic) per incr. */
+export function durableStore(target: StateTarget): Store {
+  const call = caller(target);
   return {
     get: async (k) => (await call("/get", { key: k })).value ?? undefined,
     set: async (k, v, ttl) => {
@@ -221,8 +383,8 @@ export function durableStore(stub: DOStubLike): Store {
 }
 
 /** A breaker whose every operation is one fetch, executed inside the Durable Object. */
-export function durableBreaker(stub: DOStubLike, cfg: BreakerConfig = {}): BreakerLike {
-  const call = caller(stub);
+export function durableBreaker(target: StateTarget, cfg: BreakerConfig = {}): BreakerLike {
+  const call = caller(target);
   const op = (o: BreakerOp["op"], extra: Record<string, unknown> = {}) => call("/breaker", { op: o, cfg, ...extra });
   return {
     state: async () => (await op("state")).value as State,
@@ -235,8 +397,8 @@ export function durableBreaker(stub: DOStubLike, cfg: BreakerConfig = {}): Break
 }
 
 /** Adaptive timeout whose observe() runs inside the Durable Object: one fetch, atomic. */
-export function durableAdaptive(stub: DOStubLike, cfg: JevConfig): AdaptiveLike {
-  const call = caller(stub);
+export function durableAdaptive(target: StateTarget, cfg: JevConfig): AdaptiveLike {
+  const call = caller(target);
   const t = tuning(cfg);
   const op = (o: AdaptiveOp["op"], extra: Record<string, unknown> = {}) => call("/adaptive", { op: o, cfg, ...extra });
   return {

@@ -60,7 +60,37 @@ groups:
             fail_ratio the breaker opens (JevBreakerOpen). rejected (another
             4xx) and unusable (no scores) never open it, as the judged text
             can provoke them: near 100% usually means a model parameter, the
-            key's permissions or a WAF (JevL2NoVerdicts).
+            key's permissions or a WAF (JevL2NoVerdicts). busy ("max_inflight
+            exceeded"): jev.max_inflight was full and no call was made; see
+            JevL2Saturated.
+
+      # jev.max_inflight is full: the gateway's own cap refuses L2 calls
+      # before they are made (jev_l2_errors_total{kind="busy"}, reason
+      # "max_inflight exceeded"; not in jev_l2_latency_ms), and those requests
+      # pass with verdict=error. The breaker never counts them, so nothing
+      # else pages. Denominator: every request that reached the L2 stage.
+      - alert: JevL2Saturated
+        expr: |
+          sum by (job, instance) (rate(jev_l2_errors_total{kind="busy"}[5m]))
+            /
+          sum by (job, instance) (rate(jev_requests_total{source=~"l2|breaker"}[5m]))
+            > 0.10
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "jev-edge L2 saturated at max_inflight on {{ $labels.instance }}"
+          description: >-
+            {{ $value | humanizePercentage }} of the requests reaching L2 on
+            {{ $labels.instance }} have been refused by jev.max_inflight for
+            5 minutes: they pass unjudged (verdict=error, reason "max_inflight
+            exceeded"), with no call made and the breaker closed.
+          runbook: >-
+            Raise jev.max_inflight if the provider has headroom (its rate
+            limits, the L2 latency panel), or scale the provider. A slow
+            provider holds each slot longer: check jev_l2_latency_ms and
+            JevL2TimeoutAtCeiling first, since a higher cap on a provider
+            that is timing out only moves the errors to timeout.
 
       # Watched requests nobody could read (body too large, binary body,
       # unknown content-encoding). Denominator: every request that got past

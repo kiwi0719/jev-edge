@@ -184,7 +184,9 @@ tests:
                 fail_ratio the breaker opens (JevBreakerOpen). rejected (another
                 4xx) and unusable (no scores) never open it, as the judged text
                 can provoke them: near 100% usually means a model parameter, the
-                key's permissions or a WAF (JevL2NoVerdicts).
+                key's permissions or a WAF (JevL2NoVerdicts). busy ("max_inflight
+                exceeded"): jev.max_inflight was full and no call was made; see
+                JevL2Saturated.
 
   # Async drops: gw1 drops a job once at minute 5; no drops afterwards.
   - interval: 1m
@@ -270,3 +272,49 @@ tests:
       - eval_time: 20m
         alertname: JevBreakerOpen
         exp_alerts: []
+
+  # Saturated: gw1 turns away 20 of 60 L2-stage requests at max_inflight
+  # (33%); gw2 3 of 100 (3%), under the line; gw3 has none. The per-part
+  # cache hits of gw3 (source=cache) are not L2-stage requests.
+  - interval: 1m
+    input_series:
+      - series: 'jev_requests_total{job="jev",instance="gw1",source="l2",verdict="safe"}'
+        values: '0+40x30'
+      - series: 'jev_requests_total{job="jev",instance="gw1",source="l2",verdict="error"}'
+        values: '0+20x30'
+      - series: 'jev_l2_errors_total{job="jev",instance="gw1",kind="busy"}'
+        values: '0+20x30'
+      - series: 'jev_requests_total{job="jev",instance="gw2",source="l2",verdict="safe"}'
+        values: '0+97x30'
+      - series: 'jev_requests_total{job="jev",instance="gw2",source="l2",verdict="error"}'
+        values: '0+3x30'
+      - series: 'jev_l2_errors_total{job="jev",instance="gw2",kind="busy"}'
+        values: '0+3x30'
+      - series: 'jev_requests_total{job="jev",instance="gw3",source="cache",verdict="safe"}'
+        values: '0+50x30'
+      - series: 'jev_requests_total{job="jev",instance="gw3",source="l2",verdict="safe"}'
+        values: '0+10x30'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: JevL2Saturated
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: JevL2Saturated
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: jev
+              instance: gw1
+            exp_annotations:
+              summary: "jev-edge L2 saturated at max_inflight on gw1"
+              description: >-
+                33.33% of the requests reaching L2 on
+                gw1 have been refused by jev.max_inflight for
+                5 minutes: they pass unjudged (verdict=error, reason "max_inflight
+                exceeded"), with no call made and the breaker closed.
+              runbook: >-
+                Raise jev.max_inflight if the provider has headroom (its rate
+                limits, the L2 latency panel), or scale the provider. A slow
+                provider holds each slot longer: check jev_l2_latency_ms and
+                JevL2TimeoutAtCeiling first, since a higher cap on a provider
+                that is timing out only moves the errors to timeout.

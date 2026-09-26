@@ -35,7 +35,10 @@ function _M.record(v)
     if not L2_ERROR_KINDS[kind] then kind = "other" end
     incr("l2_err:" .. kind)
   end
-  if v.source == "l2" then
+  -- the latency of L2 calls made: a verdict jev.max_inflight turned away
+  -- (error_kind "busy") made none, and its ~0 ms would drag the quantiles
+  -- down just as the provider saturates (counted in jev_l2_errors_total)
+  if v.source == "l2" and v.error_kind ~= "busy" then
     incr("l2_count")
     incr("l2_sum_ms", math.floor(v.l2_ms))
     for _, b in ipairs(BUCKETS) do

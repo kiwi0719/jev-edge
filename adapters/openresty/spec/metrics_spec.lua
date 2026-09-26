@@ -59,4 +59,28 @@ describe("metrics: L2 errors by kind", function()
     for _ in out:gmatch("jev_l2_errors_total{") do n = n + 1 end
     assert.equals(1, n)
   end)
+
+  -- ops#1: a verdict max_inflight turned away made no call; its ~0 ms is
+  -- not an L2 latency. A cache verdict (every part a per-part hit) is none.
+  it("leaves a busy verdict and a cache verdict out of the L2 latency histogram", function()
+    local busy = verdict.new({ verdict = verdict.ERROR, source = verdict.SRC_L2, reason = "max_inflight exceeded",
+      error_kind = "busy" })
+    metrics.record(busy)
+    metrics.record(busy)
+    metrics.record(verdict.new({ verdict = verdict.SAFE, source = verdict.SRC_CACHE, reason = "injection 0.10" }))
+    metrics.record(verdict.new({ verdict = verdict.SAFE, source = verdict.SRC_L2, reason = "injection 0.10",
+      l2_ms = 180 }))
+    metrics.record(verdict.new({ verdict = verdict.ERROR, source = verdict.SRC_L2, reason = "timeout",
+      error_kind = "timeout", l2_ms = 300 }))
+    local out = metrics.render()
+    assert.matches('jev_l2_errors_total{kind="busy"} 2', out, 1, true)
+    assert.matches("jev_l2_latency_ms_count 2\n", out, 1, true)
+    assert.matches("jev_l2_latency_ms_sum 480\n", out, 1, true)
+    -- the busy verdicts' 0 ms would have filled the lowest bucket
+    assert.is_nil(out:find('jev_l2_latency_ms_bucket{le="25"}', 1, true))
+    assert.matches('jev_l2_latency_ms_bucket{le="200"} 1', out, 1, true)
+    assert.matches('jev_l2_latency_ms_bucket{le="+Inf"} 2', out, 1, true)
+    assert.matches('jev_cache_hits_total{kind="fp"} 1', out, 1, true)
+    assert.matches('jev_requests_total{source="l2",verdict="error"} 3', out, 1, true)
+  end)
 end)

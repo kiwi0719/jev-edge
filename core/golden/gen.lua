@@ -2064,6 +2064,20 @@ eval_case("untrusted: a field outside text_fields is judged beside a message too
 eval_case("untrusted: a tool result already judged is not judged again", {
   req = raw_req(U_TOOL), config = U_ON,
   cache = { [untrusted_key(U_EMAIL, U_ON)] = { score = 0.85, reason = "untrusted 0.85" } }, judge = U_SCORES })
+do
+  -- ops#1: every part (the text and the tool result) a per-part cache hit:
+  -- the judge is not asked, and the verdict is the cache's, as on a
+  -- whole-request hit (source cache, never async, no L2 time)
+  local r = raw_req(U_TOOL)
+  local cfg = defaults.merge(defaults.config, U_ON)
+  local ctx = { cache = H.store(), clock = function() return 1000 end, json_decode = H.body_decode,
+                re_find = H.re_find, config = cfg }
+  local _, text = rules_mod.evaluate(r, llm, ctx)
+  eval_case("untrusted: every part already judged is a cache verdict, not an L2 one", {
+    req = r, config = U_ON, judge = U_SCORES,
+    cache = { [core.cache_key(fp_of(text), llm, cfg, normalize.djb2)] = { score = 0.2, reason = "injection 0.20" },
+              [untrusted_key(U_EMAIL, U_ON)] = { score = 0.6, reason = "untrusted 0.60" } } })
+end
 eval_case("untrusted: no answer to the untrusted question is an error", {
   req = raw_req(U_TOOL), config = U_ON_ENF, judge = { by_question = { injection = 0.2 } } })
 eval_case("untrusted: no answer to one question, an answer to the other, is a breaker success", {

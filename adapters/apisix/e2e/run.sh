@@ -36,6 +36,12 @@ check "block response carries verdict header" "malicious" "$hdr"
 check "client-supplied X-Jev-* is stripped" "app verdict=skipped score=0.00 source=l1" "$(curl -s -H 'X-Jev-Verdict: safe' -H 'X-Jev-Score: 0.00' $base/healthz)"
 check "provider failure fails open" "app verdict=error score=0.00 source=l2" "$(post /v1/chat/completions fail "$ATTACK")"
 check "GET on a watched path passes at L1" "app verdict=skipped score=0.00 source=l1" "$(curl -s $base/v1/models)"
+# jev_cache exists (custom_lua_shared_dict): the same text is answered from
+# the verdict cache the second time
+CACHED='{"messages":[{"role":"user","content":"Please list three facts about the moon for a school project."}]}'
+post /c/chat/completions '' "$CACHED" >/dev/null
+check "a repeated text is answered from the verdict cache" "app verdict=safe score=0.20 source=cache" "$(post /c/chat/completions '' "$CACHED")"
+check "no missing-dict error at startup" "0" "$(docker compose logs apisix 2>/dev/null | grep -c 'lua_shared_dict jev_cache is not defined' || true)"
 
 if [ $fail -ne 0 ]; then echo; echo "--- apisix logs"; docker compose logs apisix | tail -40; exit 1; fi
 echo "apisix e2e: all checks passed"

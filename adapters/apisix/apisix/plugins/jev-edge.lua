@@ -4,7 +4,7 @@
 -- the APISIX plugin contract (schema, phases, per-route config) and the
 -- mapping from APISIX's request API to core's `req` table.
 --
--- Install: put the repo on the Lua path and declare the shared dict:
+-- Install: put the repo on the Lua path and declare the shared dicts:
 --
 --   # conf/config.yaml
 --   apisix:
@@ -15,11 +15,19 @@
 --     - ...
 --   nginx_config:
 --     http:
---       lua_shared_dict:
+--       # custom_lua_shared_dict, not lua_shared_dict: APISIX renders only its
+--       # own dicts from that key and drops anything else put there
+--       custom_lua_shared_dict:
 --         jev_cache: 64m
+--         jev_subject: 16m        # with subject.enabled
+--         jev_subject_rep: 4m     # with subject.reputation
 --       # `env TYPESAFE_API_KEY;` is `nginx_config.envs: [TYPESAFE_API_KEY]`
 --     envs:
 --       - TYPESAFE_API_KEY
+--
+-- Without jev_cache there is no verdict cache, the breaker never opens and
+-- max_inflight, max_async and reputation do nothing; the plugin logs an error
+-- at startup when it is missing.
 --
 -- then enable it on a route, service or globally with the same keys as the
 -- Lua config file: jev, rules, policy, cache, breaker, async.
@@ -177,6 +185,17 @@ end
 local runtimes = setmetatable({}, { __mode = "k" })
 local cache
 
+-- A dict the config needs and nginx.conf does not have: one error per worker
+-- and dict, naming the key APISIX reads it from.
+local missing_logged = {}
+local function check_dict(name, why)
+  if ngx.shared[name] or missing_logged[name] then return end
+  missing_logged[name] = true
+  core.log.error("jev-edge: lua_shared_dict ", name, " is not defined (", why, "); declare it under ",
+    "nginx_config.http.custom_lua_shared_dict in config.yaml: APISIX ignores ",
+    "nginx_config.http.lua_shared_dict")
+end
+
 -- SHA-256 for fingerprints and subject ids, the same as the OpenResty adapter
 -- and the JavaScript hosts: a collision-resistant fingerprint (it keys the
 -- verdict cache and the trust store) and one trajectory per user whichever
@@ -256,6 +275,9 @@ local function runtime_for(conf)
     if not cfg.jev.api_key then
       core.log.warn("jev-edge: env ", cfg.jev.api_key_env, " is empty (add it to nginx_config.envs in config.yaml)")
     end
+  end
+  if cfg.subject and cfg.subject.enabled then
+    check_dict(SUBJECT_DICT, "subject.enabled: no trajectories, no subject reputation")
   end
   cache = cache or cache_m.new(DICT)
   -- Breaker, adaptive timeout and in-flight counters describe one provider,
@@ -366,10 +388,12 @@ function _M.access(conf, ctx)
   end
 end
 
---- `$jev_log` for APISIX's logger plugins (http-logger, file-logger, ...):
--- the same JSON object the OpenResty adapter writes, registered as a
--- custom variable so `log_format: { jev: "$jev_log" }` works.
+--- Runs when APISIX loads the plugin: says so when jev_cache is missing, and
+-- registers `$jev_log` for APISIX's logger plugins (http-logger,
+-- file-logger, ...), the same JSON object the OpenResty adapter writes, so
+-- `log_format: { jev: "$jev_log" }` works.
 function _M.init()
+  check_dict(DICT, "no verdict cache, breaker, max_inflight, max_async or reputation")
   core.ctx.register_var("jev_log", function(ctx)
     local v = ctx.jev
     if not v then return "" end

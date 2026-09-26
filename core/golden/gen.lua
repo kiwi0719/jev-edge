@@ -1517,6 +1517,25 @@ eval_case("a tenant pattern with capitals and a set is folded like the path", {
   rules = { { id = "tenant", extends = "llm-endpoints", watch_paths = { "^/Tenants/[A-Z]+/chat" },
               deployment_context = "A tenant assistant." }, "llm-endpoints" },
   judge = { answers = { injection = 0.1 } } })
+-- watch_paths are Lua patterns on every adapter: every class and its
+-- complement, frontiers, and '.' across line terminators, matched over bytes
+-- (js-core-parity#2, js-core-parity#5). A path the rule does not watch
+-- passes at L1; one it watches is judged.
+local function path_rule(p) return { { id = "pat", extends = "llm-endpoints", watch_paths = { p } } } end
+for _, c in ipairs({
+  { "^/v%d+/%l+", "/v12/chat" }, { "^/v%d+/%l+", "/vx/chat" },
+  { "^/api/%A+$", "/api/1-2" }, { "^/api/%A+$", "/api/x-1" },
+  { "^/api/[%l%d]+/chat", "/api/a1b/chat" }, { "^/api/[%l%d]+/chat", "/api/a_b/chat" },
+  { "^/%u%U+/chat", "/Ab1/chat", true }, { "^/%u%U+/chat", "/AB/chat", true },
+  { "%f[%w]chat%f[%W]", "/x/chat" }, { "%f[%w]chat%f[%W]", "/x/mychat" },
+  { "^/tenant/.+/v1/chat", "/tenant/a\nb/v1/chat" }, { "^/tenant/.+/v1/chat", "/tenant/a\226\128\168b/v1/chat" },
+  { "^/a/(b)?c", "/a/b?c" }, { "^/a/(b)?c", "/a/bc" },
+}) do
+  local rules = path_rule(c[1])
+  if c[3] then rules[1].paths_case_sensitive = true end
+  eval_case("watch path " .. c[1] .. " on " .. c[2]:gsub("[%c\128-\255]", "?"), { req = req(ATTACK, { path = c[2] }),
+    rules = rules, judge = { answers = { injection = 0.95 } } })
+end
 eval_case("trusted fingerprint passes without L2", { req = req(ATTACK),
   config = { feedback = { enabled = true, token = "t" } },
   cache = { ["trust:" .. fp_of(ATTACK)] = { trusted_until = 2000, renewals = 0, by = "alice" } },

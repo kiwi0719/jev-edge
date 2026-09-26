@@ -1,7 +1,7 @@
 // Ports of rules/*.lua. Keep the pattern lists identical to the Lua files;
 // core/golden/rules.json has one positive per always_suspect pattern and
 // fails a named case when the two drift.
-import { patternError, type Rule } from "../core/rules.js";
+import { patternError, pathPatternError, type Rule } from "../core/rules.js";
 import { validateUntrusted, stringListError, templatesError } from "../core/defaults.js";
 import { pathError } from "../core/normalize.js";
 
@@ -192,11 +192,12 @@ export function resolve(spec: RuleSpec): Rule {
     throw new Error(`rule ${out.id}: json_only_paths must be a list of patterns`);
   }
   // watch_paths and json_only_paths are Lua patterns; a malformed one raises
-  // on every request.
+  // on every request, and so does one this adapter cannot translate (%b, a
+  // back-reference), which OpenResty would match: refused here, at load.
   for (const k of ["watch_paths", "json_only_paths"] as const) {
     (out[k] ?? []).forEach((p, i) => {
       if (typeof p !== "string") throw new Error(`rule ${out.id}: ${k}[${i + 1}] must be a string`);
-      const perr = patternError(p);
+      const perr = patternError(p) ?? pathPatternError(p, out.paths_case_sensitive);
       if (perr) throw new Error(`rule ${out.id}: ${k}[${i + 1}] ${perr}`);
     });
   }

@@ -9,6 +9,7 @@ import { truncateBytes, normalize, fingerprint, djb2 } from "../src/core/normali
 import { encodeReason } from "../src/core/verdict";
 import { buildSample } from "../src/sampling";
 import { Breaker, memoryStore, OPEN, CLOSED } from "../src/core/breaker";
+import { createRuntime } from "../src";
 
 describe("luaPatternToRegExp", () => {
   it("keeps '-' inside a set as a range/literal and makes it lazy outside", () => {
@@ -31,7 +32,70 @@ describe("luaPatternToRegExp", () => {
     expect(luaPatternToRegExp("^/a%.b/%d+$").test("/a.b/42")).toBe(true);
     expect(luaPatternToRegExp("^/a%.b/%d+$").test("/aXb/42")).toBe(false);
     expect(luaPatternToRegExp("^/x{y}|z$").test("/x{y}|z")).toBe(true);
-    expect(() => luaPatternToRegExp("^/%g")).toThrow(/unsupported/);
+    // %b and back-references have no RegExp translation (js-core-parity#2)
+    expect(() => luaPatternToRegExp("^/%b()")).toThrow(/not supported/);
+    expect(() => luaPatternToRegExp("^/(v1)/%1")).toThrow(/not supported/);
+  });
+
+  // js-core-parity#2 and #5: every Lua class and its complement, sets,
+  // frontiers, anchors and quantifier placement, against string.find. The
+  // table is what Lua 5.5 and LuaJIT both print for these patterns over these
+  // subjects (subjects are byte strings, as luaBytes makes them).
+  it("matches what string.find matches", () => {
+    const PATS = ["^/v%d+/%l+$", "^/api/%A+$", "^/api/[%l%d]+/chat", "^/%u%u%u/chat", "^/v1/chat%-%l+", "^/x%c", "^/x%C+$", "^/%g+$", "^/%G", "^/%S+$", "^/%W", "^/%D+$", "^/%U+$", "^/%L+$", "^/%P+$", "^/%X+$", "^/[%A%d]+$", "^/[^%l]+$", "^/[%S]+$", "^/[+--]+$", "^/[a-%%]", "^/[%a-z]+$", "%f[%w]chat", "%f[%a]%a+%f[%A]$", "chat%f[%z]", "chat%f[%W]", "^%f[/]/v", "%f[^/]v1", "^/a/(b)?c", "^/a/()c", "^/a+-b", "^-x", "^/a$b", "^/a^b", "^/(*)", "^/a**$", "a?$", "^/tenant/.+/v1/chat", "^/a.b", "%y", "%Y", "^/[]]", "^/[^]]+$", "^/%z", "^/%Z+$"];
+    const SUBJECTS = ["/v1/chat", "/v12/abc", "/v1/Chat", "/api/ABC", "/api/abc", "/api/a1b/chat", "/api/A1/chat", "/ABC/chat", "/abc/chat", "/v1/chat-x", "/v1/chat-", "/x\x09", "/xab", "/x a", "/ab c", "/abc", "/a-b", "/a%b", "/a.b", "/a\x0ab", "/a\x0db", "/aab", "-x", "/a$b", "/a^b", "/*", "/a**", "a", "", "/a/b?c", "/a/bc", "/a/c", "/tenant/a\x0ab/v1/chat", "/tenant/a\xe2\x80\xa8b/v1/chat", "x/v1 chat", "/chat", "a chat", "/ychat", "/Y", "/]", "/]]", "/a]", "/\x00", "/abc\x00", "/caf\xc3\xa9", "/v1/chatx", "/v", "chat"];
+    const LUA_FIND = [
+      "110000000000000000000000000000000000000000000100",
+      "000000000000000000000000000000000000000000000000",
+      "000001000000000000000000000000000000000000000000",
+      "000000010000000000000000000000000000000000000000",
+      "000000000100000000000000000000000000000000000000",
+      "000000000001000000000000000000000000000000000000",
+      "000000000000110000000000000000000000000000000000",
+      "111111111110100111100101111001110001011111000110",
+      "000000000000000000000000000000000000000000100000",
+      "111111111110100111100101111001110101011111111110",
+      "000000000000000000000000010000000000000110100000",
+      "000110011001111111111101111001110001011111111010",
+      "110011001111111111111101111001111101010111111110",
+      "000000000000000000000000010000000000001110100000",
+      "000000000001111100011100000000000001011000111010",
+      "000000000001000000000000010000000000001110100010",
+      "000000000000000000000000010000000000000110100000",
+      "000000000000000000000000010000000000001110100000",
+      "111111111110100111100101111001110101011111111110",
+      "000000000000000000000000000000000000000000000000",
+      "000000000000000000000000000000000000000110000000",
+      "000000000000100110000100000000000001011000000010",
+      "100001111110000000000000000000001111100000000101",
+      "111111111100111111111111100101111111111000000111",
+      "100001111000000000000000000000001111110000000001",
+      "100001111110000000000000000000001111110000000001",
+      "111000000110000000000000000000000000000000000110",
+      "111000000110000000000000000000001110000000000100",
+      "000000000000000000000000000001000000000000000000",
+      "000000000000000000000000000000010000000000000000",
+      "000000000000000010000000000000000000000000000000",
+      "000000000000000000000010000000000000000000000000",
+      "000000000000000000000001000000000000000000000000",
+      "000000000000000000000000100000000000000000000000",
+      "000000000000000000000000010000000000000000000000",
+      "000000000000000000000000010000000000000000000000",
+      "111111111111111111111111111111111111111111111111",
+      "000000000000000000000000000000001100000000000000",
+      "000000000000000011111101100001100000000000000000",
+      "000000000000000000000000000000000000010000000000",
+      "000000000000000000000000000000000000001000000000",
+      "000000000000000000000000000000000000000110000000",
+      "111111111111111111111101111001111101011000111110",
+      "000000000000000000000000000000000000000000100000",
+      "111111111111111111111101111001111101011111001110",
+    ];
+    for (const [i, p] of PATS.entries()) {
+      const re = luaPatternToRegExp(p);
+      const got = SUBJECTS.map((s) => (re.test(s) ? "1" : "0")).join("");
+      expect(got, p).toBe(LUA_FIND[i]);
+    }
   });
 
   it("reads '.' as one byte, line terminators included, as Lua does", () => {
@@ -248,6 +312,22 @@ describe("rules.resolve", () => {
     expect(() => resolve({ id: "t", watch_paths: ["^/v1/["] })).toThrow(/watch_paths\[1\]/);
     expect(() => resolve({ id: "t", watch_paths: [42 as never] })).toThrow(/must be a string/);
     expect(() => resolve({ watch_paths: [] })).toThrow(/needs an id/);
+  });
+
+  // js-core-parity#2: a pattern OpenResty matches and this adapter cannot
+  // translate fails at load, never per request (which failed every request open)
+  it("accepts every Lua class, and refuses what the adapter cannot translate at load", () => {
+    for (const p of ["^/v%d+/%l+", "^/api/%A+", "^/api/[%l%d]+/chat", "%f[%w]chat", "^/%g+$", "^/v1/chat%-%U+"]) {
+      const r = resolve({ id: "t", watch_paths: [p] });
+      expect(() => pathMatches("/v1/chat", r.watch_paths)).not.toThrow();
+    }
+    expect(pathMatches("/v12/chat", resolve({ id: "t", watch_paths: ["^/v%d+/%l+"] }).watch_paths)).toBe("^/v%d+/%l+");
+    expect(pathMatches("/API/X-1", resolve({ id: "t", watch_paths: ["^/api/%A+$"] }).watch_paths)).toBeNull();
+    expect(() => resolve({ id: "t", watch_paths: ["^/v1/chat", "^/%b()"] })).toThrow(/rule t: watch_paths\[2\] %b/);
+    expect(() => resolve({ id: "t", watch_paths: ["^/(v1)/%1"] })).toThrow(/watch_paths\[1\] back-reference %1/);
+    expect(() => resolve({ id: "t", watch_paths: ["^/"], json_only_paths: ["^/%b{}"] })).toThrow(/json_only_paths\[1\] %b/);
+    expect(() => createRuntime({ config: { jev: { provider: "mock" } }, rules: [{ id: "t", watch_paths: ["^/%b()"] }] }))
+      .toThrow(/watch_paths\[1\] %b/);
   });
 
   it("checks json_only_paths like watch_paths, and inherits them", () => {

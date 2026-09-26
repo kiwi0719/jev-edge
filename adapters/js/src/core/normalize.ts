@@ -42,8 +42,8 @@ export type JsonValue = null | boolean | number | string | JsonValue[] | { [k: s
 // ---------------------------------------------------------------------------
 
 interface Seg { key: string; each: boolean }
-/** A field path's segments; `whole` when its value is read whole (WHOLE_FIELDS). */
-type Segs = Seg[] & { whole?: boolean };
+/** A field path's segments; `whole` when its value is read whole (WHOLE_FIELDS), `keyed` when an object value is read by its keys too (KEY_FIELDS). */
+type Segs = Seg[] & { whole?: boolean; keyed?: boolean };
 
 function splitPath(path: string): Seg[] {
   const segs: Seg[] = [];
@@ -90,6 +90,18 @@ function byteOrder(a: string, b: string): number {
   return a.length - b.length;
 }
 
+// Port of object_keys() in core/normalize.lua: the keys of object `node`, in
+// byte order while the extraction's sort budget lasts, in the object's own
+// order past it.
+function objectKeys(node: { [k: string]: JsonValue }): string[] {
+  const keys = Object.keys(node);
+  if (keys.length <= sortLeft) {
+    sortLeft -= keys.length;
+    keys.sort(byteOrder);
+  }
+  return keys;
+}
+
 function readWhole(node: JsonValue | undefined, out: string[], depth: number): void {
   if (typeof node === "string") {
     if (node !== "") out.push(node);
@@ -100,12 +112,7 @@ function readWhole(node: JsonValue | undefined, out: string[], depth: number): v
     for (const v of node) readWhole(v, out, depth + 1);
     return;
   }
-  const keys = Object.keys(node);
-  if (keys.length <= sortLeft) {
-    sortLeft -= keys.length;
-    keys.sort(byteOrder);
-  }
-  for (const k of keys) {
+  for (const k of objectKeys(node)) {
     if (k !== "") out.push(k);
     readWhole(node[k], out, depth + 1);
   }
@@ -198,9 +205,19 @@ function variants(node: { [k: string]: JsonValue }, key: string): string[] | und
 // with (strings or input_text parts, under names the client picks).
 const WHOLE_FIELDS = new Set(["documents", "prompt.variables"]);
 
+// Port of KEY_FIELDS in core/normalize.lua: field paths whose value, when it
+// is an object and not a list, is read as content parts and by its keys as
+// well: Gemini's `contents` parts. The Gemini API takes one part object
+// there; LiteLLM's generateContent adapter iterates `parts` without checking
+// its type, so an object yields its keys, and each non-empty key reaches the
+// model as a text part. The keys come after the part's own text, in byte
+// order (objectKeys).
+const KEY_FIELDS = new Set(["contents[*].parts", "contents.parts"]);
+
 function fieldPath(f: string): Segs {
   const segs: Segs = splitPath(f);
   segs.whole = WHOLE_FIELDS.has(f);
+  segs.keyed = KEY_FIELDS.has(f);
   return segs;
 }
 
@@ -223,8 +240,14 @@ function descend(child: JsonValue | undefined, segs: Segs, i: number, out: strin
 function walk(node: JsonValue | undefined, segs: Segs, i: number, out: string[]): void {
   if (node === undefined || node === null) return;
   if (i >= segs.length) {
-    if (segs.whole) readWhole(node, out, 1);
-    else collect(node, out, 1);
+    if (segs.whole) {
+      readWhole(node, out, 1);
+      return;
+    }
+    collect(node, out, 1);
+    if (segs.keyed && isObj(node) && !Array.isArray(node)) {
+      for (const k of objectKeys(node)) if (k !== "") out.push(k);
+    }
     return;
   }
   const key = segs[i].key;

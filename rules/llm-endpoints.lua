@@ -84,7 +84,9 @@ return {
   -- whole: every key and string in them (WHOLE_FIELDS in core/normalize.lua).
   -- template: Ollama. messages[*].parts: AI SDK 5 UIMessages, which carry no
   -- content. contents: Gemini (a list, or one content as LiteLLM takes it),
-  -- function responses included. chat_history[*].message, message: Cohere v1
+  -- function responses included; parts given as one object are read by their
+  -- keys too, which LiteLLM sends as text parts (KEY_FIELDS in
+  -- core/normalize.lua). chat_history[*].message, message: Cohere v1
   -- /v1/chat. prompt.prompt_string: llama.cpp's prompt object, alone or in a
   -- list. prompt.variables: the values a Responses API stored prompt is
   -- filled with, read whole.

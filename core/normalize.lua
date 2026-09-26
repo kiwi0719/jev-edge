@@ -42,16 +42,9 @@ local WHOLE_SORT = 20000
 -- reset it (extraction never yields, so one counter per VM is enough)
 local sort_left = WHOLE_SORT
 
-local function read_whole(node, out, depth)
-  if type(node) == "string" then
-    if node ~= "" then out[#out + 1] = node end
-    return
-  end
-  if type(node) ~= "table" or depth > WHOLE_DEPTH then return end
-  if node[1] ~= nil then
-    for _, v in ipairs(node) do read_whole(v, out, depth + 1) end
-    return
-  end
+-- The string keys of object `node`: in byte order while the extraction's
+-- sort budget lasts, in the table's own order past it.
+local function object_keys(node)
   local keys, n = {}, 0
   for k in pairs(node) do
     if type(k) == "string" then
@@ -63,8 +56,20 @@ local function read_whole(node, out, depth)
     sort_left = sort_left - n
     table.sort(keys)
   end
-  for i = 1, n do
-    local k = keys[i]
+  return keys
+end
+
+local function read_whole(node, out, depth)
+  if type(node) == "string" then
+    if node ~= "" then out[#out + 1] = node end
+    return
+  end
+  if type(node) ~= "table" or depth > WHOLE_DEPTH then return end
+  if node[1] ~= nil then
+    for _, v in ipairs(node) do read_whole(v, out, depth + 1) end
+    return
+  end
+  for _, k in ipairs(object_keys(node)) do
     if k ~= "" then out[#out + 1] = k end
     read_whole(node[k], out, depth + 1)
   end
@@ -167,10 +172,20 @@ end
 -- input_text parts, under names the client picks).
 local WHOLE_FIELDS = { documents = true, ["prompt.variables"] = true }
 
--- The segments of field path `f`; `whole` when its value is read whole.
+-- Field paths whose value, when it is an object and not a list, is read as
+-- content parts and by its keys as well: Gemini's `contents` parts. The
+-- Gemini API takes one part object there; LiteLLM's generateContent adapter
+-- iterates `parts` without checking its type, so an object yields its keys,
+-- and each non-empty key reaches the model as a text part. The keys come
+-- after the part's own text, in byte order (object_keys).
+local KEY_FIELDS = { ["contents[*].parts"] = true, ["contents.parts"] = true }
+
+-- The segments of field path `f`; `whole` when its value is read whole,
+-- `keyed` when an object value is read by its keys too.
 local function field_path(f)
   local segs = split_path(f)
   segs.whole = WHOLE_FIELDS[f] == true
+  segs.keyed = KEY_FIELDS[f] == true
   return segs
 end
 
@@ -190,7 +205,16 @@ end
 walk = function(node, segs, i, out)
   if node == nil then return end
   if i > #segs then
-    if segs.whole then read_whole(node, out, 1) else collect(node, out, 1) end
+    if segs.whole then
+      read_whole(node, out, 1)
+      return
+    end
+    collect(node, out, 1)
+    if segs.keyed and type(node) == "table" and node[1] == nil then
+      for _, k in ipairs(object_keys(node)) do
+        if k ~= "" then out[#out + 1] = k end
+      end
+    end
     return
   end
   local key = segs[i].key

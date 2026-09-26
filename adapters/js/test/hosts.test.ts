@@ -64,6 +64,44 @@ describe("nextMiddleware", () => {
     }
   });
 
+  /** A NextRequest-like request: `url` keeps next.config's basePath (and the
+   *  locale), `nextUrl.pathname` is the path Next routes on, without them. */
+  function nextReq(body: string, url: string, nextUrl: { pathname: string; search?: string; basePath?: string; locale?: string }, headers: Record<string, string> = {}) {
+    return Object.assign(chat(body, headers, url), { nextUrl: { search: "", basePath: "", ...nextUrl } });
+  }
+
+  it("judges the path Next routes on under a basePath, and a locale", async () => {
+    const mw = nextMiddleware(opts(), NextResponse);
+    const hot = { "x-jev-mock-score": "0.95" };
+    const based = await mw(nextReq(ATTACK, "/docs/v1/chat/completions", { pathname: "/v1/chat/completions", basePath: "/docs" }, hot));
+    expect(based.status).toBe(403);
+    expect(based.headers.get("x-jev-source")).toBe("l2");
+    const localized = await mw(nextReq(ATTACK, "/docs/fr/v1/chat/completions?x=1", { pathname: "/v1/chat/completions", search: "?x=1", basePath: "/docs", locale: "fr" }, hot));
+    expect(localized.status).toBe(403);
+    // a benign body under the basePath is judged too, and continues
+    const ok = await mw(nextReq(BENIGN, "/docs/v1/chat/completions", { pathname: "/v1/chat/completions", basePath: "/docs" }));
+    expect(((await ok.json()) as Record<string, unknown>).verdict).toBe("safe");
+  });
+
+  it("without nextUrl the request URL is judged as before", async () => {
+    const mw = nextMiddleware(opts(), NextResponse);
+    const res = await mw(chat(ATTACK, { "x-jev-mock-score": "0.95" }, "/docs/v1/chat/completions"));
+    expect(((await res.json()) as Record<string, unknown>).verdict).toBe("skipped"); // not a watched path
+  });
+
+  it("serves /_jev/health under a basePath", async () => {
+    const mw = nextMiddleware(opts(), NextResponse);
+    const req = Object.assign(new Request("https://app.example/docs/_jev/health"), { nextUrl: { pathname: "/_jev/health", search: "", basePath: "/docs" } });
+    const res = await mw(req);
+    expect(await res.json()).toMatchObject({ ok: true });
+  });
+
+  it("a //-path from nextUrl stays a path, never a host", async () => {
+    const mw = nextMiddleware(opts(), NextResponse);
+    const res = await mw(nextReq(ATTACK, "/docs//v1/chat/completions", { pathname: "//v1/chat/completions", basePath: "/docs" }, { "x-jev-mock-score": "0.95" }));
+    expect(res.status).toBe(403);
+  });
+
   it("hands the subject write to the event's waitUntil", async () => {
     const { memoryStore } = await import("../src/cf/stores");
     const { ringLoad } = await import("../src/core/subject");

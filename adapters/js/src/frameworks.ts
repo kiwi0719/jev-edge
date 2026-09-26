@@ -27,6 +27,36 @@ export interface NextFetchEventLike {
   waitUntil(p: Promise<unknown>): void;
 }
 
+/** The subset of NextRequest's `nextUrl` this module reads: the path Next
+ *  routes on, with next.config's basePath and the locale taken off. */
+export interface NextUrlLike {
+  pathname: string;
+  search?: string;
+}
+
+/**
+ * The request to judge. `request.url` keeps next.config's basePath (and the
+ * i18n locale): under basePath "/docs" a call to /v1/chat/completions arrives
+ * as /docs/v1/chat/completions, which no rule watches, and would pass as
+ * "path not watched". A NextRequest's `nextUrl.pathname` is the path Next
+ * routes on, without them, so the judged request carries that path, the
+ * original method and headers, and a clone of the body (Next buffers it).
+ * Built as a string on the request's origin, never resolved as a reference:
+ * `//v1/...` stays a path. A plain Request (no nextUrl) is judged as is.
+ */
+function nextJudged(request: Request, url: URL): Request {
+  const nu = (request as Request & { nextUrl?: NextUrlLike }).nextUrl;
+  if (!nu || typeof nu.pathname !== "string" || !nu.pathname.startsWith("/")) return request;
+  const search = typeof nu.search === "string" ? nu.search : url.search;
+  if (nu.pathname === url.pathname && search === url.search) return request;
+  const init: RequestInit & { duplex?: "half" } = { method: request.method, headers: request.headers };
+  if (request.body && request.method !== "GET" && request.method !== "HEAD") {
+    init.body = request.clone().body;
+    init.duplex = "half"; // a stream body, as Node's fetch requires
+  }
+  return new Request(url.origin + nu.pathname + search, init);
+}
+
 /**
  * middleware.ts:
  *
@@ -40,15 +70,18 @@ export interface NextFetchEventLike {
  * buffers the body for middleware, so `request.text()` works on the edge and
  * Node runtimes alike. Next passes a `NextFetchEvent` as the second
  * argument; its `waitUntil` keeps the subject write alive after the response.
+ * The path judged (and matched against /_jev/health) is `nextUrl.pathname`,
+ * without next.config's basePath and locale, as Next routes it.
  */
 export function nextMiddleware(opts: Options, NextResponse: NextResponseLike) {
   const rt = runtimeOnce(opts);
   return async (request: Request, event?: NextFetchEventLike): Promise<Response> => {
     const r = rt();
-    const url = new URL(request.url);
+    const judged = nextJudged(request, new URL(request.url));
+    const url = new URL(judged.url);
     if (r.opts.health !== false && url.pathname === "/_jev/health" && request.method === "GET") return healthResponse(r);
     // the event is a RequestCtx as is: evaluate calls event.waitUntil(p)
-    const { verdict, response, requestId, subjectId } = await evaluate(request, r, event); // never throws: fails open
+    const { verdict, response, requestId, subjectId } = await evaluate(judged, r, event); // never throws: fails open
     if (response) return response;
     const forwarded = withVerdictHeaders(request, verdict, requestId, subjectId);
     return NextResponse.next({ request: { headers: forwarded.headers } });

@@ -1533,6 +1533,16 @@ do
     rules = { { id = "any", extends = "llm-endpoints", json_only_paths = { "^/upload$" } } },
     config = { policy = { mode = "enforce" } }, judge = { answers = { injection = 0.95 } } })
 end
+-- an inline rule's methods as a JSON config writes them, a list or a
+-- lowercase map, watch what they name: a POST attack reaches L2 and a GET
+-- passes as not watched (kong-apisix#7)
+for _, m in ipairs({ { "list", { "POST" } }, { "lowercase map", { post = true } } }) do
+  local rules = { { id = "m", extends = "llm-endpoints", methods = m[2] } }
+  eval_case("inline rule methods as a " .. m[1] .. " watch a POST", { req = req(ATTACK), rules = rules,
+    config = { policy = { mode = "enforce" } }, judge = { answers = { injection = 0.95 } } })
+  eval_case("inline rule methods as a " .. m[1] .. " leave a GET unwatched", { req = req(ATTACK, { method = "GET" }),
+    rules = rules, config = { policy = { mode = "enforce" } }, judge = { answers = { injection = 0.95 } } })
+end
 eval_case("a tenant pattern with capitals and a set is folded like the path", {
   req = req(LONG, { path = "/tenants/acme/Chat" }),
   rules = { { id = "tenant", extends = "llm-endpoints", watch_paths = { "^/Tenants/[A-Z]+/chat" },

@@ -280,8 +280,12 @@ export interface HonoContextLike {
  * `c.get("jev")` is the verdict in handlers. The request handlers see is
  * `c.req.raw` with every client-supplied X-Jev-* removed and the verdict's
  * X-Jev-* set (Hono's `raw` is a plain property, so it is replaced in
- * place); the same X-Jev-* are set on the response. Blocked requests return
- * the 403 from the middleware; an adapter error fails open.
+ * place). The response gets X-Jev-Request-Id only: the verdict, score,
+ * reason, source and subject are for the handlers and the log, never the
+ * client, which could otherwise map the judge one request at a time (in
+ * monitor mode too) and see when the breaker is open. Blocked requests
+ * return the block response from the middleware; an adapter error fails
+ * open.
  */
 export function honoMiddleware(opts: Options) {
   const rt = runtimeOnce(opts);
@@ -311,12 +315,10 @@ export function honoMiddleware(opts: Options) {
         /* a context with a read-only raw keeps the original request */
       }
     }
-    const outHeaders: Record<string, string> = {};
-    if (forwarded) forwarded.headers.forEach((v, k) => { if (k.startsWith("x-jev-")) outHeaders[k] = v; });
-    else Object.assign(outHeaders, verdictHeaders(verdict));
-    for (const [k, v] of Object.entries(outHeaders)) {
+    const rid = forwarded?.headers.get("x-jev-request-id");
+    if (rid) {
       try {
-        c.header(k, v);
+        c.header("X-Jev-Request-Id", rid);
       } catch {
         /* response headers are best effort */
       }

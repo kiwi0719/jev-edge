@@ -423,15 +423,47 @@ describe("honoMiddleware", () => {
     return { c: { req: { raw: req }, set: (k: string, v: unknown) => { vars[k] = v; }, header: (k: string, v: string) => { resHeaders[k] = v; } }, vars, resHeaders };
   }
 
-  it("strips inbound X-Jev-* from the request and sets the verdict headers on request and response", async () => {
+  it("strips inbound X-Jev-* from the request and sets the verdict headers on it, the response gets the request id only", async () => {
     const mw = honoMiddleware(opts());
     const { c, resHeaders } = ctx(chat(BENIGN, { "x-jev-verdict": "malicious", "x-jev-subject": "header:00" }));
     await mw(c, async () => {});
     expect(c.req.raw.headers.get("x-jev-verdict")).toBe("safe");
+    expect(c.req.raw.headers.get("x-jev-score")).toBe("0.20");
     expect(c.req.raw.headers.get("x-jev-subject")).toBeNull();
     expect(c.req.raw.headers.get("x-jev-request-id")).toBeTruthy();
-    expect(resHeaders["x-jev-verdict"]).toBe("safe");
-    expect(resHeaders["x-jev-score"]).toBe("0.20");
+    expect(resHeaders).toEqual({ "X-Jev-Request-Id": c.req.raw.headers.get("x-jev-request-id") });
+  });
+
+  it("tells the client nothing of the verdict: monitor-mode score, open breaker, the judge's error text", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const failing = (reason: string) => ({ name: "failing", call: async () => [null, reason, "unusable"] as [null, string, "unusable"] });
+      // monitor mode: an attack scored 0.97 passes
+      const monitor = honoMiddleware({ ...opts("monitor"), config: { ...opts("monitor").config, subject: { enabled: true, from: "ip" as const, salt: "pepper" } } });
+      const m = ctx(chat(ATTACK, { "x-jev-mock-score": "0.97" }));
+      await monitor(m.c, async () => {});
+      expect(m.c.req.raw.headers.get("x-jev-verdict")).toBe("malicious");
+      expect(m.c.req.raw.headers.get("x-jev-subject")).toMatch(/^ip:/);
+      expect(Object.keys(m.resHeaders)).toEqual(["X-Jev-Request-Id"]);
+      // a judge whose error text would echo into X-Jev-Reason
+      const leaky = honoMiddleware({ provider: failing("openai-compat: no numeric answers in SECRET deployment notes"), config: { policy: { mode: "enforce" } } });
+      const l = ctx(chat(ATTACK));
+      await leaky(l.c, async () => {});
+      expect(decodeURIComponent(l.c.req.raw.headers.get("x-jev-reason") ?? "")).toMatch(/SECRET/);
+      expect(Object.keys(l.resHeaders)).toEqual(["X-Jev-Request-Id"]);
+      // the breaker open: every request fails open, and the client must not learn it
+      const down = honoMiddleware({
+        provider: { name: "down", call: async () => [null, "fetch failed", "transport"] as [null, string, "transport"] },
+        config: { policy: { mode: "enforce" }, breaker: { min_samples: 1 } },
+      });
+      await down(ctx(chat(ATTACK)).c, async () => {});
+      const b = ctx(chat(ATTACK.replace("print", "show")));
+      await down(b.c, async () => {});
+      expect(b.c.req.raw.headers.get("x-jev-source")).toBe("breaker");
+      expect(Object.keys(b.resHeaders)).toEqual(["X-Jev-Request-Id"]);
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("fails open when the runtime cannot be built", async () => {
@@ -444,7 +476,8 @@ describe("honoMiddleware", () => {
     expect(out).toBeUndefined();
     expect(nexted).toBe(true);
     expect((vars.jev as { verdict: string; source: string })).toMatchObject({ verdict: "error", source: "adapter" });
-    expect(resHeaders["X-Jev-Source"]).toBe("adapter");
+    expect(resHeaders["X-Jev-Source"]).toBeUndefined();
+    expect(resHeaders["X-Jev-Verdict"]).toBeUndefined();
   });
 
   it("sets c.get('jev') and continues", async () => {

@@ -28,8 +28,10 @@ When SPOE gets no answer from the agent at all (agent down, slower than `timeout
 1. Run the agent next to HAProxy, pointing at your jev-edge:
 
    ```bash
-   cd adapters/haproxy/spoa && go build -o jev-spoa . && ./jev-spoa -listen :9000 -upstream http://jev-edge:8080/_jev/authz -timeout 1500ms -unjudged pass
+   cd adapters/haproxy/spoa && go build -o jev-spoa . && ./jev-spoa -listen 127.0.0.1:9000 -upstream http://jev-edge:8080/_jev/authz -timeout 1500ms -unjudged pass
    ```
+
+   SPOP has no authentication: whoever reaches the agent's port can send it frames. `-listen` defaults to `127.0.0.1:9000`; in a container of its own (`-listen :9000`, as in [e2e/](e2e/)), keep the port on a network only HAProxy reaches. The agent serves at most `-max-conns` connections at once (256; one more is closed as it is accepted), takes frames up to `-max-frame-size` bytes (131072; keep it at least `tune.bufsize`, or a message that fills the buffer is refused and unjudgeable) and gives a frame `-frame-timeout` (5 s) from its first byte to arrive whole; idle time between frames has no limit. `-max-idle` (64) is how many keepalive connections to jev-edge it keeps: at least the checks in flight at once.
 
    `-timeout` must stay below `timeout processing` in `spoe.conf` (2 s in the reference) and above jev-edge's `timeout_max_ms`: when jev-edge is slow the agent gives up first and still answers `verdict=error`, instead of HAProxy dropping the whole message. `-unjudged` (`pass` by default, or `block`) decides what an unjudgeable request gets: `pass` forwards it marked `X-Jev-Verdict: skipped`, `block` sets `action=block, status=403`. Keep it equal to jev-edge's `policy.unjudgeable` and to `proc.jev_unjudged` in `haproxy.cfg`.
 

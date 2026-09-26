@@ -34,6 +34,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -43,21 +45,26 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/negasus/haproxy-spoe-go/action"
-	"github.com/negasus/haproxy-spoe-go/agent"
 	"github.com/negasus/haproxy-spoe-go/logger"
 	"github.com/negasus/haproxy-spoe-go/request"
+	"github.com/negasus/haproxy-spoe-go/worker"
 )
 
 var (
-	listen   = flag.String("listen", ":9000", "SPOE listen address")
+	listen   = flag.String("listen", "127.0.0.1:9000", "SPOE listen address; SPOP has no authentication, so keep it on loopback or a network only HAProxy reaches")
 	upstream = flag.String("upstream", "http://127.0.0.1:8080/_jev/authz", "jev-edge authz URL prefix")
 	timeout  = flag.Duration("timeout", 1500*time.Millisecond, "per-check timeout (fail-open when exceeded); keep it below spoe.conf's `timeout processing` so the fail-open answer still reaches HAProxy")
 	message  = flag.String("message", "check-request", "SPOE message name")
 	unjudged = flag.String("unjudged", "pass", "a request jev-edge's server answered without X-Jev-Verdict (refused before judging): pass, marked verdict=skipped, or block with 403; keep it equal to jev-edge's policy.unjudgeable")
 	maxIdle  = flag.Int("max-idle", 64, "idle keepalive connections kept open to jev-edge; at least the checks in flight at once, or each check past it opens a new connection")
+	maxConns = flag.Int("max-conns", 256, "SPOP connections served at once; one past it is closed as it is accepted")
+	maxFrame = flag.Uint("max-frame-size", 131072, "largest SPOP frame taken, in bytes after the 4-byte length; at least HAProxy's tune.bufsize (131072 in the reference haproxy.cfg), or a message that fills it is refused and unjudgeable")
+	frameTTL = flag.Duration("frame-timeout", 5*time.Second, "time a frame may take to arrive once its first byte has; idle time between frames has no limit")
 )
 
 var client *http.Client
@@ -411,6 +418,150 @@ func check(get func(string) string) map[string]string {
 	return vars
 }
 
+// minFrame is the shortest well-formed SPOP frame after its length: type,
+// 4 bytes of flags, and a stream id and a frame id of a byte each.
+// haproxy-spoe-go allocates the declared length minus one before it reads
+// the frame, so a length of 0 asks it for 4 GiB, and 1 to 4 make it slice
+// past the end.
+const minFrame = 7
+
+var errFrameSize = errors.New("frame length out of bounds")
+
+// frameConn guards one SPOP connection. haproxy-spoe-go reads a frame's
+// 4-byte big-endian length and allocates that many bytes without a check,
+// then waits for all of them with no deadline: one connection declaring
+// 4 GiB, or a thousand declaring 128 KiB and sending none of it, took the
+// agent's memory. frameConn follows the frame boundaries in the bytes as
+// they are read, refuses a length outside [minFrame, max] before the
+// library sees it, and gives a frame `ttl` from its first byte to arrive
+// whole. Between frames there is no deadline: HAProxy keeps SPOP
+// connections open and idle between requests.
+type frameConn struct {
+	net.Conn
+	max     uint32
+	ttl     time.Duration
+	release func()
+
+	hdr   [4]byte
+	nhdr  int       // bytes of the current length read
+	left  uint32    // bytes of the current frame still to come
+	start time.Time // the current frame's first byte; zero between frames
+	err   error
+	once  sync.Once
+}
+
+func (c *frameConn) Read(p []byte) (int, error) {
+	if c.err != nil {
+		return 0, c.err
+	}
+	deadline := time.Time{}
+	if !c.start.IsZero() {
+		deadline = c.start.Add(c.ttl)
+	}
+	if err := c.Conn.SetReadDeadline(deadline); err != nil {
+		return 0, err
+	}
+	n, err := c.Conn.Read(p)
+	now := time.Now()
+	for i := 0; i < n; {
+		if c.left == 0 { // in the length
+			if c.nhdr == 0 {
+				c.start = now
+			}
+			c.hdr[c.nhdr] = p[i]
+			c.nhdr++
+			i++
+			if c.nhdr < 4 {
+				continue
+			}
+			c.nhdr = 0
+			l := binary.BigEndian.Uint32(c.hdr[:])
+			if l < minFrame || l > c.max {
+				c.err = fmt.Errorf("%w: %d bytes, not %d to %d (-max-frame-size)", errFrameSize, l, minFrame, c.max)
+				log.Printf("jev-spoa: closing %s: %v", c.RemoteAddr(), c.err)
+				c.Conn.Close()
+				return 0, c.err
+			}
+			c.left = l
+			continue
+		}
+		k := uint32(n - i)
+		if k > c.left {
+			k = c.left
+		}
+		c.left -= k
+		i += int(k)
+		if c.left == 0 {
+			c.start = time.Time{}
+		}
+	}
+	return n, err
+}
+
+func (c *frameConn) Close() error {
+	c.once.Do(c.release)
+	return c.Conn.Close()
+}
+
+// guardListener hands out at most `max` connections at once, each guarded
+// by a frameConn; one past the cap is closed as it is accepted, so the
+// agent's goroutines and buffers stay bounded whoever connects.
+type guardListener struct {
+	net.Listener
+	max, active int64
+	frame       uint32
+	ttl         time.Duration
+	refused     atomic.Int64
+	lastLog     atomic.Int64
+}
+
+func (l *guardListener) Accept() (net.Conn, error) {
+	for {
+		c, err := l.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
+		if atomic.AddInt64(&l.active, 1) > l.max {
+			atomic.AddInt64(&l.active, -1)
+			c.Close()
+			n := l.refused.Add(1)
+			// one line a second at most, whatever the rate
+			if now := time.Now().Unix(); l.lastLog.Swap(now) != now {
+				log.Printf("jev-spoa: over %d connections (-max-conns): closed %s (%d refused so far)", l.max, c.RemoteAddr(), n)
+			}
+			continue
+		}
+		return &frameConn{Conn: c, max: l.frame, ttl: l.ttl,
+			release: func() { atomic.AddInt64(&l.active, -1) }}, nil
+	}
+}
+
+// serve runs the SPOP worker on each connection ln hands out, as
+// agent.Serve does, and survives a frame haproxy-spoe-go panics on (a
+// varint or a list cut short): that connection is closed and the others
+// carry on.
+func serve(ln net.Listener, h func(*request.Request), lg logger.Logger) error {
+	for {
+		c, err := ln.Accept()
+		if err != nil {
+			var ne net.Error
+			if errors.As(err, &ne) && ne.Timeout() {
+				continue
+			}
+			return err
+		}
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("jev-spoa: closing %s: malformed frame: %v", c.RemoteAddr(), r)
+					c.Close()
+				}
+			}()
+			worker.Handle(c, h, lg)
+		}()
+	}
+}
+
 func main() {
 	flag.Parse()
 	if *unjudged != "pass" && *unjudged != "block" {
@@ -420,13 +571,16 @@ func main() {
 		log.Fatalf("-max-idle must be at least 1, got %d", *maxIdle)
 	}
 	client = newClient(*timeout, *maxIdle)
+	if *maxConns < 1 || *maxFrame < minFrame || *maxFrame > 1<<31 || *frameTTL <= 0 {
+		log.Fatalf("-max-conns must be at least 1, -max-frame-size %d to %d, -frame-timeout above 0", minFrame, 1<<31)
+	}
 	ln, err := net.Listen("tcp", *listen)
 	if err != nil {
 		log.Fatalf("listen: %v", err)
 	}
 	log.Printf("jev-spoa listening on %s, upstream %s", *listen, *upstream)
-	a := agent.New(handler, logger.NewDefaultLog())
-	if err := a.Serve(ln); err != nil {
+	gl := &guardListener{Listener: ln, max: int64(*maxConns), frame: uint32(*maxFrame), ttl: *frameTTL}
+	if err := serve(gl, handler, logger.NewDefaultLog()); err != nil {
 		log.Fatalf("serve: %v", err)
 	}
 }

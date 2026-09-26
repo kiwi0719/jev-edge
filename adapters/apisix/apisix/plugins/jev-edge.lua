@@ -341,8 +341,10 @@ local function build_req(rt, ctx)
   return req
 end
 
--- the byte span of the first match at or after byte init, which places the
--- hit in the judging window
+-- the byte span of the first match at or after byte init (from, to), which
+-- places the hit in the judging window; nil when there is none. When PCRE
+-- fails (a JIT stack or match limit, a pattern it refuses) ngx.re.find
+-- returns nil, nil, err, passed on whole: core counts the pattern as a hit.
 local function re_find(subject, pattern, init)
   if init and init > 1 then return ngx.re.find(subject, pattern, "ijo", { pos = init }) end
   return ngx.re.find(subject, pattern, "ijo")

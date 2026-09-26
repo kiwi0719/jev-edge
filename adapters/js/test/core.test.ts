@@ -427,16 +427,42 @@ describe("rules.evaluate body size", () => {
     expect([r3, reason3]).toEqual(["unjudgeable", "unjudgeable: body too large"]);
   });
 
-  it("warns once about an always_suspect pattern that does not compile", async () => {
+  // lead-openresty-runtime#17: a failed match was a silent miss in Lua
+  // (ngx.re.find's nil, nil, err); in both cores it is now a hit, logged once
+  it("counts an always_suspect pattern that does not compile as a hit, and warns once", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const rule = { ...load("llm-endpoints"), id: "bad", always_suspect: ["(unclosed"] };
-    const body = '{"prompt":"Please write a detailed summary of the attached quarterly report."}';
+    const body = '{"prompt":"hi there"}';
     const req = { method: "POST", path: "/v1/chat/completions", headers: { "content-type": "application/json" }, body, body_size: body.length };
-    await rulesEvaluate(req, rule, { re_find: core.rules.reFind });
+    const [r, , reason] = await rulesEvaluate(req, rule, { re_find: core.rules.reFind });
+    expect([r, reason]).toEqual(["suspect", "pattern: (unclosed"]);
     await rulesEvaluate(req, rule, { re_find: core.rules.reFind });
     expect(warn).toHaveBeenCalledTimes(1);
-    expect(warn.mock.calls[0][0]).toMatch(/does not compile/);
+    expect(warn.mock.calls[0][0]).toMatch(/\(unclosed failed .*counts as a hit/);
     warn.mockRestore();
+  });
+
+  it("counts a matcher that throws mid-walk as a hit, keeping the spans it found", async () => {
+    const logs: string[] = [];
+    const rule = { ...load("llm-endpoints"), id: "midwalk", always_suspect: ["hi-17"] };
+    const body = '{"prompt":"hi there"}';
+    const req = { method: "POST", path: "/v1/chat/completions", headers: { "content-type": "application/json" }, body, body_size: body.length };
+    let calls = 0;
+    const reFind = (s: string, _p: string, init?: number) => {
+      calls++;
+      if (calls === 1) return core.rules.reFind(s, "hi", init);
+      throw new RangeError("Maximum call stack size exceeded");
+    };
+    const [r, text, reason] = await rulesEvaluate(req, rule, { re_find: reFind, log: (_l, m) => logs.push(m) });
+    expect([r, text, reason]).toEqual(["suspect", "hi there", "pattern: hi-17"]);
+    expect(logs.filter((m) => m.includes("hi-17"))).toHaveLength(1);
+  });
+
+  it("matches a 20 KB base64 run with the shipped pattern", async () => {
+    const body = JSON.stringify({ prompt: "QUJD".repeat(5000) });
+    const req = { method: "POST", path: "/v1/chat/completions", headers: { "content-type": "application/json" }, body, body_size: body.length };
+    const [r, , reason] = await rulesEvaluate(req, load("llm-endpoints"), { re_find: core.rules.reFind });
+    expect([r, reason]).toEqual(["suspect", "pattern: [A-Za-z0-9+/]{160,}={0,2}"]);
   });
 });
 

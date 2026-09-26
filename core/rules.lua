@@ -102,6 +102,11 @@ local path_matches = _M.path_matches
 -- the walk skips halfway to the end of the text (the later matches are the
 -- ones kept), so a text full of matches costs a bounded number of calls and
 -- still one pass per pattern.
+--
+-- A matcher that fails (ngx.re.find's third value, a PCRE JIT stack or
+-- match limit on a long input, or a pattern the engine refuses; or one that
+-- throws) counts that pattern as a hit with no span, logged once per
+-- pattern: the prefilter fails toward judging, never into a silent miss.
 _M.MAX_SPANS = 8
 local WALK = 64
 
@@ -110,7 +115,17 @@ local function by_start(a, b)
   return a[2] < b[2]
 end
 
-local warned = false
+local warned, failed = false, {}
+
+local function matcher_failed(p, err, ctx)
+  if failed[p] then return end
+  failed[p] = true
+  if ctx and ctx.log then
+    ctx.log("warn", "jev-edge: always_suspect pattern " .. p .. " failed (" .. tostring(err)
+      .. "); it counts as a hit")
+  end
+end
+
 -- @return the first pattern in list order that matched (the reason names
 --         it), and the spans of the matches, at most MAX_SPANS, the latest
 --         in the text, in text order (nil when no match gave a span); nil
@@ -129,8 +144,13 @@ local function text_matches(s, patterns, ctx)
   for _, p in ipairs(patterns) do
     local mine, init, walked = {}, 1, 0
     while init <= n do
-      local ok, from, to = pcall(re_find, s, p, init)
-      if not ok or not from then break end
+      local ok, from, to, err = pcall(re_find, s, p, init)
+      if not ok or (not from and err ~= nil) then
+        matcher_failed(p, ok and err or from, ctx)
+        hit = hit or p
+        break
+      end
+      if not from then break end
       hit = hit or p
       if type(from) ~= "number" or type(to) ~= "number" or from < init then break end
       mine[#mine + 1] = { from, to }
@@ -503,7 +523,8 @@ end
 -- @param ctx  { cache = {get=fn}, json_decode = fn, clock = fn,
 --               re_find = fn(subject, pcre, init) -> from, to of the first
 --               case-insensitive match at or after byte init (1 when nil),
---               or truthy on a match, or nil }
+--               or truthy on a match, or nil; nil, nil, err when the
+--               matcher fails, which counts as a hit }
 -- @return result, text, reason, windowed, chunks, capped, untrusted ({ text,
 --         windowed } of retrieved content to judge on its own, or nil), tools
 --         ({ text, windowed, hit } of the tool definitions, or nil). `only`

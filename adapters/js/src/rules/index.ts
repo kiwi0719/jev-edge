@@ -73,7 +73,8 @@ export const llmEndpoints: Rule = {
     String.raw`\bdeveloper mode\b`,
     String.raw`\b(DAN|do anything now)\b`,
     String.raw`\b(reveal|print|repeat|show)\b.{0,30}\b(instructions|system prompt|rules)\b`,
-    String.raw`(?:[A-Za-z0-9+/]{4}){40,}={0,2}`,
+    // a long base64 blob, as one class run (see rules/llm-endpoints.lua)
+    String.raw`[A-Za-z0-9+/]{160,}={0,2}`,
     // Judge-directed text: the input talks to the classifier judging it.
     String.raw`\b(rate|classify|mark|label|score|flag|treat|judge)\b.{0,30}\b(this|it|me|the (above|following|message|request|input|prompt|text))\b.{0,30}\bas\s+(a\s+)?(safe|benign|harmless|clean|legitimate|non-?malicious|0(\.0+)?)\b(?!\s+(to|for)\b)`,
     String.raw`\b(classifier|moderator|guardrail|safety (filter|model|system|check)|content filter|judge model)\b.{0,40}\b(output|return|respond|answer|reply|say|print)\b.{0,20}\b(0(\.0+)?|safe|benign|harmless|false)\b`,

@@ -90,6 +90,8 @@ export interface RulesCtx {
    * undefined): truthy on a match; a [from, to] 1-based inclusive UTF-8 byte
    * span places the hit in the judging window. A matcher that ignores init
    * returns an earlier span again, and the walk of that pattern stops there.
+   * A matcher that throws (a pattern the engine refuses, a match that runs
+   * out of stack) counts that pattern as a hit with no span.
    */
   re_find?: (subject: string, pattern: string, init?: number) => boolean | readonly [number, number] | null;
   log?: (level: string, msg: string) => void;
@@ -423,7 +425,9 @@ export function pathMatches(path: string, patterns: string[] | undefined, caseSe
 // text (the later matches are the ones kept), so a text full of matches
 // costs a bounded number of calls. Returns the first pattern in list order
 // that matched (the reason names it) and the spans, at most MAX_SPANS, the
-// latest in the text, in text order (none when no match gave a span).
+// latest in the text, in text order (none when no match gave a span). A
+// matcher that throws counts that pattern as a hit with no span, logged once
+// per pattern: the prefilter fails toward judging, never into a silent miss.
 export const MAX_SPANS = 8;
 const WALK = 64;
 type Span = [number, number];
@@ -451,14 +455,16 @@ function textMatches(s: string, patterns: string[] | undefined, ctx: RulesCtx | 
       try {
         r = reFind(s, p, init);
       } catch (e) {
-        // a pattern the engine rejects is skipped, like pcall in Lua, but an
-        // operator should hear about it once instead of losing the prefilter silently
+        // a pattern the engine refuses, or a match it cannot finish, is a
+        // hit (as a failed ngx.re.find is in Lua), and the operator hears
+        // about it once
         if (!badPatterns.has(p)) {
           badPatterns.add(p);
-          const msg = `jev-edge: always_suspect pattern ${JSON.stringify(p)} does not compile and is skipped: ${e instanceof Error ? e.message : String(e)}`;
+          const msg = `jev-edge: always_suspect pattern ${p} failed (${e instanceof Error ? e.message : String(e)}); it counts as a hit`;
           if (ctx?.log) ctx.log("warn", msg);
           else console.warn(msg);
         }
+        hit ??= p;
         break;
       }
       if (!r) break;

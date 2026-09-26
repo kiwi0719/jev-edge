@@ -154,7 +154,9 @@ return {
     [[\bdeveloper mode\b]],
     [[\b(DAN|do anything now)\b]],
     [[\b(reveal|print|repeat|show)\b.{0,30}\b(instructions|system prompt|rules)\b]],
-    [[(?:[A-Za-z0-9+/]{4}){40,}={0,2}]],   -- long base64 blob
+    -- a long base64 blob: one class run, not a repeated group, so PCRE's
+    -- JIT needs no stack per 4 characters and a 20 KB run still matches
+    [[[A-Za-z0-9+/]{160,}={0,2}]],
     -- Judge-directed text: the input talks to the classifier judging it
     -- (docs/design.md, "Judge robustness"). A hit only guarantees an L2 call
     -- and keeps the hit inside the judging window of a long body.

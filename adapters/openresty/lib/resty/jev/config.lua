@@ -36,25 +36,30 @@ local state = {
 local rules_mod = require "jev.core.rules"
 
 -- rules entries are rule set ids or inline tables (with optional `extends`),
--- see core/rules.lua resolve(). A bad entry is logged and skipped so one
--- tenant's typo does not take the gateway down.
+-- see core/rules.lua resolve(). At startup a bad entry is logged, skipped and
+-- reported (config.error()), so one tenant's typo does not leave the other
+-- rules off; once a config is in force, a file edit or override with one is
+-- refused whole and the previous config stays, as for any invalid key.
 local function load_rule_set(id)
   local ok, r = pcall(require, "jev.rules." .. id)
   if ok then return r end
   return nil, tostring(r)
 end
 
+-- the rules that load, their specs, and one "rules[i]: why" per one that
+-- does not
 local function load_rules(specs)
-  local out = {}
+  local out, good, errs = {}, {}, {}
   for i, spec in ipairs(specs or {}) do
     local rule, err = rules_mod.resolve(spec, load_rule_set)
     if rule then
-      out[#out + 1] = rule
+      out[#out + 1], good[#good + 1] = rule, spec
     else
+      errs[#errs + 1] = "rules[" .. i .. "]: " .. tostring(err)
       ngx.log(ngx.ERR, "jev-edge: rules[", i, "] failed to load: ", tostring(err))
     end
   end
-  return out
+  return out, good, errs
 end
 
 local function read_api_key(cfg)
@@ -151,12 +156,32 @@ local function read_override()
 end
 
 -- defaults < file < override, validated and with its rules loaded; nothing in
--- `state` changes. Returns what commit() puts in force, or nil, err.
-local function build(file_cfg, override)
+-- `state` changes. Returns what commit() puts in force, or nil, err. A rule
+-- that does not load refuses the config, unless `lenient` (startup): then it
+-- is skipped and named in `skipped`, and what goes in force is the file
+-- without it, which GET /_jev/config shows and set_override checks against.
+local function build(file_cfg, override, lenient)
   local merged = defaults.merge(defaults.merge(defaults.config, file_cfg), override)
   local ok, err = defaults.validate(merged)
   if not ok then return nil, tostring(err) end
-  return { cfg = merged, rules = load_rules(merged.rules), file = file_cfg }
+  if not lenient then
+    local rules, rerr = rules_mod.resolve_all(merged.rules, load_rule_set)
+    if not rules then return nil, rerr end
+    return { cfg = merged, rules = rules, file = file_cfg }
+  end
+  local rules, good, errs = load_rules(merged.rules)
+  local b = { cfg = merged, rules = rules, file = file_cfg }
+  if #errs > 0 then
+    b.skipped = table.concat(errs, "; ")
+    if override.rules == nil then
+      local f = {}
+      for k, v in pairs(file_cfg) do f[k] = v end
+      f.rules = good
+      b.file = f
+      b.cfg = defaults.merge(defaults.merge(defaults.config, f), override)
+    end
+  end
+  return b
 end
 
 local function commit(b)
@@ -177,26 +202,31 @@ end
 local function rebuild(reloaded)
   local override = read_override()
   local was_applied = state.applied
+  local lenient = not was_applied
   local pending, perr = state.file_pending, nil
   if pending then
-    local b, err = build(pending, override)
+    local b, err = build(pending, override, lenient)
     if b then
       commit(b)
-      state.file_pending, state.error = nil, nil
+      -- in force without the rules it skipped at startup, the file stays
+      -- pending: reported until an edit fixes it, and tried again (whole)
+      -- when the override changes
+      state.file_pending = b.skipped and pending or nil
+      state.error = b.skipped
       if reloaded then ngx.log(ngx.NOTICE, "jev-edge: config file reloaded") end
-      return true
+      return b.skipped == nil
     end
     perr = err
   end
-  local b, err = build(state.file_cfg, override)
+  local b, err = build(state.file_cfg, override, lenient)
   local why = perr or err
   if b then
     commit(b)
-    state.error = perr
+    state.error = perr or b.skipped
   else
     state.error = why
   end
-  if not why then return true end
+  if not why then return b.skipped == nil end
   if was_applied then
     ngx.log(ngx.ERR, "jev-edge: config invalid, keeping previous: ", why, env_hint(why))
     return false
@@ -207,7 +237,7 @@ local function rebuild(reloaded)
     return false
   end
   ngx.log(ngx.ERR, "jev-edge: config invalid, using the defaults (monitor mode): ", why, env_hint(why))
-  local fallback = build({}, {})
+  local fallback = build({}, {}, true)
   if fallback then commit(fallback) end
   return false
 end

@@ -104,6 +104,17 @@ export function cookieValues(header: string | string[] | null | undefined, name:
   return [all[0], all[1], all[all.length - 2], all[all.length - 1]];
 }
 
+// Port of canonical_credentials in core/subject.lua: for Authorization and
+// Proxy-Authorization the scheme is lowercased (ASCII, as Lua's lower) and
+// the run of spaces or tabs after it becomes one space; the credentials are
+// kept as sent, a value with no scheme as is.
+const CREDENTIAL_HEADERS = new Set(["authorization", "proxy-authorization"]);
+function canonicalCredentials(v: string): string {
+  const m = /^([^ \t\n\v\f\r]+)[ \t]+([\s\S]*)$/.exec(v);
+  if (!m) return v;
+  return m[1].replace(/[A-Z]+/g, (c) => c.toLowerCase()) + " " + m[2];
+}
+
 /** Every raw subject value for this request (one for ip and header, up to
  *  MAX_IDS for cookie). Mirrors core/subject.lua extract_all(). */
 export function extractAll(scfg: SubjectConfig | undefined, view: RequestView): string[] {
@@ -117,10 +128,12 @@ export function extractAll(scfg: SubjectConfig | undefined, view: RequestView): 
       ? cookieValues(view.cookieHeader, scfg.name)
       : [view.cookie?.(scfg.name ?? "")];
   }
+  const creds = from === "header" && CREDENTIAL_HEADERS.has(String(scfg.name ?? "").toLowerCase());
   const out: string[] = [];
   for (const r of raw) {
     if (typeof r !== "string") continue;
-    const v = trim(r);
+    let v = trim(r);
+    if (creds) v = canonicalCredentials(v);
     if (v !== "" && new TextEncoder().encode(v).length <= MAX_VALUE_BYTES && !out.includes(v)) out.push(v);
   }
   return out;

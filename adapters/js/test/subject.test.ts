@@ -153,6 +153,28 @@ describe("subject: cookie candidates (g1-subject-id-evasion#1)", () => {
     expect(core.subject.extractAll(scfg, { cookie: () => "s-9" })).toEqual(["s-9"]);
   });
 
+  // The same table is in core/spec/subject_store_spec.lua.
+  const AUTH: [string, string][] = [
+    ["Bearer k", "bearer k"], ["bearer k", "bearer k"], ["BEARER k", "bearer k"],
+    ["Bearer  k", "bearer k"], ["Bearer\tk", "bearer k"], [" Bearer \t k ", "bearer k"],
+    ["Bearer K", "bearer K"],
+    ["Basic QWxhZGRpbjpvcGVu", "basic QWxhZGRpbjpvcGVu"],
+    ["sk-no-scheme", "sk-no-scheme"],
+    ["Digest a=1,  b=2", "digest a=1,  b=2"],
+  ];
+
+  it("canonicalises the scheme of Authorization and Proxy-Authorization as Lua does (g1-subject-id-evasion#4)", async () => {
+    for (const name of ["authorization", "Authorization", "proxy-authorization", "Proxy-Authorization"]) {
+      const hcfg = { enabled: true, from: "header" as const, name, salt: "pepper" };
+      for (const [raw, want] of AUTH) expect(core.subject.extract(hcfg, { header: () => raw })).toBe(want);
+      const one = await core.subject.hashId(hcfg, core.subject.extract(hcfg, { header: () => "Bearer k" }), hash);
+      for (const v of ["bearer k", "BEARER k", "Bearer  k", "Bearer\tk"]) {
+        expect(await core.subject.hashId(hcfg, core.subject.extract(hcfg, { header: () => v }), hash)).toBe(one);
+      }
+    }
+    expect(core.subject.extract({ enabled: true, from: "header", name: "x-api-key" }, { header: () => "Bearer  K" })).toBe("Bearer  K");
+  });
+
   it("idsOf: id first, then the distinct ids, at most MAX_IDS", () => {
     expect(core.subject.idsOf({ subject: { ids: ["a"] } })).toEqual([]);
     expect(core.subject.idsOf({ subject: { id: "a" } })).toEqual(["a"]);

@@ -70,6 +70,32 @@ describe("subject extraction and hashing", function()
     assert.same({ "s-9" }, subject.extract_all(scfg, { cookie = function() return "s-9" end }))
   end)
 
+  -- The same table is in adapters/js/test/subject.test.ts.
+  local AUTH = {
+    { "Bearer k", "bearer k" }, { "bearer k", "bearer k" }, { "BEARER k", "bearer k" },
+    { "Bearer  k", "bearer k" }, { "Bearer\tk", "bearer k" }, { " Bearer \t k ", "bearer k" },
+    { "Bearer K", "bearer K" },                       -- the credentials are kept byte for byte
+    { "Basic QWxhZGRpbjpvcGVu", "basic QWxhZGRpbjpvcGVu" },
+    { "sk-no-scheme", "sk-no-scheme" },               -- no scheme: as is
+    { "Digest a=1,  b=2", "digest a=1,  b=2" },
+  }
+
+  it("canonicalises the scheme of Authorization and Proxy-Authorization (g1-subject-id-evasion#4)", function()
+    for _, name in ipairs({ "authorization", "Authorization", "proxy-authorization", "Proxy-Authorization" }) do
+      local scfg = { enabled = true, from = "header", name = name, salt = "pepper" }
+      for _, c in ipairs(AUTH) do
+        assert.equals(c[2], subject.extract(scfg, { header = function() return c[1] end }), name .. " " .. c[1])
+      end
+      local one = subject.hash_id(scfg, subject.extract(scfg, { header = function() return "Bearer k" end }), hash)
+      for _, v in ipairs({ "bearer k", "BEARER k", "Bearer  k", "Bearer\tk" }) do
+        assert.equals(one, subject.hash_id(scfg, subject.extract(scfg, { header = function() return v end }), hash))
+      end
+    end
+    -- any other header is kept as sent
+    assert.equals("Bearer  K", subject.extract({ enabled = true, from = "header", name = "x-api-key" },
+      { header = function() return "Bearer  K" end }))
+  end)
+
   it("ids_of: id first, then the distinct ids, at most MAX_IDS", function()
     assert.same({}, subject.ids_of({ subject = { ids = { "a" } } }))
     assert.same({ "a" }, subject.ids_of({ subject = { id = "a" } }))

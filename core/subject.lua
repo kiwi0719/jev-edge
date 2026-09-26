@@ -272,6 +272,19 @@ function _M.cookie_values(header, name)
   return { all[1], all[2], all[#all - 1], all[#all] }
 end
 
+-- Authorization and Proxy-Authorization: the auth scheme is
+-- case-insensitive and any run of spaces or tabs may follow it (RFC 9110
+-- 11.1), so "Bearer k", "bearer k" and "Bearer\tk" are one credential to the
+-- backend. The scheme is lowercased and the run becomes one space; the
+-- credentials are kept byte for byte, and a value with no scheme as is.
+local CREDENTIAL_HEADERS = { authorization = true, ["proxy-authorization"] = true }
+
+local function canonical_credentials(v)
+  local scheme, rest = v:match("^(%S+)[ \t]+(.-)$")
+  if not scheme then return v end
+  return scheme:lower() .. " " .. rest
+end
+
 --- Every raw subject value for this request: one for `ip` and `header`,
 -- up to MAX_IDS for `cookie` (cookie_values), trimmed, distinct, none empty
 -- or longer than MAX_VALUE_BYTES. Empty when there is none.
@@ -295,11 +308,13 @@ function _M.extract_all(scfg, view)
     end
   end
   if type(raw[1]) == "table" then raw[1] = raw[1][1] end
+  local creds = from == "header" and CREDENTIAL_HEADERS[tostring(scfg.name):lower()]
   local out, seen = {}, {}
   for i = 1, #raw do
     local v = raw[i]
     if type(v) == "string" then
       v = trim(v)
+      if creds then v = canonical_credentials(v) end
       if v ~= "" and #v <= _M.MAX_VALUE_BYTES and not seen[v] then seen[v], out[#out + 1] = true, v end
     end
   end

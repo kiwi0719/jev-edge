@@ -51,7 +51,7 @@ _M.SKIP_CONTENT_TYPES = {
 local LOWER = {}
 for c = 65, 90 do LOWER[string.char(c)] = string.char(c + 32) end
 
-local function canonical_path(path, case_sensitive)
+local function canonical_rewrite(path, case_sensitive)
   local p = path:gsub(";[^/]*", "")
   if p:find("//", 1, true) or p:find("/.", 1, true) then
     local out = {}
@@ -70,14 +70,60 @@ local function canonical_path(path, case_sensitive)
   return (p:gsub("[A-Z]", LOWER))
 end
 
+-- One request asks for the same path several times (the adapter's body
+-- decision, rule_for, evaluate), and gsub does not compile under LuaJIT: the
+-- last answer per case mode is kept, and a path with nothing to rewrite is
+-- its own answer.
+local last_in, last_out = {}, {}
+
+local function canonical_path(path, case_sensitive)
+  local mode = case_sensitive and 1 or 2
+  if last_in[mode] == path then return last_out[mode] end
+  local out = path
+  if path:find("[;A-Z]") or path:find("//", 1, true) or path:find("/.", 1, true) then
+    out = canonical_rewrite(path, case_sensitive)
+  end
+  last_in[mode], last_out[mode] = path, out
+  return out
+end
+
+-- Not a closure inside fold_pattern: creating one there (FNEW, UCLO) stops
+-- LuaJIT compiling every loop that calls it, path_matches's among them.
+local function fold_char(t) if #t == 1 then return LOWER[t] end end
+
 local folded = {}
 local function fold_pattern(p)
   local f = folded[p]
   if not f then
-    f = p:gsub("%%?.", function(t) if #t == 1 then return LOWER[t] end end)
+    f = p:gsub("%%?.", fold_char)
     folded[p] = f
   end
   return f
+end
+
+-- The literal text an anchored pattern's match must start with (`^/v1%w*/`
+-- gives "/v1", `^/api/completions?` "/api/completion"), or false. Pattern
+-- matching does not compile under LuaJIT and the default rule watches over
+-- 40 paths, so a path that is not watched is turned away on a plain,
+-- compiled prefix test and only a prefix hit runs the pattern. The prefix's
+-- second byte (the first after the leading slash) is kept too: comparing it
+-- turns most patterns away before any find, in PUC Lua as well, where a
+-- plain find is not anchored.
+local prefixes, seconds = {}, {}
+local function anchored_prefix(q)
+  local pre = prefixes[q]
+  if pre == nil then
+    pre = false
+    if q:sub(1, 1) == "^" then
+      local stop = q:find("[%^%$%(%)%%%.%[%]%*%+%-%?]", 2) or #q + 1
+      local lit = q:sub(2, stop - 1)
+      local nxt = q:sub(stop, stop)
+      if nxt == "*" or nxt == "+" or nxt == "-" or nxt == "?" then lit = lit:sub(1, -2) end
+      if lit ~= "" then pre = lit end
+    end
+    prefixes[q], seconds[q] = pre, pre and #pre >= 2 and pre:byte(2) or false
+  end
+  return pre, seconds[q]
 end
 
 --- The first of `patterns` (a rule's watch_paths) that matches `path`, or
@@ -88,8 +134,11 @@ function _M.path_matches(path, patterns, case_sensitive)
   if not patterns or #patterns == 0 then return nil end
   local cs = case_sensitive == true
   local s = canonical_path(path or "", cs)
+  local b2 = s:byte(2)
   for _, p in ipairs(patterns) do
-    if s:find(cs and p or fold_pattern(p)) then return p end
+    local q = cs and p or fold_pattern(p)
+    local pre, second = anchored_prefix(q)
+    if (not pre or ((not second or second == b2) and s:find(pre, 1, true) == 1)) and s:find(q) then return p end
   end
   return nil
 end

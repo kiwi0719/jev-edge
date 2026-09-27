@@ -6,6 +6,21 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.6.3] - 2026-09-28
+
+### Fixed
+
+- **Unwatched requests cost twice what they did in 0.6.1 under LuaJIT**
+  (OpenResty, APISIX, Kong). The default rule watches 44 routes instead of 4,
+  and the path check ran all of them as Lua patterns, three times per request;
+  a closure created inside the pattern-folding helper also kept LuaJIT from
+  compiling that loop. The check now turns a route away on its literal prefix
+  (a compiled plain comparison) and runs the pattern only on a prefix hit, and
+  a request's path is canonicalized once. `access()` on an unwatched path:
+  4–5 µs in 0.6.1, 9.5–10.7 µs in 0.6.2, 6 µs now; watched paths were and are
+  at parity (~20 µs, cached or breaker open). Matching is unchanged
+  (275,000 random paths agree with the plain pattern walk).
+
 ## [0.6.2] - 2026-09-27
 
 The fixes from a full audit of 0.6.1 (correctness, security and latent bugs in

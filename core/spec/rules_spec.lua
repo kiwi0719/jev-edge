@@ -660,6 +660,25 @@ describe("rules.path_matches", function()
     assert.is_not_nil(R.path_matches("/t/%a", { "^/t/%%A$" }))
   end)
 
+  it("answers the same through the literal-prefix shortcut", function()
+    -- a quantifier takes back the letter before it; a magic character ends the prefix
+    assert.is_not_nil(R.path_matches("/api/completion", { "^/api/completions?" }))
+    assert.is_not_nil(R.path_matches("/ab", { "^/ax*b" }))
+    assert.is_not_nil(R.path_matches("/v1.x/chat", { "^/v1%.x/chat" }))
+    assert.is_not_nil(R.path_matches("/v1-x/chat", { "^/v1.x/chat" }))
+    assert.is_nil(R.path_matches("/x", { "^/$" }))
+    assert.is_not_nil(R.path_matches("/", { "^/$" }))
+    -- unanchored and all-magic patterns have no prefix and still match
+    assert.is_not_nil(R.path_matches("/proxy/v1/chat", { "/v1/chat$" }))
+    assert.is_not_nil(R.path_matches("/anything", { "^.+$" }))
+    -- the same path twice in a row, then another: the kept answer is per path
+    assert.is_not_nil(R.path_matches("/v1/chat", W))
+    assert.is_not_nil(R.path_matches("/v1/chat", W))
+    assert.is_nil(R.path_matches("/static/app.js", W))
+    assert.is_nil(R.path_matches("/V1/chat", W, true))
+    assert.is_not_nil(R.path_matches("/V1/chat", W))
+  end)
+
   it("folds ASCII only, like the TypeScript core", function()
     assert.is_nil(R.path_matches("/v1/\195\137", { "^/v1/\195\169" }))   -- É is not é
   end)

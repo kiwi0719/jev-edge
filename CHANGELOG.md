@@ -6,6 +6,8 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.6.3] - 2026-09-28
+
 ### Fixed
 
 - **Unwatched requests cost twice what they did in 0.6.1 under LuaJIT**

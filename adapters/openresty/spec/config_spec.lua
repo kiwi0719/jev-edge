@@ -87,9 +87,9 @@ describe("config: set_override", function()
     assert.equal(30, config.current().cache.fp_ttl)
 
     -- a DELETE the version cannot announce leaves the override too
-    ok, err, internal = config.set_override(nil)
-    assert.is_nil(ok)
-    assert.is_true(internal)
+    local dok, _, dinternal = config.set_override(nil)
+    assert.is_nil(dok)
+    assert.is_true(dinternal)
     assert.same({ cache = { fp_ttl = 30 } }, config.get_override())
   end)
 

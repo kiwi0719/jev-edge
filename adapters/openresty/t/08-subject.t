@@ -24,7 +24,7 @@ location = /_t/subject {
         for _, k in ipairs(d:get_keys(0)) do
             local id = k:match("^subj:(.-):n\$")
             if id then ids[#ids + 1] = id end
-            if (k .. tostring(d:get(k))):find("secret%-key", 1, true) then raw = true end
+            if (k .. tostring(d:get(k))):find("secret-key", 1, true) then raw = true end
         end
         table.sort(ids)
         local out = {}

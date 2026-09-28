@@ -33,7 +33,8 @@ local themes = {
 local W, H, L, R, T, B = 760, 340, 70, 20, 50, 60
 local pw, ph = W - L - R, H - T - B
 local lo, hi = 1, 6 -- log10(µs): 10 µs .. 1 s
-local function y(v) return T + ph - (math.log(v, 10) - lo) / (hi - lo) * ph end
+-- math.log(v) / math.log(10), not math.log(v, 10): Lua 5.1 ignores the base
+local function y(v) return T + ph - (math.log(v) / math.log(10) - lo) / (hi - lo) * ph end
 
 local function render(mode, c)
   local o = {}

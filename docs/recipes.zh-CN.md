@@ -227,7 +227,7 @@ spec:
 
 ## Azure API Management
 
-在 API 上，或者在承载自然语言的那几个 operation 上，加一段 inbound 策略。失败放行靠两处实现：`send-request` 设了 `ignore-error="true"`，后面再判断一次响应是否为空。
+在 API 上，或者在承载自然语言的那几个 operation 上，加一段 inbound 策略。失败放行靠两处实现：`send-request` 设了 `ignore-error="true"`，后面再判断一次响应是否为空。拦截指的是带 `X-Jev-Verdict` 的 4xx，状态码是多少都算（`policy.block_status` 可以是任意 4xx），网关把 jev-edge 的状态码和响应体原样还给客户端。不带 `X-Jev-Verdict` 的 4xx 是 jev-edge 前面的 nginx 拒掉了请求，不是判定结果，请求按 `error` 继续往下走。
 
 ```xml
 <inbound>
@@ -244,15 +244,23 @@ spec:
     </set-header>
     <set-body>@((string)context.Variables["jevBody"])</set-body>
   </send-request>
+  <set-variable name="jevBlocked" value="@{
+    var r = context.Variables.GetValueOrDefault<IResponse>("jev");
+    return r != null && r.StatusCode >= 400 && r.StatusCode < 500
+      && r.Headers.GetValueOrDefault("X-Jev-Verdict", "") != "";
+  }" />
   <choose>
-    <when condition="@(context.Variables["jev"] != null && ((IResponse)context.Variables["jev"]).StatusCode == 403)">
+    <when condition="@((bool)context.Variables["jevBlocked"])">
       <return-response>
-        <set-status code="403" reason="Forbidden" />
-        <set-header name="Content-Type" exists-action="override"><value>application/json</value></set-header>
+        <set-status code="@(((IResponse)context.Variables["jev"]).StatusCode)"
+                    reason="@(((IResponse)context.Variables["jev"]).StatusReason)" />
+        <set-header name="Content-Type" exists-action="override">
+          <value>@(((IResponse)context.Variables["jev"]).Headers.GetValueOrDefault("Content-Type", "application/json"))</value>
+        </set-header>
         <set-header name="X-Jev-Verdict" exists-action="override">
           <value>@(((IResponse)context.Variables["jev"]).Headers.GetValueOrDefault("X-Jev-Verdict", "malicious"))</value>
         </set-header>
-        <set-body>{"error":"request rejected"}</set-body>
+        <set-body>@(((IResponse)context.Variables["jev"]).Body.As<string>())</set-body>
       </return-response>
     </when>
     <when condition="@(context.Variables["jev"] != null)">
@@ -281,10 +289,10 @@ spec:
 
 ## Google Apigee
 
-在代理的请求流上挂三个策略：一个 `ServiceCallout` 负责调用 jev-edge，一个 `AssignMessage` 把判定头拷到请求上，一个 `RaiseFault` 在返回 403 时触发。callout 失败时，`<Response>` 对应的状态变量是空的，fault 条件不成立，请求照常往下走，这就是失败放行。
+在代理的请求流上挂三个策略：一个 `ServiceCallout` 负责调用 jev-edge，一个 `AssignMessage` 把判定头拷到请求上，一个 `RaiseFault` 在拦截时触发：拦截指的是带 `X-Jev-Verdict` 的 4xx，状态码是多少都算（`policy.block_status` 可以是任意 4xx），把 jev-edge 的状态码和响应体原样交给客户端。失败放行靠 `continueOnError="true"`：不设的话，callout 超时或连不上就会抛 fault，代理直接回错误，请求不再往下走。`success.codes` 让 4xx 或 5xx 的答复成为一个可读的响应，而不是 callout fault，否则 `continueOnError` 会跳过它，`jevResponse` 读不到。callout 失败时 `jevResponse` 没有值，下面两个条件都不成立，请求照常往下走。
 
 ```xml
-<ServiceCallout name="SC-JevEdge">
+<ServiceCallout name="SC-JevEdge" continueOnError="true">
   <Request variable="jevRequest">
     <Set>
       <Verb>POST</Verb>
@@ -300,6 +308,10 @@ spec:
   <Response>jevResponse</Response>
   <Timeout>2000</Timeout>
   <HTTPTargetConnection>
+    <Properties>
+      <!-- a block (4xx) or a 5xx is an answer to read, not a callout fault -->
+      <Property name="success.codes">1xx,2xx,3xx,4xx,5xx</Property>
+    </Properties>
     <URL>https://jev-edge.internal.example.com</URL>
   </HTTPTargetConnection>
 </ServiceCallout>
@@ -324,13 +336,13 @@ spec:
 <RaiseFault name="RF-JevBlock">
   <FaultResponse>
     <Set>
-      <StatusCode>403</StatusCode>
-      <ReasonPhrase>Forbidden</ReasonPhrase>
+      <StatusCode>{jevResponse.status.code}</StatusCode>
+      <ReasonPhrase>{jevResponse.reason.phrase}</ReasonPhrase>
       <Headers>
-        <Header name="Content-Type">application/json</Header>
+        <Header name="Content-Type">{jevResponse.header.Content-Type}</Header>
         <Header name="X-Jev-Verdict">{jevResponse.header.X-Jev-Verdict}</Header>
       </Headers>
-      <Payload contentType="application/json">{"error":"request rejected"}</Payload>
+      <Payload>{jevResponse.content}</Payload>
     </Set>
   </FaultResponse>
 </RaiseFault>
@@ -340,7 +352,7 @@ spec:
 
 ```xml
 <Step><Name>SC-JevEdge</Name><Condition>request.verb = "POST" and (proxy.pathsuffix MatchesPath "/v1/**")</Condition></Step>
-<Step><Name>RF-JevBlock</Name><Condition>jevResponse.status.code = 403</Condition></Step>
+<Step><Name>RF-JevBlock</Name><Condition>jevResponse.status.code >= 400 and jevResponse.status.code < 500 and jevResponse.header.X-Jev-Verdict != null</Condition></Step>
 <Step><Name>AM-JevHeaders</Name><Condition>jevResponse.status.code = 200</Condition></Step>
 ```
 
@@ -348,4 +360,4 @@ spec:
 
 ## 其他网关
 
-做法永远是这三步：把请求体连同 `X-Forwarded-For` 转发到 `/_jev/authz` 加原始路径；把答复里的 `X-Jev-*` 拷到上游请求上；jev-edge 回 403，网关就回 403。Traefik、Caddy 和 nginx `auth_request` 用 forward-auth 适配器；HAProxy 在 `adapters/haproxy` 里有自己的 agent。如果你的网关只能转发请求头、转发不了请求体，能得到的检查也就和其他只转发请求头的接入一样：只有路径、方法和信誉检查，其余一律返回 `skipped`，原因是 `no body`。
+做法永远是这三步：把请求体连同 `X-Forwarded-For` 转发到 `/_jev/authz` 加原始路径；把答复里的 `X-Jev-*` 拷到上游请求上；jev-edge 回带 `X-Jev-Verdict` 的 4xx，网关就原样回这个状态码和响应体。Traefik、Caddy 和 nginx `auth_request` 用 forward-auth 适配器；HAProxy 在 `adapters/haproxy` 里有自己的 agent。如果你的网关只能转发请求头、转发不了请求体，能得到的检查也就和其他只转发请求头的接入一样：只有路径、方法和信誉检查，其余一律返回 `skipped`，原因是 `no body`。

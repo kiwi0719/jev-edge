@@ -153,7 +153,10 @@ A fixed 300 ms timeout would have cut 15% of the 60-sample smoke run and about t
 | breaker + adaptive state | identical sample counts from every worker: shared |
 | worker RSS | 35 MB → 56 MB at 120 s (56 MB after a 60 s run too: plateau) |
 
-Against the 2026-09-22 run, p99 went from 3.0 ms to 46 ms and `max_inflight exceeded` from 2,746 to 234,251, while async drops fell from 11.9 M to 235 k. 0.6.3 shows the same on this host (60 s: p99 43 ms, 187 k over the cap), so the change came with the 0.6.x in-flight and async accounting, not with these fixes; it was not bisected further.
+Against the 2026-09-22 run, p99 went from 3.0 ms to 46 ms and `max_inflight exceeded` from 2,746 to 234,251. Bisected to 3ccd97d (0.6.1, "in-flight overflow no longer trips the breaker"), and neither number is a slowdown:
+
+- **The old run barely judged anything.** Before 3ccd97d a call refused by the gateway's own cap counted as a provider failure, so the breaker opened and stayed open: in a 20 s soak on 3ccd97d~1, 92% of requests were `source="breaker"` (L2 skipped) and 59 were judged. On 3ccd97d the breaker stays closed and every cache miss asks L2; with 8 slots and an 80 ms mock the cap is full about a fifth of the time (sampled counter: 0 for 75% of samples, 8 for 22%), and the misses in those windows are refused.
+- **The p99 is wrk's, not the gateway's.** nginx's own `$request_time` puts only the judged requests (about 0.03%) above 20 ms; every other request takes under 1 ms, and the event loop never stalls more than 20 ms. wrk inflates a small slow share: a plain OpenResty location that sleeps 80 ms on exactly 0.20% of requests (server-side count) reads p90 59 ms, p99 78 ms under the same `wrk -t4 -c64`. Read the soak's p99 as "some requests waited on the judge", not as a latency figure.
 
 The 256 KB cache dict was permanently full; `ngx.shared.DICT` evicts LRU on `set`, so no failures were logged and the cache kept serving.
 

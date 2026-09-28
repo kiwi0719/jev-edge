@@ -234,13 +234,25 @@ local function rates_at(t)
   return (n_neg > 0 and fp / n_neg or 0), (n_pos > 0 and (n_pos - tp) / n_pos or 0), fp, n_pos - tp
 end
 
--- candidate thresholds: every distinct score seen, so the recommendation is
--- an operating point that exists in the data rather than a round number
+-- A threshold as it is printed and applied: two decimals, rounded up. The
+-- report, the JSON and the curl line all give it with two, so its rates are
+-- the ones measured at that value. Measured at the raw score instead, a
+-- recommendation of 0.6349 printed as 0.63 would block every benign request
+-- scored 0.63 - 0.6349 the budget left out. Up, not to nearest: blocking
+-- less, never more, than the score it came from keeps the false positives
+-- within the budget. The 1e-9 keeps 0.07 (7.000000000000001 hundredths) at
+-- 0.07.
+local function printed(t) return math.ceil(t * 100 - 1e-9) / 100 end
+
+-- candidate thresholds: every distinct score seen, at the printed precision,
+-- so the recommendation is an operating point that exists in the data rather
+-- than a round number
 local function recommend(budget)
   if n_pos == 0 or n_neg == 0 then return nil end
   local seen, cands = {}, {}
   for _, r in ipairs(labelled) do
-    if not seen[r.score] then seen[r.score] = true; cands[#cands + 1] = r.score end
+    local t = printed(r.score)
+    if not seen[t] then seen[t] = true; cands[#cands + 1] = t end
   end
   table.sort(cands)
   local best

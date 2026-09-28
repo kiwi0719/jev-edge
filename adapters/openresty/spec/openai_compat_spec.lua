@@ -87,7 +87,7 @@ describe("openai-compat provider: deployment context", function()
     end
   end)
 
-  it("jev.questions replaces the wording in the system prompt, as the TS provider does (openai_compat_prompts.json)", function()
+  it("jev.questions replaces the wording in the system prompt as the TS provider does (prompts.json)", function()
     assert.is_true(#V.overrides >= 3)
     for _, c in ipairs(V.overrides) do
       local p = { questions = V.questions, text = "x", context = { deployment = c.deployment } }

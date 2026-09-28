@@ -271,7 +271,7 @@ const HEADER_NAMES = ["X-Jev-Verdict", "X-Jev-Score", "X-Jev-Source", "X-Jev-Rea
 const SUBJECT_HEADER = "x-jev-subject";
 
 /** Is the inbound X-Jev-Subject header the one this deployment consumes (hashed id from another jev-edge)? */
-function consumesSubjectHeader(cfg: core.Config): boolean {
+export function consumesSubjectHeader(cfg: core.Config): boolean {
   const s = cfg.subject;
   return !!(s?.enabled && s.from === "header" && typeof s.name === "string" && s.name.toLowerCase() === SUBJECT_HEADER);
 }

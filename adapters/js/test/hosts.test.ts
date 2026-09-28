@@ -779,6 +779,26 @@ describe("lambdaEdgeHandler", () => {
     expect(out.headers["x-jev-subject"]).toBeUndefined();
   });
 
+  it("judges on X-Jev-Subject when the config consumes it, and still strips the client's from what it forwards", async () => {
+    const hashed = "header:" + "ab".repeat(32);
+    const subject = { enabled: true, from: "header" as const, name: "x-jev-subject", hashed: true, reputation: { block_at: 5 } };
+    const h = lambdaEdgeHandler({ ...opts(), config: { ...opts().config, subject } });
+    for (let i = 0; i < 2; i++) {
+      await h(event(ATTACK.replace("print", "print " + i), {}, { "X-Jev-Subject": hashed, "X-Jev-Mock-Score": "0.95" }));
+    }
+    // blocked on the subject the header names: it reached the evaluation
+    const blocked = (await h(event(BENIGN, {}, { "X-Jev-Subject": hashed }))) as CfResponse;
+    expect(blocked.status).toBe("403");
+    // another subject passes, and what CloudFront forwards carries the id jev-edge took, never the client's header as sent
+    const other = (await h(event(BENIGN, {}, { "X-Jev-Subject": "header:" + "cd".repeat(32) }))) as CfRequest;
+    expect(other.headers["x-jev-verdict"][0].value).toBe("safe");
+    expect(other.headers["x-jev-subject"]).toEqual([{ key: "X-Jev-Subject", value: "header:" + "cd".repeat(32) }]);
+    // not consumed: dropped before the evaluation and from the forwarded request
+    const plain = lambdaEdgeHandler({ ...opts(), config: { ...opts().config, subject: { ...subject, name: "x-api-key" } } });
+    const out = (await plain(event(BENIGN, {}, { "X-Jev-Subject": hashed }))) as CfRequest;
+    expect(out.headers["x-jev-subject"]).toBeUndefined();
+  });
+
   it("uses policy.block_status for the response status and description", async () => {
     const h = lambdaEdgeHandler({ ...opts(), config: { ...opts().config, policy: { mode: "enforce", block_status: 429 } } });
     const out = await h(event(ATTACK, {}, { "X-Jev-Mock-Score": "0.95" }));

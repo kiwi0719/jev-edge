@@ -6,6 +6,83 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.6.4] - 2026-09-29
+
+The fixes from an external review of 0.6.3 (R1–R17), each checked against a
+reproduction before and after, plus bench fixes. No config key changes.
+
+### Upgrade notes
+
+- **laya-server past `LAYA_MAX_CONNECTIONS`** answers 503 at once, without
+  reading the request, so `/healthz` gets the 503 too while it is saturated.
+  The Docker `HEALTHCHECK` marks the container unhealthy only after about 30 s
+  of continuous saturation.
+- **`jev.questions` now applies to `openai-compat`** in both cores. A config
+  that set wording for it used to be ignored silently; the judge now reads it.
+- **`POST /_jev/config`** answers 500 when the shared dict cannot store the
+  override (it used to answer `{"ok":true}` and keep the old config). A
+  validation error is still 422.
+- **JS**: with the default memory store, subject reputation lives in its own
+  store (`Runtime.reputationStore`), apart from the trajectories. A custom
+  `subjectStore` still holds both.
+- **Apigee / APIM recipes** changed: copy them again if you use them (see
+  Fixed).
+
+### Security
+
+- **Text over `max_judge_chunks` could pass on a cached or trusted
+  fingerprint** (both cores). The whole-request fingerprint covers only the
+  window judged, so a short text that reads like the window, sent first,
+  answered for a long request whose unjudged part held anything, and an entry
+  cached in monitor mode answered after the switch to enforce with
+  `policy.unjudgeable = block`. The capacity check now runs before trust and
+  the cache, and a capped request's cache entry is scoped apart.
+- **Durable Object subject sessions checked only the first id** (JS). With
+  duplicate cookies (`sid=fresh; sid=banned`) a banned subject passed when
+  the backend reads the last one. Every candidate id is now checked and
+  charged, as with the memory store.
+- **`jev.max_inflight` was not enforced in the JS runtime.** It is now, per
+  isolate: past the cap a call passes as `error` (kind `busy`) and does not
+  count against the breaker, as on nginx.
+- **laya-server created a thread and read the request before refusing a
+  connection past the cap**, so slow clients could hold any number of
+  threads. Admission now happens before the thread.
+
+### Fixed
+
+- The whole-request cache entry is written only when every part answered: a
+  part that failed while another blocked left a score that outlived a
+  threshold change and skipped the re-judge of the failed part.
+- JS memory store: a flood of trajectory writes could evict a running
+  reputation block from the shared LRU.
+- Lambda@Edge dropped `X-Jev-Subject` before evaluation even when the config
+  consumes it; it is still stripped from the forwarded request.
+- The Envoy gRPC shim reads `header_map` when Envoy's `encode_raw_headers` is
+  on (every header but method and path was lost).
+- Apigee recipe: the `ServiceCallout` has `continueOnError="true"`, so it
+  fails open as documented. APIM and Apigee recipes treat any 4xx with an
+  `X-Jev-Verdict` as a block (they matched only 403, so `block_status = 429`
+  forwarded blocked requests) and pass jev-edge's status through.
+- `make calibrate` recommends a threshold at the precision it prints and
+  measures its rates there (0.704 printed as 0.70 with "0% FP" could block a
+  benign 0.702).
+- `conformance/run.py` sizes the recommended `timeout_ms` from the NFKC case
+  when it is the slower one.
+- `bench/chart.lua` computes log10 under Lua 5.1 too.
+- Tests: the Test::Nginx raw-subject privacy check could never fail; the
+  laya truncation test passed on a `TypeError` instead of the check it names.
+
+### Bench
+
+- The `slow` scenario pins `timeout_max_ms = 300`: the adaptive timeout had
+  grown past the 500 ms mock and the scenario read ~480 ms at p99.
+- `make bench` passes `CONN`, `DUR` and `OUT` into the container; the bench
+  bodies are written to `bench/out*/` instead of a tracked file.
+- `bench/report.md`: latency, soak, replay cache and L1 sections re-run. The
+  soak's p99 since 0.6.1 (46 ms against 3 ms) is explained there: the old run
+  had the breaker open for 92% of requests, and the new figure is wrk's
+  reading of the ~0.03% of requests that waited on the judge.
+
 ## [0.6.3] - 2026-09-28
 
 ### Fixed

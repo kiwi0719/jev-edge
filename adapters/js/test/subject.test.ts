@@ -261,7 +261,8 @@ describe("subject: cookie candidates (g1-subject-id-evasion#1)", () => {
       },
     });
     const id = await core.subject.hashId(scfg, "REAL", core.subject.sha256Hex);
-    await rt.subjectStore.set("srep:" + id + ":until", Date.now() / 1000 + 600, 600);
+    // reputation has a memory store of its own (runtime.ts, reputationStore)
+    await rt.reputationStore!.set("srep:" + id + ":until", Date.now() / 1000 + 600, 600);
     const body = JSON.stringify({ messages: [{ role: "user", content: LONG }] });
     const post = (cookie: string) => new Request("https://edge.example/v1/chat/completions", {
       method: "POST", headers: { "content-type": "application/json", cookie }, body,

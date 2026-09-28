@@ -8,7 +8,8 @@
 #   baseline   jev-edge not loaded at all
 #   unwatched  access() runs, path not watched (L1 pass)
 #   healthy    watched path, mock Jev answers in 100 ms
-#   slow       watched path, mock Jev answers in 500 ms (over the 300 ms cut)
+#   slow       watched path, mock Jev answers in 500 ms (over the 300 ms cut,
+#              timeout_max_ms pinned so the adaptive timeout cannot wait it out)
 #   dead       watched path, mock Jev fails every call
 #
 # Bodies come from the benign half of the deepset dataset (natural language,
@@ -23,14 +24,19 @@ CONN=${CONN:-32}
 OUT=${OUT:-bench/out}
 mkdir -p $OUT /tmp/nx/logs /tmp/nx/conf
 
+# generated, never committed: bench/out*/ is gitignored
+BODIES=/work/$OUT/bodies.jsonl
 jq -c '.samples[] | select(.label==0) | {messages:[{role:"user",content:.text}]}' \
-  bench/datasets/jev-sec-bench-injection.json > bench/datasets/bodies.jsonl
+  bench/datasets/jev-sec-bench-injection.json > $BODIES
 
 write_conf() { # $1 = mock_delay_ms, $2 = mock_fail_ratio
 cat > /tmp/nx/conf/jev-edge.conf.lua <<EOF
 return {
   jev = { provider = "mock", mock_header = "x-jev-mock-score", mock_score = 0.2,
-          mock_delay_ms = $1, mock_fail_ratio = $2, timeout_ms = 300 },
+          mock_delay_ms = $1, mock_fail_ratio = $2, timeout_ms = 300,
+          -- the adaptive timeout may otherwise grow to 1000 ms and wait out
+          -- the 500 ms mock: pin the cut the slow scenario measures
+          timeout_max_ms = 300 },
   rules = { "llm-endpoints" },
   policy = { mode = "enforce", block_threshold = 0.85, suspect_threshold = 0.5 },
   cache = { fp_ttl = 0.001 },
@@ -60,7 +66,7 @@ EOF
 
 run() { # name path score
   name=$1; path=$2; score=$3
-  BODIES=/work/bench/datasets/bodies.jsonl PATH_=$path SCORE=$score \
+  BODIES=$BODIES PATH_=$path SCORE=$score \
     wrk -t2 -c$CONN -d$DUR -s bench/wrk-post.lua http://127.0.0.1:18080$path 2>/dev/null | grep RESULT | sed "s/^RESULT/$name/" | tee -a $OUT/results.txt
 }
 

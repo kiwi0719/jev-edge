@@ -100,8 +100,7 @@ function systemOne(name: string, defaults: { model: string; url: string }): Prov
       const deployment = prompt.context.deployment || undefined;
       const questions: Record<string, unknown> = {};
       for (const [qname, base] of Object.entries(prompt.questions)) {
-        const over = cfg.questions?.[qname];
-        const t = over ? { ...base, ...pickWording(over) } : base;
+        const t = withWording(qname, base, cfg);
         const instr = (deployment && t.instructions_ctx) || t.instructions;
         const crit = (deployment && t.criteria_ctx) || t.criteria;
         const q: Record<string, unknown> = { type: "noul", instructions: instr };
@@ -157,6 +156,14 @@ function pickWording(o: QuestionWording): Partial<Template> {
   if (o.criteria !== undefined) out.criteria = sides(o.criteria);
   if (o.criteria_ctx !== undefined) out.criteria_ctx = sides(o.criteria_ctx);
   return out;
+}
+
+/** Template `t` of question `name` with this provider's wording from
+ *  cfg.questions, or `t` itself when it has none. Port of jev.wording,
+ *  shared by the System One providers and openai-compat. */
+function withWording(name: string, t: Template, cfg: JevConfig): Template {
+  const over = cfg.questions?.[name];
+  return over ? { ...t, ...pickWording(over) } : t;
 }
 
 export const jev: Provider = systemOne("jev", { model: "jev-latest", url: "https://api.typesafe.ai/v1/systemone" });
@@ -553,7 +560,10 @@ export const openaiCompat: Provider = {
   async call(prompt, cfg, timeoutMs) {
     const endpoint = (cfg.endpoint ?? "http://127.0.0.1:11434/v1").replace(/\/+$/, "");
     const nonce = newNonce();
-    const body = JSON.stringify(openaiBody(cfg, openaiSystemPrompt(prompt.questions, nonce, prompt.context.deployment), openaiUserMessage(prompt.text, nonce)));
+    // cfg.questions: this provider's wording, merged as the System One providers do
+    const questions: Prompt["questions"] = {};
+    for (const [name, t] of Object.entries(prompt.questions)) questions[name] = withWording(name, t, cfg);
+    const body = JSON.stringify(openaiBody(cfg, openaiSystemPrompt(questions, nonce, prompt.context.deployment), openaiUserMessage(prompt.text, nonce)));
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (cfg.api_key) headers.Authorization = "Bearer " + cfg.api_key;
     let content: unknown;

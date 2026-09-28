@@ -426,8 +426,8 @@ class Http(unittest.TestCase):
 
     def test_conformance_catches_silent_truncation(self):
         class Truncating(L.Scorer):
-            def windows(self, first, text, spans=None):
-                return super().windows(first, text, spans)[:1]   # the bug the suite exists for
+            def windows(self, first, text, spans=None, counts=None):
+                return super().windows(first, text, spans, counts)[:1]   # the bug the suite exists for
 
         srv, url = serve()
         srv.RequestHandlerClass.scorer = Truncating(L.MockBackend())
@@ -436,8 +436,15 @@ class Http(unittest.TestCase):
         finally:
             srv.shutdown()
             srv.server_close()
-        self.assertEqual(rc, 1)
-        self.assertIn("FAIL  long text: an attack at the tail is still seen", out)
+        # the one failure is the tail the truncation dropped, not a 500 on
+        # every request (a stub out of step with Scorer.windows' signature
+        # made this test pass on a server that answered nothing)
+        self.assertEqual(rc, 1, out)
+        fails = [ln for ln in out.splitlines() if ln.startswith("FAIL")]
+        self.assertEqual(len(fails), 1, out)
+        self.assertRegex(fails[0], r"^FAIL  long text: an attack at the tail is still seen: "
+                                   r"mock: injection = [\d.]+, want high$")
+        self.assertIn("ok    long text: an attack at the head is still seen", out)
 
     def test_backend_failure_is_a_500_never_a_score(self):
         srv, url = serve()
@@ -816,7 +823,6 @@ class Load(unittest.TestCase):
             self.assertEqual(r.status, 503)
             self.assertEqual(r.getheader("Connection"), "close")
             self.assertEqual(json.loads(data)["error"]["code"], "overloaded")
-            self.assertEqual(t.request("GET", "/healthz", None)[0], 200)  # busy is not unhealthy
         finally:
             held.close()
         try:
@@ -825,6 +831,46 @@ class Load(unittest.TestCase):
                 time.sleep(0.01)
             self.assertEqual(post(url)[0], 200)
         finally:
+            stop(srv)
+
+    def test_connection_past_the_cap_is_refused_before_a_thread_or_a_read(self):
+        # A connection past the cap got a thread that waited for its headers
+        # (LAYA_IDLE_TIMEOUT_S) and read its body before the 503: connections
+        # that send nothing held a thread and a socket each, past the cap.
+        # Now the 503 comes at once, without a byte sent, and no thread.
+        srv, url = serve({"LAYA_MAX_CONNECTIONS": "1"})
+        host, port = srv.server_address[:2]
+        held = socket.create_connection((host, port))
+        extra = []
+        try:
+            held.sendall(b"POST /v1/systemone HTTP/1.1\r\nHost: x\r\n")  # headers never finished
+            deadline = time.monotonic() + 5
+            while srv.connections < 1 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            threads = threading.active_count()
+            for _ in range(8):
+                s = socket.create_connection((host, port))
+                s.settimeout(2)
+                extra.append(s)
+            for s in extra:
+                t0 = time.monotonic()
+                got = b""
+                while True:
+                    chunk = s.recv(4096)
+                    if not chunk:
+                        break
+                    got += chunk
+                self.assertLess(time.monotonic() - t0, 1)
+                head, _, body = got.partition(b"\r\n\r\n")
+                self.assertTrue(head.startswith(b"HTTP/1.1 503 "), head)
+                self.assertIn(b"Connection: close", head)
+                self.assertEqual(json.loads(body)["error"]["code"], "overloaded")
+            self.assertEqual(srv.connections, 1)
+            self.assertEqual(threading.active_count(), threads)
+        finally:
+            for s in extra:
+                s.close()
+            held.close()
             stop(srv)
 
     def test_workers_default(self):

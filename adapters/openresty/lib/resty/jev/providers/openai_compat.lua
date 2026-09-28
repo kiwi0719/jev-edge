@@ -28,6 +28,7 @@
 
 local cjson = require "cjson.safe"
 local defaults = require "jev.core.defaults"
+local jev = require "resty.jev.providers.jev"
 
 local _M = { name = "openai-compat" }
 
@@ -221,7 +222,10 @@ function _M.build_request(prompt, cfg, nonce)
   nonce = nonce or new_nonce()
   local deployment = prompt.context and prompt.context.deployment
   local endpoint = (cfg.endpoint or "http://127.0.0.1:11434/v1"):gsub("/+$", "")
-  local body = cjson.encode(_M.body(cfg, system_prompt(prompt.questions, nonce, deployment),
+  -- cfg.questions: this provider's wording, merged as providers/jev.lua does
+  local questions = {}
+  for name, t in pairs(prompt.questions) do questions[name] = jev.wording(name, t, cfg) end
+  local body = cjson.encode(_M.body(cfg, system_prompt(questions, nonce, deployment),
     user_message(prompt.text, nonce)))
   return {
     method  = "POST",

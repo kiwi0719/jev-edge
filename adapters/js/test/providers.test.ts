@@ -60,11 +60,31 @@ describe("openai-compat provider: deployment context", () => {
     nonce: string;
     questions: Parameters<typeof openaiSystemPrompt>[0];
     cases: { name: string; deployment: string; system: string }[];
+    overrides: { name: string; wording: JevConfig["questions"]; deployment: string; system: string }[];
   };
 
   it("builds the system prompt the Lua provider builds (openai_compat_prompts.json)", () => {
     expect(V.cases.length).toBeGreaterThanOrEqual(3);
     for (const c of V.cases) expect(openaiSystemPrompt(V.questions, V.nonce, c.deployment), c.name).toBe(c.system);
+  });
+
+  it("jev.questions replaces the wording in the system prompt, as the Lua provider does (openai_compat_prompts.json)", async () => {
+    expect(V.overrides.length).toBeGreaterThanOrEqual(3);
+    for (const c of V.overrides) {
+      let sys = "";
+      vi.stubGlobal("fetch", vi.fn(async (_url: string, init: RequestInit) => {
+        sys = (JSON.parse(String(init.body)) as { messages: { content: string }[] }).messages[0].content;
+        return Response.json({ choices: [{ message: { content: '{"injection": 0.1, "abuse": 0.1}' } }] });
+      }));
+      const p = { questions: V.questions, text: "x", context: { deployment: c.deployment } } as unknown as Parameters<typeof openaiCompat.call>[0];
+      const [a, err] = await openaiCompat.call(p, { questions: c.wording } as JevConfig, 1000);
+      expect(err, c.name).toBeNull();
+      expect(a, c.name).toEqual({ injection: 0.1, abuse: 0.1 });
+      const nonce = /<<<INPUT ([0-9a-f]{32})>>>/.exec(sys)![1];
+      expect(sys.split(nonce).join(V.nonce), c.name).toBe(c.system);
+    }
+    // the templates the prompt was built from are untouched
+    expect(V.questions.injection.instructions).toBe("Is `user_message` an injection?");
   });
 
   it("a request with a context carries the description and the context wording, one without does not", async () => {

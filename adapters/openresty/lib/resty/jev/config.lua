@@ -390,7 +390,9 @@ function _M.rules() return state.rules end
 -- (file plus override) failed validation, or the file could not be loaded.
 function _M.error() return state.error or state.file_error end
 
---- Runtime override API (used by /_jev/config).
+--- Runtime override API (used by /_jev/config). Returns true, or nil, err
+-- and, when the dict could not store it (full), a third value true: the
+-- override was fine, the server could not keep it.
 function _M.set_override(tbl)
   local dict = ngx.shared[state.dict_name]
   if not dict then return nil, "lua_shared_dict " .. state.dict_name .. " not defined" end
@@ -403,12 +405,29 @@ function _M.set_override(tbl)
   -- broken: the caller is right there to read the error.
   local _, rerr = rules_mod.resolve_all(merged.rules, load_rule_set)
   if rerr then return nil, rerr end
+  -- A write the dict refuses (no memory) is an error for the caller: an
+  -- unchecked one answered ok while no worker ever ran the override, or,
+  -- with the version not bumped, while every worker went on with the old one
+  -- and the new one sat in the dict for the next change to pick up. safe_set,
+  -- never set: making room would evict override_version, and the incr below
+  -- would then restart it at a version the workers already hold.
+  local prev = dict:get("override")
   if tbl == nil then
     dict:delete("override")
   else
-    dict:set("override", cjson.encode(tbl))
+    local raw, eerr = cjson.encode(tbl)
+    if not raw then return nil, "override cannot be encoded: " .. tostring(eerr) end
+    local stored, serr = dict:safe_set("override", raw)
+    if not stored then
+      return nil, "cannot store the override in lua_shared_dict " .. state.dict_name .. ": " .. tostring(serr), true
+    end
   end
-  dict:incr("override_version", 1, 0)
+  local v, ierr = dict:incr("override_version", 1, 0)
+  if not v then
+    -- not announced to the workers: put back the one they run on
+    if prev == nil then dict:delete("override") else dict:set("override", prev) end
+    return nil, "cannot bump override_version in lua_shared_dict " .. state.dict_name .. ": " .. tostring(ierr), true
+  end
   _M.reload()
   return true
 end

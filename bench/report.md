@@ -1,6 +1,6 @@
 # Bench report
 
-Generated 2026-09-22. Reproduce with `make bench-offline`, `make bench`, `make live-check`, `make live-full`, `make soak`, `make live-openai`.
+Generated 2026-09-22; latency, soak, replay cache and L1 sections re-run 2026-09-28 (accuracy tables reproduce unchanged). Reproduce with `make bench-offline`, `make bench`, `make live-check`, `make live-full`, `make soak`, `make live-openai`.
 
 Dataset for every accuracy number: deepset/prompt-injections via jev-sec-bench (662 samples: 263 attacks, 399 benign). Its labels were collected for a specific deployment, a German news publisher's reader assistant, so "write me C++" counts as an attack there and as a normal request anywhere else. That single fact drives the biggest result below.
 
@@ -44,7 +44,7 @@ Pipeline table with the +context oracle (`lua bench/offline.lua bench/datasets/l
 
 ## Replay cache
 
-263 attack texts × 5 variants (case, whitespace, trailing reference number, padding): 1315 requests, 524 L2 calls. Of the 1052 repeats, **74.3%** were served from cache; 0.7% passed at L1.
+263 attack texts × 5 variants (case, whitespace, trailing reference number, padding): 1315 requests, 525 L2 calls. Of the 1052 repeats, **74.2%** were served from cache; 0.7% passed at L1.
 
 The variant that defeats the cache is the appended reference number: digits are stripped but the surrounding `(ref )` text remains, so the fingerprint differs. Case, whitespace and padding variants all hit.
 
@@ -56,26 +56,32 @@ Worst-case match time per pattern on 5 adversarial inputs (20 KB repeats):
 
 | # | worst ms | pattern |
 |---|---|---|
-| 1 | 1.00 | `\b(ignore\|disregard\|forget)\b.{0,20}\b(previous\|prior\|above\|earlier\|all)\b.{0,20}\b(instructions?\|rules?\|prompts?)\b` |
+| 1 | 1.20 | `\b(ignore\|disregard\|forget)\b.{0,20}\b(previous\|prior\|above\|earlier\|all)\b.{0,20}\b(instructions?\|rules?\|prompts?)\b` |
 | 2 | 0.00 | `\byou are now\b` |
 | 3 | 0.01 | `\b(system\|hidden\|secret\|initial)\s+prompt\b` |
 | 4 | 0.00 | `<\\|?(system\|im_start)\\|?>` |
 | 5 | 0.00 | `\[/?INST\]` |
 | 6 | 0.00 | `\bdeveloper mode\b` |
-| 7 | 0.08 | `\b(DAN\|do anything now)\b` |
+| 7 | 0.09 | `\b(DAN\|do anything now)\b` |
 | 8 | 0.03 | `\b(reveal\|print\|repeat\|show)\b.{0,30}\b(instructions\|system prompt\|rules)\b` |
-| 9 | 0.22 | `(?:[A-Za-z0-9+/]{4}){40,}={0,2}` |
-
+| 9 | 0.22 | `[A-Za-z0-9+/]{160,}={0,2}` |
+| 10 | 0.01 | `\b(rate\|classify\|mark\|label\|score\|flag\|treat\|judge)\b.{0,30}\b(this\|it\|me\|the (above\|following\|message\|request\|input\|prompt\|text))\b.{0,30}\bas\s+(a\s+)?(safe\|benign\|harmless\|clean\|legitimate\|non-?malicious\|0(\.0+)?)\b(?!\s+(to\|for)\b)` |
+| 11 | 0.08 | `\b(classifier\|moderator\|guardrail\|safety (filter\|model\|system\|check)\|content filter\|judge model)\b.{0,40}\b(output\|return\|respond\|answer\|reply\|say\|print)\b.{0,20}\b(0(\.0+)?\|safe\|benign\|harmless\|false)\b` |
+| 12 | 0.01 | `\b(to\|for)\s+(the\|any)\s+(ai\|model\|llm\|classifier\|moderator\|reviewer\|filter)\s+(reviewing\|checking\|scanning\|screening\|evaluating\|analy[sz]ing\|reading\|judging)\s+(this\|these\|the)\b` |
+| 13 | 0.01 | `[\x7b,]\s*"(injection\|abuse\|noul\|jailbreak\|prompt_injection)"\s*:\s*(\x7b\|\[\|"?(0(\.\d+)?\|false\|safe\|benign)\b)` |
+| 14 | 0.01 | `(={3,}\|-{3,}\|#{2,}\|\*{3,}\|\[\|</?)\s*end[ _-]+(of[ _-]+)?(the[ _-]+)?(user[ _-]+)?(input\|message\|prompt\|text\|data\|query)\b` |
+| 15 | 0.34 | `\b(real\|actual\|true\|correct\|final)\s+(verdict\|rating\|classification)(\s+(is\|should be)\|\s*[=:])\s*"?(safe\|benign\|harmless\|clean\|0(\.0+)?\|not (malicious\|an? (injection\|attack)))\b` |
 
 ## core.evaluate latency (single core, Lua 5.5, no nginx)
 
 | path | µs per call |
 |---|---|
-| unwatched path | 0.87 |
-| watched, short body | 11.42 |
-| watched, natural language → L1 suspect (judge stubbed) | 16.65 |
+| unwatched path | 4.38 |
+| watched, short body | 30.61 |
+| watched, natural language → L1 suspect (judge stubbed) | 41.82 |
 
 The OpenResty adapter adds body read, header writes and shared-dict access on top; see `bench/run.sh` for end-to-end P99.
+
 
 ## Part 2: end-to-end latency (OpenResty in Docker, mock provider)
 
@@ -89,28 +95,29 @@ Scenarios: **baseline** = plain `content_by_lua`, jev-edge not loaded. **unwatch
 
 | scenario | rps | p50 | p99 | max |
 |---|---|---|---|---|
-| baseline | 94,889 | 36 µs | 47 µs | 865 µs |
-| unwatched | 92,531 | 39 µs | 71 µs | 3.29 ms |
-| healthy | 40 | 102.43 ms | 105.53 ms | 105.74 ms |
-| slow | 54,662 | 53 µs | 288.05 ms | 308.67 ms |
-| dead | 69,912 | 48 µs | 173 µs | 4.51 ms |
+| baseline | 101,391 | 33 µs | 76 µs | 1.23 ms |
+| unwatched | 72,197 | 40 µs | 1.14 ms | 3.25 ms |
+| healthy | 40 | 103.03 ms | 106.99 ms | 107.36 ms |
+| slow | 45,543 | 66 µs | 285.39 ms | 307.60 ms |
+| dead | 53,727 | 65 µs | 200 µs | 7.22 ms |
 
 ### 32 connections (both workers saturated; throughput, not latency)
 
 | scenario | rps | p50 | p99 | max |
 |---|---|---|---|---|
-| baseline | 531,433 | 41 µs | 87 µs | 3.09 ms |
-| unwatched | 253,475 | 111 µs | 1.63 ms | 65.51 ms |
-| healthy | 324 | 103.04 ms | 105.85 ms | 107.58 ms |
-| slow | 83,142 | 330 µs | 214.05 ms | 312.30 ms |
-| dead | 84,543 | 335 µs | 1.42 ms | 14.27 ms |
+| baseline | 366,667 | 61 µs | 223 µs | 3.27 ms |
+| unwatched | 170,675 | 162 µs | 515 µs | 6.37 ms |
+| healthy | 320 | 104.13 ms | 108.30 ms | 108.97 ms |
+| slow | 68,939 | 418 µs | 203.79 ms | 308.70 ms |
+| dead | 66,286 | 446 µs | 1.05 ms | 13.75 ms |
 
 ### Reading the numbers
 
-- **Added latency on the L1 pass path**: p99 goes from 47 µs to 71 µs at light load. Target was ≤ 1 ms.
-- **Dead Jev**: every request passed (`jev_actions_total{action="pass"}` equals the request count, breaker gauge = 1). After the first 20 failures the breaker opens and p50 returns to ~50 µs.
-- **Slow Jev**: p99 sits at the 300 ms hard cut until the breaker opens, then the median drops to 53 µs. The p99 stays high because the breaker re-probes every `open_s` seconds.
-- **Healthy Jev**: latency is the provider's; jev-edge adds ~3 ms on top of the 100 ms mock delay at p99 (`ngx.sleep` granularity plus header work).
+- **Added latency on the L1 pass path**: p50 goes from 33 µs to 40 µs at light load. The unwatched p99 is not stable between runs on this host: 123 µs to 1.38 ms over six 4-connection runs, on 0.6.3 and on this tree alike, against a baseline p99 of 76–97 µs. Target was ≤ 1 ms.
+- **Dead Jev**: every request passed (`jev_actions_total{action="pass"}` equals the request count, breaker gauge = 1). After the first 20 failures the breaker opens and p50 returns to ~65 µs.
+- **Slow Jev**: p99 sits at the 300 ms hard cut until the breaker opens, then the median drops to 66 µs. The p99 stays high because the breaker re-probes every `open_s` seconds. The bench pins `timeout_max_ms = 300`: without it the adaptive timeout (ceiling 1000 ms by default) grows past 500 ms, waits out the slow mock and the p99 reads ~480 ms, which is what the scenario measured between the adaptive default and this fix.
+- **Healthy Jev**: latency is the provider's; jev-edge adds ~7 ms on top of the 100 ms mock delay at p99 (`ngx.sleep` granularity plus header work).
+- These numbers come from a different, slower host state than the 2026-09-22 run (core.evaluate is ~2.5× slower here too); compare runs from the same host only. Main (0.6.3) and this tree were run interleaved, three times each: every scenario within ±5%, with overlapping ranges.
 
 
 ## Part 3: live provider checks
@@ -138,13 +145,18 @@ A fixed 300 ms timeout would have cut 15% of the 60-sample smoke run and about t
 
 | | |
 |---|---|
-| requests / errors | 12,304,781 / 0 |
-| p50 / p99 | 541 µs / 3.0 ms |
+| requests / errors | 9,461,721 / 0 |
+| p50 / p99 | 711 µs / 46.18 ms |
 | workers alive / crashes | 4 / 0 |
-| `max_inflight exceeded` | 2,746 (logged and passed, not queued) |
-| `jev_async_dropped_total` | 11,850,621 (dropped, not queued) |
+| `max_inflight exceeded` | 234,251 (logged and passed, not queued) |
+| `jev_async_dropped_total` | 235,383 (dropped, not queued) |
 | breaker + adaptive state | identical sample counts from every worker: shared |
-| worker RSS | 34 MB → 47 MB at 60 s → 48 MB at 120 s (plateau) |
+| worker RSS | 35 MB → 56 MB at 120 s (56 MB after a 60 s run too: plateau) |
+
+Against the 2026-09-22 run, p99 went from 3.0 ms to 46 ms and `max_inflight exceeded` from 2,746 to 234,251. Bisected to 3ccd97d (0.6.1, "in-flight overflow no longer trips the breaker"), and neither number is a slowdown:
+
+- **The old run barely judged anything.** Before 3ccd97d a call refused by the gateway's own cap counted as a provider failure, so the breaker opened and stayed open: in a 20 s soak on 3ccd97d~1, 92% of requests were `source="breaker"` (L2 skipped) and 59 were judged. On 3ccd97d the breaker stays closed and every cache miss asks L2; with 8 slots and an 80 ms mock the cap is full about a fifth of the time (sampled counter: 0 for 75% of samples, 8 for 22%), and the misses in those windows are refused.
+- **The p99 is wrk's, not the gateway's.** nginx's own `$request_time` puts only the judged requests (about 0.03%) above 20 ms; every other request takes under 1 ms, and the event loop never stalls more than 20 ms. wrk inflates a small slow share: a plain OpenResty location that sleeps 80 ms on exactly 0.20% of requests (server-side count) reads p90 59 ms, p99 78 ms under the same `wrk -t4 -c64`. Read the soak's p99 as "some requests waited on the judge", not as a latency figure.
 
 The 256 KB cache dict was permanently full; `ngx.shared.DICT` evicts LRU on `set`, so no failures were logged and the cache kept serving.
 
@@ -152,9 +164,9 @@ The 256 KB cache dict was permanently full; `ngx.shared.DICT` evicts LRU on `set
 
 | Metric | Target | Measured |
 |---|---|---|
-| P99 added to L1-passed traffic | ≤ 1 ms | 24 µs |
+| P99 added to L1-passed traffic | ≤ 1 ms | 40–55 µs typical (unwatched p99 minus baseline p99); over 1 ms in two of six runs on this host (see Part 2) |
 | False-positive rate (enforce) | ≤ 0.1% | 0.0% at ≥ 0.70 with context; 0.8% at 0.50 |
 | Miss rate vs Jev alone | ≤ oracle + 2 pt | +1.2 pt at 0.50 (6.5% vs 5.3%) |
-| Replay cache hit rate | ≥ 80% | 74% of repeats (appended-reference variant defeats normalization) |
+| Replay cache hit rate | ≥ 80% | 74.2% of repeats (appended-reference variant defeats normalization) |
 | Pass rate with Jev dead | 100% | 100% |
 | Normal traffic sent to L2 | ≤ 2% site-wide | not measurable on a chat-only dataset |

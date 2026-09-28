@@ -20,7 +20,7 @@ local subject_m = require "jev.core.subject"
 local trust     = require "jev.core.trust"
 local cjson     = require "cjson.safe"
 
-local _M = { _VERSION = "0.6.3" }
+local _M = { _VERSION = "0.6.4" }
 
 local CACHE_DICT = "jev_cache"
 -- Safety-critical state (trust grants, breaker, in-flight counters, adaptive
@@ -631,9 +631,9 @@ function _M.config_api()
       ngx.say('{"error":"body must be a JSON object"}')
       return
     end
-    local ok, err = config.set_override(tbl)
+    local ok, err, internal = config.set_override(tbl)
     if not ok then
-      ngx.status = 422
+      ngx.status = internal and 500 or 422  -- 500: valid, but the dict could not keep it
       ngx.say(cjson.encode({ error = err }))
       return
     end
@@ -642,9 +642,9 @@ function _M.config_api()
   elseif method == "DELETE" then
     -- refused when the file in force needs something the override supplies
     -- (the override then stays): say so instead of answering ok
-    local ok, err = config.set_override(nil)
+    local ok, err, internal = config.set_override(nil)
     if not ok then
-      ngx.status = 422
+      ngx.status = internal and 500 or 422
       ngx.say(cjson.encode({ error = err }))
       return
     end

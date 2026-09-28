@@ -9614,17 +9614,17 @@
       "expect": {
         "breaker": null,
         "cache_writes": {
+          "fp:2a08467a:7646af02": {
+            "ttl": 300,
+            "value": {
+              "reason": "injection 0.20 (window)",
+              "score": 0.2
+            }
+          },
           "fp:daf36bf6:43010345": {
             "ttl": 300,
             "value": {
               "reason": "injection 0.20",
-              "score": 0.2
-            }
-          },
-          "fp:daf36bf6:7646af02": {
-            "ttl": 300,
-            "value": {
-              "reason": "injection 0.20 (window)",
               "score": 0.2
             }
           },
@@ -9975,15 +9975,7 @@
     {
       "expect": {
         "breaker": null,
-        "cache_writes": {
-          "fp:daf36bf6:8bc2cafa": {
-            "ttl": 300,
-            "value": {
-              "reason": "injection 0.95 (3 chunks)",
-              "score": 0.95
-            }
-          }
-        },
+        "cache_writes": {},
         "headers": {
           "X-Jev-Reason": "injection+0.95+%283+chunks%29",
           "X-Jev-Score": "0.95",
@@ -10476,6 +10468,13 @@
       "expect": {
         "breaker": null,
         "cache_writes": {
+          "fp:2a08467a:dc444891": {
+            "ttl": 300,
+            "value": {
+              "reason": "injection 0.20 (window)",
+              "score": 0.2
+            }
+          },
           "fp:daf36bf6:648105e3": {
             "ttl": 300,
             "value": {
@@ -10487,13 +10486,6 @@
             "ttl": 300,
             "value": {
               "reason": "injection 0.20",
-              "score": 0.2
-            }
-          },
-          "fp:daf36bf6:dc444891": {
-            "ttl": 300,
-            "value": {
-              "reason": "injection 0.20 (window)",
               "score": 0.2
             }
           },
@@ -15231,16 +15223,7 @@
     {
       "expect": {
         "breaker": null,
-        "cache_writes": {
-          "fp:6cf8e982:9871e49a": {
-            "ttl": 300,
-            "value": {
-              "reason": "tools+injection 0.95",
-              "rep": false,
-              "score": 0.95
-            }
-          }
-        },
+        "cache_writes": {},
         "headers": {
           "X-Jev-Reason": "tools%2Binjection+0.95",
           "X-Jev-Score": "0.95",
@@ -15764,7 +15747,7 @@
       "expect": {
         "breaker": null,
         "cache_writes": {
-          "fp:daf36bf6:7646af02": {
+          "fp:2a08467a:7646af02": {
             "ttl": 300,
             "value": {
               "reason": "injection 0.20 (window)",
@@ -17993,7 +17976,7 @@
       "name": "custom cache ttl and prefix"
     }
   ],
-  "core_version": "0.6.3",
+  "core_version": "0.6.4",
   "format_version": 2,
   "generated_by": "core/golden/gen.lua",
   "suite": "evaluate"

@@ -51,7 +51,8 @@ export interface Options {
    *  both idFromName and get. */
   state?: StateTarget | Store;
   /** Store for per-subject trajectories and reputation: KV, the JevState Durable Object or any Store. Memory
-   *  (per isolate, the 50000 most recently used entries) if absent; the Cloudflare presets pass their Durable
+   *  (per isolate) if absent: the 50000 most recently used trajectory entries, and reputation in a store of
+   *  its own (another 50000), which a flood of trajectories cannot evict; the Cloudflare presets pass their Durable
    *  Object when config.subject.reputation is on. Only used with config.subject.enabled. The JevState
    *  namespace (or `{ namespace, name }`) keeps each subject in an object of its own (durableSubjectStore:
    *  `jev-subject:<id>`, atomic and consistent everywhere), and a judged request makes one hop to it before
@@ -84,6 +85,10 @@ export interface Runtime {
   cache: Store;
   state: Store;
   subjectStore: Store;
+  /** Reputation points and blocks, apart from the trajectories in
+   *  `subjectStore`, when that is the default memory store; absent (both in
+   *  `subjectStore`) when a subjectStore was passed. */
+  reputationStore?: Store;
   breaker: BreakerLike;
   adaptive: AdaptiveLike;
   /** With `state` a JevState: the breaker and adaptive one judged request
@@ -96,6 +101,11 @@ export interface Runtime {
    *  (durableSubjectStore); null when that read failed, logged once per
    *  outage. Absent otherwise, and a request reads `subjectStore` per key. */
   subjectSession?: (id: string) => Promise<SubjectSession | null>;
+  /** L2 calls in flight from this runtime, capped by jev.max_inflight
+   *  (judgeOnce). Per isolate: a counter in memory, not shared across
+   *  isolates or processes. Absent on a Runtime built by hand, which then
+   *  gets one on its first judged request. */
+  inflight?: { held: number };
   opts: Options;
 }
 
@@ -137,9 +147,14 @@ function storeOption(x: KVLike | StateTarget | Store | undefined, clock: () => n
 
 /** Caps of the default memory stores (least recently used out past them):
  *  one cache entry per judged text, and a subject's ring takes max_entries
- *  + 1 keys. `state` has none, so breaker and adaptive keys stay. */
+ *  + 1 keys. Reputation has a store of its own (at most three small keys a
+ *  subject: the block and two windows' points), as jev_subject_rep is apart
+ *  from jev_subject on nginx: a flood of new subject values, which any
+ *  client can send, fills the trajectories and cannot push a running block
+ *  out. `state` has none, so breaker and adaptive keys stay. */
 const MEMORY_CACHE_ENTRIES = 20000;
 const MEMORY_SUBJECT_ENTRIES = 50000;
+const MEMORY_REPUTATION_ENTRIES = 50000;
 
 const warnedKv = new WeakSet<object>();
 
@@ -178,6 +193,8 @@ export function createRuntime(opts: Options): Runtime {
   // isolate's breaker already queues on
   const subjects = isNamespace(opts.subjectStore) || isNamed(opts.subjectStore) ? durableSubjectStore(opts.subjectStore) : undefined;
   const subjectStore = subjects ?? storeOption(opts.subjectStore, clock, MEMORY_SUBJECT_ENTRIES);
+  // the default memory store only: a store passed in keeps both, as before
+  const reputationStore = opts.subjectStore === undefined ? memoryStore(clock, { maxEntries: MEMORY_REPUTATION_ENTRIES }) : undefined;
   warnKvReputation(config, opts.subjectStore);
   let subjectSession: Runtime["subjectSession"];
   if (subjects) {
@@ -227,8 +244,10 @@ export function createRuntime(opts: Options): Runtime {
   }
   return {
     config, rules, provider, state, opts, perRequest, subjectSession,
+    inflight: { held: 0 },
     cache: bestEffortStore(cache, "cache"),
     subjectStore: bestEffortStore(subjectStore, "subject store"),
+    reputationStore: reputationStore && bestEffortStore(reputationStore, "subject store"),
     breaker: bestEffortBreaker(breaker, { failing }),
     adaptive: bestEffortAdaptive(adaptive, { failing, floor }),
   };
@@ -252,7 +271,7 @@ const HEADER_NAMES = ["X-Jev-Verdict", "X-Jev-Score", "X-Jev-Source", "X-Jev-Rea
 const SUBJECT_HEADER = "x-jev-subject";
 
 /** Is the inbound X-Jev-Subject header the one this deployment consumes (hashed id from another jev-edge)? */
-function consumesSubjectHeader(cfg: core.Config): boolean {
+export function consumesSubjectHeader(cfg: core.Config): boolean {
   const s = cfg.subject;
   return !!(s?.enabled && s.from === "header" && typeof s.name === "string" && s.name.toLowerCase() === SUBJECT_HEADER);
 }
@@ -518,6 +537,10 @@ async function subjectCtx(
     const s = candidate ? await rt.subjectSession(id) : null;
     return {
       id,
+      // every id, as below: repBlocked and repRecord check and charge each.
+      // The load read the first one's keys; another id's are read from its
+      // own object (cf/stores.ts, loaded falls back to the routed store).
+      ids,
       history: s?.history ?? null,
       store: s ? bestEffortStore(s.store, "subject store") : rt.subjectStore,
       record: (e) => {
@@ -549,8 +572,9 @@ async function subjectCtx(
     // ring layout (incr + one key per entry) when the store has incr, so
     // concurrent requests do not lose entries; the one-list layout otherwise
     history,
-    // reputation counters (subject.reputation); atomic where the store has incr
-    store,
+    // reputation counters (subject.reputation); atomic where the store has
+    // incr. In memory a store of their own, which trajectories cannot evict.
+    store: rt.reputationStore ?? store,
     record: (e) => {
       const p = subjectMod.appendHistory(store, id, e, scfg.max_entries, scfg.history_ttl ?? 3600).catch(() => {});
       // On Workers the isolate may be torn down right after the response;
@@ -651,23 +675,38 @@ async function evaluateInner(request: Request, rt: Runtime, requestId: string, r
   const subject = await subjectCtx(rt, request, info.clientIp, candidate, rctx);
   if (subject?.id) info.subjectId = subject.id;
   const { breaker, adaptive } = rt.perRequest?.(rctx) ?? rt;
+  // jev.max_inflight caps the L2 calls in flight, as resty/jev/http.lua
+  // does: past it a call is refused as judge.BUSY before it reaches the
+  // provider, which core passes as an error that does not count against the
+  // breaker. Counted in this isolate only (Runtime.inflight). Each call of
+  // call_many takes its own slot, and a slot is given back however the call
+  // ends: an answer, an error, a timeout or a throw.
+  const inflight = (rt.inflight ??= { held: 0 });
+  const maxInflight = Number(rt.config.jev.max_inflight);
+  const cap = Number.isFinite(maxInflight) ? maxInflight : 64;
   const judgeOnce = async (prompt: core.Prompt): Promise<core.JudgeResult> => {
-    const timeoutMs = await adaptive.current();
-    const t0 = Date.now();
-    const r = await rt.provider.call(prompt, rt.config.jev, timeoutMs, info);
-    const elapsed = Date.now() - t0;
-    if (r[0]) {
-      // the sample only serves later requests: past the response where the host can keep it alive
-      const p = adaptive.success(elapsed).catch(() => {});
-      if (!keepAlive(rctx, p)) await p;
+    if (inflight.held + 1 > cap) return [null, core.judge.BUSY];
+    inflight.held++;
+    try {
+      const timeoutMs = await adaptive.current();
+      const t0 = Date.now();
+      const r = await rt.provider.call(prompt, rt.config.jev, timeoutMs, info);
+      const elapsed = Date.now() - t0;
+      if (r[0]) {
+        // the sample only serves later requests: past the response where the host can keep it alive
+        const p = adaptive.success(elapsed).catch(() => {});
+        if (!keepAlive(rctx, p)) await p;
+      }
+      // a timeout by its kind: an HTTP error whose message says "timeout"
+      // (openai-compat quotes the provider's) is not one; the error string
+      // only for a provider that gives no kind
+      else if (r[2] === core.judge.TIMEOUT || (r[2] === undefined && String(r[1]).includes("timeout"))) {
+        await adaptive.timeout(timeoutMs);
+      }
+      return r;
+    } finally {
+      inflight.held--;
     }
-    // a timeout by its kind: an HTTP error whose message says "timeout"
-    // (openai-compat quotes the provider's) is not one; the error string
-    // only for a provider that gives no kind
-    else if (r[2] === core.judge.TIMEOUT || (r[2] === undefined && String(r[1]).includes("timeout"))) {
-      await adaptive.timeout(timeoutMs);
-    }
-    return r;
   };
   const ctx: core.Ctx = {
     config: rt.config,

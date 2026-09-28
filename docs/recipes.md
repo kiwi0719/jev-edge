@@ -71,7 +71,7 @@ spec:
     spec:
       containers:
         - name: jev-edge
-          image: registry.example.com/jev-edge:0.6.3   # your OpenResty image with the files above
+          image: registry.example.com/jev-edge:0.6.4   # your OpenResty image with the files above
           ports: [{ containerPort: 8080 }]
           env:
             - name: TYPESAFE_API_KEY                  # jev.api_key_env; `env TYPESAFE_API_KEY;` in nginx.conf
@@ -227,7 +227,7 @@ jev-edge's `x-envoy-auth-headers-to-remove` clears a client's other `X-Jev-*` he
 
 ## Azure API Management
 
-An inbound policy on the API or the operations that carry natural language. `send-request` with `ignore-error="true"` and the null check are the fail-open.
+An inbound policy on the API or the operations that carry natural language. `send-request` with `ignore-error="true"` and the null check are the fail-open. A block is a 4xx that carries `X-Jev-Verdict`, whatever its status (`policy.block_status` can be any 4xx), and goes back to the client with jev-edge's status and body. A 4xx without `X-Jev-Verdict` is the nginx in front of jev-edge refusing the request, not a verdict, and the request goes on as `error`.
 
 ```xml
 <inbound>
@@ -244,15 +244,23 @@ An inbound policy on the API or the operations that carry natural language. `sen
     </set-header>
     <set-body>@((string)context.Variables["jevBody"])</set-body>
   </send-request>
+  <set-variable name="jevBlocked" value="@{
+    var r = context.Variables.GetValueOrDefault<IResponse>("jev");
+    return r != null && r.StatusCode >= 400 && r.StatusCode < 500
+      && r.Headers.GetValueOrDefault("X-Jev-Verdict", "") != "";
+  }" />
   <choose>
-    <when condition="@(context.Variables["jev"] != null && ((IResponse)context.Variables["jev"]).StatusCode == 403)">
+    <when condition="@((bool)context.Variables["jevBlocked"])">
       <return-response>
-        <set-status code="403" reason="Forbidden" />
-        <set-header name="Content-Type" exists-action="override"><value>application/json</value></set-header>
+        <set-status code="@(((IResponse)context.Variables["jev"]).StatusCode)"
+                    reason="@(((IResponse)context.Variables["jev"]).StatusReason)" />
+        <set-header name="Content-Type" exists-action="override">
+          <value>@(((IResponse)context.Variables["jev"]).Headers.GetValueOrDefault("Content-Type", "application/json"))</value>
+        </set-header>
         <set-header name="X-Jev-Verdict" exists-action="override">
           <value>@(((IResponse)context.Variables["jev"]).Headers.GetValueOrDefault("X-Jev-Verdict", "malicious"))</value>
         </set-header>
-        <set-body>{"error":"request rejected"}</set-body>
+        <set-body>@(((IResponse)context.Variables["jev"]).Body.As<string>())</set-body>
       </return-response>
     </when>
     <when condition="@(context.Variables["jev"] != null)">
@@ -281,10 +289,10 @@ An inbound policy on the API or the operations that carry natural language. `sen
 
 ## Google Apigee
 
-Three policies on the proxy request flow: a `ServiceCallout` to jev-edge, an `AssignMessage` that copies the verdict headers onto the request, and a `RaiseFault` conditioned on a 403. `<Response>` on a failed callout leaves the status variable empty, so the fault condition is false and the request continues: fail-open.
+Three policies on the proxy request flow: a `ServiceCallout` to jev-edge, an `AssignMessage` that copies the verdict headers onto the request, and a `RaiseFault` for a block: a 4xx that carries `X-Jev-Verdict`, whatever its status (`policy.block_status` can be any 4xx), passed to the client with jev-edge's status and body. `continueOnError="true"` is the fail-open: without it a callout that times out or cannot connect raises a fault, and the proxy answers with an error instead of going on. `success.codes` makes a 4xx or 5xx answer a response to read rather than a callout fault, which `continueOnError` would skip past with `jevResponse` unread. A failed callout leaves `jevResponse` unset, so neither condition below holds and the request continues.
 
 ```xml
-<ServiceCallout name="SC-JevEdge">
+<ServiceCallout name="SC-JevEdge" continueOnError="true">
   <Request variable="jevRequest">
     <Set>
       <Verb>POST</Verb>
@@ -300,6 +308,10 @@ Three policies on the proxy request flow: a `ServiceCallout` to jev-edge, an `As
   <Response>jevResponse</Response>
   <Timeout>2000</Timeout>
   <HTTPTargetConnection>
+    <Properties>
+      <!-- a block (4xx) or a 5xx is an answer to read, not a callout fault -->
+      <Property name="success.codes">1xx,2xx,3xx,4xx,5xx</Property>
+    </Properties>
     <URL>https://jev-edge.internal.example.com</URL>
   </HTTPTargetConnection>
 </ServiceCallout>
@@ -324,13 +336,13 @@ Three policies on the proxy request flow: a `ServiceCallout` to jev-edge, an `As
 <RaiseFault name="RF-JevBlock">
   <FaultResponse>
     <Set>
-      <StatusCode>403</StatusCode>
-      <ReasonPhrase>Forbidden</ReasonPhrase>
+      <StatusCode>{jevResponse.status.code}</StatusCode>
+      <ReasonPhrase>{jevResponse.reason.phrase}</ReasonPhrase>
       <Headers>
-        <Header name="Content-Type">application/json</Header>
+        <Header name="Content-Type">{jevResponse.header.Content-Type}</Header>
         <Header name="X-Jev-Verdict">{jevResponse.header.X-Jev-Verdict}</Header>
       </Headers>
-      <Payload contentType="application/json">{"error":"request rejected"}</Payload>
+      <Payload>{jevResponse.content}</Payload>
     </Set>
   </FaultResponse>
 </RaiseFault>
@@ -340,7 +352,7 @@ Flow, in order:
 
 ```xml
 <Step><Name>SC-JevEdge</Name><Condition>request.verb = "POST" and (proxy.pathsuffix MatchesPath "/v1/**")</Condition></Step>
-<Step><Name>RF-JevBlock</Name><Condition>jevResponse.status.code = 403</Condition></Step>
+<Step><Name>RF-JevBlock</Name><Condition>jevResponse.status.code >= 400 and jevResponse.status.code < 500 and jevResponse.header.X-Jev-Verdict != null</Condition></Step>
 <Step><Name>AM-JevHeaders</Name><Condition>jevResponse.status.code = 200</Condition></Step>
 ```
 
@@ -348,4 +360,4 @@ Set `<Timeout>` below the proxy's own target timeout. If a callout to jev-edge f
 
 ## Anything else
 
-The pattern is always the same three lines: forward the body with `X-Forwarded-For` to `/_jev/authz` plus the original path, copy `X-Jev-*` from the answer to the upstream request, turn a 403 into a 403. The forward-auth adapter covers Traefik, Caddy and nginx `auth_request`; HAProxy has its own agent in `adapters/haproxy`. If your gateway can only send headers and not the body, you get what those get: path, method and reputation checks, and `skipped` with reason `no body` for the rest.
+The pattern is always the same three lines: forward the body with `X-Forwarded-For` to `/_jev/authz` plus the original path, copy `X-Jev-*` from the answer to the upstream request, turn a 4xx that carries `X-Jev-Verdict` into the same status and body. The forward-auth adapter covers Traefik, Caddy and nginx `auth_request`; HAProxy has its own agent in `adapters/haproxy`. If your gateway can only send headers and not the body, you get what those get: path, method and reputation checks, and `skipped` with reason `no body` for the rest.

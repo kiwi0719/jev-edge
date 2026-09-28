@@ -108,7 +108,7 @@ func (s *server) Check(ctx context.Context, req *authv3.CheckRequest) (*authv3.C
 	if err != nil {
 		return failOpen(err.Error()), nil
 	}
-	for k, v := range httpReq.GetHeaders() {
+	for k, v := range requestHeaders(httpReq) {
 		if strings.HasPrefix(k, ":") { // pseudo-headers
 			continue
 		}
@@ -190,6 +190,33 @@ func (s *server) Check(ctx context.Context, req *authv3.CheckRequest) (*authv3.C
 			},
 		},
 	}, nil
+}
+
+// requestHeaders are the request's headers, from whichever field Envoy
+// filled: headers, or header_map alone when the ext_authz filter sets
+// encode_raw_headers (headers is then empty, and a shim that read it alone
+// judged every request without its Content-Type, subject or client
+// headers). A name header_map carries more than once is joined with ",",
+// as Envoy joins it in headers, so the adapter sees the same request
+// either way. A value is raw_value, or value where Envoy set that.
+func requestHeaders(r *authv3.AttributeContext_HttpRequest) map[string]string {
+	hm := r.GetHeaderMap().GetHeaders()
+	if len(hm) == 0 {
+		return r.GetHeaders()
+	}
+	out := make(map[string]string, len(hm))
+	for _, h := range hm {
+		k := strings.ToLower(h.GetKey())
+		v := string(h.GetRawValue())
+		if len(h.GetRawValue()) == 0 {
+			v = h.GetValue()
+		}
+		if prev, ok := out[k]; ok {
+			v = prev + "," + v
+		}
+		out[k] = v
+	}
+	return out
 }
 
 // clientHeaders are the headers a block hands to the client: Envoy puts

@@ -15,16 +15,21 @@ local _M = { name = "jev" }
 -- another. Only the four wording fields; anything else is ignored.
 local WORDING = { "instructions", "criteria", "instructions_ctx", "criteria_ctx" }
 
-local function question(name, t, cfg, deployment)
+--- Template `t` of question `name` with this provider's wording from
+-- cfg.questions, or `t` itself when it has none. Shared with openai_compat.
+function _M.wording(name, t, cfg)
   local over = type(cfg.questions) == "table" and cfg.questions[name]
-  if type(over) == "table" then
-    local merged = {}
-    for k, v in pairs(t) do merged[k] = v end
-    for _, k in ipairs(WORDING) do
-      if over[k] ~= nil then merged[k] = over[k] end
-    end
-    t = merged
+  if type(over) ~= "table" then return t end
+  local merged = {}
+  for k, v in pairs(t) do merged[k] = v end
+  for _, k in ipairs(WORDING) do
+    if over[k] ~= nil then merged[k] = over[k] end
   end
+  return merged
+end
+
+local function question(name, t, cfg, deployment)
+  t = _M.wording(name, t, cfg)
   local instr = (deployment and t.instructions_ctx) or t.instructions
   local crit  = (deployment and t.criteria_ctx) or t.criteria
   local q = { type = "noul", instructions = instr }

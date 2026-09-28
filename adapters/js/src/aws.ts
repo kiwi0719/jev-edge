@@ -13,7 +13,8 @@
 // you pass Store implementations (DynamoDB Global Tables is the usual
 // choice; it costs a round trip per lookup). Read the API key from Secrets
 // Manager at cold start and pass it in `config.jev.api_key`.
-import { createRuntime, evaluate, markTruncated, jevHeaderNames, type Options, type Runtime } from "./runtime.js";
+import { createRuntime, evaluate, markTruncated, jevHeaderNames, consumesSubjectHeader, type Options, type Runtime } from "./runtime.js";
+import type { Config } from "./core/defaults.js";
 import { headers as verdictHeaders, newVerdict, ERROR, SRC_ADAPTER } from "./core/verdict.js";
 
 export interface CfHeader { key?: string; value: string }
@@ -45,13 +46,19 @@ let warnedNoBody = false;
  * gives it the header-only treatment ("no body", IP reputation still
  * applies), and the first one in each execution environment is warned
  * about. The request CloudFront forwards is untouched.
+ *
+ * X-Jev-Subject stays when the config consumes it (subject.from = "header",
+ * name = "x-jev-subject": the hashed id another jev-edge in front forwards),
+ * as readReq keeps it on every other host; the forwarded request still loses
+ * it (setJevHeaders), as it loses every client-supplied X-Jev-*.
  */
-function toRequest(cf: CfRequest): Request {
+function toRequest(cf: CfRequest, config: Config): Request {
   const headers = new Headers();
   for (const [name, values] of Object.entries(cf.headers ?? {})) {
     for (const v of values) headers.append(values[0]?.key ?? name, v.value);
   }
-  for (const h of HEADER_NAMES) headers.delete(h);
+  const keep = consumesSubjectHeader(config) ? "x-jev-subject" : undefined;
+  for (const h of HEADER_NAMES) if (h !== keep) headers.delete(h);
   headers.set("x-forwarded-for", cf.clientIp);
   const host = headers.get("host") ?? "edge.local";
   const url = "https://" + host + cf.uri + (cf.querystring ? "?" + cf.querystring : "");
@@ -101,7 +108,7 @@ export function lambdaEdgeHandler(opts: Options): (event: CfEvent) => Promise<Cf
     const cf = event.Records[0].cf.request;
     try {
       rt ??= createRuntime(opts);
-      const { verdict, response, requestId, subjectId } = await evaluate(toRequest(cf), rt);
+      const { verdict, response, requestId, subjectId } = await evaluate(toRequest(cf, rt.config), rt);
       if (response) {
         const headers: Record<string, CfHeader[]> = {};
         response.headers.forEach((v, k) => (headers[k] = [{ key: k, value: v }]));

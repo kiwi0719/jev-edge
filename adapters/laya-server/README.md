@@ -34,7 +34,7 @@ docker run --rm -p 8080:8080 -v /path/to/finetuned:/model:ro \
 | `LAYA_WORKERS` | CPUs / `LAYA_ORT_THREADS` | requests scored at once. `mock` defaults to the CPUs, `python` to `1`, because your scorer may not be thread-safe |
 | `LAYA_GATEWAY_TIMEOUT_MS` | `500` | the gateway's `jev.timeout_ms` (the lowest, when several gateways call this server; 500 in the profile). A request waits for a free worker only while it can still be answered within half of it, and otherwise gets `503 overloaded` (below) |
 | `LAYA_BACKLOG` | `1024` | listen backlog: at least the sum of `jev.max_inflight` over the gateways that call this server. The kernel caps it (`net.core.somaxconn` on Linux, logged at start when lower) |
-| `LAYA_MAX_CONNECTIONS` | `1024` | open connections; the next one is answered `503 overloaded` and closed |
+| `LAYA_MAX_CONNECTIONS` | `1024` | open connections; the next one is answered `503 overloaded` and closed before its request is read, a `/healthz` probe too |
 | `LAYA_IDLE_TIMEOUT_S` | `120` | a connection silent this long is closed, `0` never. Keep it above the gateway's keepalive idle time (60 s) |
 
 CPUs are the CPUs the server may use: the ones it may run on, capped by the container's CPU quota (cgroup `cpu.max`, or `cpu.cfs_quota_us` on cgroup v1), not the host's count. By default `LAYA_WORKERS` x `LAYA_ORT_THREADS` stays within them. Past them, the requests in flight take turns on the CPUs and all slow down together. The server logs the sizes it chose at start, and warns when the ones you set go past the CPUs.

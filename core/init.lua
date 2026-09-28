@@ -223,12 +223,17 @@ local function plan(req, cfg, hash, rule, text, windowed, chunks, capped, untrus
   local p = { whole = whole, fp = normalize.fingerprint(whole, { prefix_bytes = cfg.cache.fp_prefix_bytes }, hash) }
   local uspec = untrusted and defaults.untrusted_spec(cfg, rule)
   -- The whole request's entry. Judged in parts, it names the parts in its
-  -- scope, so it never answers for the same text judged in one piece.
+  -- scope, so it never answers for the same text judged in one piece. Text
+  -- over max_judge_chunks is fingerprinted by the window judged, not by what
+  -- the window left out: its entry is scoped apart, so a short text that
+  -- reads like the window never answers for it.
   local over
-  if uspec or tools then
+  local cut = capped and chunks and #chunks > 1
+  if uspec or tools or cut then
     local names = { table.concat(rule.templates or {}, ",") }
     if uspec then names[#names + 1] = "+" .. table.concat(uspec.templates, ",") end
     if tools then names[#names + 1] = "+tools" end
+    if cut then names[#names + 1] = "+capped" end
     over = { templates = names }
   end
   p.key = p.fp ~= "" and _M.cache_key(p.fp, rule, cfg, hash, over) or nil
@@ -378,7 +383,10 @@ local function judge_parts(ctx, rule, parts, suffix, fp, ckey, reason)
   local action, label, async = policy.decide(best, cfg.policy)
   local why = top ~= "" and (top .. " " .. string.format("%.2f", best)) or reason
   if top ~= "" then why = why .. suffix end
-  if ckey and ctx.cache and not left_out then
+  -- Only when every part answered: a score that blocks with a part failed
+  -- is not the score of the whole request, and would outlive a threshold
+  -- change (l3_result writes it the same way).
+  if ckey and ctx.cache and not left_out and not err then
     ctx.cache:set(ckey, { score = best, reason = why, rep = rep }, cfg.cache.fp_ttl)
   end
   -- a part left out (its prompt could not be built): the score is for less
@@ -438,6 +446,21 @@ function _M.evaluate(req, ctx)
   local p = plan(req, cfg, ctx.hash, rule, text, windowed, chunks, capped, untrusted, tools, retrieved)
   local fp, ckey = p.fp, p.key
 
+  -- capped --------------------------------------------------------------
+  -- max_judge_chunks > 1 was the operator's choice to judge long text in
+  -- full; what still did not fit is unjudgeable, and policy.unjudgeable
+  -- decides as it does for any other unreadable request. An L1 decision
+  -- that needs no provider: an open breaker must not turn it into a pass.
+  -- It comes before trust and the cache too: both speak for the window
+  -- judged, never for the text the window left out.
+  if chunks and #chunks > 1 and capped and cfg.policy.unjudgeable == "block"
+     and cfg.policy.mode == "enforce" then
+    return finish(ctx, verdict.new({
+      action = verdict.ACTION_BLOCK, verdict = verdict.SKIPPED, source = verdict.SRC_L1,
+      reason = "unjudgeable: text over max_judge_chunks", fingerprint = fp,
+    }))
+  end
+
   -- trust ---------------------------------------------------------------
   -- An operator called this exact text a false positive. Checked before the
   -- verdict cache so it wins over a stale malicious score for the same text.
@@ -472,19 +495,6 @@ function _M.evaluate(req, ctx)
         source = verdict.SRC_CACHE, reason = hit.reason or reason, fingerprint = fp,
       }), rep)
     end
-  end
-
-  -- capped --------------------------------------------------------------
-  -- max_judge_chunks > 1 was the operator's choice to judge long text in
-  -- full; what still did not fit is unjudgeable, and policy.unjudgeable
-  -- decides as it does for any other unreadable request. An L1 decision
-  -- that needs no provider: an open breaker must not turn it into a pass.
-  if chunks and #chunks > 1 and capped and cfg.policy.unjudgeable == "block"
-     and cfg.policy.mode == "enforce" then
-    return finish(ctx, verdict.new({
-      action = verdict.ACTION_BLOCK, verdict = verdict.SKIPPED, source = verdict.SRC_L1,
-      reason = "unjudgeable: text over max_judge_chunks", fingerprint = fp,
-    }))
   end
 
   -- breaker -------------------------------------------------------------

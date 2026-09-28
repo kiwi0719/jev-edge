@@ -331,7 +331,8 @@ async function judgeParts(
   let why = top !== "" ? `${top} ${verdict.format2(score)}` : reason;
   if (top !== "") why += suffix;
   const cache = ctx.cache;
-  if (ckey && cache && leftOut === undefined) {
+  // only when every part answered (see core/init.lua)
+  if (ckey && cache && leftOut === undefined && err === undefined) {
     await after(ctx, () => cache.set(ckey, { score, reason: why, ...(rep !== undefined ? { rep } : {}) }, cfg.cache.fp_ttl));
   }
   // a part left out: the score is for less than the whole request
@@ -389,6 +390,19 @@ export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
   // the text holds retrieved content: not the subject's own (repOf)
   const textRep: false | undefined = retrieved ? false : undefined;
 
+  // capped ----------------------------------------------------------------
+  // max_judge_chunks > 1: what still did not fit is unjudgeable. An L1
+  // decision that needs no provider, so it comes before the breaker: an open
+  // breaker must not turn it into a pass. It comes before trust and the cache
+  // too: both speak for the window judged, never for what it left out
+  // (core/init.lua).
+  if (chunks && chunks.length > 1 && capped && cfg.policy.unjudgeable === "block" && cfg.policy.mode === "enforce") {
+    return finish(ctx, verdict.newVerdict({
+      action: verdict.ACTION_BLOCK, verdict: verdict.SKIPPED, source: verdict.SRC_L1,
+      reason: "unjudgeable: text over max_judge_chunks", fingerprint: fp,
+    }));
+  }
+
   // trust -----------------------------------------------------------------
   // An operator called this exact text a false positive. Checked before the
   // verdict cache so it wins over a stale malicious score for the same text.
@@ -410,11 +424,16 @@ export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
   // cache -----------------------------------------------------------------
   // The whole request's entry. Judged in parts, it names the parts in its
   // scope, so it never answers for the same text judged in one piece.
+  // Text over max_judge_chunks is fingerprinted by the window judged: its
+  // entry is scoped apart, so a short text that reads like the window never
+  // answers for it (core/init.lua).
   let over: { templates: string[] } | undefined;
-  if (uspec || tools) {
+  const cut = !!(capped && chunks && chunks.length > 1);
+  if (uspec || tools || cut) {
     const names = [(rule?.templates ?? []).join(",")];
     if (uspec) names.push("+" + uspec.templates.join(","));
     if (tools) names.push("+tools");
+    if (cut) names.push("+capped");
     over = { templates: names };
   }
   const ckey = fp !== "" ? cacheKey(fp, rule, cfg, ctx.hash, over) : undefined;
@@ -432,17 +451,6 @@ export async function evaluate(req: Req, ctx: Ctx): Promise<verdict.Verdict> {
         source: verdict.SRC_CACHE, reason: hit.reason ?? reason, fingerprint: fp,
       }), rep);
     }
-  }
-
-  // capped ----------------------------------------------------------------
-  // max_judge_chunks > 1: what still did not fit is unjudgeable. An L1
-  // decision that needs no provider, so it comes before the breaker: an open
-  // breaker must not turn it into a pass (core/init.lua).
-  if (chunks && chunks.length > 1 && capped && cfg.policy.unjudgeable === "block" && cfg.policy.mode === "enforce") {
-    return finish(ctx, verdict.newVerdict({
-      action: verdict.ACTION_BLOCK, verdict: verdict.SKIPPED, source: verdict.SRC_L1,
-      reason: "unjudgeable: text over max_judge_chunks", fingerprint: fp,
-    }));
   }
 
   // breaker ---------------------------------------------------------------

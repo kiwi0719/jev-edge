@@ -871,7 +871,6 @@ class Handler(BaseHTTPRequestHandler):
     timeout = 120  # LAYA_IDLE_TIMEOUT_S, applied to the socket by StreamRequestHandler
 
     access_log = True
-    over_capacity = False  # set on a connection past LAYA_MAX_CONNECTIONS (Server)
 
     def log_message(self, fmt, *args):  # one line per request on stderr
         if self.access_log:
@@ -936,31 +935,14 @@ class Handler(BaseHTTPRequestHandler):
         elif n > 0:
             self._read(n)
 
-    def _shed(self) -> bool:
-        """On a connection past LAYA_MAX_CONNECTIONS: answer 503 and close.
-        Refusing it in the kernel instead would reach the gateway only when
-        its connect budget runs out, as a timeout."""
-        if not self.over_capacity:
-            return False
-        self._drain()
-        self.close_connection = True
-        self._error(Refused(503, "overloaded", f"over {self.server.max_connections} open "
-                                               "connections (LAYA_MAX_CONNECTIONS)"))
-        return True
-
     def do_GET(self):
-        if self.path == "/healthz":  # busy is not unhealthy: probes are answered even past the cap
-            self.close_connection = self.close_connection or self.over_capacity
+        if self.path == "/healthz":
             return self._send(200, {"status": "ok", "model": self.model_name})
-        if self._shed():
-            return
         if self.path == PATH:
             return self._error(Refused(405, "method_not_allowed", "use POST"))
         return self._error(Refused(404, "not_found", "no such path"))
 
     def do_PUT(self):
-        if self._shed():
-            return
         self._drain()
         if self.path == PATH:
             return self._error(Refused(405, "method_not_allowed", "use POST"))
@@ -969,8 +951,6 @@ class Handler(BaseHTTPRequestHandler):
     do_DELETE = do_PATCH = do_PUT
 
     def do_POST(self):
-        if self._shed():
-            return
         if self.path != PATH:
             self._drain()
             return self._error(Refused(404, "not_found", "no such path"))
@@ -1028,6 +1008,12 @@ class Server(ThreadingHTTPServer):
     LAYA_BACKLOG, and a connection past LAYA_MAX_CONNECTIONS is still
     accepted and answered 503: the gateway sees that at once, and this
     server's log says why.
+
+    That 503 is written by the accepting thread, before any is started for
+    the connection, and without reading the request: a thread per refused
+    connection that waited for its headers (LAYA_IDLE_TIMEOUT_S) and read
+    its body (LAYA_MAX_BODY_BYTES) let a client that opens connections and
+    sends nothing hold a thread and a socket each, past the cap.
     """
 
     daemon_threads = True
@@ -1042,15 +1028,49 @@ class Server(ThreadingHTTPServer):
         self.max_connections = max_connections
         self.connections = 0
         self._count = threading.Lock()
-        self.shed_handler = type(handler.__name__ + "Shed", (handler,), {"over_capacity": True})
+        body = json.dumps({"error": {"code": "overloaded", "message": f"over {max_connections} open "
+                                     "connections (LAYA_MAX_CONNECTIONS)"}}).encode()
+        self.shed_response = (b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\n"
+                              b"Content-Length: %d\r\nConnection: close\r\n\r\n" % len(body)) + body
         super().__init__(address, handler, bind_and_activate=activate)
 
-    def process_request_thread(self, request, client_address):
+    def process_request(self, request, client_address):
         with self._count:
-            self.connections += 1
-            over = self.connections > self.max_connections
+            over = self.connections >= self.max_connections
+            if not over:
+                self.connections += 1
+        if over:
+            return self.shed(request, client_address)
         try:
-            (self.shed_handler if over else self.RequestHandlerClass)(request, client_address, self)
+            super().process_request(request, client_address)  # starts the thread
+        except BaseException:
+            with self._count:
+                self.connections -= 1
+            raise
+
+    def shed(self, request, client_address) -> None:
+        """A connection past LAYA_MAX_CONNECTIONS: the fixed 503, then close,
+        in the accepting thread. The socket never blocks it (a client that
+        does not read gets no 503, and the accept loop never waits on it);
+        what the client already sent is read off and dropped unparsed, so the
+        close does not reset the connection before it reads the 503."""
+        try:
+            request.settimeout(0)
+            request.send(self.shed_response)
+            request.shutdown(socket.SHUT_WR)
+            for _ in range(4):
+                if not request.recv(65536):
+                    break
+        except OSError:
+            pass
+        finally:
+            request.close()
+        sys.stderr.write("%s overloaded: over %d open connections (LAYA_MAX_CONNECTIONS)\n"
+                         % (client_address[0], self.max_connections))
+
+    def process_request_thread(self, request, client_address):
+        try:
+            self.RequestHandlerClass(request, client_address, self)
         except Exception:
             self.handle_error(request, client_address)
         finally:

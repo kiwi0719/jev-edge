@@ -96,6 +96,11 @@ export interface Runtime {
    *  (durableSubjectStore); null when that read failed, logged once per
    *  outage. Absent otherwise, and a request reads `subjectStore` per key. */
   subjectSession?: (id: string) => Promise<SubjectSession | null>;
+  /** L2 calls in flight from this runtime, capped by jev.max_inflight
+   *  (judgeOnce). Per isolate: a counter in memory, not shared across
+   *  isolates or processes. Absent on a Runtime built by hand, which then
+   *  gets one on its first judged request. */
+  inflight?: { held: number };
   opts: Options;
 }
 
@@ -227,6 +232,7 @@ export function createRuntime(opts: Options): Runtime {
   }
   return {
     config, rules, provider, state, opts, perRequest, subjectSession,
+    inflight: { held: 0 },
     cache: bestEffortStore(cache, "cache"),
     subjectStore: bestEffortStore(subjectStore, "subject store"),
     breaker: bestEffortBreaker(breaker, { failing }),
@@ -655,23 +661,38 @@ async function evaluateInner(request: Request, rt: Runtime, requestId: string, r
   const subject = await subjectCtx(rt, request, info.clientIp, candidate, rctx);
   if (subject?.id) info.subjectId = subject.id;
   const { breaker, adaptive } = rt.perRequest?.(rctx) ?? rt;
+  // jev.max_inflight caps the L2 calls in flight, as resty/jev/http.lua
+  // does: past it a call is refused as judge.BUSY before it reaches the
+  // provider, which core passes as an error that does not count against the
+  // breaker. Counted in this isolate only (Runtime.inflight). Each call of
+  // call_many takes its own slot, and a slot is given back however the call
+  // ends: an answer, an error, a timeout or a throw.
+  const inflight = (rt.inflight ??= { held: 0 });
+  const maxInflight = Number(rt.config.jev.max_inflight);
+  const cap = Number.isFinite(maxInflight) ? maxInflight : 64;
   const judgeOnce = async (prompt: core.Prompt): Promise<core.JudgeResult> => {
-    const timeoutMs = await adaptive.current();
-    const t0 = Date.now();
-    const r = await rt.provider.call(prompt, rt.config.jev, timeoutMs, info);
-    const elapsed = Date.now() - t0;
-    if (r[0]) {
-      // the sample only serves later requests: past the response where the host can keep it alive
-      const p = adaptive.success(elapsed).catch(() => {});
-      if (!keepAlive(rctx, p)) await p;
+    if (inflight.held + 1 > cap) return [null, core.judge.BUSY];
+    inflight.held++;
+    try {
+      const timeoutMs = await adaptive.current();
+      const t0 = Date.now();
+      const r = await rt.provider.call(prompt, rt.config.jev, timeoutMs, info);
+      const elapsed = Date.now() - t0;
+      if (r[0]) {
+        // the sample only serves later requests: past the response where the host can keep it alive
+        const p = adaptive.success(elapsed).catch(() => {});
+        if (!keepAlive(rctx, p)) await p;
+      }
+      // a timeout by its kind: an HTTP error whose message says "timeout"
+      // (openai-compat quotes the provider's) is not one; the error string
+      // only for a provider that gives no kind
+      else if (r[2] === core.judge.TIMEOUT || (r[2] === undefined && String(r[1]).includes("timeout"))) {
+        await adaptive.timeout(timeoutMs);
+      }
+      return r;
+    } finally {
+      inflight.held--;
     }
-    // a timeout by its kind: an HTTP error whose message says "timeout"
-    // (openai-compat quotes the provider's) is not one; the error string
-    // only for a provider that gives no kind
-    else if (r[2] === core.judge.TIMEOUT || (r[2] === undefined && String(r[1]).includes("timeout"))) {
-      await adaptive.timeout(timeoutMs);
-    }
-    return r;
   };
   const ctx: core.Ctx = {
     config: rt.config,

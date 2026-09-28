@@ -426,8 +426,8 @@ class Http(unittest.TestCase):
 
     def test_conformance_catches_silent_truncation(self):
         class Truncating(L.Scorer):
-            def windows(self, first, text, spans=None):
-                return super().windows(first, text, spans)[:1]   # the bug the suite exists for
+            def windows(self, first, text, spans=None, counts=None):
+                return super().windows(first, text, spans, counts)[:1]   # the bug the suite exists for
 
         srv, url = serve()
         srv.RequestHandlerClass.scorer = Truncating(L.MockBackend())
@@ -436,8 +436,15 @@ class Http(unittest.TestCase):
         finally:
             srv.shutdown()
             srv.server_close()
-        self.assertEqual(rc, 1)
-        self.assertIn("FAIL  long text: an attack at the tail is still seen", out)
+        # the one failure is the tail the truncation dropped, not a 500 on
+        # every request (a stub out of step with Scorer.windows' signature
+        # made this test pass on a server that answered nothing)
+        self.assertEqual(rc, 1, out)
+        fails = [ln for ln in out.splitlines() if ln.startswith("FAIL")]
+        self.assertEqual(len(fails), 1, out)
+        self.assertRegex(fails[0], r"^FAIL  long text: an attack at the tail is still seen: "
+                                   r"mock: injection = [\d.]+, want high$")
+        self.assertIn("ok    long text: an attack at the head is still seen", out)
 
     def test_backend_failure_is_a_500_never_a_score(self):
         srv, url = serve()

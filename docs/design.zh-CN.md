@@ -606,7 +606,7 @@ X-Jev-Request-Id: nginx $request_id, to correlate L3 results
 配置分三层，后者覆盖前者：core 默认值 < 配置文件 < shared dict 里的运行时覆盖。
 
 - `init_worker` 里运行 `ngx.timer.every(2, reload)`；文件内容一变（按 CRC-32 和长度判断，签名来自同一次读取，读到的也正是要加载的内容），就重新加载并做校验，规则也一起校验。只 `touch` 一下不会再触发重新加载。新配置无效（包括某条规则写坏了）时继续用之前的配置；拒绝原因会记日志，并出现在 `GET /_jev/config` 的 `config_error` 里，在有效的文件或覆盖生效之前，`/_jev/health` 一直回 503。启动时还没有任何配置在生效，这时被拒的文件会改用默认配置及其规则，只有一条规则写坏的文件则去掉那条规则运行，同样会报告出来。
-- 内部 location `/_jev/config`（放在管理监听端口上，`example.nginx.conf` 里是 `127.0.0.1:9180`）接受 `PUT` JSON，写进覆盖用的 dict，`DELETE` 则清空覆盖。如果发现有正常请求被误拦，就用它回滚：`PUT {"policy":{"mode":"monitor"}}`。覆盖里任何位置出现 JSON `null` 都会被拒绝，并指出它的路径；如果 `DELETE` 之后正在生效的文件会变得无效，就回 422。原始路径里带 `..`、`//`，或者编码过的 `.`、`/`、`\` 时，管理端点会拒绝，因为这种请求只可能是经过 nginx 自己的解码才落到这里的。
+- 内部 location `/_jev/config`（放在管理监听端口上，`example.nginx.conf` 里是 `127.0.0.1:9180`）接受 `PUT` JSON，写进覆盖用的 dict，`DELETE` 则清空覆盖。如果发现有正常请求被误拦，就用它回滚：`PUT {"policy":{"mode":"monitor"}}`。覆盖里任何位置出现 JSON `null` 都会被拒绝，并指出它的路径；如果 `DELETE` 之后正在生效的文件会变得无效，就回 422。`jev_config` dict 没有空间存下的改动回 500，什么也不改。原始路径里带 `..`、`//`，或者编码过的 `.`、`/`、`\` 时，管理端点会拒绝，因为这种请求只可能是经过 nginx 自己的解码才落到这里的。
 - 每个 worker 各自持有一个指向当前配置的普通 Lua table 引用；读配置不需要加锁。
 
 ## 降级矩阵

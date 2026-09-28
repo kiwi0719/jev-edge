@@ -423,3 +423,41 @@ func TestClientAddressAndJevHeadersAreNotRelayed(t *testing.T) {
 		t.Fatalf("without a source address: adapter saw %+v, want %+v", got, want)
 	}
 }
+
+func TestRawHeaderMapIsRelayedLikeHeaders(t *testing.T) {
+	type seen struct{ ct, xea, subject, other, auth string }
+	var got seen
+	var dup []string
+	s, _ := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		got = seen{r.Header.Get("Content-Type"), r.Header.Get("X-Envoy-External-Address"),
+			r.Header.Get("X-Jev-Subject"), r.Header.Get("X-Other"), r.Header.Get("Authorization")}
+		dup = r.Header.Values("X-Dup")
+		w.Header().Set("X-Jev-Verdict", "safe")
+		w.WriteHeader(200)
+	})
+	// encode_raw_headers: true fills header_map, never headers
+	req := checkReq("/v1/chat/completions", nil)
+	req.Attributes.Request.Http.HeaderMap = &corev3.HeaderMap{Headers: []*corev3.HeaderValue{
+		{Key: ":path", RawValue: []byte("/v1/chat/completions")},
+		{Key: "content-type", RawValue: []byte("application/json")},
+		{Key: "authorization", Value: "Bearer from-value"}, // value where raw_value is unset
+		{Key: "x-envoy-external-address", RawValue: []byte("198.51.100.7")},
+		{Key: "x-jev-subject", RawValue: []byte("someone-else")},
+		{Key: "x-other", RawValue: []byte("kept")},
+		{Key: "x-dup", RawValue: []byte("a")},
+		{Key: "X-Dup", RawValue: []byte("b")},
+	}}
+	req.Attributes.Source = &authv3.AttributeContext_Peer{Address: &corev3.Address{Address: &corev3.Address_SocketAddress{
+		SocketAddress: &corev3.SocketAddress{Address: "172.18.0.1", PortSpecifier: &corev3.SocketAddress_PortValue{PortValue: 51234}},
+	}}}
+	if res, _ := s.Check(context.Background(), req); res.GetOkResponse() == nil {
+		t.Fatalf("expected OK, got %v", res)
+	}
+	if want := (seen{"application/json", "172.18.0.1", "", "kept", "Bearer from-value"}); got != want {
+		t.Fatalf("adapter saw %+v, want %+v", got, want)
+	}
+	// joined with ",", as Envoy joins a repeated name in headers
+	if len(dup) != 1 || dup[0] != "a,b" {
+		t.Fatalf("x-dup = %q, want one value \"a,b\"", dup)
+	}
+}

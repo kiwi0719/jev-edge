@@ -1,10 +1,10 @@
 rockspec_format = "3.0"
 package = "lua-resty-jev-edge"
-version = "0.6.3-1"
+version = "0.6.4-1"
 
 source = {
    url = "git+https://github.com/kiwi0719/jev-edge",
-   tag = "v0.6.3",
+   tag = "v0.6.4",
 }
 
 description = {

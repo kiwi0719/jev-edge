@@ -17976,7 +17976,7 @@
       "name": "custom cache ttl and prefix"
     }
   ],
-  "core_version": "0.6.3",
+  "core_version": "0.6.4",
   "format_version": 2,
   "generated_by": "core/golden/gen.lua",
   "suite": "evaluate"

@@ -518,6 +518,10 @@ async function subjectCtx(
     const s = candidate ? await rt.subjectSession(id) : null;
     return {
       id,
+      // every id, as below: repBlocked and repRecord check and charge each.
+      // The load read the first one's keys; another id's are read from its
+      // own object (cf/stores.ts, loaded falls back to the routed store).
+      ids,
       history: s?.history ?? null,
       store: s ? bestEffortStore(s.store, "subject store") : rt.subjectStore,
       record: (e) => {

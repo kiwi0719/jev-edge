@@ -230,6 +230,31 @@ describe("subject reputation in the JevState namespace: one object per subject",
     }
   });
 
+  it("a cookie sent twice is checked on every id, not only the first (sid=fresh; sid=banned)", async () => {
+    const { ns, objects } = gatedNamespace();
+    const kept: Promise<unknown>[] = [];
+    const rctx: RequestCtx = { waitUntil: (p) => { kept.push(p); } };
+    const cfg = { ...REP(5), subject: { enabled: true, from: "cookie" as const, name: "sid", salt: "pepper", reputation: { block_at: 5 } } };
+    const r = createRuntime({ config: cfg, subjectStore: ns });
+    const cookie = (c: string, body: string, extra: Record<string, string> = {}) => new Request("https://edge.example/v1/chat/completions", {
+      method: "POST", body, headers: { "content-type": "application/json", cookie: c, "x-forwarded-for": "203.0.113.7", ...extra },
+    });
+    for (let i = 0; i < 2; i++) await evaluate(cookie("sid=banned", ATTACK.replace("print", "print " + i), { "x-jev-mock-score": "0.97" }), r, rctx);
+    await Promise.all(kept.splice(0));
+    const alone = await evaluate(cookie("sid=banned", BENIGN), r, rctx);
+    expect(alone.verdict.reason).toBe("subject reputation");
+    const dup = await evaluate(cookie("sid=fresh; sid=banned", BENIGN), r, rctx);
+    expect([dup.verdict.source, dup.verdict.reason]).toEqual(["l1", "subject reputation"]);
+    expect(dup.subjectId).not.toBe(alone.subjectId); // the trajectory is still the first id's
+    await Promise.all(kept.splice(0));
+    // and a malicious verdict under both ids charges the second one's own object too
+    const both = await evaluate(cookie("sid=other; sid=second", ATTACK.replace("print", "print 9"), { "x-jev-mock-score": "0.97" }), r, rctx);
+    await Promise.all(kept.splice(0));
+    const second = (await evaluate(cookie("sid=second", BENIGN), r, rctx)).subjectId!;
+    expect(points(objects.get("jev-subject:" + both.subjectId)!.mem)).toBe(3);
+    expect(points(objects.get("jev-subject:" + second)!.mem)).toBe(3);
+  });
+
   it("a JevState of an older build (404 on /subject) is read and written per key, and still counts", async () => {
     const { ns, objects, hops } = gatedNamespace({ legacy: true });
     const kept: Promise<unknown>[] = [];

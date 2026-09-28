@@ -68,6 +68,22 @@ describe("subject reputation", () => {
     expect(((await res.json()) as Record<string, string>).verdict).toBe("safe");
   });
 
+  it("a flood of trajectories in the default memory store does not evict a running block", async () => {
+    const r = rt();
+    for (let i = 0; i < 2; i++) await handle(post(ATTACK.replace("print", "print " + i), "key-A", { "x-jev-mock-score": "0.97" }), r, seen);
+    expect((await handle(post(BENIGN, "key-A"), r, seen)).status).toBe(403);
+    // what random subject values write: one new ring past the store's cap
+    for (let i = 0; i <= 50_000; i++) {
+      await subject.appendHistory(r.subjectStore, "header:" + i.toString(16), { at: 0, subject: "x", verdict: "safe" } as never, 1, 3600);
+    }
+    const res = await handle(post(BENIGN, "key-A", { "x-forwarded-for": "198.51.100.77" }), r, seen);
+    expect(res.status).toBe(403);
+    expect(lastReason).toBe("subject reputation");
+    // a subjectStore passed in keeps both, as before
+    const own = memoryStore();
+    expect(createRuntime({ config: r.config, subjectStore: own }).reputationStore).toBeUndefined();
+  });
+
   it("is off by default", async () => {
     const r = createRuntime({
       config: {

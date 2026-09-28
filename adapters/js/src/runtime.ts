@@ -51,7 +51,8 @@ export interface Options {
    *  both idFromName and get. */
   state?: StateTarget | Store;
   /** Store for per-subject trajectories and reputation: KV, the JevState Durable Object or any Store. Memory
-   *  (per isolate, the 50000 most recently used entries) if absent; the Cloudflare presets pass their Durable
+   *  (per isolate) if absent: the 50000 most recently used trajectory entries, and reputation in a store of
+   *  its own (another 50000), which a flood of trajectories cannot evict; the Cloudflare presets pass their Durable
    *  Object when config.subject.reputation is on. Only used with config.subject.enabled. The JevState
    *  namespace (or `{ namespace, name }`) keeps each subject in an object of its own (durableSubjectStore:
    *  `jev-subject:<id>`, atomic and consistent everywhere), and a judged request makes one hop to it before
@@ -84,6 +85,10 @@ export interface Runtime {
   cache: Store;
   state: Store;
   subjectStore: Store;
+  /** Reputation points and blocks, apart from the trajectories in
+   *  `subjectStore`, when that is the default memory store; absent (both in
+   *  `subjectStore`) when a subjectStore was passed. */
+  reputationStore?: Store;
   breaker: BreakerLike;
   adaptive: AdaptiveLike;
   /** With `state` a JevState: the breaker and adaptive one judged request
@@ -142,9 +147,14 @@ function storeOption(x: KVLike | StateTarget | Store | undefined, clock: () => n
 
 /** Caps of the default memory stores (least recently used out past them):
  *  one cache entry per judged text, and a subject's ring takes max_entries
- *  + 1 keys. `state` has none, so breaker and adaptive keys stay. */
+ *  + 1 keys. Reputation has a store of its own (at most three small keys a
+ *  subject: the block and two windows' points), as jev_subject_rep is apart
+ *  from jev_subject on nginx: a flood of new subject values, which any
+ *  client can send, fills the trajectories and cannot push a running block
+ *  out. `state` has none, so breaker and adaptive keys stay. */
 const MEMORY_CACHE_ENTRIES = 20000;
 const MEMORY_SUBJECT_ENTRIES = 50000;
+const MEMORY_REPUTATION_ENTRIES = 50000;
 
 const warnedKv = new WeakSet<object>();
 
@@ -183,6 +193,8 @@ export function createRuntime(opts: Options): Runtime {
   // isolate's breaker already queues on
   const subjects = isNamespace(opts.subjectStore) || isNamed(opts.subjectStore) ? durableSubjectStore(opts.subjectStore) : undefined;
   const subjectStore = subjects ?? storeOption(opts.subjectStore, clock, MEMORY_SUBJECT_ENTRIES);
+  // the default memory store only: a store passed in keeps both, as before
+  const reputationStore = opts.subjectStore === undefined ? memoryStore(clock, { maxEntries: MEMORY_REPUTATION_ENTRIES }) : undefined;
   warnKvReputation(config, opts.subjectStore);
   let subjectSession: Runtime["subjectSession"];
   if (subjects) {
@@ -235,6 +247,7 @@ export function createRuntime(opts: Options): Runtime {
     inflight: { held: 0 },
     cache: bestEffortStore(cache, "cache"),
     subjectStore: bestEffortStore(subjectStore, "subject store"),
+    reputationStore: reputationStore && bestEffortStore(reputationStore, "subject store"),
     breaker: bestEffortBreaker(breaker, { failing }),
     adaptive: bestEffortAdaptive(adaptive, { failing, floor }),
   };
@@ -559,8 +572,9 @@ async function subjectCtx(
     // ring layout (incr + one key per entry) when the store has incr, so
     // concurrent requests do not lose entries; the one-list layout otherwise
     history,
-    // reputation counters (subject.reputation); atomic where the store has incr
-    store,
+    // reputation counters (subject.reputation); atomic where the store has
+    // incr. In memory a store of their own, which trajectories cannot evict.
+    store: rt.reputationStore ?? store,
     record: (e) => {
       const p = subjectMod.appendHistory(store, id, e, scfg.max_entries, scfg.history_ttl ?? 3600).catch(() => {});
       // On Workers the isolate may be torn down right after the response;

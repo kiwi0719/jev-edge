@@ -465,9 +465,11 @@ def nfkc_text(nbytes: int) -> str:
 
 
 def check_nfkc(t: Target, body: bytes, nbytes: int, samples: int, budget_ms: float,
-               mock: bool) -> tuple[str | None, str, None]:
+               mock: bool) -> tuple[str | None, str, float | None]:
     """The NFKC-expanding text one at a time: answered 200 and judged whole,
-    the p99 with the headroom, and the input tokens per byte it cost."""
+    the p99 with the headroom, and the input tokens per byte it cost. Returns
+    the p99 too, once measured, for the closing timeout_ms line: with an
+    NFKC normalizer this text, not the ASCII one, can be the slowest."""
     what = f"{nbytes} bytes of U+FDFA one at a time, a text the gateway sends as is (max_judge_bytes)"
     err, lat, data = timed(t, body, samples)
     if err:
@@ -491,8 +493,8 @@ def check_nfkc(t: Target, body: bytes, nbytes: int, samples: int, budget_ms: flo
                if isinstance(tokens, (int, float)) and nbytes > 0 else ""))
     if over_headroom(p99, budget_ms):
         return (f"p99 {p99:.1f} ms {needs(p99, budget_ms)} ({info}). With this tokenizer the NFKC case, "
-                f"not the ASCII one, is the worst: size timeout_ms and max_judge_bytes from it"), info, None
-    return None, info, None
+                f"not the ASCII one, is the worst: size timeout_ms and max_judge_bytes from it"), info, p99
+    return None, info, p99
 
 
 def at_once(t: Target, body: bytes, warm: bytes, n: int, rounds: int) -> list:
@@ -618,20 +620,34 @@ def span(ms: float) -> str:
     return f"{lo}-{hi}" if hi > lo else f"{hi}"
 
 
-def timeout_line(w: Worst, short: float) -> str:
+def timeout_line(w: Worst, short: float, nfkc: float = 0.0) -> str:
     """The closing advice: the timeout_ms that covers the worst case at the
     gateway's concurrency; when the server did not answer that many at once,
     what one at a time needs and, if that fits the budget, the max_inflight
-    the server holds at it."""
+    the server holds at it. nfkc: the NFKC text's p99 one at a time
+    (check_nfkc), 0 when not measured. The line sizes from the slower of the
+    two texts: from the ASCII one alone, it advised a timeout_ms that the
+    NFKC text, sent by any client, overran."""
     also = f"; short text: {short:.1f} ms" if short else ""
+    nf = f"; NFKC text alone: {nfkc:.1f} ms" if nfkc else ""
     why = (". Size the gateway's floor from the worst case: the client chooses the text, and how many "
            "it sends at once.")
-    if w.together is not None:
+    if w.together is not None and w.together >= nfkc:
         return (f"timeout_ms: {span(w.together)}, {HEADROOM[0]}-{HEADROOM[1]}x the worst-case p99 of "
-                f"{w.together:.1f} ms with {w.n} at once (alone: {w.alone:.1f} ms{also})" + why)
-    head = f"timeout_ms: {span(w.alone)} for the worst case one at a time (p99 {w.alone:.1f} ms{also}). "
-    if over_headroom(w.alone, w.budget_ms):
-        return head + (f"Run again with --budget-ms {math.ceil(w.alone * HEADROOM[0])} or more to see how many "
+                f"{w.together:.1f} ms with {w.n} at once (alone: {w.alone:.1f} ms{nf}{also})" + why)
+    if w.together is not None:
+        return (f"timeout_ms: {span(nfkc)} or more, {HEADROOM[0]}-{HEADROOM[1]}x the NFKC text's p99 of "
+                f"{nfkc:.1f} ms one at a time, over the ASCII worst case's {w.together:.1f} ms with {w.n} at "
+                f"once (alone: {w.alone:.1f} ms{also}). The NFKC text was timed one at a time only: {w.n} of "
+                f"it at once take longer still") + why
+    alone = max(w.alone, nfkc)
+    if nfkc > w.alone:
+        head = (f"timeout_ms: {span(alone)} for the NFKC text one at a time (p99 {alone:.1f} ms; ASCII "
+                f"worst case alone: {w.alone:.1f} ms{also}). ")
+    else:
+        head = f"timeout_ms: {span(alone)} for the worst case one at a time (p99 {alone:.1f} ms{nf}{also}). "
+    if over_headroom(alone, w.budget_ms):
+        return head + (f"Run again with --budget-ms {math.ceil(alone * HEADROOM[0])} or more to see how many "
                        f"at once the server answers in time") + why
     return head + (f"With {w.n} at once, {w.fit} per round were answered in time at timeout_ms "
                    f"{w.budget_ms:.0f}: set max_inflight to at most {max(1, w.fit or 0)} there, or add "
@@ -720,12 +736,12 @@ def main(argv=None) -> int:
             err, info, m = f"transport error: {e!r}", "", None
         report(name, err, info)
         measured.append(m)
-    short, w = measured[1] or 0.0, measured[2]
+    short, w, nfkc = measured[1] or 0.0, measured[2], measured[3] or 0.0
 
     total = len(vectors) + len(checks) + len(timing)
     print(f"\n{total - failed}/{total} passed" + ("" if args.strict else "  (not --strict: exact error codes not checked)"))
     if w is not None and w.alone:
-        print(timeout_line(w, short))
+        print(timeout_line(w, short, nfkc))
     return 1 if failed else 0
 
 

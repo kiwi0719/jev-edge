@@ -2,7 +2,7 @@
 -- env BODIES=/path/to/file.jsonl  PATH_=/v1/chat/completions  SCORE=0.2|fail|slow
 
 local bodies = {}
-local f = assert(io.open(os.getenv("BODIES") or "/work/bench/datasets/bodies.jsonl", "r"))
+local f = assert(io.open(os.getenv("BODIES") or "/work/bench/out/bodies.jsonl", "r"))
 for line in f:lines() do if #line > 0 then bodies[#bodies + 1] = line end end
 f:close()
 

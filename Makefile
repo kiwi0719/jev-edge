@@ -113,9 +113,10 @@ bench-judge-live:
 	  'resty --http-conf "lua_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt; lua_ssl_verify_depth 5;" \
 	   -I /work/adapters/openresty/lib -I /work /work/bench/judge_robustness.lua --live'
 
+# End-to-end latency in OpenResty (bench/run.sh): make bench [CONN=4] [DUR=10s] [OUT=bench/out-c4]
 bench:
 	docker build -q -t jev-edge-test -f adapters/openresty/Dockerfile.test adapters/openresty
-	docker run --rm --init -v "$(CURDIR)":/work jev-edge-test sh /work/bench/run.sh
+	docker run --rm --init -e CONN -e DUR -e OUT -v "$(CURDIR)":/work jev-edge-test sh /work/bench/run.sh
 
 # Redraw docs/bench-latency-*.svg from a results.txt (default: the 4-connection run)
 # and docs/bench-accuracy-*.svg from the live results committed under bench/datasets.

@@ -12,7 +12,9 @@ cd /work
 apk add --no-cache -q wrk jq procps >/dev/null 2>&1 || true
 DUR=${DUR:-60s}
 mkdir -p /tmp/nx/logs /tmp/nx/conf bench/out
-jq -c '.samples[] | {messages:[{role:"user",content:.text}]}' bench/datasets/jev-sec-bench-injection.json > bench/datasets/bodies.jsonl
+# generated, never committed: bench/out/ is gitignored
+BODIES=/work/bench/out/bodies-soak.jsonl
+jq -c '.samples[] | {messages:[{role:"user",content:.text}]}' bench/datasets/jev-sec-bench-injection.json > $BODIES
 
 cat > /tmp/nx/conf/jev-edge.conf.lua <<'EOF'
 return {
@@ -45,7 +47,7 @@ EOF
 openresty -p /tmp/nx -c /tmp/nx/conf/nginx.conf; sleep 0.5
 rss() { ps -o rss= -p $(pgrep -f 'nginx: worker' | tr '\n' ',' | sed 's/,$//') | awk '{s+=$1} END {print s}'; }
 echo "rss_kb_start=$(rss)"
-BODIES=/work/bench/datasets/bodies.jsonl PATH_=/v1/chat/completions SCORE=0.6 \
+BODIES=$BODIES PATH_=/v1/chat/completions SCORE=0.6 \
   wrk -t4 -c64 -d$DUR -s bench/wrk-post.lua http://127.0.0.1:18080/v1/chat/completions 2>/dev/null | grep RESULT
 echo "rss_kb_end=$(rss)"
 echo "--- metrics"
